@@ -1,6 +1,7 @@
 **
 !Dockerfile
 !package.json
+!package-lock.json
 !tsconfig.json
 !eslint.config.js
 !main.py

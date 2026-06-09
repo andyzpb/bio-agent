@@ -46,6 +46,14 @@ def _clean_registry():
     plugin_registry._instances.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_shell_restore_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("AKASIC_RESTORE_DIR", str(tmp_path / "restore"))
+
+
 def _make_manager(plugin_dirs: list[Path], *, event_bus: EventBus, tools: ToolRegistry | None = None) -> PluginManager:
     return PluginManager(plugin_dirs=plugin_dirs, event_bus=event_bus, tool_registry=tools)
 

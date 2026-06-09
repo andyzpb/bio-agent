@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import tempfile
 import types
 from pathlib import Path
 from typing import cast, Any
@@ -144,8 +145,6 @@ system_prompt = "test"
 @pytest.mark.asyncio
 async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
-    socket_path = tmp_path / "akashic.sock"
-    _write_config(config_path, socket_path)
 
     original_build_core_runtime = bootstrap_app.build_core_runtime
     observed: dict[str, object] = {}
@@ -179,11 +178,21 @@ async def test_serve_smoke_loads_config_and_runs_shutdown(monkeypatch, tmp_path)
     monkeypatch.setattr(
         bootstrap_app, "build_dashboard_server", lambda **_: _FakeDashboardServer()
     )
-    monkeypatch.setattr(main.Path, "home", lambda: tmp_path)
 
-    await main.serve(str(config_path))
+    short_tmp_parent = (
+        Path("/private/tmp")
+        if Path("/private/tmp").is_dir()
+        else Path(tempfile.gettempdir())
+    )
+    with tempfile.TemporaryDirectory(prefix="ak-", dir=str(short_tmp_parent)) as short_tmp:
+        short_root = Path(short_tmp)
+        socket_path = short_root / "a.sock"
+        _write_config(config_path, socket_path)
+        monkeypatch.setattr(main.Path, "home", lambda: short_root)
 
-    assert socket_path.exists() is False
+        await main.serve(str(config_path))
+
+        assert socket_path.exists() is False
     assert "scheduler" in observed
     assert "bus" in observed
     assert cast(SharedHttpResources, observed["http_resources"]).closed is True

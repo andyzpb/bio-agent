@@ -931,6 +931,39 @@ def test_plugin_asset_paths_reject_cross_platform_traversal(tmp_path) -> None:
         assert client.get("/plugins/missing/dashboard_panel.js").status_code == 404
 
 
+def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        plugins = client.get("/api/dashboard/plugins")
+        assert plugins.status_code == 200
+        assert any(item["id"] == "biomed_evidence" for item in plugins.json())
+
+        panel = client.get("/plugins/biomed_evidence/dashboard_panel.js")
+        assert panel.status_code == 200
+        assert "Biomedical" in panel.text
+
+        search = client.get(
+            "/api/biomed/search",
+            params={"query": "microglia", "source": "mock"},
+        )
+        assert search.status_code == 200
+        assert search.json()["items"]
+
+        answer = client.post(
+            "/api/biomed/answer",
+            json={
+                "question": "What evidence links microglia to Alzheimer's disease?",
+                "source": "mock",
+                "max_papers": 5,
+            },
+        )
+        assert answer.status_code == 200
+        assert answer.json()["citations"]
+
+        graph = client.get("/api/biomed/graph", params={"topic": "microglia"})
+        assert graph.status_code == 200
+        assert graph.json()["nodes"]
+
+
 def test_memory_engine_plugins_only_expose_active_engine_panels(tmp_path) -> None:
     with TestClient(create_dashboard_app(tmp_path)) as client:
         plugins = client.get("/api/dashboard/plugins").json()

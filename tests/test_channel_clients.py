@@ -306,7 +306,11 @@ def _import_telegram_channel(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("infra.channels.telegram_channel")
 
 
-def _import_qq_channel(monkeypatch: pytest.MonkeyPatch):
+def _import_qq_channel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    qq_home = tmp_path / "qq-home"
+    qq_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: qq_home)
+
     ncatbot_core = types.ModuleType("ncatbot.core")
     ncatbot_core_adapter = types.ModuleType("ncatbot.core.adapter")
     ncatbot_core_adapter_adapter = types.ModuleType("ncatbot.core.adapter.adapter")
@@ -432,8 +436,9 @@ def _import_qq_channel(monkeypatch: pytest.MonkeyPatch):
 
 def test_qq_channel_ws_timeout_patch_is_best_effort(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    mod = _import_qq_channel(monkeypatch)
+    mod = _import_qq_channel(monkeypatch, tmp_path)
     monkeypatch.delitem(sys.modules, "ncatbot.core.adapter.adapter", raising=False)
 
     mod._patch_ncatbot_ws_open_timeout(7.5)
@@ -938,7 +943,7 @@ async def test_telegram_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
 @pytest.mark.asyncio
 async def test_qq_channel_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    mod = _import_qq_channel(monkeypatch)
+    mod = _import_qq_channel(monkeypatch, tmp_path)
     bus = _Bus()
     session_manager = _SessionManager()
     async def _request_get(url, **kwargs):
@@ -1042,7 +1047,7 @@ async def test_qq_private_trace_sends_forward_then_final_and_clears_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    mod = _import_qq_channel(monkeypatch)
+    mod = _import_qq_channel(monkeypatch, tmp_path)
     bus = _Bus()
     session_manager = _SessionManager()
     event_bus = EventBus()
@@ -1138,8 +1143,11 @@ async def test_qq_private_trace_sends_forward_then_final_and_clears_state(
 
 
 @pytest.mark.asyncio
-async def test_qq_private_trace_skips_empty_trace(monkeypatch: pytest.MonkeyPatch):
-    mod = _import_qq_channel(monkeypatch)
+async def test_qq_private_trace_skips_empty_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    mod = _import_qq_channel(monkeypatch, tmp_path)
     bus = _Bus()
     session_manager = _SessionManager()
     event_bus = EventBus()

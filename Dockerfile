@@ -9,10 +9,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs npm build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-dev.txt package.json ./
+COPY requirements.txt requirements-dev.txt package.json package-lock.json ./
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt \
-    && npm install
+    && npm ci
 
 COPY . .
 RUN npm run build
