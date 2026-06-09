@@ -12,7 +12,7 @@
 
 ```bash
 git clone <this-repo>
-cd akashic-agent
+cd bio-agent
 uv venv && uv pip install -r requirements.txt
 ```
 
@@ -98,6 +98,49 @@ uv run python main.py
 | 怎么写后台任务让 agent 空闲时自动干活 | [_handbook/drift-guide.md](./_handbook/drift-guide.md) |
 | MEMORY.md / SELF.md / consolidation / 记忆怎么流转 | [_handbook/memory-markdown.md](./_handbook/memory-markdown.md) |
 | 怎么写插件介入生命周期、注册工具 | [_handbook/plugins-tutorial.md](./_handbook/plugins-tutorial.md) |
+
+---
+
+## Biomedical Evidence Demo
+
+本仓库包含一个可离线演示的 `Biomedical Evidence` 插件，用来展示面向生物医学研究的证据检索、证据抽取、引用回答、轻量证据图和 Research Watch 决策日志。
+
+核心入口：
+
+- 插件代码：[plugins/biomed_evidence](./plugins/biomed_evidence)
+- 案例说明：[cases/ki-biomed-research-assistant/README.md](./cases/ki-biomed-research-assistant/README.md)
+- Responsible AI：[docs/responsible_ai.md](./docs/responsible_ai.md)
+- 部署说明：[docs/deployment.md](./docs/deployment.md)
+- 评估说明：[docs/evaluation.md](./docs/evaluation.md)
+
+默认使用 deterministic `mock` 数据，不需要外部 API key。需要真实文献检索时，可在工具或 API 中使用 `source=pubmed`，并可选配置 `NCBI_EMAIL` / `NCBI_API_KEY`。
+
+```bash
+uv run python main.py dashboard
+```
+
+打开 `http://127.0.0.1:2236`，选择 `Biomedical Evidence`。可以直接提问：
+
+```text
+What recent evidence links microglial activation to Alzheimer's disease progression?
+```
+
+本地验证：
+
+```bash
+python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
+npm run typecheck
+npm run build
+docker build -t bio-agent-biomed:latest .
+```
+
+Docker 运行：
+
+```bash
+docker compose up --build
+```
+
+该插件是研究支持工具，不提供诊断、治疗建议或患者特异性医学建议。
 
 ---
 

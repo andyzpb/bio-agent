@@ -1,0 +1,220 @@
+.biomed-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.biomed-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.biomed-tab,
+.biomed-row button,
+.biomed-watch-row button,
+#biomed-watch-create,
+#biomed-ask-btn,
+#biomed-graph-btn {
+  border: 1px solid var(--border, #d0d7de);
+  background: var(--panel-bg, #fff);
+  color: var(--text, #24292f);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.biomed-tab.is-active {
+  background: #0f766e;
+  border-color: #0f766e;
+  color: #fff;
+}
+
+.biomed-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.biomed-title {
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.biomed-subtitle,
+.biomed-muted,
+.biomed-watch-meta {
+  color: var(--muted, #57606a);
+  font-size: 12px;
+}
+
+.biomed-label {
+  color: var(--muted, #57606a);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.biomed-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.biomed-form textarea,
+.biomed-form input,
+.biomed-form select,
+.biomed-row input,
+.biomed-row select {
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 6px;
+  color: var(--text, #24292f);
+  background: var(--panel-bg, #fff);
+  padding: 8px;
+  min-width: 0;
+}
+
+.biomed-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.biomed-row input {
+  flex: 1;
+}
+
+.biomed-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.biomed-answer {
+  line-height: 1.5;
+}
+
+.biomed-answer-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.biomed-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 650;
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  color: #24292f;
+}
+
+.biomed-pill-supports,
+.biomed-pill-low {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.biomed-pill-contradicts,
+.biomed-pill-high {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+.biomed-pill-inconclusive,
+.biomed-pill-medium,
+.biomed-pill-defer {
+  background: #fffbeb;
+  border-color: #fde68a;
+  color: #92400e;
+}
+
+.biomed-pill-push {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}
+
+.biomed-pill-skip {
+  background: #f3f4f6;
+  border-color: #d1d5db;
+  color: #374151;
+}
+
+.biomed-evidence-item,
+.biomed-watch-row,
+.biomed-decision,
+.biomed-policy {
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-bg, #fff);
+}
+
+.biomed-evidence-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.biomed-evidence-claim {
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.biomed-evidence-finding {
+  color: var(--muted, #57606a);
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
+.biomed-two-col {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.biomed-list {
+  margin: 0;
+  padding-left: 18px;
+  line-height: 1.45;
+}
+
+.biomed-watch-form input:first-child {
+  font-weight: 600;
+}
+
+.biomed-watch-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.biomed-watch-title {
+  font-weight: 650;
+}
+
+.biomed-error {
+  color: #991b1b;
+}
+
+@media (max-width: 720px) {
+  .biomed-two-col {
+    grid-template-columns: 1fr;
+  }
+
+  .biomed-row,
+  .biomed-watch-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

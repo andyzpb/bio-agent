@@ -1,0 +1,402 @@
+/// <reference path="../../types/akashic-dashboard.d.ts" />
+
+type BiomedView = "ask" | "evidence" | "graph" | "watch" | "responsible";
+
+interface EvidenceRow {
+  evidence_id: string;
+  paper_id: string;
+  paper_title?: string;
+  claim: string;
+  finding: string;
+  evidence_direction: string;
+  confidence: string;
+  limitations?: string[];
+  entities?: { name: string; entity_type: string }[];
+  methods?: string[];
+}
+
+interface AnswerResult {
+  run_id: string;
+  answer: string;
+  citations: { paper_id: string; title: string; doi?: string | null; url?: string | null; cited_claim: string }[];
+  evidence_summary: EvidenceRow[];
+  conflicting_evidence: EvidenceRow[];
+  limitations: string[];
+  uncertainty_level: string;
+  suggested_next_steps: string[];
+  disclaimer: string;
+}
+
+interface WatchTopic {
+  watch_id: string;
+  topic: string;
+  schedule: string;
+  enabled: boolean;
+  min_relevance_score: number;
+  last_checked_at?: string | null;
+  next_check_at?: string | null;
+}
+
+function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
+  const value = dispatch?.filters["_view"];
+  if (value === "graph" || value === "watch" || value === "responsible" || value === "evidence") {
+    return value;
+  }
+  return "ask";
+}
+
+function pill(value: string): string {
+  return `<span class="biomed-pill biomed-pill-${escapeHtml(value)}">${escapeHtml(value)}</span>`;
+}
+
+function renderList(items: unknown[] | undefined): string {
+  const values = (items || []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (!values.length) return '<span class="biomed-muted">None recorded</span>';
+  return `<ul class="biomed-list">${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function renderEvidenceItem(item: EvidenceRow): string {
+  return `
+    <div class="biomed-evidence-item">
+      <div class="biomed-evidence-head">
+        ${pill(item.evidence_direction)}
+        ${pill(item.confidence)}
+        <code>${escapeHtml(item.paper_id)}</code>
+      </div>
+      <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
+      <div class="biomed-evidence-finding">${escapeHtml(item.finding)}</div>
+    </div>
+  `;
+}
+
+function renderEvidenceDetail(item: EvidenceRow): string {
+  const entities = (item.entities || []).map((entity) => `${entity.name} (${entity.entity_type})`);
+  return `
+    <div class="biomed-section">
+      <div class="biomed-title">Evidence Detail</div>
+      <div class="biomed-subtitle">${escapeHtml(item.paper_title || item.paper_id)}</div>
+      ${renderEvidenceItem(item)}
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Entities</div>
+          ${renderList(entities)}
+        </div>
+        <div>
+          <div class="biomed-label">Methods</div>
+          ${renderList(item.methods)}
+        </div>
+      </div>
+      <div class="biomed-label">Limitations</div>
+      ${renderList(item.limitations)}
+    </div>
+  `;
+}
+
+function renderTabs(view: BiomedView): string {
+  const tabs: { id: BiomedView; label: string }[] = [
+    { id: "ask", label: "Ask" },
+    { id: "evidence", label: "Evidence" },
+    { id: "graph", label: "Graph" },
+    { id: "watch", label: "Watch" },
+    { id: "responsible", label: "Responsible AI" },
+  ];
+  return `
+    <div class="biomed-tabs">
+      ${tabs.map((tab) => `
+        <button class="biomed-tab ${tab.id === view ? "is-active" : ""}" data-biomed-view="${tab.id}">
+          ${escapeHtml(tab.label)}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderAsk(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Ask Evidence Question</div>
+      <div class="biomed-form">
+        <textarea id="biomed-question" rows="4">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
+        <div class="biomed-row">
+          <select id="biomed-source">
+            <option value="mock">mock</option>
+            <option value="pubmed">pubmed</option>
+          </select>
+          <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
+          <button id="biomed-ask-btn">Answer</button>
+        </div>
+      </div>
+      <div id="biomed-ask-result" class="biomed-result"></div>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-ask-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+    if (!resultNode) return;
+    resultNode.textContent = "Running evidence search...";
+    const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
+    const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
+    const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
+    try {
+      const result = await api<AnswerResult>("/api/biomed/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, source, max_papers: maxPapers }),
+      });
+      resultNode.innerHTML = `
+        <div class="biomed-answer-meta">
+          <code>${escapeHtml(result.run_id)}</code>
+          ${pill(result.uncertainty_level)}
+        </div>
+        <div class="biomed-answer">${renderMarkdown(result.answer)}</div>
+        <div class="biomed-label">Citations</div>
+        ${renderList(result.citations.map((citation) => `${citation.title} | ${citation.paper_id}${citation.doi ? ` | doi:${citation.doi}` : ""}`))}
+        <div class="biomed-label">Evidence</div>
+        ${result.evidence_summary.map(renderEvidenceItem).join("") || '<div class="biomed-muted">No evidence extracted.</div>'}
+        <div class="biomed-label">Limitations</div>
+        ${renderList(result.limitations)}
+      `;
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+}
+
+function renderGraph(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Evidence Graph</div>
+      <div class="biomed-row">
+        <input id="biomed-graph-topic" placeholder="topic or entity" value="microglial activation Alzheimer's disease" />
+        <button id="biomed-graph-btn">Load</button>
+      </div>
+      <div id="biomed-graph-result" class="biomed-result"></div>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-graph-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-graph-result");
+    if (!resultNode) return;
+    const topic = container.querySelector<HTMLInputElement>("#biomed-graph-topic")?.value || "";
+    resultNode.textContent = "Loading graph...";
+    try {
+      const params = new URLSearchParams({ topic });
+      const graph = await api<{ nodes: { id: string; label: string; kind: string }[]; edges: { source: string; target: string; type: string }[] }>(`/api/biomed/graph?${params.toString()}`);
+      resultNode.innerHTML = `
+        <div class="biomed-two-col">
+          <div>
+            <div class="biomed-label">Nodes (${graph.nodes.length})</div>
+            ${renderList(graph.nodes.slice(0, 30).map((node) => `${node.kind}: ${node.label}`))}
+          </div>
+          <div>
+            <div class="biomed-label">Edges (${graph.edges.length})</div>
+            ${renderList(graph.edges.slice(0, 30).map((edge) => `${edge.source} -> ${edge.type} -> ${edge.target}`))}
+          </div>
+        </div>
+      `;
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+}
+
+async function loadWatchList(container: HTMLElement): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-watch-list");
+  if (!target) return;
+  target.textContent = "Loading watches...";
+  const data = await api<{ items: WatchTopic[] }>("/api/biomed/watch");
+  if (!data.items.length) {
+    target.innerHTML = '<div class="biomed-muted">No watch topics yet.</div>';
+    return;
+  }
+  target.innerHTML = data.items.map((watch) => `
+    <div class="biomed-watch-row">
+      <div>
+        <div class="biomed-watch-title">${escapeHtml(watch.topic)}</div>
+        <div class="biomed-watch-meta">
+          ${escapeHtml(watch.schedule)} · ${watch.enabled ? "enabled" : "paused"} · threshold ${watch.min_relevance_score}
+        </div>
+        <div class="biomed-watch-meta">
+          last ${escapeHtml(watch.last_checked_at || "-")} · next ${escapeHtml(watch.next_check_at || "-")}
+        </div>
+      </div>
+      <button data-biomed-check="${escapeHtml(watch.watch_id)}">Check</button>
+    </div>
+  `).join("");
+  target.querySelectorAll<HTMLButtonElement>("[data-biomed-check]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.getAttribute("data-biomed-check") || "";
+      button.disabled = true;
+      button.textContent = "Checking...";
+      await api(`/api/biomed/watch/${encodeURIComponent(id)}/check`, { method: "POST" });
+      await loadWatchList(container);
+      await loadWatchEvents(container, id);
+    });
+  });
+}
+
+async function loadWatchEvents(container: HTMLElement, watchId = ""): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-watch-events");
+  if (!target) return;
+  const url = watchId ? `/api/biomed/watch/${encodeURIComponent(watchId)}/events` : "/api/biomed/watch//events";
+  if (!watchId) {
+    target.innerHTML = '<div class="biomed-muted">Check a watch to inspect its decisions.</div>';
+    return;
+  }
+  const data = await api<{ items: Record<string, unknown>[] }>(url);
+  target.innerHTML = data.items.map((item) => `
+    <div class="biomed-decision">
+      <div>${pill(String(item["decision"] || ""))} ${escapeHtml(String(item["title"] || item["paper_id"] || ""))}</div>
+      <div class="biomed-watch-meta">score ${escapeHtml(String(item["relevance_score"] || ""))} · ${escapeHtml(String(item["rationale"] || ""))}</div>
+    </div>
+  `).join("") || '<div class="biomed-muted">No decisions.</div>';
+}
+
+function renderWatch(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Research Watch</div>
+      <div class="biomed-form biomed-watch-form">
+        <input id="biomed-watch-topic" value="spatial transcriptomics in tumor microenvironment" />
+        <input id="biomed-watch-include" value="spatial transcriptomics,tumor microenvironment" />
+        <input id="biomed-watch-methods" value="spatial transcriptomics" />
+        <div class="biomed-row">
+          <input id="biomed-watch-threshold" type="number" min="0" max="1" step="0.05" value="0.7" />
+          <select id="biomed-watch-schedule"><option>daily</option><option>weekly</option><option>manual</option></select>
+          <button id="biomed-watch-create">Create Watch</button>
+        </div>
+      </div>
+      <div class="biomed-label">Topics</div>
+      <div id="biomed-watch-list" class="biomed-result"></div>
+      <div class="biomed-label">Decision Log</div>
+      <div id="biomed-watch-events" class="biomed-result"></div>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-watch-create")?.addEventListener("click", async () => {
+    const topic = container.querySelector<HTMLInputElement>("#biomed-watch-topic")?.value || "";
+    const include = csv(container.querySelector<HTMLInputElement>("#biomed-watch-include")?.value || "");
+    const methods = csv(container.querySelector<HTMLInputElement>("#biomed-watch-methods")?.value || "");
+    const min_relevance_score = Number(container.querySelector<HTMLInputElement>("#biomed-watch-threshold")?.value || 0.7);
+    const schedule = container.querySelector<HTMLSelectElement>("#biomed-watch-schedule")?.value || "daily";
+    await api("/api/biomed/watch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic, include_keywords: include, preferred_methods: methods, min_relevance_score, schedule }),
+    });
+    await loadWatchList(container);
+  });
+  void loadWatchList(container);
+  void loadWatchEvents(container);
+}
+
+function csv(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function renderResponsible(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Responsible AI Boundary</div>
+      <div class="biomed-policy">
+        This system is intended for biomedical research support only. It does not provide clinical diagnosis,
+        treatment recommendations, or patient-specific medical advice. Outputs require expert review.
+      </div>
+      <div class="biomed-label">Policy</div>
+      <ul class="biomed-list">
+        <li>Biomedical factual claims must be grounded in retrieved citations.</li>
+        <li>Project memory is treated as user context, not biomedical fact.</li>
+        <li>Clinical diagnosis, patient-specific treatment, and private medical-record interpretation are refused.</li>
+        <li>Uncertainty is elevated when evidence is conflicting, observational, abstract-only, or missing citations.</li>
+      </ul>
+    </div>
+  `;
+}
+
+window.AkashicDashboard.registerPlugin({
+  id: "biomed_evidence",
+  label: "Biomedical Evidence",
+  viewLabel: "biomed",
+  pageSize: 25,
+  rowKey: "evidence_id",
+  defaultSortBy: "updated_at",
+
+  columns: [
+    { key: "paper_id", label: "Paper", width: 132, cellClass: "mono", rawTitle: true },
+    { key: "evidence_direction", label: "Dir", width: 92, renderCell: (value) => pill(String(value || "")) },
+    { key: "confidence", label: "Conf", width: 72, renderCell: (value) => pill(String(value || "")) },
+    { key: "claim", label: "Claim", flex: true, fmt: "text-preview", cellClass: "content-preview" },
+  ],
+
+  countTitle(total: number): string {
+    return `${total} evidence items`;
+  },
+
+  async getCount(): Promise<number | null> {
+    const data = await api<{ total: number }>("/api/biomed/evidence?page_size=1").catch(() => ({ total: 0 }));
+    return data.total || 0;
+  },
+
+  async fetchPage({ page, pageSize, filters }) {
+    const params = new URLSearchParams();
+    params.set("page", String(page));
+    params.set("page_size", String(pageSize));
+    for (const key of ["q", "direction", "entity"]) {
+      const value = filters?.[key];
+      if (value) params.set(key, value);
+    }
+    const data = await api<{ items: Record<string, unknown>[]; total: number }>(`/api/biomed/evidence?${params.toString()}`);
+    return { items: data.items || [], total: data.total || 0 };
+  },
+
+  renderFilters(container: HTMLElement, dispatch: PluginDispatch): void {
+    container.innerHTML = `
+      <input class="filter-input" placeholder="Search evidence" value="${escapeHtml(dispatch.filters["q"] || "")}" data-filter="q" />
+      <select class="filter-input" data-filter="direction">
+        <option value="">all directions</option>
+        ${["supports", "contradicts", "inconclusive", "background"].map((value) => `
+          <option value="${value}" ${dispatch.filters["direction"] === value ? "selected" : ""}>${value}</option>
+        `).join("")}
+      </select>
+      <input class="filter-input" placeholder="Entity" value="${escapeHtml(dispatch.filters["entity"] || "")}" data-filter="entity" />
+    `;
+    container.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-filter]").forEach((node) => {
+      node.addEventListener("change", () => dispatch.setFilter(node.dataset.filter || "", node.value));
+      if (node instanceof HTMLInputElement) {
+        node.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") dispatch.setFilter(node.dataset.filter || "", node.value);
+        });
+      }
+    });
+  },
+
+  renderNavBody(container: HTMLElement, dispatch: PluginDispatch): void {
+    const view = viewFromDispatch(dispatch);
+    container.innerHTML = renderTabs(view);
+    container.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
+      button.addEventListener("click", () => dispatch.setFilter("_view", button.dataset.biomedView || "ask"));
+    });
+  },
+
+  renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch?: PluginDispatch): void {
+    const view = viewFromDispatch(dispatch);
+    container.innerHTML = `<div class="biomed-wrap">${renderTabs(view)}</div>`;
+    container.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
+      button.addEventListener("click", () => dispatch?.setFilter("_view", button.dataset.biomedView || "ask"));
+    });
+    const root = container.querySelector<HTMLElement>(".biomed-wrap");
+    if (!root) return;
+    if (item && view === "evidence") {
+      root.innerHTML += renderEvidenceDetail(item as unknown as EvidenceRow);
+      return;
+    }
+    if (view === "graph") {
+      renderGraph(root);
+    } else if (view === "watch") {
+      renderWatch(root);
+    } else if (view === "responsible") {
+      renderResponsible(root);
+    } else if (view === "evidence") {
+      root.innerHTML += '<div class="biomed-section"><div class="biomed-title">Evidence Browser</div><div class="biomed-muted">Select an evidence row to inspect entities, methods, and limitations.</div></div>';
+    } else {
+      renderAsk(root);
+    }
+  },
+});

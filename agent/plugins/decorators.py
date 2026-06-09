@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import inspect
-from typing import Any, Callable
+from types import UnionType
+from typing import Any, Callable, Literal, Union, get_args, get_origin, get_type_hints
 
 import docstring_parser
 
@@ -161,7 +163,7 @@ def tool(
 
 _PY_TO_JSON: dict[str, str] = {
     "str": "string",
-    "int": "number",
+    "int": "integer",
     "float": "number",
     "bool": "boolean",
     "dict": "object",
@@ -171,6 +173,10 @@ _PY_TO_JSON: dict[str, str] = {
 
 def _derive_params_schema(func: Callable[..., Any]) -> dict[str, Any]:
     sig = inspect.signature(func)
+    try:
+        type_hints = get_type_hints(func)
+    except Exception:
+        type_hints = {}
     docs = docstring_parser.parse(func.__doc__ or "")
     param_docs = {p.arg_name: p.description for p in docs.params}
     props: dict[str, Any] = {}
@@ -179,9 +185,8 @@ def _derive_params_schema(func: Callable[..., Any]) -> dict[str, Any]:
         # 1. 跳过 self 和 event（生命周期占位参数，不进 schema）
         if pn in ("self", "event"):
             continue
-        ann = p.annotation
-        json_type = _PY_TO_JSON.get(getattr(ann, "__name__", ""), "string")
-        prop: dict[str, Any] = {"type": json_type}
+        ann = type_hints.get(pn, p.annotation)
+        prop = _annotation_to_json_schema(ann)
         if pn in param_docs:
             prop["description"] = param_docs[pn]
         props[pn] = prop
@@ -189,3 +194,96 @@ def _derive_params_schema(func: Callable[..., Any]) -> dict[str, Any]:
         if p.default is inspect.Parameter.empty:
             required.append(pn)
     return {"type": "object", "properties": props, "required": required}
+
+
+def _annotation_to_json_schema(annotation: Any) -> dict[str, Any]:
+    if annotation is inspect.Parameter.empty:
+        return {"type": "string"}
+    if isinstance(annotation, str):
+        return _string_annotation_to_json_schema(annotation)
+
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Literal:
+        values = list(args)
+        schema: dict[str, Any] = {"enum": values}
+        value_type = _literal_json_type(values)
+        if value_type:
+            schema["type"] = value_type
+        return schema
+
+    if origin in (Union, UnionType):
+        non_none = [arg for arg in args if arg is not type(None)]
+        if len(non_none) == 1:
+            return _annotation_to_json_schema(non_none[0])
+        return {"type": "string"}
+
+    if origin in (list, set, tuple):
+        item_schema = (
+            _annotation_to_json_schema(args[0])
+            if args
+            else {"type": "string"}
+        )
+        return {"type": "array", "items": item_schema}
+
+    if origin is dict:
+        return {"type": "object"}
+
+    if annotation is str:
+        return {"type": "string"}
+    if annotation is int:
+        return {"type": "integer"}
+    if annotation is float:
+        return {"type": "number"}
+    if annotation is bool:
+        return {"type": "boolean"}
+    if annotation is dict:
+        return {"type": "object"}
+    if annotation is list:
+        return {"type": "array", "items": {"type": "string"}}
+
+    return {"type": _PY_TO_JSON.get(getattr(annotation, "__name__", ""), "string")}
+
+
+def _string_annotation_to_json_schema(annotation: str) -> dict[str, Any]:
+    text = annotation.strip()
+    if " | " in text:
+        non_none = [part.strip() for part in text.split("|") if part.strip() != "None"]
+        if len(non_none) == 1:
+            return _string_annotation_to_json_schema(non_none[0])
+    if text.startswith("Literal[") and text.endswith("]"):
+        inner = text[len("Literal[") : -1]
+        try:
+            loaded = ast.literal_eval(f"({inner},)")
+        except Exception:
+            return {"type": "string"}
+        values = list(loaded if isinstance(loaded, tuple) else (loaded,))
+        schema: dict[str, Any] = {"enum": values}
+        value_type = _literal_json_type(values)
+        if value_type:
+            schema["type"] = value_type
+        return schema
+    if text.startswith("list[") and text.endswith("]"):
+        return {
+            "type": "array",
+            "items": _string_annotation_to_json_schema(text[len("list[") : -1]),
+        }
+    if text.startswith("dict[") or text == "dict":
+        return {"type": "object"}
+    return {"type": _PY_TO_JSON.get(text, "string")}
+
+
+def _literal_json_type(values: list[Any]) -> str:
+    non_none = [value for value in values if value is not None]
+    if not non_none:
+        return "string"
+    if all(isinstance(value, str) for value in non_none):
+        return "string"
+    if all(isinstance(value, bool) for value in non_none):
+        return "boolean"
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in non_none):
+        return "integer"
+    if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in non_none):
+        return "number"
+    return ""

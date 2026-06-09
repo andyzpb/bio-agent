@@ -18,12 +18,18 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install dependencies
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -r requirements.txt
           .venv/bin/python -m pip install -r requirements-dev.txt
+          npm install
 
       - name: Run pyright
         run: |
@@ -38,3 +44,19 @@ jobs:
           PYTHONWARNINGS: "ignore:.*AbstractEventLoopPolicy.*:DeprecationWarning"
         run: |
           .venv/bin/pytest -q -W error tests/
+
+      - name: Run biomedical mock eval
+        run: |
+          .venv/bin/python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
+
+      - name: Frontend typecheck
+        run: |
+          npm run typecheck
+
+      - name: Frontend build
+        run: |
+          npm run build
+
+      - name: Docker build
+        run: |
+          docker build -t akashic-biomed-agent .

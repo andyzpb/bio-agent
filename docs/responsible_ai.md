@@ -1,0 +1,29 @@
+# Biomedical Evidence Agent Responsible AI
+
+The Biomedical Evidence Agent is a research support tool. It is not a clinical decision system.
+
+## Research-Only Scope
+
+- Supports literature search, evidence extraction, citation-grounded summaries, and project monitoring.
+- Does not diagnose patients, recommend treatment, interpret private medical records, or replace expert review.
+- Uses public literature and synthetic project context by default.
+
+## Citation Policy
+
+- Biomedical factual claims should be grounded in retrieved papers.
+- If no citation is available, the agent must say so and avoid strong claims.
+- Project memory is treated as user preference or project context, not biomedical fact.
+
+## Uncertainty Policy
+
+The system raises uncertainty when evidence is conflicting, observational, abstract-only, missing abstracts, heuristic-extracted, or based on small/animal cohorts.
+
+## Human Review
+
+All evidence items include `requires_expert_review=true` by default. Researchers should inspect source papers, evidence spans, limitations, and conflicting findings before using outputs in research decisions.
+
+## Data Handling
+
+- Demo mode uses mock public-domain-style literature data.
+- Secrets must be provided through environment variables or local config excluded from Git.
+- Watch topics and biomedical evidence are stored in the local workspace database and can be deleted.

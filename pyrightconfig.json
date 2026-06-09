@@ -13,7 +13,8 @@
     "memory2",
     "proactive_v2",
     "prompts",
-    "session"
+    "session",
+    "plugins/biomed_evidence"
   ],
   "exclude": [
     ".venv",
