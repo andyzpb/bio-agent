@@ -59,6 +59,70 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert payload["retrieval_id"]
         assert payload["retrieval_manifest"]["compiled_query"]
 
+        project = client.post(
+            "/api/biomed/projects",
+            json={
+                "name": "Microglia API project",
+                "research_question": "microglial activation and Alzheimer's disease progression",
+                "include_keywords": ["microglial activation"],
+            },
+        )
+        assert project.status_code == 200
+        project_id = project.json()["project_id"]
+        rejected_paper = search_payload["items"][0]["paper_id"]
+        saved_paper = search_payload["items"][1]["paper_id"]
+        assert client.post(
+            f"/api/biomed/projects/{project_id}/papers",
+            json={
+                "paper_id": rejected_paper,
+                "source": "mock",
+                "decision": "rejected",
+                "reason": "API test rejection",
+            },
+        ).status_code == 200
+        assert client.post(
+            f"/api/biomed/projects/{project_id}/papers",
+            json={
+                "paper_id": saved_paper,
+                "source": "mock",
+                "decision": "saved",
+                "reason": "API test priority",
+            },
+        ).status_code == 200
+        project_answer = client.post(
+            "/api/biomed/answer",
+            json={
+                "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+                "max_papers": 5,
+                "project_id": project_id,
+            },
+        )
+        assert project_answer.status_code == 200
+        project_payload = project_answer.json()
+        assert project_payload["project_id"] == project_id
+        assert project_payload["project_context_trace"]["memory_used"] is True
+        assert rejected_paper not in project_payload["retrieval_manifest"]["returned_paper_ids"]
+
+        claim = client.post(
+            f"/api/biomed/projects/{project_id}/claims",
+            json={
+                "claim": project_payload["evidence_summary"][0]["claim"],
+                "status": "supported",
+                "evidence_ids": [project_payload["evidence_summary"][0]["evidence_id"]],
+                "audit_ids": ["audit-api-test"],
+            },
+        )
+        assert claim.status_code == 200
+        brief = client.post(
+            f"/api/biomed/projects/{project_id}/briefs",
+            json={"format": "markdown"},
+        )
+        assert brief.status_code == 200
+        assert "Project memory is context only" in brief.json()["content"]
+        queue = client.get(f"/api/biomed/projects/{project_id}/review-queue")
+        assert queue.status_code == 200
+
         evidence = client.get("/api/biomed/evidence", params={"direction": "supports"})
         assert evidence.status_code == 200
         assert evidence.json()["total"] >= 1

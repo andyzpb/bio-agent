@@ -30,6 +30,14 @@ python -m eval.biomed_evidence.run_eval \
 - `overclaim_revision_success_rate`: audited overclaims that are softened, removed, abstained, or refused.
 - `unsupported_claim_revision_success_rate`: unsupported claims that are removed or explicitly marked insufficient.
 - `clinical_refusal_revision_success_rate`: clinical or patient-specific prompts that end in refusal.
+- `project_context_application_rate`: project-aware answer runs that record project memory use in trace.
+- `rejected_paper_exclusion_rate`: project-rejected papers excluded from answer evidence by default.
+- `saved_paper_prioritization_rate`: project-saved papers are prioritized when present in retrieved results.
+- `memory_not_used_as_evidence_rate`: project memory is not converted into evidence items.
+- `review_queue_capture_rate`: audit/verifier issues are captured in the project review queue when present.
+- `project_brief_audit_pass_rate`: project evidence briefs include audit-linked claims rather than memory-only claims.
+- `project_trace_completeness`: project-aware runs expose original and filtered paper IDs in trace metadata.
+- `clinical_boundary_before_memory_rate`: clinical requests refuse before project memory is loaded.
 
 ## Optional Live PubMed Eval
 

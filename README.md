@@ -6,63 +6,106 @@ integrations, tool plugins, and a FastAPI dashboard.
 
 This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
 a research-only biomedical literature assistant built on top of the framework.
-The plugin currently supports deterministic mock retrieval, optional PubMed
-retrieval, structured router/planner, planner-driven primary/support/refute
-retrieval bundles, evidence extraction with retrieval-intent provenance,
-optional span-grounded LLM evidence extraction, optional audit-gated LLM
-synthesis, citation-grounded answers, claim-level citation audit, audit/revise
-answer traces, Research Watch decision logs, dashboard views, evaluation,
-Docker, and CI-friendly checks.
+The current implementation is **V2.0 Project Evidence Workspace + Review
+Memory**.
 
-The current roadmap direction is **claim-level evidence trustworthiness**:
-moving from "answers with citations" toward a biomedical research agent whose
-retrieval, evidence use, revision, and trace can be inspected claim by claim.
+The biomedical direction is claim-level evidence trustworthiness: every answer
+should be traceable from question, routing, retrieval plan, retrieved papers,
+evidence spans, citations, audit, revision, and final output.
 
-## Status
+## Current V2.0 Snapshot
 
-Implemented today:
+Implemented now:
 
-- Plugin-driven agent framework with memory, background workflows, channels,
-  and dashboard.
-- Biomedical Evidence plugin with mock/PubMed literature retrieval.
-- Pydantic schemas, SQLite persistence, FastAPI routes, and dashboard panel.
-- Structured evidence extraction, citation-grounded answers, evidence graph,
-  and report export.
-- Retrieval manifests with compiled queries, pagination, warnings, errors, and
-  returned paper IDs.
-- V1.5 structured biomedical router/planner with `plan_biomedical_search`,
-  `/api/biomed/plan`, schema-validated query plans, clinical routing, and
-  `validate_plan` trace steps.
-- V1.6 planner-driven multi-query retrieval bundles that execute primary,
-  support, and refute queries, preserve per-query manifests, dedupe papers, and
-  label evidence by retrieval intent.
-- V1.7 optional span-grounded LLM evidence extraction and evidence-constrained
-  LLM synthesis behind `use_llm_extractor` and `use_llm_synthesis`; deterministic
-  span validation and citation audit remain the acceptance gates, with safe
-  fallback to deterministic extraction/synthesis.
-- V1.8 optional advisory verifier model behind `use_llm_verifier`, with
-  persisted disagreement records, `advisory_verify` trace step, dashboard
-  display, and eval metrics. Deterministic citation audit remains the verifier
-  of record.
+- Plugin-based framework with memory, background workflows, channels, dashboard,
+  and tool lifecycle.
+- Biomedical Evidence plugin with deterministic mock retrieval and optional
+  PubMed E-utilities retrieval.
+- Structured biomedical router/planner with clinical boundary classification,
+  schema-validated plans, and primary/support/refute query generation.
+- Retrieval manifests and retrieval bundles with source, compiled query,
+  pagination, returned paper IDs, duplicate handling, and warnings.
+- Evidence extraction with paper/entity/claim records, limitations, confidence,
+  evidence spans, and retrieval-intent provenance.
+- Optional LLM stages behind explicit flags:
+  `use_llm_planner`, `use_llm_extractor`, `use_llm_synthesis`,
+  `use_llm_verifier`, and `use_llm_revision`.
+- Citation-grounded answers with deterministic claim-level audit, overclaim
+  checks, conflict awareness, uncertainty calibration, audit/revise loop, and
+  persisted trace.
+- Optional advisory verifier model. It records disagreement and review pressure,
+  but deterministic audit remains the verifier of record.
+- V2.0 project evidence workspace:
+  `BiomedProject`, saved/rejected/needs-review paper decisions, project claim
+  records, review queue, evidence brief generation, project-aware answer trace,
+  API/tools, dashboard Projects view, and eval metrics.
 - Research Watch topics with relevance scoring, retrieval snapshots, and
   push/skip decision logs.
-- V1.3 claim-level citation audit with atomic claims, support verdicts,
+- Mock eval, Python tests, Node typecheck/build, Docker, and CI-friendly checks.
+
+Project memory is context only. It can influence planning preferences and
+post-retrieval filtering, but it is never treated as biomedical evidence.
+
+## Version Summary
+
+- V1.0: Biomedical Evidence plugin, service/storage/API/dashboard/eval, mock
+  retrieval, citation-grounded answers, graph, Docker, and CI baseline.
+- V1.1: Reproducible installs and local smoke hardening.
+- V1.2: Retrieval reliability, PubMed pagination/dedupe, retrieval manifests,
+  Watch snapshots, and answer/export provenance.
+- V1.3: Claim-level citation audit with atomic claims, support verdicts,
   overclaim detection, conflict checks, uncertainty calibration, persisted
-  audit records, API routes, tools, dashboard audit view, and eval metrics.
-- V1.4 audit/revise loop with `answer_with_audit`, persisted trace steps,
-  deterministic claim revision/refusal, dashboard Trace view, and revision
+  audits, API/tools, dashboard Audit view, and eval metrics.
+- V1.4: `answer_with_audit`, audit/revise loop, optional LLM revision,
+  post-revision audit, persisted trace, dashboard Trace view, and revision
   eval metrics.
-- Optional framework-provider LLM planner and revision paths are supported
-  behind `use_llm_planner` and `use_llm_revision`; default mock demos and CI
-  remain deterministic/keyless.
-- Responsible-AI guardrails for research-only use.
-- Mock biomedical eval, Python tests, Node typecheck/build, Docker, and CI
-  support.
+- V1.5: Structured router/planner with schema-validated query plans and
+  clinical routing.
+- V1.6: Planner-driven primary/support/refute retrieval bundles and
+  retrieval-intent labels.
+- V1.7: Optional span-grounded LLM evidence extraction and audit-gated LLM
+  synthesis.
+- V1.8: Optional advisory verifier model / LLM judge with disagreement trace.
+- V2.0: Project evidence workspace, project memory as context, saved/rejected
+  paper decisions, project claims, review queue, evidence briefs, dashboard
+  Projects view, API/tools, and project-level eval metrics.
 
-Planned next:
+## What Remains
 
-- Project memory for research preferences.
-- Claim-level eval gates in CI and a larger golden dataset.
+Near-term V2.1:
+
+- Richer project reviewer workflows: accept/reject review queue items, claim
+  status transitions, reviewer notes, and decision provenance.
+- Better project evidence brief templates, export controls, and dashboard
+  comparison views.
+- Dashboard visual regression checks for Ask, Projects, Audit, and Trace.
+- Larger project-level golden eval set with human-labeled claims, conflicts,
+  and overclaims.
+
+Trust and evaluation:
+
+- CI gates for claim support, citation precision, overclaim rate, clinical
+  boundary robustness, trace completeness, and project memory isolation.
+- More adversarial clinical-boundary and memory-as-evidence tests.
+- Better disagreement analysis between deterministic audit and advisory
+  verifier.
+
+Retrieval expansion:
+
+- Keep live PubMed optional until reliability and rate-limit behavior are
+  hardened further.
+- Add optional Europe PMC or Semantic Scholar adapters.
+- Improve conflict search across claims and topics.
+- Add full-text/PDF ingestion only after abstract-level provenance and audit
+  gates remain stable.
+
+Non-goals:
+
+- Clinical diagnosis, treatment, dosing, prognosis, or patient-specific advice.
+- Treating saved papers, project notes, or memory as biomedical fact.
+- Replacing deterministic audit with an advisory verifier.
+- Making live PubMed the default source in CI or demos.
+- Multi-user auth/permissions before the single-user research workflow is solid.
 
 ## Quickstart
 
@@ -105,8 +148,14 @@ The dashboard is served at `http://127.0.0.1:2236`.
 
 ## Configuration
 
-Create or edit `config.toml`. A typical setup uses a strong main model, a fast
-utility model, an optional vision model, and embeddings for memory retrieval.
+Create or edit `config.toml`. Default biomedical demos and evals use mock data
+and do not require external API keys.
+
+Optional LLM paths use the framework-configured OpenAI-compatible provider.
+For local Ollama/OpenAI-compatible testing, use the local proxy configuration
+documented in `agent.md`.
+
+Example shape:
 
 ```toml
 [llm]
@@ -119,16 +168,6 @@ base_url = "https://api.deepseek.com/v1"
 enable_thinking = true
 multimodal = false
 
-[llm.fast]
-model = "qwen-flash"
-api_key = "sk-..."
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-[llm.vl]
-model = "qwen-vl-plus"
-api_key = "sk-..."
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
 [memory]
 enabled = true
 engine = ""
@@ -137,75 +176,7 @@ engine = ""
 model = "text-embedding-v3"
 api_key = "sk-..."
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-[channels.telegram]
-token = "123456:ABC..."
-allow_from = ["your_username"]
 ```
-
-## Architecture
-
-```text
-User message
-  -> passive reply
-  -> agent loop
-       -> memory retrieval and consolidation
-       -> plugin lifecycle, tool registration, guards
-       -> tool calls
-       -> response
-
-Proactive loop
-  -> alert/content/context sources
-  -> LLM decision
-  -> push or skip
-  -> Drift background tasks when there is nothing to push
-```
-
-Biomedical Evidence currently sits inside the plugin layer:
-
-```text
-Question
-  -> research/clinical boundary guardrail
-  -> structured router / query planner
-  -> deterministic plan validation
-  -> primary/support/refute literature retrieval with manifests
-  -> paper fetch
-  -> evidence extraction with retrieval-intent labels
-  -> citation-grounded draft answer
-  -> claim-level audit
-  -> deterministic or LLM-backed revision
-  -> answer run / retrieval bundle / report / dashboard trace
-```
-
-Useful framework docs:
-
-| Topic | Document |
-| --- | --- |
-| Proactive monitoring and data sources | [_handbook/proactive-guide.md](./_handbook/proactive-guide.md) |
-| Drift background tasks | [_handbook/drift-guide.md](./_handbook/drift-guide.md) |
-| Long-term memory flow | [_handbook/memory-markdown.md](./_handbook/memory-markdown.md) |
-| Plugin lifecycle and tool registration | [_handbook/plugins-tutorial.md](./_handbook/plugins-tutorial.md) |
-
-## Biomedical Evidence Plugin
-
-The `Biomedical Evidence` plugin demonstrates research-only biomedical tooling
-for literature search, structured evidence extraction, citation-grounded
-answers, lightweight evidence graphs, retrieval manifests, multi-query
-retrieval bundles, traceable audit/revision, and Research Watch decision logs.
-
-Entry points:
-
-- Plugin code: [plugins/biomed_evidence](./plugins/biomed_evidence)
-- Plugin README: [plugins/biomed_evidence/README.md](./plugins/biomed_evidence/README.md)
-- Case study: [cases/ki-biomed-research-assistant/README.md](./cases/ki-biomed-research-assistant/README.md)
-- Responsible AI: [docs/responsible_ai.md](./docs/responsible_ai.md)
-- Deployment: [docs/deployment.md](./docs/deployment.md)
-- Evaluation: [docs/evaluation.md](./docs/evaluation.md)
-
-The default source is deterministic `mock` data, so the demo works without
-external API keys. Use `source=pubmed` for optional NCBI E-utilities retrieval.
-Optional LLM planner/revision uses the framework-configured OpenAI-compatible
-provider and remains request-gated.
 
 Optional PubMed environment variables:
 
@@ -214,11 +185,53 @@ NCBI_EMAIL=you@example.com
 NCBI_API_KEY=...
 ```
 
-Run the dashboard and choose `Biomedical Evidence`:
+## Biomedical Pipeline
+
+```text
+User question
+  -> clinical/research boundary check
+  -> optional project context loading for research questions only
+  -> structured router / planner
+  -> deterministic plan validation
+  -> primary/support/refute retrieval bundle
+  -> project saved/rejected paper prioritization and filtering
+  -> paper fetch
+  -> evidence extraction with spans and retrieval-intent labels
+  -> citation-grounded draft answer
+  -> deterministic claim-level audit
+  -> optional advisory verifier
+  -> deterministic or LLM-backed revision
+  -> final answer + citations + trace + project review queue update
+```
+
+Clinical or patient-specific requests are refused before project memory,
+retrieval, extraction, synthesis, verifier, or brief generation.
+
+## Biomedical Dashboard
+
+Run:
 
 ```bash
 uv run python main.py dashboard
 ```
+
+Open `http://127.0.0.1:2236` and choose `Biomedical Evidence`.
+
+Views:
+
+- Ask: citation-grounded answers, optional LLM stages, support/refute retrieval,
+  and project-aware answer traces.
+- Projects: project creation, saved/rejected/needs-review paper decisions,
+  project claims, review queue, and evidence brief generation.
+- Evidence: extracted claims, entities, methods, limitations, confidence, and
+  retrieval provenance.
+- Graph: paper, entity, and claim graph.
+- Watch: research topic monitoring, snapshots, and push/skip decision logs.
+- Audit: atomic claim audit, support verdicts, overclaims, conflicts, and
+  uncertainty calibration.
+- Trace: classify, plan, validate_plan, retrieve, extract, draft, audit,
+  advisory_verify, revise, post_audit, and finalize steps.
+- Responsible AI: research-only boundary and project-memory constraints.
 
 Example question:
 
@@ -226,13 +239,9 @@ Example question:
 What recent evidence links microglial activation to Alzheimer's disease progression?
 ```
 
-The plugin is for biomedical research support only. It does not provide
-clinical diagnosis, treatment recommendations, medication advice, prognosis, or
-patient-specific medical guidance.
-
 ## Biomedical Tools
 
-The plugin currently registers these agent tools:
+The plugin registers:
 
 - `plan_biomedical_search`
 - `search_biomedical_literature`
@@ -240,6 +249,18 @@ The plugin currently registers these agent tools:
 - `extract_evidence`
 - `answer_with_evidence`
 - `answer_with_audit`
+- `create_biomed_project`
+- `list_biomed_projects`
+- `update_biomed_project`
+- `record_project_paper_decision`
+- `save_project_paper`
+- `reject_project_paper`
+- `list_project_paper_decisions`
+- `record_project_claim`
+- `save_project_claim`
+- `list_project_evidence`
+- `list_project_review_queue`
+- `generate_project_evidence_brief`
 - `watch_research_topic`
 - `list_research_watch_topics`
 - `update_research_watch_topic`
@@ -250,269 +271,38 @@ The plugin currently registers these agent tools:
 - `audit_biomedical_answer`
 - `find_conflicting_evidence`
 
-Runtime biomedical data is stored under the active workspace:
+## API Surface
 
-```text
-biomed_evidence/biomed.db
-```
+Core routes are mounted under `/api/biomed`.
 
-Search and answer runs record retrieval manifests with source, original query,
-compiled query, API parameters, pagination, result counts, warnings, errors,
-and returned paper IDs. Planner-enabled answer runs can also record retrieval
-bundles that preserve primary/support/refute retrieval records, deduped paper
-IDs, duplicate IDs, and evidence retrieval-intent labels. Research Watch checks
-also record retrieval snapshots for push/skip audit.
+Common routes:
 
-## Frontier Roadmap
-
-Plain RAG with citations is not enough for biomedical research support. The
-next higher-trust direction is a **claim-level evidence audit pipeline**:
-
-```text
-Question
-  -> research/clinical boundary classifier
-  -> structured query planner
-  -> deterministic plan validation
-  -> multi-query retrieval bundle
-       -> primary query
-       -> supporting evidence queries
-       -> refuting evidence queries
-       -> manifest per executed query
-  -> evidence extraction
-       -> paper metadata
-       -> evidence span
-       -> claim
-       -> direction
-       -> method/cohort/species
-       -> limitation
-       -> retrieval intent
-  -> draft answer
-  -> post-hoc audit
-       -> atomic claim extraction
-       -> citation existence check
-       -> claim-citation support check
-       -> overclaim check
-       -> conflict check
-       -> uncertainty calibration check
-       -> clinical safety check
-  -> pass / revise / refuse
-  -> final answer with trace
-```
-
-The key design principle is generator/verifier separation. The answer generator
-drafts the response; an independent verifier audits claims against evidence
-spans and citations. The roadmap favors deterministic checks first, with
-optional model-based graders only after schema validation and rule-based
-baselines.
-
-Target audit labels:
-
-- `supported`
-- `partial_support`
-- `overclaimed`
-- `contradicted`
-- `insufficient_evidence`
-- `irrelevant_citation`
-- `not_cited`
-
-Target audit metrics:
-
-- `router_schema_validity`
-- `planner_schema_validity`
-- `query_plan_validity`
-- `support_refute_query_presence`
-- `multi_query_bundle_validity`
-- `support_refute_execution_rate`
-- `evidence_intent_label_rate`
-- `claim_support_rate`
-- `citation_precision`
-- `unsupported_claim_rate`
-- `overclaim_rate`
-- `conflict_awareness_rate`
-- `uncertainty_calibration_rate`
-- `clinical_boundary_robustness`
-- `audit_trace_completeness`
-- `plan_trace_completeness`
-- `retrieval_bundle_trace_completeness`
-- `revision_success_rate`
-
-## TODO Roadmap
-
-V1.3 Citation & Evidence Audit Layer:
-
-- [x] Add `AtomicClaim`, `ClaimAuditItem`, `CitationAuditResult`,
-  `ConflictAuditResult`, and `UncertaintyAudit` schemas.
-- [x] Implement deterministic `extract_atomic_claims`.
-- [x] Implement `validate_citation_support` with claim-to-citation/evidence
-  span alignment.
-- [x] Implement overclaim detection for association-to-causation,
-  animal-to-human, in-vitro-to-clinical, single-study-to-consensus,
-  abstract-only-to-established, and mechanism-to-treatment errors.
-- [x] Implement conflict-aware checks using supporting, refuting, and
-  inconclusive evidence.
-- [x] Persist answer audits and claim audits in SQLite.
-- [x] Add audit API routes and plugin tools.
-- [x] Add dashboard audit view with failed-claim table.
-- [x] Extend mock eval with claim-level metrics.
-
-Audit/revise loop:
-
-- [x] Add `answer_with_audit` without breaking `answer_with_evidence`.
-- [x] Save agent trace steps: classify, plan, validate_plan, retrieve, extract,
-  draft, audit, revise, post_audit, finalize.
-- [x] Downgrade unsupported or overclaimed language before final answer.
-- [x] Refuse or abstain when clinical or evidence-insufficient boundaries are
-  triggered.
-- [x] Add optional framework-provider LLM revision behind `use_llm_revision`
-  with post-audit acceptance or safe fallback.
-
-Structured biomedical planner:
-
-- [x] Add `BiomedicalQueryPlan`.
-- [x] Route requests into `research_question`, `clinical_or_patient_specific`, or
-  `needs_clarification`.
-- [x] Generate primary, support, and refute queries.
-- [x] Use existing `mesh_terms`, `species_terms`, `publication_types`, and
-  `exclude_terms` search fields.
-- [x] Add `plan_biomedical_search` and `/api/biomed/plan`.
-- [x] Add optional framework-provider LLM planner behind `use_llm_planner`
-  with deterministic fallback.
-
-Planner-driven multi-query retrieval:
-
-- [x] Add answer-level retrieval bundles.
-- [x] Execute primary/support/refute query records when
-  `execute_support_refute=true`.
-- [x] Preserve each executed query's retrieval manifest.
-- [x] Dedupe papers before evidence extraction.
-- [x] Label evidence as `primary`, `support`, `refute`, or `unknown`.
-- [x] Show bundle metadata in answer responses and trace metadata.
-
-Project memory:
-
-- [ ] Add project memory records for preferred methods, excluded terms/species,
-  saved papers, rejected papers, known conflicts, and open questions.
-- [ ] Inject project memory into query planning as preference context only.
-- [ ] Keep memory out of biomedical factual citation paths.
-- [ ] Add dashboard controls to edit, disable, and delete memory entries.
-
-Claim-level evaluation:
-
-- [ ] Add golden biomedical question cases.
-- [ ] Add overclaim, conflict, clinical-boundary, and memory eval cases.
-- [x] Add mock eval metrics for trace completeness and revision success.
-- [x] Add mock eval metrics for router/planner validity and retrieval bundles.
-- [ ] Add CI gates for claim support, citation precision, overclaim rate,
-  clinical robustness, and trace completeness.
-- [ ] Keep live PubMed eval opt-in and out of default CI.
-
-Dashboard and portfolio polish:
-
-- [x] Add Evidence Audit panel.
-- [x] Add Agent Trace panel.
-- [x] Add conflict-audit API and evidence graph conflict direction display.
-- [ ] Add Project Memory panel.
-- [x] Add docs for evidence audit and claim-level eval after implementation.
-- [ ] Add screenshots or a demo GIF once the UI stabilizes.
-
-## Validation
-
-Run targeted biomedical checks:
-
-```bash
-python -m pytest -q tests/test_biomed_evidence.py tests/test_biomed_api.py
-python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
-python -m eval.biomed_evidence.run_eval --source pubmed --live-pubmed --output /tmp/biomed_live_eval_results.json
-npm ci
-npm run typecheck
-npm run build
-docker build -t bio-agent-biomed:latest .
-```
-
-Run a local dashboard API smoke for planner, V1.7 extractor/synthesis, V1.8
-advisory verifier, audit/revision, trace, and multi-query retrieval bundles:
-
-```bash
-uv run python main.py dashboard
-
-curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What recent evidence links microglial activation to Alzheimer disease progression?",
-    "source": "mock",
-    "max_papers": 5,
-    "use_llm_planner": true,
-    "use_llm_extractor": true,
-    "use_llm_synthesis": true,
-    "use_llm_verifier": true,
-    "use_llm_revision": true,
-    "execute_support_refute": true
-  }' | jq '{
-    planner_mode: .answer_result.query_plan.planner_mode,
-    planner_model: .answer_result.query_plan.llm_model,
-    extraction_modes: ([.answer_result.evidence_summary[].extraction_mode] | unique),
-    synthesis_mode: .answer_result.synthesis_mode,
-    synthesis_model: .answer_result.synthesis_model,
-    synthesis_fallback_reason: .answer_result.synthesis_fallback_reason,
-    verifier_mode: .advisory_verifier.verifier_mode,
-    verifier_model: .advisory_verifier.llm_model,
-    advisory_action: .advisory_verifier.advisory_action,
-    high_risk_disagreements: .advisory_verifier.high_risk_disagreement_count,
-    revision_mode: .revision.revision_mode,
-    revision_model: .revision.llm_model,
-    multi_query: .answer_result.retrieval_bundle.executed_multi_query,
-    retrieval_records: (.answer_result.retrieval_bundle.records | length),
-    citations: (.answer_result.citations | length),
-    evidence: (.answer_result.evidence_summary | length),
-    trace_steps: (.trace | length)
-  }'
-```
-
-With no configured LLM provider, planner/revision may report `fallback`; the
-request should still return citations, a retrieval bundle, and a 10-step trace.
-With a reachable local Ollama/OpenAI-compatible provider, `planner_mode` and
-`revision_mode` should be `llm` when schema validation and post-audit pass. LLM
-extractor and synthesis are independently gated: individual papers may fall
-back to deterministic extraction when returned spans are not grounded, and
-`synthesis_mode` may be `fallback` when deterministic citation audit rejects
-the model-generated draft. The advisory verifier is also gated: it records
-disagreements and revision pressure, but it cannot convert a deterministic audit
-failure into a pass.
-
-Run the broader test suite:
-
-```bash
-pytest tests/
-akashic_RUN_SCENARIOS=1 pytest -c pytest-scenarios.ini tests_scenarios/
-```
-
-For reproducible Node installs, use:
-
-```bash
-npm ci
-```
-
-## Docker
-
-Build and run locally:
-
-```bash
-docker compose up --build
-```
-
-The compose file mounts `.akashic-workspace` as the runtime workspace and
-exposes the dashboard on port `2236`.
-
-CI builds the Docker image as `akashic-biomed-agent`. Local docs use
-`bio-agent-biomed:latest`.
-
-## Common Commands
-
-```bash
-uv run python main.py cli
-uv run python main.py dashboard
-uv run python main.py --help
-```
+- `POST /api/biomed/plan`
+- `GET /api/biomed/search`
+- `GET /api/biomed/retrievals/{retrieval_id}`
+- `GET /api/biomed/papers`
+- `GET /api/biomed/evidence`
+- `POST /api/biomed/answer`
+- `POST /api/biomed/answer/audited`
+- `POST /api/biomed/answer-runs/{run_id}/audit`
+- `GET /api/biomed/answer-runs/{run_id}/trace`
+- `GET /api/biomed/audits`
+- `POST /api/biomed/conflicts`
+- `GET /api/biomed/graph`
+- `GET /api/biomed/watch`
+- `POST /api/biomed/watch`
+- `POST /api/biomed/watch/{watch_id}/check`
+- `GET /api/biomed/projects`
+- `POST /api/biomed/projects`
+- `GET /api/biomed/projects/{project_id}`
+- `PATCH /api/biomed/projects/{project_id}`
+- `POST /api/biomed/projects/{project_id}/papers`
+- `GET /api/biomed/projects/{project_id}/papers`
+- `POST /api/biomed/projects/{project_id}/claims`
+- `GET /api/biomed/projects/{project_id}/claims`
+- `GET /api/biomed/projects/{project_id}/review-queue`
+- `POST /api/biomed/projects/{project_id}/briefs`
+- `GET /api/biomed/projects/{project_id}/briefs`
 
 ## Runtime Data
 
@@ -531,6 +321,98 @@ biomed_evidence/biomed.db
 Local configuration files, workspace databases, logs, and generated artifacts
 are excluded from Git.
 
+## Validation
+
+Run targeted biomedical checks:
+
+```bash
+python -m pytest -q tests/test_biomed_evidence.py tests/test_biomed_api.py tests/test_dashboard_api.py
+python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
+npm ci
+npm run typecheck
+npm run build
+docker build -t bio-agent-biomed:latest .
+```
+
+Run broader tests:
+
+```bash
+pytest tests/
+akashic_RUN_SCENARIOS=1 pytest -c pytest-scenarios.ini tests_scenarios/
+```
+
+Optional live PubMed eval remains opt-in:
+
+```bash
+python -m eval.biomed_evidence.run_eval \
+  --source pubmed \
+  --live-pubmed \
+  --output /tmp/biomed_live_eval_results.json
+```
+
+Local audited answer smoke:
+
+```bash
+uv run python main.py dashboard
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What recent evidence links microglial activation to Alzheimer disease progression?",
+    "source": "mock",
+    "max_papers": 5,
+    "project_id": null,
+    "use_llm_planner": true,
+    "use_llm_extractor": true,
+    "use_llm_synthesis": true,
+    "use_llm_verifier": true,
+    "use_llm_revision": true,
+    "execute_support_refute": true
+  }' | jq '{
+    planner_mode: .answer_result.query_plan.planner_mode,
+    extraction_modes: ([.answer_result.evidence_summary[].extraction_mode] | unique),
+    synthesis_mode: .answer_result.synthesis_mode,
+    verifier_mode: .advisory_verifier.verifier_mode,
+    revision_mode: .revision.revision_mode,
+    multi_query: .answer_result.retrieval_bundle.executed_multi_query,
+    retrieval_records: (.answer_result.retrieval_bundle.records | length),
+    citations: (.answer_result.citations | length),
+    evidence: (.answer_result.evidence_summary | length),
+    trace_steps: (.trace | length)
+  }'
+```
+
+With no configured LLM provider, optional LLM stages may report `fallback`.
+The request should still return citations, a retrieval bundle, and an 11-step
+trace.
+
+## Docker
+
+Build and run locally:
+
+```bash
+docker compose up --build
+```
+
+The compose file mounts `.akashic-workspace` as the runtime workspace and
+exposes the dashboard on port `2236`.
+
+CI builds the Docker image as `akashic-biomed-agent`. Local docs use
+`bio-agent-biomed:latest`.
+
+## Useful Docs
+
+| Topic | Document |
+| --- | --- |
+| Biomedical plugin details | [plugins/biomed_evidence/README.md](./plugins/biomed_evidence/README.md) |
+| Biomedical case study | [cases/ki-biomed-research-assistant/README.md](./cases/ki-biomed-research-assistant/README.md) |
+| Responsible AI | [docs/responsible_ai.md](./docs/responsible_ai.md) |
+| Evaluation | [docs/evaluation.md](./docs/evaluation.md) |
+| Deployment | [docs/deployment.md](./docs/deployment.md) |
+| Proactive workflows | [_handbook/proactive-guide.md](./_handbook/proactive-guide.md) |
+| Long-term memory | [_handbook/memory-markdown.md](./_handbook/memory-markdown.md) |
+| Plugin lifecycle | [_handbook/plugins-tutorial.md](./_handbook/plugins-tutorial.md) |
+
 ## Responsible AI Boundary
 
 Biomedical Evidence is a research support plugin, not a clinical decision
@@ -539,6 +421,6 @@ system. It should:
 - cite retrieved papers for factual biomedical claims when possible;
 - avoid strong claims when citations or evidence are missing;
 - surface uncertainty and limitations;
-- refuse diagnosis, treatment, medication, prognosis, and patient-specific
-  medical-record interpretation;
+- refuse diagnosis, treatment, medication, prognosis, dosing, and
+  patient-specific medical-record interpretation;
 - treat project memory as user/project context, not biomedical fact.

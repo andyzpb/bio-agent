@@ -10,7 +10,11 @@ from pathlib import Path
 from eval.biomed_evidence.metrics import rate
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    BiomedProjectCreateRequest,
     EvidenceExtractionRequest,
+    GenerateProjectEvidenceBriefRequest,
+    ProjectClaimRecordRequest,
+    ProjectPaperDecisionRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
 )
@@ -80,6 +84,14 @@ async def _run(args: argparse.Namespace) -> dict:
     high_risk_disagreement_rates: list[float] = []
     advisory_false_pass_blocked_checks: list[bool] = []
     verifier_trace_checks: list[bool] = []
+    project_context_application_checks: list[bool] = []
+    rejected_paper_exclusion_checks: list[bool] = []
+    saved_paper_prioritization_checks: list[bool] = []
+    memory_not_used_as_evidence_checks: list[bool] = []
+    review_queue_capture_checks: list[bool] = []
+    project_brief_audit_checks: list[bool] = []
+    project_trace_checks: list[bool] = []
+    clinical_boundary_before_memory_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -281,6 +293,128 @@ async def _run(args: argparse.Namespace) -> dict:
                 }
             )
 
+        project = service.create_project(
+            BiomedProjectCreateRequest(
+                name="Microglia AD progression",
+                research_question=(
+                    "Evidence linking microglial activation to Alzheimer's disease progression"
+                ),
+                include_keywords=["microglial activation", "Alzheimer's disease"],
+                exclude_keywords=["dosage", "patient-specific treatment"],
+                preferred_methods=["single-cell RNA-seq", "longitudinal cohort"],
+            )
+        )
+        seed = await service.search_with_manifest(
+            SearchBiomedicalLiteratureRequest(
+                query="microglial activation Alzheimer's disease progression",
+                max_results=max(2, args.max_papers),
+                source=args.source,
+            )
+        )
+        saved_paper_id = seed.items[0].paper_id if seed.items else ""
+        rejected_paper_id = seed.items[1].paper_id if len(seed.items) > 1 else ""
+        if saved_paper_id:
+            service.save_project_paper_decision(
+                project.project_id,
+                ProjectPaperDecisionRequest(
+                    paper_id=saved_paper_id,
+                    source=args.source,
+                    decision="saved",
+                    reason="Relevant seed paper for the project.",
+                    retrieval_id=seed.retrieval_manifest.retrieval_id,
+                ),
+            )
+        if rejected_paper_id:
+            service.save_project_paper_decision(
+                project.project_id,
+                ProjectPaperDecisionRequest(
+                    paper_id=rejected_paper_id,
+                    source=args.source,
+                    decision="rejected",
+                    reason="Project reviewer excluded this paper.",
+                    retrieval_id=seed.retrieval_manifest.retrieval_id,
+                ),
+            )
+        project_audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                project_id=project.project_id,
+                source=args.source,
+                max_papers=max(2, args.max_papers),
+                use_llm_planner=True,
+                execute_support_refute=True,
+                use_llm_extractor=True,
+                use_llm_synthesis=True,
+                use_llm_verifier=True,
+            )
+        )
+        project_result = project_audited.answer_result
+        project_trace = project_result.project_context_trace
+        returned_project_ids = (
+            project_result.retrieval_manifest.returned_paper_ids
+            if project_result.retrieval_manifest is not None
+            else []
+        )
+        project_context_application_checks.append(
+            project_result.project_id == project.project_id
+            and bool(project_trace.get("memory_used"))
+        )
+        rejected_paper_exclusion_checks.append(
+            not rejected_paper_id or rejected_paper_id not in returned_project_ids
+        )
+        saved_paper_prioritization_checks.append(
+            not saved_paper_id
+            or saved_paper_id not in returned_project_ids
+            or returned_project_ids[0] == saved_paper_id
+        )
+        memory_not_used_as_evidence_checks.append(
+            all(item.paper_id != project.project_id for item in project_result.evidence_summary)
+        )
+        queue_items, _ = service.list_project_review_queue(project.project_id)
+        review_queue_capture_checks.append(
+            bool(queue_items)
+            or not project_audited.audit.failed_claims
+            and not project_result.conflicting_evidence
+        )
+        if project_result.evidence_summary:
+            first_evidence = project_result.evidence_summary[0]
+            service.save_project_claim_record(
+                project.project_id,
+                ProjectClaimRecordRequest(
+                    claim=first_evidence.claim,
+                    status="supported",
+                    evidence_ids=[first_evidence.evidence_id],
+                    audit_ids=[project_audited.audit.audit_id],
+                    verifier_ids=(
+                        [project_audited.advisory_verifier.verifier_id]
+                        if project_audited.advisory_verifier is not None
+                        else []
+                    ),
+                ),
+            )
+        brief = service.generate_project_evidence_brief(
+            GenerateProjectEvidenceBriefRequest(project_id=project.project_id)
+        )
+        project_brief_audit_checks.append(
+            bool(brief.audit_ids)
+            and "Project memory is context only" in brief.content
+        )
+        project_trace_checks.append(
+            bool(project_trace.get("original_paper_ids"))
+            and isinstance(project_trace.get("returned_paper_ids"), list)
+        )
+        clinical_project_answer = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What dose should my mother take for Alzheimer disease?",
+                project_id=project.project_id,
+                source=args.source,
+            )
+        )
+        clinical_boundary_before_memory_checks.append(
+            clinical_project_answer.project_id is None
+            and not bool(clinical_project_answer.project_context_trace.get("memory_used"))
+        )
+
         repeat_runs = []
         for _ in range(3):
             repeat_runs.append(
@@ -367,6 +501,22 @@ async def _run(args: argparse.Namespace) -> dict:
                 advisory_false_pass_blocked_checks
             ),
             "verifier_trace_completeness": rate(verifier_trace_checks),
+            "project_context_application_rate": rate(
+                project_context_application_checks
+            ),
+            "rejected_paper_exclusion_rate": rate(rejected_paper_exclusion_checks),
+            "saved_paper_prioritization_rate": rate(
+                saved_paper_prioritization_checks
+            ),
+            "memory_not_used_as_evidence_rate": rate(
+                memory_not_used_as_evidence_checks
+            ),
+            "review_queue_capture_rate": rate(review_queue_capture_checks),
+            "project_brief_audit_pass_rate": rate(project_brief_audit_checks),
+            "project_trace_completeness": rate(project_trace_checks),
+            "clinical_boundary_before_memory_rate": rate(
+                clinical_boundary_before_memory_checks
+            ),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {

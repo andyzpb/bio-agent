@@ -21,6 +21,21 @@ EntityType = Literal[
 ]
 WatchSchedule = Literal["daily", "weekly", "manual"]
 WatchDecisionValue = Literal["push", "skip", "defer"]
+ProjectPaperDecisionValue = Literal["saved", "rejected", "needs_review"]
+ProjectClaimStatus = Literal[
+    "supported",
+    "mixed",
+    "uncertain",
+    "rejected",
+    "needs_review",
+]
+ProjectReviewItemType = Literal[
+    "claim_audit_failure",
+    "advisory_disagreement",
+    "conflicting_evidence",
+    "needs_expert_review",
+]
+ProjectEvidenceBriefFormat = Literal["markdown", "json"]
 ClaimType = Literal[
     "background",
     "association",
@@ -220,6 +235,143 @@ class WatchDecisionDetail(WatchDecision):
     notification: dict[str, object] = Field(default_factory=dict)
 
 
+class BiomedProject(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    name: str
+    description: str | None = None
+    research_question: str = ""
+    include_keywords: list[str] = Field(default_factory=list)
+    exclude_keywords: list[str] = Field(default_factory=list)
+    preferred_methods: list[str] = Field(default_factory=list)
+    preferred_species: list[str] = Field(default_factory=list)
+    preferred_study_types: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class BiomedProjectCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str | None = None
+    research_question: str = ""
+    include_keywords: list[str] = Field(default_factory=list)
+    exclude_keywords: list[str] = Field(default_factory=list)
+    preferred_methods: list[str] = Field(default_factory=list)
+    preferred_species: list[str] = Field(default_factory=list)
+    preferred_study_types: list[str] = Field(default_factory=list)
+
+
+class BiomedProjectUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    research_question: str | None = None
+    include_keywords: list[str] | None = None
+    exclude_keywords: list[str] | None = None
+    preferred_methods: list[str] | None = None
+    preferred_species: list[str] | None = None
+    preferred_study_types: list[str] | None = None
+
+
+class ProjectPaperDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str
+    project_id: str
+    paper_id: str
+    source: Literal["pubmed", "mock"] = "mock"
+    decision: ProjectPaperDecisionValue
+    reason: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class ProjectPaperDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: str
+    source: Literal["pubmed", "mock"] = "mock"
+    decision: ProjectPaperDecisionValue = "saved"
+    reason: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    run_id: str | None = None
+    retrieval_id: str | None = None
+
+
+class ProjectClaimRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    project_id: str
+    claim: str
+    status: ProjectClaimStatus = "needs_review"
+    evidence_ids: list[str] = Field(default_factory=list)
+    audit_ids: list[str] = Field(default_factory=list)
+    verifier_ids: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class ProjectClaimRecordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str
+    status: ProjectClaimStatus = "needs_review"
+    evidence_ids: list[str] = Field(default_factory=list)
+    audit_ids: list[str] = Field(default_factory=list)
+    verifier_ids: list[str] = Field(default_factory=list)
+    notes: str | None = None
+
+
+class ProjectReviewQueueItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    project_id: str
+    item_type: ProjectReviewItemType
+    title: str
+    reason: str
+    risk_level: ConfidenceLevel = "medium"
+    run_id: str | None = None
+    evidence_id: str | None = None
+    audit_id: str | None = None
+    verifier_id: str | None = None
+    created_at: str
+
+
+class ProjectEvidenceBrief(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    brief_id: str
+    project_id: str
+    title: str
+    format: ProjectEvidenceBriefFormat = "markdown"
+    content: str
+    included_claim_ids: list[str] = Field(default_factory=list)
+    included_evidence_ids: list[str] = Field(default_factory=list)
+    audit_ids: list[str] = Field(default_factory=list)
+    verifier_ids: list[str] = Field(default_factory=list)
+    created_at: str
+
+
+class GenerateProjectEvidenceBriefRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    title: str | None = None
+    format: ProjectEvidenceBriefFormat = "markdown"
+
+
 class SearchBiomedicalLiteratureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -404,9 +556,11 @@ class AnswerWithEvidenceRequest(BaseModel):
 
     question: str
     max_papers: int = 10
+    project_id: str | None = None
     project_context: str | None = None
     require_citations: bool = True
     source: Literal["pubmed", "mock"] = "mock"
+    include_rejected_papers: bool = False
     use_llm_revision: bool = False
     use_llm_planner: bool = False
     execute_support_refute: bool = False
@@ -431,7 +585,9 @@ class AnswerWithEvidenceResult(BaseModel):
     suggested_next_steps: list[str] = Field(default_factory=list)
     not_medical_advice: bool = True
     disclaimer: str
+    project_id: str | None = None
     project_context_used: str | None = None
+    project_context_trace: dict[str, object] = Field(default_factory=dict)
     question_classification: BiomedicalQuestionClassification | None = None
     query_plan: BiomedicalQueryPlan | None = None
     query_plan_validation: QueryPlanValidation | None = None

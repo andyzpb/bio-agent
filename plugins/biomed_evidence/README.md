@@ -5,7 +5,8 @@ biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured router/planner output, planner-driven
 primary/support/refute retrieval bundles, structured evidence extraction, cited
 answers, retrieval manifests, claim-level citation audit, audit/revise traces,
-a lightweight evidence graph, and Research Watch decision logs. It is
+project evidence workspaces, a lightweight evidence graph, and Research Watch
+decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
 
@@ -24,9 +25,11 @@ Runtime storage is created under the active workspace:
 biomed_evidence/biomed.db
 ```
 
-Optional LLM planner/revision uses the framework-configured provider. It is
-request-gated with `use_llm_planner` and `use_llm_revision`; default demos,
-tests, and eval remain deterministic and keyless.
+Optional LLM planner, extractor, synthesizer, verifier, and revision paths use
+the framework-configured provider. They are request-gated with
+`use_llm_planner`, `use_llm_extractor`, `use_llm_synthesis`,
+`use_llm_verifier`, and `use_llm_revision`; default demos, tests, and eval
+remain deterministic and keyless.
 
 ## Tools
 
@@ -38,6 +41,18 @@ Registered agent tools:
 - `extract_evidence`
 - `answer_with_evidence`
 - `answer_with_audit`
+- `create_biomed_project`
+- `list_biomed_projects`
+- `update_biomed_project`
+- `record_project_paper_decision`
+- `save_project_paper`
+- `reject_project_paper`
+- `list_project_paper_decisions`
+- `record_project_claim`
+- `save_project_claim`
+- `list_project_evidence`
+- `list_project_review_queue`
+- `generate_project_evidence_brief`
 - `watch_research_topic`
 - `list_research_watch_topics`
 - `update_research_watch_topic`
@@ -60,6 +75,11 @@ primary/support/refute retrieval records, per-query manifest IDs, deduped paper
 IDs, duplicate IDs, and bundle warnings. Extracted evidence carries
 `retrieval_intent` as `primary`, `support`, `refute`, or `unknown`.
 
+Project-enabled answer responses include `project_id` and
+`project_context_trace`. Saved papers are prioritized after retrieval; rejected
+papers are excluded by default unless `include_rejected_papers` is true.
+Project memory is never accepted as citation evidence.
+
 ## Dashboard
 
 Start the dashboard:
@@ -73,7 +93,11 @@ Open `http://127.0.0.1:2236` and choose `Biomedical Evidence`.
 The panel includes:
 
 - Ask: answer biomedical research questions with citations, optional LLM
-  planner/revision, and optional support/refute retrieval.
+  planner/extractor/synthesis/verifier/revision, optional support/refute
+  retrieval, and optional project context.
+- Projects: create project workspaces, record saved/rejected/needs-review paper
+  decisions, record project claims, inspect review queue items, and generate
+  evidence briefs.
 - Evidence: browse extracted claims, entities, limitations, and confidence.
 - Graph: inspect paper, claim, and entity links.
 - Watch: create, update, check, and review research-watch topics, snapshots,
@@ -90,8 +114,8 @@ The panel includes:
 
 The plugin mounts `/api/biomed/*` routes for search, paper detail, evidence
 extraction, answer runs, audited answer generation, claim-level citation audit,
-trace retrieval, graph retrieval, watch CRUD/check/events, conflict checks, and
-export.
+trace retrieval, project workspaces, graph retrieval, watch CRUD/check/events,
+conflict checks, and export.
 
 Common routes:
 
@@ -101,6 +125,12 @@ Common routes:
 - `POST /api/biomed/answer/audited`
 - `POST /api/biomed/answer-runs/{run_id}/audit`
 - `GET /api/biomed/answer-runs/{run_id}/trace`
+- `GET /api/biomed/projects`
+- `POST /api/biomed/projects`
+- `POST /api/biomed/projects/{project_id}/papers`
+- `POST /api/biomed/projects/{project_id}/claims`
+- `GET /api/biomed/projects/{project_id}/review-queue`
+- `POST /api/biomed/projects/{project_id}/briefs`
 
 ## Safety Boundary
 

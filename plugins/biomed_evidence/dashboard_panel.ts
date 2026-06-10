@@ -1,6 +1,6 @@
 /// <reference path="../../types/akashic-dashboard.d.ts" />
 
-type BiomedView = "ask" | "evidence" | "graph" | "watch" | "audit" | "trace" | "responsible";
+type BiomedView = "ask" | "projects" | "evidence" | "graph" | "watch" | "audit" | "trace" | "responsible";
 
 interface EvidenceRow {
   evidence_id: string;
@@ -57,6 +57,8 @@ interface RetrievalBundle {
 
 interface AnswerResult {
   run_id: string;
+  project_id?: string | null;
+  project_context_trace?: Record<string, unknown>;
   retrieval_id?: string | null;
   retrieval_manifest?: RetrievalManifest | null;
   retrieval_bundle?: RetrievalBundle | null;
@@ -215,9 +217,71 @@ interface TracePayload {
   latest_advisory_verifier?: AdvisoryVerifierResult | null;
 }
 
+interface BiomedProject {
+  project_id: string;
+  name: string;
+  description?: string | null;
+  research_question: string;
+  include_keywords: string[];
+  exclude_keywords: string[];
+  preferred_methods: string[];
+  preferred_species: string[];
+  preferred_study_types: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+interface ProjectPaperDecision {
+  decision_id: string;
+  project_id: string;
+  paper_id: string;
+  source: string;
+  decision: string;
+  reason?: string | null;
+  tags: string[];
+  run_id?: string | null;
+  retrieval_id?: string | null;
+  updated_at: string;
+}
+
+interface ProjectClaimRecord {
+  claim_id: string;
+  project_id: string;
+  claim: string;
+  status: string;
+  evidence_ids: string[];
+  audit_ids: string[];
+  verifier_ids: string[];
+  updated_at: string;
+}
+
+interface ProjectReviewQueueItem {
+  item_id: string;
+  project_id: string;
+  item_type: string;
+  title: string;
+  reason: string;
+  risk_level: string;
+  run_id?: string | null;
+  audit_id?: string | null;
+  verifier_id?: string | null;
+  created_at: string;
+}
+
+interface ProjectEvidenceBrief {
+  brief_id: string;
+  project_id: string;
+  title: string;
+  format: string;
+  content: string;
+  audit_ids: string[];
+  verifier_ids: string[];
+  created_at: string;
+}
+
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
   const value = dispatch?.filters["_view"];
-  if (value === "graph" || value === "watch" || value === "audit" || value === "trace" || value === "responsible" || value === "evidence") {
+  if (value === "projects" || value === "graph" || value === "watch" || value === "audit" || value === "trace" || value === "responsible" || value === "evidence") {
     return value;
   }
   return "ask";
@@ -507,9 +571,221 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
   `;
 }
 
+async function loadProjectOptions(container: HTMLElement): Promise<void> {
+  const select = container.querySelector<HTMLSelectElement>("#biomed-project-select");
+  if (!select) return;
+  try {
+    const data = await api<{ items: BiomedProject[] }>("/api/biomed/projects");
+    const current = select.value;
+    select.innerHTML = `
+      <option value="">no project</option>
+      ${data.items.map((project) => `
+        <option value="${escapeHtml(project.project_id)}">${escapeHtml(project.name)}</option>
+      `).join("")}
+    `;
+    if (current) select.value = current;
+  } catch {
+    select.innerHTML = '<option value="">projects unavailable</option>';
+  }
+}
+
+function renderProjectList(projects: BiomedProject[]): string {
+  if (!projects.length) return '<div class="biomed-muted">No projects yet.</div>';
+  return projects.map((project) => `
+    <div class="biomed-decision">
+      <div>
+        <strong>${escapeHtml(project.name)}</strong>
+        <code>${escapeHtml(project.project_id)}</code>
+      </div>
+      <div class="biomed-watch-meta">
+        ${escapeHtml(project.research_question || "no research question")} · updated ${escapeHtml(project.updated_at)}
+      </div>
+      <div class="biomed-watch-meta">
+        include ${escapeHtml(project.include_keywords.join(", ") || "-")} · exclude ${escapeHtml(project.exclude_keywords.join(", ") || "-")}
+      </div>
+      <button data-biomed-load-project="${escapeHtml(project.project_id)}">Load</button>
+    </div>
+  `).join("");
+}
+
+async function loadProjectDetail(container: HTMLElement, projectId: string): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-project-detail");
+  if (!target || !projectId) return;
+  target.textContent = "Loading project...";
+  try {
+    const [papers, claims, queue, briefs] = await Promise.all([
+      api<{ items: ProjectPaperDecision[] }>(`/api/biomed/projects/${encodeURIComponent(projectId)}/papers`),
+      api<{ items: ProjectClaimRecord[] }>(`/api/biomed/projects/${encodeURIComponent(projectId)}/claims`),
+      api<{ items: ProjectReviewQueueItem[] }>(`/api/biomed/projects/${encodeURIComponent(projectId)}/review-queue`),
+      api<{ items: ProjectEvidenceBrief[] }>(`/api/biomed/projects/${encodeURIComponent(projectId)}/briefs`),
+    ]);
+    target.innerHTML = `
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Paper Decisions</div>
+          ${papers.items.map((item) => `
+            <div class="biomed-decision">
+              <div>${pill(item.decision)} <code>${escapeHtml(item.paper_id)}</code></div>
+              <div class="biomed-watch-meta">${escapeHtml(item.reason || "")}</div>
+            </div>
+          `).join("") || '<div class="biomed-muted">No paper decisions.</div>'}
+        </div>
+        <div>
+          <div class="biomed-label">Project Claims</div>
+          ${claims.items.map((item) => `
+            <div class="biomed-decision">
+              <div>${pill(item.status)} ${escapeHtml(item.claim)}</div>
+              <div class="biomed-watch-meta">audits ${escapeHtml(item.audit_ids.join(", ") || "-")} · evidence ${escapeHtml(item.evidence_ids.join(", ") || "-")}</div>
+            </div>
+          `).join("") || '<div class="biomed-muted">No project claims.</div>'}
+        </div>
+      </div>
+      <div class="biomed-label">Review Queue</div>
+      ${queue.items.map((item) => `
+        <div class="biomed-audit-row ${item.risk_level === "high" ? "is-failed" : ""}">
+          <div class="biomed-audit-row-head">${pill(item.risk_level)} ${pill(item.item_type)} <span>${escapeHtml(item.created_at)}</span></div>
+          <div class="biomed-evidence-claim">${escapeHtml(item.title)}</div>
+          <div class="biomed-evidence-finding">${escapeHtml(item.reason)}</div>
+        </div>
+      `).join("") || '<div class="biomed-muted">No review items.</div>'}
+      <div class="biomed-label">Evidence Briefs</div>
+      ${briefs.items.map((item) => `
+        <div class="biomed-decision">
+          <div>${pill(item.format)} <code>${escapeHtml(item.brief_id)}</code> ${escapeHtml(item.title)}</div>
+          <pre class="biomed-json">${escapeHtml(item.content)}</pre>
+        </div>
+      `).join("") || '<div class="biomed-muted">No briefs generated.</div>'}
+    `;
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function loadProjects(container: HTMLElement): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-project-list");
+  if (!target) return;
+  target.textContent = "Loading projects...";
+  try {
+    const data = await api<{ items: BiomedProject[] }>("/api/biomed/projects");
+    target.innerHTML = renderProjectList(data.items);
+    target.querySelectorAll<HTMLButtonElement>("[data-biomed-load-project]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const projectId = button.dataset.biomedLoadProject || "";
+        const current = container.querySelector<HTMLInputElement>("#biomed-current-project");
+        if (current) current.value = projectId;
+        await loadProjectDetail(container, projectId);
+      });
+    });
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+function renderProjects(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Project Evidence Workspace</div>
+      <div class="biomed-form">
+        <input id="biomed-project-name" value="Microglia AD progression" />
+        <input id="biomed-project-question" value="Evidence linking microglial activation to Alzheimer's disease progression" />
+        <input id="biomed-project-include" value="microglial activation,Alzheimer's disease,progression" />
+        <input id="biomed-project-exclude" placeholder="exclude keywords" />
+        <input id="biomed-project-methods" placeholder="preferred methods" />
+        <div class="biomed-row">
+          <button id="biomed-project-create">Create Project</button>
+          <input id="biomed-current-project" placeholder="project id" />
+          <button id="biomed-project-load">Load Project</button>
+        </div>
+      </div>
+      <div class="biomed-label">Projects</div>
+      <div id="biomed-project-list" class="biomed-result"></div>
+      <div class="biomed-label">Paper Decision</div>
+      <div class="biomed-row">
+        <input id="biomed-project-paper-id" placeholder="paper id" />
+        <select id="biomed-project-paper-source"><option value="mock">mock</option><option value="pubmed">pubmed</option></select>
+        <select id="biomed-project-paper-decision"><option value="saved">saved</option><option value="rejected">rejected</option><option value="needs_review">needs_review</option></select>
+        <input id="biomed-project-paper-reason" placeholder="reason" />
+        <button id="biomed-project-paper-save">Record</button>
+      </div>
+      <div class="biomed-label">Claim Record</div>
+      <div class="biomed-row">
+        <input id="biomed-project-claim" placeholder="claim" />
+        <select id="biomed-project-claim-status"><option value="needs_review">needs_review</option><option value="supported">supported</option><option value="mixed">mixed</option><option value="uncertain">uncertain</option><option value="rejected">rejected</option></select>
+        <input id="biomed-project-claim-evidence" placeholder="evidence ids" />
+        <input id="biomed-project-claim-audits" placeholder="audit ids" />
+        <button id="biomed-project-claim-save">Record Claim</button>
+      </div>
+      <div class="biomed-row">
+        <button id="biomed-project-brief">Generate Brief</button>
+      </div>
+      <div id="biomed-project-detail" class="biomed-result"></div>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-project-create")?.addEventListener("click", async () => {
+    const name = container.querySelector<HTMLInputElement>("#biomed-project-name")?.value || "";
+    const research_question = container.querySelector<HTMLInputElement>("#biomed-project-question")?.value || "";
+    const include_keywords = csv(container.querySelector<HTMLInputElement>("#biomed-project-include")?.value || "");
+    const exclude_keywords = csv(container.querySelector<HTMLInputElement>("#biomed-project-exclude")?.value || "");
+    const preferred_methods = csv(container.querySelector<HTMLInputElement>("#biomed-project-methods")?.value || "");
+    const project = await api<BiomedProject>("/api/biomed/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, research_question, include_keywords, exclude_keywords, preferred_methods }),
+    });
+    const current = container.querySelector<HTMLInputElement>("#biomed-current-project");
+    if (current) current.value = project.project_id;
+    await loadProjects(container);
+    await loadProjectDetail(container, project.project_id);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-project-load")?.addEventListener("click", async () => {
+    const projectId = container.querySelector<HTMLInputElement>("#biomed-current-project")?.value || "";
+    await loadProjectDetail(container, projectId);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-project-paper-save")?.addEventListener("click", async () => {
+    const projectId = container.querySelector<HTMLInputElement>("#biomed-current-project")?.value || "";
+    const paper_id = container.querySelector<HTMLInputElement>("#biomed-project-paper-id")?.value || "";
+    const source = container.querySelector<HTMLSelectElement>("#biomed-project-paper-source")?.value || "mock";
+    const decision = container.querySelector<HTMLSelectElement>("#biomed-project-paper-decision")?.value || "saved";
+    const reason = container.querySelector<HTMLInputElement>("#biomed-project-paper-reason")?.value || "";
+    if (!projectId || !paper_id) return;
+    await api(`/api/biomed/projects/${encodeURIComponent(projectId)}/papers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paper_id, source, decision, reason }),
+    });
+    await loadProjectDetail(container, projectId);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-project-claim-save")?.addEventListener("click", async () => {
+    const projectId = container.querySelector<HTMLInputElement>("#biomed-current-project")?.value || "";
+    const claim = container.querySelector<HTMLInputElement>("#biomed-project-claim")?.value || "";
+    const status = container.querySelector<HTMLSelectElement>("#biomed-project-claim-status")?.value || "needs_review";
+    const evidence_ids = csv(container.querySelector<HTMLInputElement>("#biomed-project-claim-evidence")?.value || "");
+    const audit_ids = csv(container.querySelector<HTMLInputElement>("#biomed-project-claim-audits")?.value || "");
+    if (!projectId || !claim) return;
+    await api(`/api/biomed/projects/${encodeURIComponent(projectId)}/claims`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ claim, status, evidence_ids, audit_ids }),
+    });
+    await loadProjectDetail(container, projectId);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-project-brief")?.addEventListener("click", async () => {
+    const projectId = container.querySelector<HTMLInputElement>("#biomed-current-project")?.value || "";
+    if (!projectId) return;
+    await api(`/api/biomed/projects/${encodeURIComponent(projectId)}/briefs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ format: "markdown" }),
+    });
+    await loadProjectDetail(container, projectId);
+  });
+  void loadProjects(container);
+}
+
 function renderTabs(view: BiomedView): string {
   const tabs: { id: BiomedView; label: string }[] = [
     { id: "ask", label: "Ask" },
+    { id: "projects", label: "Projects" },
     { id: "evidence", label: "Evidence" },
     { id: "graph", label: "Graph" },
     { id: "watch", label: "Watch" },
@@ -535,11 +811,15 @@ function renderAsk(container: HTMLElement): void {
       <div class="biomed-form">
         <textarea id="biomed-question" rows="4">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
         <div class="biomed-row">
+          <select id="biomed-project-select">
+            <option value="">no project</option>
+          </select>
           <select id="biomed-source">
             <option value="mock">mock</option>
             <option value="pubmed">pubmed</option>
           </select>
           <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
+          <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
           <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
           <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
           <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
@@ -558,8 +838,10 @@ function renderAsk(container: HTMLElement): void {
     if (!resultNode) return;
     resultNode.textContent = "Running evidence search...";
     const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
+    const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
+    const includeRejected = Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked);
     const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
     const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
     const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
@@ -570,8 +852,10 @@ function renderAsk(container: HTMLElement): void {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
+          project_id: projectId || null,
           source,
           max_papers: maxPapers,
+          include_rejected_papers: includeRejected,
           use_llm_planner: usePlanner,
           execute_support_refute: executeSupportRefute,
           use_llm_extractor: useExtractor,
@@ -582,6 +866,7 @@ function renderAsk(container: HTMLElement): void {
         <div class="biomed-answer-meta">
           <code>${escapeHtml(result.run_id)}</code>
           ${pill(result.uncertainty_level)}
+          ${result.project_id ? pill("project") : ""}
           ${result.synthesis_mode ? pill(result.synthesis_mode) : ""}
           <button data-biomed-audit-run="${escapeHtml(result.run_id)}">Run Audit</button>
         </div>
@@ -589,6 +874,7 @@ function renderAsk(container: HTMLElement): void {
         ${renderManifest(result.retrieval_manifest)}
         <div class="biomed-label">Retrieval Bundle</div>
         ${renderRetrievalBundle(result.retrieval_bundle)}
+        ${result.project_context_trace ? `<div class="biomed-label">Project Trace</div><pre class="biomed-json">${escapeHtml(JSON.stringify(result.project_context_trace, null, 2))}</pre>` : ""}
         <div class="biomed-answer">${renderMarkdown(result.answer)}</div>
         <div class="biomed-label">Citations</div>
         ${renderList(result.citations.map((citation) => `${citation.title} | ${citation.paper_id}${citation.doi ? ` | doi:${citation.doi}` : ""}`))}
@@ -624,8 +910,10 @@ function renderAsk(container: HTMLElement): void {
     if (!resultNode) return;
     resultNode.textContent = "Running evidence search, audit, and revision...";
     const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
+    const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
+    const includeRejected = Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked);
     const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
     const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
     const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
@@ -638,8 +926,10 @@ function renderAsk(container: HTMLElement): void {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
+          project_id: projectId || null,
           source,
           max_papers: maxPapers,
+          include_rejected_papers: includeRejected,
           use_llm_planner: usePlanner,
           execute_support_refute: executeSupportRefute,
           use_llm_extractor: useExtractor,
@@ -653,6 +943,7 @@ function renderAsk(container: HTMLElement): void {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
   });
+  void loadProjectOptions(container);
 }
 
 function renderGraph(container: HTMLElement): void {
@@ -917,6 +1208,53 @@ function renderResponsible(container: HTMLElement): void {
   `;
 }
 
+function attachDetailTabs(
+  root: HTMLElement,
+  item: Record<string, unknown> | null,
+  dispatch?: PluginDispatch,
+): void {
+  root.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const view = (button.dataset.biomedView || "ask") as BiomedView;
+      dispatch?.setFilter("_view", view);
+      renderBiomedDetail(root, item, view, dispatch);
+    });
+  });
+}
+
+function renderBiomedDetail(
+  root: HTMLElement,
+  item: Record<string, unknown> | null,
+  view: BiomedView,
+  dispatch?: PluginDispatch,
+): void {
+  root.innerHTML = renderTabs(view);
+  if (item && view === "evidence") {
+    root.innerHTML += renderEvidenceDetail(item as unknown as EvidenceRow);
+    attachDetailTabs(root, item, dispatch);
+    void hydrateRetrievalBlocks(root);
+    return;
+  }
+  if (view === "graph") {
+    renderGraph(root);
+  } else if (view === "projects") {
+    renderProjects(root);
+  } else if (view === "watch") {
+    renderWatch(root);
+  } else if (view === "audit") {
+    renderAudit(root);
+  } else if (view === "trace") {
+    renderTrace(root);
+  } else if (view === "responsible") {
+    renderResponsible(root);
+  } else if (view === "evidence") {
+    root.innerHTML += '<div class="biomed-section"><div class="biomed-title">Evidence Browser</div><div class="biomed-muted">Select an evidence row to inspect entities, methods, and limitations.</div></div>';
+  } else {
+    renderAsk(root);
+  }
+  attachDetailTabs(root, item, dispatch);
+}
+
 window.AkashicDashboard.registerPlugin({
   id: "biomed_evidence",
   label: "Biomedical Evidence",
@@ -984,31 +1322,9 @@ window.AkashicDashboard.registerPlugin({
 
   renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch?: PluginDispatch): void {
     const view = viewFromDispatch(dispatch);
-    container.innerHTML = `<div class="biomed-wrap">${renderTabs(view)}</div>`;
-    container.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
-      button.addEventListener("click", () => dispatch?.setFilter("_view", button.dataset.biomedView || "ask"));
-    });
+    container.innerHTML = '<div class="biomed-wrap"></div>';
     const root = container.querySelector<HTMLElement>(".biomed-wrap");
     if (!root) return;
-    if (item && view === "evidence") {
-      root.innerHTML += renderEvidenceDetail(item as unknown as EvidenceRow);
-      void hydrateRetrievalBlocks(root);
-      return;
-    }
-    if (view === "graph") {
-      renderGraph(root);
-    } else if (view === "watch") {
-      renderWatch(root);
-    } else if (view === "audit") {
-      renderAudit(root);
-    } else if (view === "trace") {
-      renderTrace(root);
-    } else if (view === "responsible") {
-      renderResponsible(root);
-    } else if (view === "evidence") {
-      root.innerHTML += '<div class="biomed-section"><div class="biomed-title">Evidence Browser</div><div class="biomed-muted">Select an evidence row to inspect entities, methods, and limitations.</div></div>';
-    } else {
-      renderAsk(root);
-    }
+    renderBiomedDetail(root, item, view, dispatch);
   },
 });

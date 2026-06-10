@@ -14,8 +14,12 @@ from plugins.biomed_evidence.literature_client import (
 )
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    BiomedProjectCreateRequest,
     EvidenceExtractionRequest,
+    GenerateProjectEvidenceBriefRequest,
     PlanBiomedicalSearchRequest,
+    ProjectClaimRecordRequest,
+    ProjectPaperDecisionRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
 )
@@ -81,6 +85,132 @@ async def test_patient_specific_dose_question_is_refused(tmp_path: Path) -> None
     assert not result.citations
     assert "recommend treatment" in result.answer.lower()
     assert result.uncertainty_level == "high"
+
+
+@pytest.mark.asyncio
+async def test_project_memory_prioritizes_saved_and_excludes_rejected(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        project = service.create_project(
+            BiomedProjectCreateRequest(
+                name="Microglia project",
+                research_question="microglial activation and Alzheimer's disease progression",
+                include_keywords=["microglial activation", "Alzheimer's disease"],
+            )
+        )
+        seed = await service.search_with_manifest(
+            SearchBiomedicalLiteratureRequest(
+                query="microglial activation Alzheimer's disease progression",
+                max_results=3,
+                source="mock",
+            )
+        )
+        rejected = seed.items[0].paper_id
+        saved = seed.items[1].paper_id
+        service.save_project_paper_decision(
+            project.project_id,
+            ProjectPaperDecisionRequest(
+                paper_id=rejected,
+                source="mock",
+                decision="rejected",
+                reason="Reviewer excluded this paper.",
+            ),
+        )
+        service.save_project_paper_decision(
+            project.project_id,
+            ProjectPaperDecisionRequest(
+                paper_id=saved,
+                source="mock",
+                decision="saved",
+                reason="Reviewer marked as high priority.",
+            ),
+        )
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                project_id=project.project_id,
+                source="mock",
+                max_papers=3,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.project_id == project.project_id
+    assert result.project_context_trace["memory_used"] is True
+    assert result.retrieval_manifest is not None
+    assert rejected not in result.retrieval_manifest.returned_paper_ids
+    assert result.retrieval_manifest.returned_paper_ids[0] == saved
+    assert all(item.paper_id != rejected for item in result.evidence_summary)
+    assert result.project_context_trace["dropped_rejected_paper_ids"] == [rejected]
+
+
+@pytest.mark.asyncio
+async def test_project_memory_is_not_loaded_for_clinical_boundary(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        project = service.create_project(
+            BiomedProjectCreateRequest(
+                name="Clinical boundary project",
+                research_question="Alzheimer disease evidence review",
+            )
+        )
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What dose should my mother take for Alzheimer disease?",
+                project_id=project.project_id,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.project_id is None
+    assert result.project_context_used is None
+    assert result.project_context_trace["memory_used"] is False
+    assert result.project_context_trace["clinical_boundary_blocked_memory"] is True
+    assert not result.citations
+
+
+def test_project_brief_only_promotes_audit_linked_claims(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        project = service.create_project(
+            BiomedProjectCreateRequest(name="Brief project")
+        )
+        service.save_project_claim_record(
+            project.project_id,
+            ProjectClaimRecordRequest(
+                claim="Memory-only claim should stay out of audited findings.",
+                status="needs_review",
+            ),
+        )
+        first_brief = service.generate_project_evidence_brief(
+            GenerateProjectEvidenceBriefRequest(project_id=project.project_id)
+        )
+        service.save_project_claim_record(
+            project.project_id,
+            ProjectClaimRecordRequest(
+                claim="Audited claim can enter the project brief.",
+                status="supported",
+                evidence_ids=["evidence-1"],
+                audit_ids=["audit-1"],
+                verifier_ids=["verifier-1"],
+            ),
+        )
+        second_brief = service.generate_project_evidence_brief(
+            GenerateProjectEvidenceBriefRequest(project_id=project.project_id)
+        )
+    finally:
+        service.close()
+
+    assert first_brief.included_claim_ids == []
+    assert "Project memory is context only" in second_brief.content
+    assert second_brief.audit_ids == ["audit-1"]
+    assert second_brief.included_evidence_ids == ["evidence-1"]
 
 
 @pytest.mark.asyncio
@@ -788,6 +918,14 @@ async def test_biomed_plugin_registers_tools(tmp_path: Path) -> None:
         assert tools.has_tool("plan_biomedical_search")
         assert tools.has_tool("answer_with_evidence")
         assert tools.has_tool("answer_with_audit")
+        assert tools.has_tool("create_biomed_project")
+        assert tools.has_tool("record_project_paper_decision")
+        assert tools.has_tool("save_project_paper")
+        assert tools.has_tool("reject_project_paper")
+        assert tools.has_tool("record_project_claim")
+        assert tools.has_tool("save_project_claim")
+        assert tools.has_tool("list_project_evidence")
+        assert tools.has_tool("generate_project_evidence_brief")
         assert tools.has_tool("validate_citation_support")
         assert tools.has_tool("audit_biomedical_answer")
         assert tools.has_tool("find_conflicting_evidence")

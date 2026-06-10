@@ -36,6 +36,9 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     AnswerRevision,
     AuditedAnswerResult,
+    BiomedProject,
+    BiomedProjectCreateRequest,
+    BiomedProjectUpdateRequest,
     BiomedicalEntity,
     BiomedicalPaper,
     BiomedicalQuestionClassification,
@@ -54,11 +57,18 @@ from plugins.biomed_evidence.schemas import (
     EvidenceItem,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    GenerateProjectEvidenceBriefRequest,
     GraphEdge,
     GraphNode,
     PaperMetadata,
     PlanBiomedicalSearchRequest,
     PlanBiomedicalSearchResult,
+    ProjectClaimRecord,
+    ProjectClaimRecordRequest,
+    ProjectEvidenceBrief,
+    ProjectPaperDecision,
+    ProjectPaperDecisionRequest,
+    ProjectReviewQueueItem,
     QueryPlanValidation,
     RetrievalBundle,
     RetrievalBundleRecord,
@@ -112,6 +122,255 @@ class BiomedEvidenceService:
     async def aclose(self) -> None:
         self.storage.close()
         await self.pubmed_client.close()
+
+    def create_project(self, request: BiomedProjectCreateRequest) -> BiomedProject:
+        now = _now_iso()
+        project = BiomedProject(
+            project_id=f"biomed-project-{uuid.uuid4().hex[:12]}",
+            name=request.name.strip() or "Untitled biomedical project",
+            description=request.description,
+            research_question=request.research_question.strip(),
+            include_keywords=_clean_list(request.include_keywords),
+            exclude_keywords=_clean_list(request.exclude_keywords),
+            preferred_methods=_clean_list(request.preferred_methods),
+            preferred_species=_clean_list(request.preferred_species),
+            preferred_study_types=_clean_list(request.preferred_study_types),
+            created_at=now,
+            updated_at=now,
+        )
+        self.storage.save_project(project)
+        return project
+
+    def update_project(
+        self,
+        project_id: str,
+        request: BiomedProjectUpdateRequest,
+    ) -> BiomedProject | None:
+        current = self.storage.get_project(project_id)
+        if current is None:
+            return None
+        update: dict[str, object] = {"updated_at": _now_iso()}
+        for field in (
+            "name",
+            "description",
+            "research_question",
+            "include_keywords",
+            "exclude_keywords",
+            "preferred_methods",
+            "preferred_species",
+            "preferred_study_types",
+        ):
+            value = getattr(request, field)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                update[field] = _clean_list(value)
+            elif isinstance(value, str):
+                update[field] = value.strip()
+            else:
+                update[field] = value
+        updated = current.model_copy(update=update)
+        self.storage.save_project(updated)
+        return updated
+
+    def get_project(self, project_id: str) -> BiomedProject | None:
+        return self.storage.get_project(project_id)
+
+    def list_projects(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[BiomedProject], int]:
+        return self.storage.list_projects(page=page, page_size=page_size)
+
+    def save_project_paper_decision(
+        self,
+        project_id: str,
+        request: ProjectPaperDecisionRequest,
+    ) -> ProjectPaperDecision:
+        project = self.storage.get_project(project_id)
+        if project is None:
+            raise ValueError("project not found")
+        now = _now_iso()
+        decision = ProjectPaperDecision(
+            decision_id=f"biomed-proj-paper-{uuid.uuid4().hex[:12]}",
+            project_id=project.project_id,
+            paper_id=request.paper_id,
+            source=request.source,
+            decision=request.decision,
+            reason=request.reason,
+            tags=_clean_list(request.tags),
+            notes=request.notes,
+            run_id=request.run_id,
+            retrieval_id=request.retrieval_id,
+            created_at=now,
+            updated_at=now,
+        )
+        return self.storage.save_project_paper_decision(decision)
+
+    def list_project_paper_decisions(
+        self,
+        project_id: str,
+        *,
+        decision: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[ProjectPaperDecision], int]:
+        if self.storage.get_project(project_id) is None:
+            raise ValueError("project not found")
+        return self.storage.list_project_paper_decisions(
+            project_id,
+            decision=decision,
+            page=page,
+            page_size=page_size,
+        )
+
+    def save_project_claim_record(
+        self,
+        project_id: str,
+        request: ProjectClaimRecordRequest,
+    ) -> ProjectClaimRecord:
+        project = self.storage.get_project(project_id)
+        if project is None:
+            raise ValueError("project not found")
+        now = _now_iso()
+        claim = ProjectClaimRecord(
+            claim_id=f"biomed-proj-claim-{uuid.uuid4().hex[:12]}",
+            project_id=project.project_id,
+            claim=request.claim,
+            status=request.status,
+            evidence_ids=_clean_list(request.evidence_ids),
+            audit_ids=_clean_list(request.audit_ids),
+            verifier_ids=_clean_list(request.verifier_ids),
+            notes=request.notes,
+            created_at=now,
+            updated_at=now,
+        )
+        return self.storage.save_project_claim_record(claim)
+
+    def list_project_claim_records(
+        self,
+        project_id: str,
+        *,
+        status: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[ProjectClaimRecord], int]:
+        if self.storage.get_project(project_id) is None:
+            raise ValueError("project not found")
+        return self.storage.list_project_claim_records(
+            project_id,
+            status=status,
+            page=page,
+            page_size=page_size,
+        )
+
+    def list_project_review_queue(
+        self,
+        project_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[ProjectReviewQueueItem], int]:
+        if self.storage.get_project(project_id) is None:
+            raise ValueError("project not found")
+        return self.storage.list_project_review_queue(
+            project_id,
+            page=page,
+            page_size=page_size,
+        )
+
+    def generate_project_evidence_brief(
+        self,
+        request: GenerateProjectEvidenceBriefRequest,
+    ) -> ProjectEvidenceBrief:
+        project = self.storage.get_project(request.project_id)
+        if project is None:
+            raise ValueError("project not found")
+        claims, _ = self.storage.list_project_claim_records(
+            project.project_id,
+            page=1,
+            page_size=500,
+        )
+        decisions, _ = self.storage.list_project_paper_decisions(
+            project.project_id,
+            page=1,
+            page_size=500,
+        )
+        review_queue, _ = self.storage.list_project_review_queue(
+            project.project_id,
+            page=1,
+            page_size=200,
+        )
+        saved_decisions = [item for item in decisions if item.decision == "saved"]
+        audited_claims = [item for item in claims if item.audit_ids]
+        included_evidence_ids = sorted(
+            {evidence_id for claim in audited_claims for evidence_id in claim.evidence_ids}
+        )
+        audit_ids = sorted({audit_id for claim in audited_claims for audit_id in claim.audit_ids})
+        verifier_ids = sorted(
+            {verifier_id for claim in audited_claims for verifier_id in claim.verifier_ids}
+        )
+        title = request.title or f"{project.name} evidence brief"
+        if request.format == "json":
+            content = json.dumps(
+                {
+                    "project": project.model_dump(mode="json"),
+                    "saved_papers": [
+                        item.model_dump(mode="json") for item in saved_decisions
+                    ],
+                    "audited_claims": [
+                        item.model_dump(mode="json") for item in audited_claims
+                    ],
+                    "review_queue": [
+                        item.model_dump(mode="json") for item in review_queue
+                    ],
+                    "policy": (
+                        "Project memory is context only; brief claims are promoted "
+                        "only when linked to audit IDs."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        else:
+            content = _project_brief_markdown(
+                project=project,
+                title=title,
+                saved_decisions=saved_decisions,
+                audited_claims=audited_claims,
+                review_queue=review_queue,
+                storage=self.storage,
+            )
+        brief = ProjectEvidenceBrief(
+            brief_id=f"biomed-proj-brief-{uuid.uuid4().hex[:12]}",
+            project_id=project.project_id,
+            title=title,
+            format=request.format,
+            content=content,
+            included_claim_ids=[item.claim_id for item in audited_claims],
+            included_evidence_ids=included_evidence_ids,
+            audit_ids=audit_ids,
+            verifier_ids=verifier_ids,
+            created_at=_now_iso(),
+        )
+        return self.storage.save_project_brief(brief)
+
+    def list_project_briefs(
+        self,
+        project_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[ProjectEvidenceBrief], int]:
+        if self.storage.get_project(project_id) is None:
+            raise ValueError("project not found")
+        return self.storage.list_project_briefs(
+            project_id,
+            page=page,
+            page_size=page_size,
+        )
 
     async def search(
         self,
@@ -497,18 +756,48 @@ class BiomedEvidenceService:
         request: AnswerWithEvidenceRequest,
     ) -> AnswerWithEvidenceResult:
         run_id = f"biomed-run-{uuid.uuid4().hex[:12]}"
+        project: BiomedProject | None = None
+        project_context_trace: dict[str, object] = {
+            "project_id": request.project_id,
+            "project_found": False,
+            "memory_used": False,
+            "clinical_boundary_prechecked": is_clinical_request(request.question),
+        }
+        active_request = request
+        if request.project_id and not project_context_trace["clinical_boundary_prechecked"]:
+            project = self.storage.get_project(request.project_id)
+            if project is None:
+                raise ValueError("project not found")
+            project_context = _project_context_text(
+                project=project,
+                request_context=request.project_context,
+            )
+            active_request = request.model_copy(
+                update={"project_context": project_context}
+            )
+            project_context_trace.update(
+                {
+                    "project_found": True,
+                    "memory_used": True,
+                    "include_keywords": project.include_keywords,
+                    "exclude_keywords": project.exclude_keywords,
+                    "preferred_methods": project.preferred_methods,
+                    "preferred_species": project.preferred_species,
+                    "preferred_study_types": project.preferred_study_types,
+                }
+            )
         planning_result: PlanBiomedicalSearchResult | None = None
-        if request.use_llm_planner:
+        if active_request.use_llm_planner:
             planning_result = await self.plan_biomedical_search(
                 PlanBiomedicalSearchRequest(
-                    question=request.question,
-                    max_results=request.max_papers,
-                    source=request.source,
-                    project_context=request.project_context,
-                    use_llm_planner=request.use_llm_planner,
+                    question=active_request.question,
+                    max_results=active_request.max_papers,
+                    source=active_request.source,
+                    project_context=active_request.project_context,
+                    use_llm_planner=active_request.use_llm_planner,
                 )
             )
-        clinical_boundary = is_clinical_request(request.question) or bool(
+        clinical_boundary = bool(project_context_trace["clinical_boundary_prechecked"]) or bool(
             planning_result and planning_result.classification.clinical_boundary
         )
         if clinical_boundary:
@@ -528,7 +817,13 @@ class BiomedEvidenceService:
                 ],
                 not_medical_advice=True,
                 disclaimer=RESEARCH_USE_DISCLAIMER,
-                project_context_used=request.project_context,
+                project_id=None,
+                project_context_used=None,
+                project_context_trace={
+                    **project_context_trace,
+                    "memory_used": False,
+                    "clinical_boundary_blocked_memory": True,
+                },
                 question_classification=(
                     planning_result.classification
                     if planning_result is not None
@@ -560,7 +855,9 @@ class BiomedEvidenceService:
                 ),
                 not_medical_advice=True,
                 disclaimer=RESEARCH_USE_DISCLAIMER,
-                project_context_used=request.project_context,
+                project_id=active_request.project_id,
+                project_context_used=active_request.project_context,
+                project_context_trace=project_context_trace,
                 question_classification=planning_result.classification,
                 query_plan=planning_result.query_plan,
                 query_plan_validation=planning_result.validation,
@@ -573,9 +870,9 @@ class BiomedEvidenceService:
             if planning_result is not None
             and planning_result.search_request is not None
             else SearchBiomedicalLiteratureRequest(
-                query=request.question,
-                max_results=request.max_papers,
-                source=request.source,
+                query=active_request.question,
+                max_results=active_request.max_papers,
+                source=active_request.source,
             )
         )
         (
@@ -585,24 +882,44 @@ class BiomedEvidenceService:
             paper_intents,
             paper_retrieval_ids,
         ) = await self._retrieve_answer_papers(
-            request=request,
+            request=active_request,
             planning_result=planning_result,
             search_request=search_request,
             run_id=run_id,
         )
+        if project is not None:
+            (
+                metadata,
+                retrieval_manifest,
+                retrieval_bundle,
+                project_retrieval_trace,
+            ) = self._apply_project_memory_to_retrieval(
+                project=project,
+                request=active_request,
+                metadata=metadata,
+                retrieval_manifest=retrieval_manifest,
+                retrieval_bundle=retrieval_bundle,
+            )
+            project_context_trace.update(project_retrieval_trace)
+            self.storage.save_retrieval_manifest(retrieval_manifest)
+            self.storage.link_retrieval_papers(
+                retrieval_manifest.retrieval_id,
+                source=active_request.source,
+                paper_ids=[item.paper_id for item in metadata],
+            )
         evidence: list[EvidenceItem] = []
         papers: dict[str, BiomedicalPaper] = {}
         for item in metadata:
             paper = await self.fetch(
                 FetchBiomedicalPaperRequest(
-                    paper_id=item.paper_id, source=request.source
+                    paper_id=item.paper_id, source=active_request.source
                 )
             )
             if paper is None:
                 continue
             papers[paper.paper_id] = paper
             extracted = await self._extract_evidence_for_answer(
-                request=request,
+                request=active_request,
                 paper=paper,
                 retrieval_id=paper_retrieval_ids.get(
                     item.paper_id,
@@ -619,14 +936,14 @@ class BiomedEvidenceService:
                     item.paper_id,
                     BiomedicalPaper(
                         paper_id=item.paper_id,
-                        source=request.source,
+                        source=active_request.source,
                         title=item.paper_id,
                     ),
                 ).title,
                 source=(
                     papers[item.paper_id].source
                     if item.paper_id in papers
-                    else request.source
+                    else active_request.source
                 ),
                 doi=papers[item.paper_id].doi if item.paper_id in papers else None,
                 url=papers[item.paper_id].url if item.paper_id in papers else None,
@@ -639,7 +956,7 @@ class BiomedEvidenceService:
             item for item in evidence if item.evidence_direction == "contradicts"
         ]
         limitations = _collect_limitations(evidence)
-        if not citations and request.require_citations:
+        if not citations and active_request.require_citations:
             answer = (
                 f"{RESEARCH_USE_DISCLAIMER}\n\n"
                 "I could not retrieve citation-backed evidence for this question in "
@@ -655,10 +972,10 @@ class BiomedEvidenceService:
             )
         else:
             deterministic_answer = _compose_answer(
-                question=request.question,
+                question=active_request.question,
                 evidence=evidence,
                 papers=papers,
-                project_context=request.project_context,
+                project_context=active_request.project_context,
             )
             uncertainty = _uncertainty(evidence)
             synthesis_outcome = _SynthesisOutcome(
@@ -667,9 +984,9 @@ class BiomedEvidenceService:
                 model=None,
                 prompt_hash=None,
             )
-            if request.use_llm_synthesis:
+            if active_request.use_llm_synthesis:
                 synthesis_outcome = await self._llm_synthesis_or_fallback(
-                    request=request,
+                    request=active_request,
                     deterministic_answer=deterministic_answer,
                     citations=citations,
                     evidence=evidence,
@@ -692,11 +1009,13 @@ class BiomedEvidenceService:
             limitations=limitations,
             uncertainty_level=uncertainty,
             suggested_next_steps=_suggest_next_steps(
-                evidence, bool(request.project_context)
+                evidence, bool(active_request.project_context)
             ),
             not_medical_advice=True,
             disclaimer=RESEARCH_USE_DISCLAIMER,
-            project_context_used=request.project_context,
+            project_id=active_request.project_id,
+            project_context_used=active_request.project_context,
+            project_context_trace=project_context_trace,
             question_classification=(
                 planning_result.classification if planning_result is not None else None
             ),
@@ -814,6 +1133,115 @@ class BiomedEvidenceService:
             paper_retrieval_ids,
         )
 
+    def _apply_project_memory_to_retrieval(
+        self,
+        *,
+        project: BiomedProject,
+        request: AnswerWithEvidenceRequest,
+        metadata: list[PaperMetadata],
+        retrieval_manifest: RetrievalManifest,
+        retrieval_bundle: RetrievalBundle | None,
+    ) -> tuple[
+        list[PaperMetadata],
+        RetrievalManifest,
+        RetrievalBundle | None,
+        dict[str, object],
+    ]:
+        decisions = self.storage.get_project_paper_decision_map(
+            project.project_id,
+            source=request.source,
+        )
+        original_ids = [item.paper_id for item in metadata]
+        original_position = {paper_id: index for index, paper_id in enumerate(original_ids)}
+        rejected_ids = [
+            paper_id
+            for paper_id in original_ids
+            if decisions.get(paper_id) is not None
+            and decisions[paper_id].decision == "rejected"
+        ]
+        saved_ids = [
+            paper_id
+            for paper_id in original_ids
+            if decisions.get(paper_id) is not None
+            and decisions[paper_id].decision == "saved"
+        ]
+        needs_review_ids = [
+            paper_id
+            for paper_id in original_ids
+            if decisions.get(paper_id) is not None
+            and decisions[paper_id].decision == "needs_review"
+        ]
+        if request.include_rejected_papers:
+            filtered = list(metadata)
+            dropped_rejected_ids: list[str] = []
+        else:
+            filtered = [
+                item
+                for item in metadata
+                if decisions.get(item.paper_id) is None
+                or decisions[item.paper_id].decision != "rejected"
+            ]
+            dropped_rejected_ids = rejected_ids
+
+        def priority(item: PaperMetadata) -> tuple[int, int]:
+            decision = decisions.get(item.paper_id)
+            if decision is not None and decision.decision == "saved":
+                bucket = 0
+            elif decision is not None and decision.decision == "needs_review":
+                bucket = 1
+            elif decision is not None and decision.decision == "rejected":
+                bucket = 3
+            else:
+                bucket = 2
+            return bucket, original_position.get(item.paper_id, 9999)
+
+        sorted_metadata = sorted(filtered, key=priority)
+        returned_ids = [item.paper_id for item in sorted_metadata]
+        warnings = list(retrieval_manifest.warnings)
+        if dropped_rejected_ids:
+            warnings.append(
+                "Project memory excluded rejected papers from evidence extraction."
+            )
+        if saved_ids:
+            warnings.append("Project memory prioritized saved papers.")
+        updated_manifest = retrieval_manifest.model_copy(
+            update={
+                "returned_paper_ids": returned_ids,
+                "deduped_result_count": len(returned_ids),
+                "dropped_or_duplicate_ids": _merge_unique(
+                    retrieval_manifest.dropped_or_duplicate_ids,
+                    dropped_rejected_ids,
+                ),
+                "warnings": _merge_unique(warnings),
+            }
+        )
+        updated_bundle = retrieval_bundle
+        if retrieval_bundle is not None:
+            updated_bundle = retrieval_bundle.model_copy(
+                update={
+                    "deduped_paper_ids": returned_ids,
+                    "warnings": _merge_unique(
+                        retrieval_bundle.warnings,
+                        [
+                            "Project paper decisions were applied after retrieval."
+                        ]
+                        if decisions
+                        else [],
+                    ),
+                }
+            )
+        trace: dict[str, object] = {
+            "project_filter_applied": bool(decisions),
+            "original_paper_ids": original_ids,
+            "returned_paper_ids": returned_ids,
+            "saved_paper_ids": saved_ids,
+            "needs_review_paper_ids": needs_review_ids,
+            "rejected_paper_ids": rejected_ids,
+            "dropped_rejected_paper_ids": dropped_rejected_ids,
+            "include_rejected_papers": request.include_rejected_papers,
+        }
+        return sorted_metadata, updated_manifest, updated_bundle, trace
+
     async def answer_with_audit(
         self,
         request: AnswerWithEvidenceRequest,
@@ -884,6 +1312,13 @@ class BiomedEvidenceService:
             revision=revision,
             clinical_boundary=clinical_boundary,
         )
+        if final_result.project_id:
+            self._record_project_review_queue(
+                project_id=final_result.project_id,
+                result=final_result,
+                audit=audit,
+                advisory_verifier=advisory_verifier,
+            )
         if advisory_verifier is not None:
             self.storage.save_advisory_verifier(advisory_verifier)
         self.storage.save_answer_revision(revision)
@@ -899,6 +1334,87 @@ class BiomedEvidenceService:
             trace=trace,
             final_action=revision.revision_action,
         )
+
+    def _record_project_review_queue(
+        self,
+        *,
+        project_id: str,
+        result: AnswerWithEvidenceResult,
+        audit: CitationAuditResult,
+        advisory_verifier: AdvisoryVerifierResult | None,
+    ) -> None:
+        if self.storage.get_project(project_id) is None:
+            return
+        now = _now_iso()
+        for claim_audit in audit.failed_claims:
+            risk: ConfidenceLevel = (
+                "high"
+                if claim_audit.verdict in {"overclaimed", "contradicted"}
+                else "medium"
+            )
+            self.storage.upsert_project_review_item(
+                ProjectReviewQueueItem(
+                    item_id=f"biomed-proj-review-{uuid.uuid4().hex[:12]}",
+                    project_id=project_id,
+                    item_type="claim_audit_failure",
+                    title=claim_audit.claim,
+                    reason=claim_audit.reason,
+                    risk_level=risk,
+                    run_id=result.run_id,
+                    evidence_id=(
+                        claim_audit.evidence_ids[0]
+                        if claim_audit.evidence_ids
+                        else None
+                    ),
+                    audit_id=audit.audit_id,
+                    verifier_id=(
+                        advisory_verifier.verifier_id
+                        if advisory_verifier is not None
+                        else None
+                    ),
+                    created_at=now,
+                )
+            )
+        for evidence in result.conflicting_evidence:
+            self.storage.upsert_project_review_item(
+                ProjectReviewQueueItem(
+                    item_id=f"biomed-proj-review-{uuid.uuid4().hex[:12]}",
+                    project_id=project_id,
+                    item_type="conflicting_evidence",
+                    title=evidence.claim,
+                    reason=evidence.finding,
+                    risk_level="high",
+                    run_id=result.run_id,
+                    evidence_id=evidence.evidence_id,
+                    audit_id=audit.audit_id,
+                    verifier_id=(
+                        advisory_verifier.verifier_id
+                        if advisory_verifier is not None
+                        else None
+                    ),
+                    created_at=now,
+                )
+            )
+        if advisory_verifier is None:
+            return
+        for disagreement in advisory_verifier.disagreements:
+            if not disagreement.high_risk:
+                continue
+            self.storage.upsert_project_review_item(
+                ProjectReviewQueueItem(
+                    item_id=f"biomed-proj-review-{uuid.uuid4().hex[:12]}",
+                    project_id=project_id,
+                    item_type="advisory_disagreement",
+                    title=disagreement.claim,
+                    reason=disagreement.reason,
+                    risk_level=disagreement.risk_level,
+                    run_id=result.run_id,
+                    evidence_id=None,
+                    audit_id=audit.audit_id,
+                    verifier_id=advisory_verifier.verifier_id,
+                    created_at=now,
+                )
+            )
 
     async def _llm_advisory_verifier_or_fallback(
         self,
@@ -2665,6 +3181,85 @@ def _clean_list(values: list[str]) -> list[str]:
     return result
 
 
+def _project_context_text(
+    *,
+    project: BiomedProject,
+    request_context: str | None,
+) -> str:
+    lines = [
+        "Project memory is context only, not biomedical evidence.",
+        f"Project: {project.name}",
+    ]
+    if project.description:
+        lines.append(f"Description: {project.description}")
+    if project.research_question:
+        lines.append(f"Research question: {project.research_question}")
+    if project.include_keywords:
+        lines.append(f"Include keywords: {', '.join(project.include_keywords)}")
+    if project.exclude_keywords:
+        lines.append(f"Exclude keywords: {', '.join(project.exclude_keywords)}")
+    if project.preferred_methods:
+        lines.append(f"Preferred methods: {', '.join(project.preferred_methods)}")
+    if project.preferred_species:
+        lines.append(f"Preferred species: {', '.join(project.preferred_species)}")
+    if project.preferred_study_types:
+        lines.append(
+            f"Preferred study types: {', '.join(project.preferred_study_types)}"
+        )
+    if request_context and request_context.strip():
+        lines.append(f"User request context: {request_context.strip()}")
+    return "\n".join(lines)
+
+
+def _project_brief_markdown(
+    *,
+    project: BiomedProject,
+    title: str,
+    saved_decisions: list[ProjectPaperDecision],
+    audited_claims: list[ProjectClaimRecord],
+    review_queue: list[ProjectReviewQueueItem],
+    storage: BiomedStorage,
+) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        f"Project: {project.name}",
+        "",
+        "Project memory is context only. Brief findings are promoted only when linked to audit IDs.",
+    ]
+    if project.research_question:
+        lines.extend(["", f"Research question: {project.research_question}"])
+    lines.extend(["", "## Saved Papers"])
+    if not saved_decisions:
+        lines.append("- None recorded.")
+    for decision in saved_decisions:
+        paper = storage.get_paper(decision.paper_id, source=decision.source)
+        title_text = paper.title if paper is not None else decision.paper_id
+        reason = f" Reason: {decision.reason}" if decision.reason else ""
+        lines.append(
+            f"- {title_text} (`{decision.paper_id}`, {decision.source}).{reason}"
+        )
+    lines.extend(["", "## Audited Claims"])
+    if not audited_claims:
+        lines.append("- No project claims are linked to audits yet.")
+    for claim in audited_claims:
+        evidence_ids = ", ".join(claim.evidence_ids) or "none"
+        audit_ids = ", ".join(claim.audit_ids) or "none"
+        verifier_ids = ", ".join(claim.verifier_ids) or "none"
+        lines.append(
+            f"- {claim.claim} Status: {claim.status}. Evidence: {evidence_ids}. "
+            f"Audits: {audit_ids}. Verifiers: {verifier_ids}."
+        )
+    lines.extend(["", "## Review Queue"])
+    if not review_queue:
+        lines.append("- No review items recorded.")
+    for item in review_queue[:25]:
+        lines.append(
+            f"- [{item.risk_level}] {item.item_type}: {item.title}. {item.reason}"
+        )
+    return "\n".join(lines).strip() + "\n"
+
+
 def _pubmed_term(value: str) -> str:
     return value.replace('"', "").strip()
 
@@ -3359,6 +3954,7 @@ def _build_trace_steps(
         ),
         metadata={
             "source": request.source,
+            "project_id": result.project_id,
             "classification": (
                 result.question_classification.model_dump(mode="json")
                 if result.question_classification is not None
@@ -3441,6 +4037,7 @@ def _build_trace_steps(
                 else []
             ),
             "retrieval_bundle": _retrieval_bundle_trace(result.retrieval_bundle),
+            "project_context_trace": result.project_context_trace,
         },
     )
     add(

@@ -7,6 +7,8 @@ from typing import Literal
 from agent.plugins import Plugin, tool
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    BiomedProjectCreateRequest,
+    BiomedProjectUpdateRequest,
     BiomedicalPaper,
     Citation,
     CitationAuditRequest,
@@ -15,7 +17,10 @@ from plugins.biomed_evidence.schemas import (
     EvidenceItem,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    GenerateProjectEvidenceBriefRequest,
     PlanBiomedicalSearchRequest,
+    ProjectClaimRecordRequest,
+    ProjectPaperDecisionRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
@@ -157,6 +162,418 @@ class BiomedEvidencePlugin(Plugin):
         return _dump(result.model_dump(mode="json"))
 
     @tool(
+        name="create_biomed_project",
+        risk="read-write",
+        search_hint="create biomedical project workspace memory evidence review",
+    )
+    async def create_biomed_project(
+        self,
+        event,
+        name: str,
+        description: str | None = None,
+        research_question: str = "",
+        include_keywords: list[str] | None = None,
+        exclude_keywords: list[str] | None = None,
+        preferred_methods: list[str] | None = None,
+        preferred_species: list[str] | None = None,
+        preferred_study_types: list[str] | None = None,
+    ) -> str:
+        """Create a biomedical evidence project workspace."""
+        project = self._service.create_project(
+            BiomedProjectCreateRequest(
+                name=name,
+                description=description,
+                research_question=research_question,
+                include_keywords=include_keywords or [],
+                exclude_keywords=exclude_keywords or [],
+                preferred_methods=preferred_methods or [],
+                preferred_species=preferred_species or [],
+                preferred_study_types=preferred_study_types or [],
+            )
+        )
+        return _dump(project.model_dump(mode="json"))
+
+    @tool(
+        name="list_biomed_projects",
+        risk="read-only",
+        search_hint="list biomedical project workspaces",
+    )
+    async def list_biomed_projects(
+        self,
+        event,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> str:
+        """List biomedical evidence project workspaces."""
+        items, total = self._service.list_projects(page=page, page_size=page_size)
+        return _dump(
+            {
+                "items": [item.model_dump(mode="json") for item in items],
+                "total": total,
+            }
+        )
+
+    @tool(
+        name="update_biomed_project",
+        risk="read-write",
+        search_hint="update biomedical project workspace preferences",
+    )
+    async def update_biomed_project(
+        self,
+        event,
+        project_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        research_question: str | None = None,
+        include_keywords: list[str] | None = None,
+        exclude_keywords: list[str] | None = None,
+        preferred_methods: list[str] | None = None,
+        preferred_species: list[str] | None = None,
+        preferred_study_types: list[str] | None = None,
+    ) -> str:
+        """Update a biomedical evidence project workspace."""
+        project = self._service.update_project(
+            project_id,
+            BiomedProjectUpdateRequest(
+                name=name,
+                description=description,
+                research_question=research_question,
+                include_keywords=include_keywords,
+                exclude_keywords=exclude_keywords,
+                preferred_methods=preferred_methods,
+                preferred_species=preferred_species,
+                preferred_study_types=preferred_study_types,
+            ),
+        )
+        if project is None:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(project.model_dump(mode="json"))
+
+    @tool(
+        name="record_project_paper_decision",
+        risk="read-write",
+        search_hint="save reject needs review biomedical project paper",
+    )
+    async def record_project_paper_decision(
+        self,
+        event,
+        project_id: str,
+        paper_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+        decision: Literal["saved", "rejected", "needs_review"] = "saved",
+        reason: str | None = None,
+        tags: list[str] | None = None,
+        notes: str | None = None,
+        run_id: str | None = None,
+        retrieval_id: str | None = None,
+    ) -> str:
+        """Record a project paper decision used for future retrieval filtering."""
+        try:
+            result = self._service.save_project_paper_decision(
+                project_id,
+                ProjectPaperDecisionRequest(
+                    paper_id=paper_id,
+                    source=source,
+                    decision=decision,
+                    reason=reason,
+                    tags=tags or [],
+                    notes=notes,
+                    run_id=run_id,
+                    retrieval_id=retrieval_id,
+                ),
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="save_project_paper",
+        risk="read-write",
+        search_hint="save biomedical project paper",
+    )
+    async def save_project_paper(
+        self,
+        event,
+        project_id: str,
+        paper_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+        reason: str | None = None,
+        tags: list[str] | None = None,
+        notes: str | None = None,
+        run_id: str | None = None,
+        retrieval_id: str | None = None,
+    ) -> str:
+        """Mark a paper as saved in a project."""
+        try:
+            result = self._service.save_project_paper_decision(
+                project_id,
+                ProjectPaperDecisionRequest(
+                    paper_id=paper_id,
+                    source=source,
+                    decision="saved",
+                    reason=reason,
+                    tags=tags or [],
+                    notes=notes,
+                    run_id=run_id,
+                    retrieval_id=retrieval_id,
+                ),
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="reject_project_paper",
+        risk="read-write",
+        search_hint="reject biomedical project paper",
+    )
+    async def reject_project_paper(
+        self,
+        event,
+        project_id: str,
+        paper_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+        reason: str | None = None,
+        tags: list[str] | None = None,
+        notes: str | None = None,
+        run_id: str | None = None,
+        retrieval_id: str | None = None,
+    ) -> str:
+        """Mark a paper as rejected in a project."""
+        try:
+            result = self._service.save_project_paper_decision(
+                project_id,
+                ProjectPaperDecisionRequest(
+                    paper_id=paper_id,
+                    source=source,
+                    decision="rejected",
+                    reason=reason,
+                    tags=tags or [],
+                    notes=notes,
+                    run_id=run_id,
+                    retrieval_id=retrieval_id,
+                ),
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="list_project_paper_decisions",
+        risk="read-only",
+        search_hint="list biomedical project saved rejected papers",
+    )
+    async def list_project_paper_decisions(
+        self,
+        event,
+        project_id: str,
+        decision: Literal["", "saved", "rejected", "needs_review"] = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> str:
+        """List project paper decisions."""
+        try:
+            items, total = self._service.list_project_paper_decisions(
+                project_id,
+                decision=decision,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(
+            {
+                "items": [item.model_dump(mode="json") for item in items],
+                "total": total,
+            }
+        )
+
+    @tool(
+        name="record_project_claim",
+        risk="read-write",
+        search_hint="record biomedical project claim evidence audit status",
+    )
+    async def record_project_claim(
+        self,
+        event,
+        project_id: str,
+        claim: str,
+        status: Literal[
+            "supported",
+            "mixed",
+            "uncertain",
+            "rejected",
+            "needs_review",
+        ] = "needs_review",
+        evidence_ids: list[str] | None = None,
+        audit_ids: list[str] | None = None,
+        verifier_ids: list[str] | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """Record a project-level claim linked to audited evidence."""
+        try:
+            result = self._service.save_project_claim_record(
+                project_id,
+                ProjectClaimRecordRequest(
+                    claim=claim,
+                    status=status,
+                    evidence_ids=evidence_ids or [],
+                    audit_ids=audit_ids or [],
+                    verifier_ids=verifier_ids or [],
+                    notes=notes,
+                ),
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="save_project_claim",
+        risk="read-write",
+        search_hint="save biomedical project claim",
+    )
+    async def save_project_claim(
+        self,
+        event,
+        project_id: str,
+        claim: str,
+        status: Literal[
+            "supported",
+            "mixed",
+            "uncertain",
+            "rejected",
+            "needs_review",
+        ] = "needs_review",
+        evidence_ids: list[str] | None = None,
+        audit_ids: list[str] | None = None,
+        verifier_ids: list[str] | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """Save a project-level claim linked to audited evidence."""
+        try:
+            result = self._service.save_project_claim_record(
+                project_id,
+                ProjectClaimRecordRequest(
+                    claim=claim,
+                    status=status,
+                    evidence_ids=evidence_ids or [],
+                    audit_ids=audit_ids or [],
+                    verifier_ids=verifier_ids or [],
+                    notes=notes,
+                ),
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="list_project_evidence",
+        risk="read-only",
+        search_hint="list biomedical project evidence decisions claims queue briefs",
+    )
+    async def list_project_evidence(
+        self,
+        event,
+        project_id: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> str:
+        """Return a project evidence workspace snapshot."""
+        try:
+            paper_decisions, paper_total = self._service.list_project_paper_decisions(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+            claims, claim_total = self._service.list_project_claim_records(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+            review_queue, review_total = self._service.list_project_review_queue(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+            briefs, brief_total = self._service.list_project_briefs(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(
+            {
+                "project_id": project_id,
+                "paper_decisions": [
+                    item.model_dump(mode="json") for item in paper_decisions
+                ],
+                "paper_decision_total": paper_total,
+                "claims": [item.model_dump(mode="json") for item in claims],
+                "claim_total": claim_total,
+                "review_queue": [
+                    item.model_dump(mode="json") for item in review_queue
+                ],
+                "review_queue_total": review_total,
+                "briefs": [item.model_dump(mode="json") for item in briefs],
+                "brief_total": brief_total,
+            }
+        )
+
+    @tool(
+        name="list_project_review_queue",
+        risk="read-only",
+        search_hint="list biomedical project review queue audit verifier",
+    )
+    async def list_project_review_queue(
+        self,
+        event,
+        project_id: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> str:
+        """List project review queue items generated from audit/verifier runs."""
+        try:
+            items, total = self._service.list_project_review_queue(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(
+            {
+                "items": [item.model_dump(mode="json") for item in items],
+                "total": total,
+            }
+        )
+
+    @tool(
+        name="generate_project_evidence_brief",
+        risk="read-write",
+        search_hint="generate biomedical project evidence brief",
+    )
+    async def generate_project_evidence_brief(
+        self,
+        event,
+        project_id: str,
+        title: str | None = None,
+        format: Literal["markdown", "json"] = "markdown",
+    ) -> str:
+        """Generate and persist a project evidence brief."""
+        try:
+            brief = self._service.generate_project_evidence_brief(
+                GenerateProjectEvidenceBriefRequest(
+                    project_id=project_id,
+                    title=title,
+                    format=format,
+                )
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        return _dump(brief.model_dump(mode="json"))
+
+    @tool(
         name="answer_with_evidence",
         risk="read-only",
         search_hint="citation grounded biomedical research answer",
@@ -166,9 +583,11 @@ class BiomedEvidencePlugin(Plugin):
         event,
         question: str,
         max_papers: int = 10,
+        project_id: str | None = None,
         project_context: str | None = None,
         require_citations: bool = True,
         source: Literal["pubmed", "mock"] = "mock",
+        include_rejected_papers: bool = False,
         use_llm_planner: bool = False,
         execute_support_refute: bool = False,
         use_llm_extractor: bool = False,
@@ -179,9 +598,11 @@ class BiomedEvidencePlugin(Plugin):
         Args:
             question: Biomedical research question.
             max_papers: Maximum papers to retrieve.
+            project_id: Optional biomedical project workspace id.
             project_context: Optional user project context, treated as preference only.
             require_citations: Whether to avoid strong claims without citations.
             source: Literature source.
+            include_rejected_papers: Include papers previously rejected in the project.
             use_llm_planner: Request framework-governed retrieval planning when configured.
             execute_support_refute: Execute planner support/refute queries and bundle manifests.
             use_llm_extractor: Request framework-governed span-grounded evidence extraction.
@@ -191,9 +612,11 @@ class BiomedEvidencePlugin(Plugin):
             AnswerWithEvidenceRequest(
                 question=question,
                 max_papers=max_papers,
+                project_id=project_id,
                 project_context=project_context,
                 require_citations=require_citations,
                 source=source,
+                include_rejected_papers=include_rejected_papers,
                 use_llm_planner=use_llm_planner,
                 execute_support_refute=execute_support_refute,
                 use_llm_extractor=use_llm_extractor,
@@ -213,9 +636,11 @@ class BiomedEvidencePlugin(Plugin):
         event,
         question: str,
         max_papers: int = 10,
+        project_id: str | None = None,
         project_context: str | None = None,
         require_citations: bool = True,
         source: Literal["pubmed", "mock"] = "mock",
+        include_rejected_papers: bool = False,
         use_llm_revision: bool = False,
         use_llm_planner: bool = False,
         execute_support_refute: bool = False,
@@ -228,9 +653,11 @@ class BiomedEvidencePlugin(Plugin):
         Args:
             question: Biomedical research question.
             max_papers: Maximum papers to retrieve.
+            project_id: Optional biomedical project workspace id.
             project_context: Optional user project context, treated as preference only.
             require_citations: Whether to avoid strong claims without citations.
             source: Literature source.
+            include_rejected_papers: Include papers previously rejected in the project.
             use_llm_revision: Request framework-governed LLM revision when configured.
             use_llm_planner: Request framework-governed retrieval planning when configured.
             execute_support_refute: Execute planner support/refute queries and bundle manifests.
@@ -242,9 +669,11 @@ class BiomedEvidencePlugin(Plugin):
             AnswerWithEvidenceRequest(
                 question=question,
                 max_papers=max_papers,
+                project_id=project_id,
                 project_context=project_context,
                 require_citations=require_citations,
                 source=source,
+                include_rejected_papers=include_rejected_papers,
                 use_llm_revision=use_llm_revision,
                 use_llm_planner=use_llm_planner,
                 execute_support_refute=execute_support_refute,

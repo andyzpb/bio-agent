@@ -13,11 +13,16 @@ from plugins.biomed_evidence.schemas import (
     AgentTraceStep,
     AnswerWithEvidenceResult,
     AnswerRevision,
+    BiomedProject,
     BiomedicalEntity,
     BiomedicalPaper,
     CitationAuditResult,
     ConflictAuditResult,
     EvidenceItem,
+    ProjectClaimRecord,
+    ProjectEvidenceBrief,
+    ProjectPaperDecision,
+    ProjectReviewQueueItem,
     RetrievalManifest,
     WatchDecisionDetail,
     WatchSnapshot,
@@ -323,6 +328,383 @@ class BiomedStorage:
             page=page,
             page_size=page_size,
         )
+
+    def save_project(self, project: BiomedProject) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_projects(
+                    project_id, name, description, research_question,
+                    include_keywords_json, exclude_keywords_json,
+                    preferred_methods_json, preferred_species_json,
+                    preferred_study_types_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    name=excluded.name,
+                    description=excluded.description,
+                    research_question=excluded.research_question,
+                    include_keywords_json=excluded.include_keywords_json,
+                    exclude_keywords_json=excluded.exclude_keywords_json,
+                    preferred_methods_json=excluded.preferred_methods_json,
+                    preferred_species_json=excluded.preferred_species_json,
+                    preferred_study_types_json=excluded.preferred_study_types_json,
+                    updated_at=excluded.updated_at
+                """,
+                _project_values(project),
+            )
+            self._db.commit()
+
+    def get_project(self, project_id: str) -> BiomedProject | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM biomed_projects WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+        return _project_from_row(row) if row is not None else None
+
+    def list_projects(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[BiomedProject], int]:
+        with self._lock:
+            total = int(
+                self._db.execute("SELECT COUNT(*) FROM biomed_projects").fetchone()[0]
+            )
+            rows = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_projects
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (_safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        return [_project_from_row(row) for row in rows], total
+
+    def save_project_paper_decision(
+        self, decision: ProjectPaperDecision
+    ) -> ProjectPaperDecision:
+        now = decision.updated_at or _now_iso()
+        created_at = decision.created_at or now
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_project_paper_decisions(
+                    decision_id, project_id, paper_id, source, decision,
+                    reason, tags_json, notes, run_id, retrieval_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source, paper_id) DO UPDATE SET
+                    decision=excluded.decision,
+                    reason=excluded.reason,
+                    tags_json=excluded.tags_json,
+                    notes=excluded.notes,
+                    run_id=excluded.run_id,
+                    retrieval_id=excluded.retrieval_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    decision.decision_id,
+                    decision.project_id,
+                    decision.paper_id,
+                    decision.source,
+                    decision.decision,
+                    decision.reason,
+                    _json(decision.tags),
+                    decision.notes,
+                    decision.run_id,
+                    decision.retrieval_id,
+                    created_at,
+                    now,
+                ),
+            )
+            row = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_project_paper_decisions
+                WHERE project_id=? AND source=? AND paper_id=?
+                """,
+                (decision.project_id, decision.source, decision.paper_id),
+            ).fetchone()
+            self._db.commit()
+        return _project_paper_decision_from_row(row)
+
+    def list_project_paper_decisions(
+        self,
+        project_id: str,
+        *,
+        decision: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[ProjectPaperDecision], int]:
+        where = "WHERE project_id=?"
+        params: list[Any] = [project_id]
+        if decision.strip():
+            where += " AND decision=?"
+            params.append(decision.strip())
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    f"SELECT COUNT(*) FROM biomed_project_paper_decisions {where}",
+                    tuple(params),
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                f"""
+                SELECT *
+                FROM biomed_project_paper_decisions
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, _safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        return [_project_paper_decision_from_row(row) for row in rows], total
+
+    def get_project_paper_decision_map(
+        self,
+        project_id: str,
+        *,
+        source: str = "",
+    ) -> dict[str, ProjectPaperDecision]:
+        clauses = ["project_id=?"]
+        params: list[Any] = [project_id]
+        if source:
+            clauses.append("source=?")
+            params.append(source)
+        with self._lock:
+            rows = self._db.execute(
+                f"""
+                SELECT *
+                FROM biomed_project_paper_decisions
+                WHERE {' AND '.join(clauses)}
+                """,
+                tuple(params),
+            ).fetchall()
+        return {
+            str(row["paper_id"]): _project_paper_decision_from_row(row)
+            for row in rows
+        }
+
+    def save_project_claim_record(
+        self, claim: ProjectClaimRecord
+    ) -> ProjectClaimRecord:
+        now = claim.updated_at or _now_iso()
+        created_at = claim.created_at or now
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_project_claims(
+                    claim_id, project_id, claim, claim_hash, status,
+                    evidence_ids_json, audit_ids_json, verifier_ids_json,
+                    notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, claim_hash) DO UPDATE SET
+                    claim=excluded.claim,
+                    status=excluded.status,
+                    evidence_ids_json=excluded.evidence_ids_json,
+                    audit_ids_json=excluded.audit_ids_json,
+                    verifier_ids_json=excluded.verifier_ids_json,
+                    notes=excluded.notes,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    claim.claim_id,
+                    claim.project_id,
+                    claim.claim,
+                    _claim_hash(claim.claim),
+                    claim.status,
+                    _json(claim.evidence_ids),
+                    _json(claim.audit_ids),
+                    _json(claim.verifier_ids),
+                    claim.notes,
+                    created_at,
+                    now,
+                ),
+            )
+            row = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_project_claims
+                WHERE project_id=? AND claim_hash=?
+                """,
+                (claim.project_id, _claim_hash(claim.claim)),
+            ).fetchone()
+            self._db.commit()
+        return _project_claim_from_row(row)
+
+    def list_project_claim_records(
+        self,
+        project_id: str,
+        *,
+        status: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[ProjectClaimRecord], int]:
+        where = "WHERE project_id=?"
+        params: list[Any] = [project_id]
+        if status.strip():
+            where += " AND status=?"
+            params.append(status.strip())
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    f"SELECT COUNT(*) FROM biomed_project_claims {where}",
+                    tuple(params),
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                f"""
+                SELECT *
+                FROM biomed_project_claims
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, _safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        return [_project_claim_from_row(row) for row in rows], total
+
+    def upsert_project_review_item(
+        self, item: ProjectReviewQueueItem
+    ) -> ProjectReviewQueueItem:
+        item_key = _project_review_item_key(item)
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_project_review_queue(
+                    item_id, project_id, item_key, item_type, title, reason,
+                    risk_level, run_id, evidence_id, audit_id, verifier_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, item_key) DO UPDATE SET
+                    item_type=excluded.item_type,
+                    title=excluded.title,
+                    reason=excluded.reason,
+                    risk_level=excluded.risk_level,
+                    run_id=excluded.run_id,
+                    evidence_id=excluded.evidence_id,
+                    audit_id=excluded.audit_id,
+                    verifier_id=excluded.verifier_id
+                """,
+                (
+                    item.item_id,
+                    item.project_id,
+                    item_key,
+                    item.item_type,
+                    item.title,
+                    item.reason,
+                    item.risk_level,
+                    item.run_id,
+                    item.evidence_id,
+                    item.audit_id,
+                    item.verifier_id,
+                    item.created_at,
+                ),
+            )
+            row = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_project_review_queue
+                WHERE project_id=? AND item_key=?
+                """,
+                (item.project_id, item_key),
+            ).fetchone()
+            self._db.commit()
+        return _project_review_item_from_row(row)
+
+    def list_project_review_queue(
+        self,
+        project_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[ProjectReviewQueueItem], int]:
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    "SELECT COUNT(*) FROM biomed_project_review_queue WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_project_review_queue
+                WHERE project_id=?
+                ORDER BY
+                    CASE risk_level
+                        WHEN 'high' THEN 1
+                        WHEN 'medium' THEN 2
+                        ELSE 3
+                    END,
+                    created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (project_id, _safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        return [_project_review_item_from_row(row) for row in rows], total
+
+    def save_project_brief(self, brief: ProjectEvidenceBrief) -> ProjectEvidenceBrief:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_project_briefs(
+                    brief_id, project_id, title, format, content,
+                    included_claim_ids_json, included_evidence_ids_json,
+                    audit_ids_json, verifier_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(brief_id) DO UPDATE SET
+                    title=excluded.title,
+                    format=excluded.format,
+                    content=excluded.content,
+                    included_claim_ids_json=excluded.included_claim_ids_json,
+                    included_evidence_ids_json=excluded.included_evidence_ids_json,
+                    audit_ids_json=excluded.audit_ids_json,
+                    verifier_ids_json=excluded.verifier_ids_json
+                """,
+                (
+                    brief.brief_id,
+                    brief.project_id,
+                    brief.title,
+                    brief.format,
+                    brief.content,
+                    _json(brief.included_claim_ids),
+                    _json(brief.included_evidence_ids),
+                    _json(brief.audit_ids),
+                    _json(brief.verifier_ids),
+                    brief.created_at,
+                ),
+            )
+            self._db.commit()
+        return brief
+
+    def list_project_briefs(
+        self,
+        project_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[ProjectEvidenceBrief], int]:
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    "SELECT COUNT(*) FROM biomed_project_briefs WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_project_briefs
+                WHERE project_id=?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (project_id, _safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        return [_project_brief_from_row(row) for row in rows], total
 
     def save_agent_trace_steps(self, steps: list[AgentTraceStep]) -> None:
         if not steps:
@@ -1131,6 +1513,79 @@ class BiomedStorage:
                 UNIQUE(watch_id, paper_id),
                 FOREIGN KEY(watch_id) REFERENCES biomed_watch_topics(watch_id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS biomed_projects(
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                research_question TEXT NOT NULL DEFAULT '',
+                include_keywords_json TEXT NOT NULL DEFAULT '[]',
+                exclude_keywords_json TEXT NOT NULL DEFAULT '[]',
+                preferred_methods_json TEXT NOT NULL DEFAULT '[]',
+                preferred_species_json TEXT NOT NULL DEFAULT '[]',
+                preferred_study_types_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_project_paper_decisions(
+                decision_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                paper_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                notes TEXT,
+                run_id TEXT,
+                retrieval_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, source, paper_id),
+                FOREIGN KEY(project_id) REFERENCES biomed_projects(project_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS biomed_project_claims(
+                claim_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                claim TEXT NOT NULL,
+                claim_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'needs_review',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                audit_ids_json TEXT NOT NULL DEFAULT '[]',
+                verifier_ids_json TEXT NOT NULL DEFAULT '[]',
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, claim_hash),
+                FOREIGN KEY(project_id) REFERENCES biomed_projects(project_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS biomed_project_review_queue(
+                item_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                risk_level TEXT NOT NULL DEFAULT 'medium',
+                run_id TEXT,
+                evidence_id TEXT,
+                audit_id TEXT,
+                verifier_id TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id, item_key),
+                FOREIGN KEY(project_id) REFERENCES biomed_projects(project_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS biomed_project_briefs(
+                brief_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                format TEXT NOT NULL DEFAULT 'markdown',
+                content TEXT NOT NULL,
+                included_claim_ids_json TEXT NOT NULL DEFAULT '[]',
+                included_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                audit_ids_json TEXT NOT NULL DEFAULT '[]',
+                verifier_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES biomed_projects(project_id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS biomed_answer_runs(
                 run_id TEXT PRIMARY KEY,
                 question TEXT NOT NULL,
@@ -1298,6 +1753,113 @@ def _paper_from_row(row: sqlite3.Row) -> BiomedicalPaper:
         mesh_terms=_json_list(row["mesh_terms_json"]),
         keywords=_json_list(row["keywords_json"]),
     )
+
+
+def _project_values(project: BiomedProject) -> tuple[object, ...]:
+    return (
+        project.project_id,
+        project.name,
+        project.description,
+        project.research_question,
+        _json(project.include_keywords),
+        _json(project.exclude_keywords),
+        _json(project.preferred_methods),
+        _json(project.preferred_species),
+        _json(project.preferred_study_types),
+        project.created_at,
+        project.updated_at,
+    )
+
+
+def _project_from_row(row: sqlite3.Row) -> BiomedProject:
+    return BiomedProject(
+        project_id=str(row["project_id"]),
+        name=str(row["name"]),
+        description=row["description"],
+        research_question=str(row["research_question"] or ""),
+        include_keywords=_json_list(row["include_keywords_json"]),
+        exclude_keywords=_json_list(row["exclude_keywords_json"]),
+        preferred_methods=_json_list(row["preferred_methods_json"]),
+        preferred_species=_json_list(row["preferred_species_json"]),
+        preferred_study_types=_json_list(row["preferred_study_types_json"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _project_paper_decision_from_row(row: sqlite3.Row) -> ProjectPaperDecision:
+    return ProjectPaperDecision(
+        decision_id=str(row["decision_id"]),
+        project_id=str(row["project_id"]),
+        paper_id=str(row["paper_id"]),
+        source=row["source"],
+        decision=row["decision"],
+        reason=row["reason"],
+        tags=_json_list(row["tags_json"]),
+        notes=row["notes"],
+        run_id=row["run_id"],
+        retrieval_id=row["retrieval_id"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _project_claim_from_row(row: sqlite3.Row) -> ProjectClaimRecord:
+    return ProjectClaimRecord(
+        claim_id=str(row["claim_id"]),
+        project_id=str(row["project_id"]),
+        claim=str(row["claim"]),
+        status=row["status"],
+        evidence_ids=_json_list(row["evidence_ids_json"]),
+        audit_ids=_json_list(row["audit_ids_json"]),
+        verifier_ids=_json_list(row["verifier_ids_json"]),
+        notes=row["notes"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _project_review_item_from_row(row: sqlite3.Row) -> ProjectReviewQueueItem:
+    return ProjectReviewQueueItem(
+        item_id=str(row["item_id"]),
+        project_id=str(row["project_id"]),
+        item_type=row["item_type"],
+        title=str(row["title"]),
+        reason=str(row["reason"]),
+        risk_level=row["risk_level"],
+        run_id=row["run_id"],
+        evidence_id=row["evidence_id"],
+        audit_id=row["audit_id"],
+        verifier_id=row["verifier_id"],
+        created_at=str(row["created_at"]),
+    )
+
+
+def _project_brief_from_row(row: sqlite3.Row) -> ProjectEvidenceBrief:
+    return ProjectEvidenceBrief(
+        brief_id=str(row["brief_id"]),
+        project_id=str(row["project_id"]),
+        title=str(row["title"]),
+        format=row["format"],
+        content=str(row["content"]),
+        included_claim_ids=_json_list(row["included_claim_ids_json"]),
+        included_evidence_ids=_json_list(row["included_evidence_ids_json"]),
+        audit_ids=_json_list(row["audit_ids_json"]),
+        verifier_ids=_json_list(row["verifier_ids_json"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _project_review_item_key(item: ProjectReviewQueueItem) -> str:
+    parts = [
+        item.item_type,
+        item.run_id or "",
+        item.evidence_id or "",
+        item.audit_id or "",
+        item.verifier_id or "",
+        item.title,
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
 
 
 def _watch_values(watch: WatchTopic) -> tuple[object, ...]:

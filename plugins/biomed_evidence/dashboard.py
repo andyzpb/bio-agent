@@ -9,12 +9,17 @@ from fastapi.responses import Response
 from plugins.biomed_evidence.literature_client import LiteratureClientError
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    BiomedProjectCreateRequest,
+    BiomedProjectUpdateRequest,
     CitationAuditRequest,
     ConflictAuditRequest,
     EvidenceExtractionRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    GenerateProjectEvidenceBriefRequest,
     PlanBiomedicalSearchRequest,
+    ProjectClaimRecordRequest,
+    ProjectPaperDecisionRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
@@ -129,12 +134,171 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "page_size": max(1, min(page_size, 200)),
         }
 
+    @app.post("/api/biomed/projects")
+    def create_project(payload: BiomedProjectCreateRequest) -> dict[str, Any]:
+        return service.create_project(payload).model_dump(mode="json")
+
+    @app.get("/api/biomed/projects")
+    def list_projects(page: int = 1, page_size: int = 50) -> dict[str, Any]:
+        items, total = service.list_projects(page=page, page_size=page_size)
+        return {
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": total,
+            "page": max(1, page),
+            "page_size": max(1, min(page_size, 200)),
+        }
+
+    @app.get("/api/biomed/projects/{project_id}")
+    def get_project(project_id: str) -> dict[str, Any]:
+        project = service.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return project.model_dump(mode="json")
+
+    @app.patch("/api/biomed/projects/{project_id}")
+    def update_project(
+        project_id: str,
+        payload: BiomedProjectUpdateRequest,
+    ) -> dict[str, Any]:
+        project = service.update_project(project_id, payload)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return project.model_dump(mode="json")
+
+    @app.post("/api/biomed/projects/{project_id}/papers")
+    def save_project_paper_decision(
+        project_id: str,
+        payload: ProjectPaperDecisionRequest,
+    ) -> dict[str, Any]:
+        try:
+            decision = service.save_project_paper_decision(project_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return decision.model_dump(mode="json")
+
+    @app.get("/api/biomed/projects/{project_id}/papers")
+    def list_project_paper_decisions(
+        project_id: str,
+        decision: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            items, total = service.list_project_paper_decisions(
+                project_id,
+                decision=decision,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": total,
+            "page": max(1, page),
+            "page_size": max(1, min(page_size, 200)),
+        }
+
+    @app.post("/api/biomed/projects/{project_id}/claims")
+    def save_project_claim_record(
+        project_id: str,
+        payload: ProjectClaimRecordRequest,
+    ) -> dict[str, Any]:
+        try:
+            claim = service.save_project_claim_record(project_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return claim.model_dump(mode="json")
+
+    @app.get("/api/biomed/projects/{project_id}/claims")
+    def list_project_claim_records(
+        project_id: str,
+        status: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            items, total = service.list_project_claim_records(
+                project_id,
+                status=status,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": total,
+            "page": max(1, page),
+            "page_size": max(1, min(page_size, 200)),
+        }
+
+    @app.get("/api/biomed/projects/{project_id}/review-queue")
+    def list_project_review_queue(
+        project_id: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            items, total = service.list_project_review_queue(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": total,
+            "page": max(1, page),
+            "page_size": max(1, min(page_size, 200)),
+        }
+
+    @app.post("/api/biomed/projects/{project_id}/briefs")
+    def generate_project_evidence_brief(
+        project_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            request_payload = GenerateProjectEvidenceBriefRequest.model_validate(
+                {**payload, "project_id": project_id}
+            )
+            brief = service.generate_project_evidence_brief(
+                request_payload
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return brief.model_dump(mode="json")
+
+    @app.get("/api/biomed/projects/{project_id}/briefs")
+    def list_project_briefs(
+        project_id: str,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        try:
+            items, total = service.list_project_briefs(
+                project_id,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": total,
+            "page": max(1, page),
+            "page_size": max(1, min(page_size, 200)),
+        }
+
     @app.post("/api/biomed/answer")
     async def answer_with_evidence(payload: AnswerWithEvidenceRequest) -> dict[str, Any]:
         try:
             result = await service.answer_with_evidence(payload)
         except LiteratureClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return result.model_dump(mode="json")
 
     @app.post("/api/biomed/answer/audited")
@@ -143,6 +307,8 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             result = await service.answer_with_audit(payload)
         except LiteratureClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return result.model_dump(mode="json")
 
     @app.get("/api/biomed/answer-runs")
