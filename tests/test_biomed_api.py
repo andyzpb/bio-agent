@@ -16,6 +16,18 @@ def _client(tmp_path: Path) -> TestClient:
 
 def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
+        search = client.get(
+            "/api/biomed/search",
+            params={"query": "microglia", "source": "mock"},
+        )
+        assert search.status_code == 200
+        search_payload = search.json()
+        assert search_payload["items"]
+        retrieval_id = search_payload["retrieval_manifest"]["retrieval_id"]
+        retrieval = client.get(f"/api/biomed/retrievals/{retrieval_id}")
+        assert retrieval.status_code == 200
+        assert retrieval.json()["returned_paper_ids"]
+
         answer = client.post(
             "/api/biomed/answer",
             json={
@@ -28,6 +40,8 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         payload = answer.json()
         assert payload["citations"]
         assert payload["evidence_summary"]
+        assert payload["retrieval_id"]
+        assert payload["retrieval_manifest"]["compiled_query"]
 
         evidence = client.get("/api/biomed/evidence", params={"direction": "supports"})
         assert evidence.status_code == 200
@@ -41,10 +55,12 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         audit = client.get(f"/api/biomed/audit/{payload['run_id']}")
         assert audit.status_code == 200
         assert audit.json()["run_id"] == payload["run_id"]
+        assert audit.json()["retrieval_id"] == payload["retrieval_id"]
 
         report = client.get("/api/biomed/export", params={"run_id": payload["run_id"]})
         assert report.status_code == 200
         assert "Biomedical Evidence Report" in report.text
+        assert "Retrieval Provenance" in report.text
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
@@ -64,11 +80,15 @@ def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
 
         checked = client.post(f"/api/biomed/watch/{watch_id}/check")
         assert checked.status_code == 200
-        assert checked.json()["decisions"]
+        checked_payload = checked.json()
+        assert checked_payload["decisions"]
+        assert checked_payload["retrieval_manifest"]["retrieval_id"]
+        assert checked_payload["snapshot"]["new_paper_ids"]
 
         events = client.get(f"/api/biomed/watch/{watch_id}/events")
         assert events.status_code == 200
         assert events.json()["total"] >= 1
+        assert events.json()["items"][0]["retrieval_id"]
 
         patched = client.patch(
             f"/api/biomed/watch/{watch_id}",

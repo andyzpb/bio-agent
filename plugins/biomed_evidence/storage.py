@@ -13,7 +13,9 @@ from plugins.biomed_evidence.schemas import (
     BiomedicalEntity,
     BiomedicalPaper,
     EvidenceItem,
+    RetrievalManifest,
     WatchDecisionDetail,
+    WatchSnapshot,
     WatchTopic,
 )
 
@@ -117,7 +119,13 @@ class BiomedStorage:
             page_size=page_size,
         )
 
-    def upsert_evidence(self, item: EvidenceItem, *, paper_source: str = "") -> None:
+    def upsert_evidence(
+        self,
+        item: EvidenceItem,
+        *,
+        paper_source: str = "",
+        retrieval_id: str | None = None,
+    ) -> None:
         now = _now_iso()
         claim_hash = _claim_hash(item.claim)
         with self._lock:
@@ -126,8 +134,9 @@ class BiomedStorage:
                 INSERT INTO biomed_evidence(
                     evidence_id, paper_id, source, claim_hash, claim, finding,
                     evidence_direction, methods_json, datasets_json, limitations_json,
-                    confidence, evidence_span, requires_expert_review, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, evidence_span, requires_expert_review, retrieval_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(paper_id, claim_hash) DO UPDATE SET
                     source=excluded.source,
                     claim=excluded.claim,
@@ -139,6 +148,7 @@ class BiomedStorage:
                     confidence=excluded.confidence,
                     evidence_span=excluded.evidence_span,
                     requires_expert_review=excluded.requires_expert_review,
+                    retrieval_id=COALESCE(excluded.retrieval_id, biomed_evidence.retrieval_id),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -155,6 +165,7 @@ class BiomedStorage:
                     item.confidence,
                     item.evidence_span,
                     1 if item.requires_expert_review else 0,
+                    retrieval_id,
                     now,
                     now,
                 ),
@@ -252,13 +263,22 @@ class BiomedStorage:
         with self._lock:
             self._db.execute(
                 """
-                INSERT INTO biomed_answer_runs(run_id, question, answer_json, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO biomed_answer_runs(
+                    run_id, question, answer_json, retrieval_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     question=excluded.question,
-                    answer_json=excluded.answer_json
+                    answer_json=excluded.answer_json,
+                    retrieval_id=excluded.retrieval_id
                 """,
-                (result.run_id, question, result.model_dump_json(), now),
+                (
+                    result.run_id,
+                    question,
+                    result.model_dump_json(),
+                    result.retrieval_id,
+                    now,
+                ),
             )
             self._db.commit()
 
@@ -280,7 +300,7 @@ class BiomedStorage:
     ) -> tuple[list[dict[str, object]], int]:
         return self._list_rows(
             table="biomed_answer_runs",
-            columns="run_id, question, created_at",
+            columns="run_id, question, retrieval_id, created_at",
             where="",
             params=(),
             order_by="created_at DESC",
@@ -382,15 +402,19 @@ class BiomedStorage:
             self._db.execute(
                 """
                 INSERT INTO biomed_watch_decisions(
-                    decision_id, watch_id, paper_id, source, relevance_score,
-                    decision, rationale, uncertainty, notification_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    decision_id, watch_id, paper_id, source, retrieval_id, snapshot_id,
+                    relevance_score, decision, rationale, uncertainty, dedupe_reason,
+                    notification_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(watch_id, paper_id) DO UPDATE SET
                     source=excluded.source,
+                    retrieval_id=excluded.retrieval_id,
+                    snapshot_id=excluded.snapshot_id,
                     relevance_score=excluded.relevance_score,
                     decision=excluded.decision,
                     rationale=excluded.rationale,
                     uncertainty=excluded.uncertainty,
+                    dedupe_reason=excluded.dedupe_reason,
                     notification_json=excluded.notification_json,
                     created_at=excluded.created_at
                 """,
@@ -399,12 +423,107 @@ class BiomedStorage:
                     decision.watch_id,
                     decision.paper_id,
                     source,
+                    decision.retrieval_id,
+                    decision.snapshot_id,
                     decision.relevance_score,
                     decision.decision,
                     decision.rationale,
                     decision.uncertainty,
+                    decision.dedupe_reason,
                     _json(decision.notification),
                     decision.created_at,
+                ),
+            )
+            self._db.commit()
+
+    def save_retrieval_manifest(self, manifest: RetrievalManifest) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_retrieval_manifests(
+                    retrieval_id, source, original_query, compiled_query,
+                    manifest_json, started_at, finished_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(retrieval_id) DO UPDATE SET
+                    source=excluded.source,
+                    original_query=excluded.original_query,
+                    compiled_query=excluded.compiled_query,
+                    manifest_json=excluded.manifest_json,
+                    started_at=excluded.started_at,
+                    finished_at=excluded.finished_at
+                """,
+                (
+                    manifest.retrieval_id,
+                    manifest.source,
+                    manifest.original_query,
+                    manifest.compiled_query,
+                    manifest.model_dump_json(),
+                    manifest.started_at,
+                    manifest.finished_at,
+                    now,
+                ),
+            )
+            self._db.commit()
+
+    def get_retrieval_manifest(self, retrieval_id: str) -> RetrievalManifest | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT manifest_json
+                FROM biomed_retrieval_manifests
+                WHERE retrieval_id=?
+                """,
+                (retrieval_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RetrievalManifest.model_validate_json(str(row["manifest_json"]))
+
+    def link_retrieval_papers(
+        self,
+        retrieval_id: str,
+        *,
+        source: str,
+        paper_ids: list[str],
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM biomed_retrieval_papers WHERE retrieval_id=?",
+                (retrieval_id,),
+            )
+            for index, paper_id in enumerate(paper_ids):
+                self._db.execute(
+                    """
+                    INSERT OR IGNORE INTO biomed_retrieval_papers(
+                        retrieval_id, source, paper_id, ordinal
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (retrieval_id, source, paper_id, index),
+                )
+            self._db.commit()
+
+    def save_watch_snapshot(self, snapshot: WatchSnapshot) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_watch_snapshots(
+                    snapshot_id, watch_id, retrieval_id, paper_ids_json,
+                    new_paper_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                    retrieval_id=excluded.retrieval_id,
+                    paper_ids_json=excluded.paper_ids_json,
+                    new_paper_ids_json=excluded.new_paper_ids_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    snapshot.snapshot_id,
+                    snapshot.watch_id,
+                    snapshot.retrieval_id,
+                    _json(snapshot.paper_ids),
+                    _json(snapshot.new_paper_ids),
+                    snapshot.created_at,
                 ),
             )
             self._db.commit()
@@ -462,6 +581,7 @@ class BiomedStorage:
         data["paper_url"] = row["paper_url"]
         data["paper_doi"] = row["paper_doi"]
         data["source"] = row["source"]
+        data["retrieval_id"] = row["retrieval_id"] if "retrieval_id" in row.keys() else None
         return data
 
     def _entities_for_evidence(self, evidence_id: str) -> list[BiomedicalEntity]:
@@ -581,6 +701,7 @@ class BiomedStorage:
                 confidence TEXT NOT NULL,
                 evidence_span TEXT,
                 requires_expert_review INTEGER NOT NULL DEFAULT 1,
+                retrieval_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(paper_id, claim_hash)
@@ -612,10 +733,13 @@ class BiomedStorage:
                 watch_id TEXT NOT NULL,
                 paper_id TEXT NOT NULL,
                 source TEXT NOT NULL,
+                retrieval_id TEXT,
+                snapshot_id TEXT,
                 relevance_score REAL NOT NULL,
                 decision TEXT NOT NULL,
                 rationale TEXT NOT NULL,
                 uncertainty TEXT NOT NULL,
+                dedupe_reason TEXT,
                 notification_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 UNIQUE(watch_id, paper_id),
@@ -625,11 +749,51 @@ class BiomedStorage:
                 run_id TEXT PRIMARY KEY,
                 question TEXT NOT NULL,
                 answer_json TEXT NOT NULL,
+                retrieval_id TEXT,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_retrieval_manifests(
+                retrieval_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                original_query TEXT NOT NULL,
+                compiled_query TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_retrieval_papers(
+                retrieval_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                paper_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY(retrieval_id, paper_id),
+                FOREIGN KEY(retrieval_id) REFERENCES biomed_retrieval_manifests(retrieval_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS biomed_watch_snapshots(
+                snapshot_id TEXT PRIMARY KEY,
+                watch_id TEXT NOT NULL,
+                retrieval_id TEXT NOT NULL,
+                paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                new_paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(watch_id) REFERENCES biomed_watch_topics(watch_id) ON DELETE CASCADE,
+                FOREIGN KEY(retrieval_id) REFERENCES biomed_retrieval_manifests(retrieval_id) ON DELETE CASCADE
             );
             """
         )
+        self._ensure_column("biomed_evidence", "retrieval_id", "TEXT")
+        self._ensure_column("biomed_watch_decisions", "retrieval_id", "TEXT")
+        self._ensure_column("biomed_watch_decisions", "snapshot_id", "TEXT")
+        self._ensure_column("biomed_watch_decisions", "dedupe_reason", "TEXT")
+        self._ensure_column("biomed_answer_runs", "retrieval_id", "TEXT")
         self._db.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        rows = self._db.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(row["name"]) == column for row in rows):
+            return
+        self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _paper_from_row(row: sqlite3.Row) -> BiomedicalPaper:
@@ -689,10 +853,13 @@ def _decision_from_row(row: sqlite3.Row) -> WatchDecisionDetail:
         decision_id=str(row["decision_id"]),
         watch_id=str(row["watch_id"]),
         paper_id=str(row["paper_id"]),
+        retrieval_id=row["retrieval_id"] if "retrieval_id" in row.keys() else None,
+        snapshot_id=row["snapshot_id"] if "snapshot_id" in row.keys() else None,
         relevance_score=float(row["relevance_score"]),
         decision=row["decision"],
         rationale=str(row["rationale"]),
         uncertainty=row["uncertainty"],
+        dedupe_reason=row["dedupe_reason"] if "dedupe_reason" in row.keys() else None,
         created_at=str(row["created_at"]),
         title=row["title"] if "title" in row.keys() else None,
         source=row["source"] if "source" in row.keys() else None,

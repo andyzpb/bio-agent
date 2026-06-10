@@ -37,9 +37,12 @@ from plugins.biomed_evidence.schemas import (
     GraphEdge,
     GraphNode,
     PaperMetadata,
+    RetrievalManifest,
     SearchBiomedicalLiteratureRequest,
+    SearchBiomedicalLiteratureResult,
     WatchCheckResult,
     WatchDecisionDetail,
+    WatchSnapshot,
     WatchTopic,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
@@ -75,25 +78,96 @@ class BiomedEvidenceService:
         self,
         request: SearchBiomedicalLiteratureRequest,
     ) -> list[PaperMetadata]:
+        return (await self.search_with_manifest(request)).items
+
+    async def search_with_manifest(
+        self,
+        request: SearchBiomedicalLiteratureRequest,
+    ) -> SearchBiomedicalLiteratureResult:
         client = self._client(request.source)
+        started_at = _now_iso()
+        retrieval_id = _retrieval_id(request, started_at)
+        compiled_query, normalized_filters, unsupported_filters = _compile_query(request)
+        warnings: list[str] = []
+        errors: list[str] = []
+        trace: dict[str, object]
         try:
-            items = await client.search(
-                request.query,
-                max_results=max(0, min(request.max_results, 50)),
-                date_from=request.date_from,
-                date_to=request.date_to,
+            if request.source == "pubmed":
+                pubmed_result = await self.pubmed_client.search_with_trace(
+                    compiled_query,
+                    max_results=max(0, min(request.max_results, 50)),
+                    date_from=request.date_from,
+                    date_to=request.date_to,
+                )
+                items = pubmed_result.items
+                trace = pubmed_result.trace
+                for paper in pubmed_result.papers:
+                    self.storage.upsert_paper(paper)
+            else:
+                items = await client.search(
+                    request.query,
+                    max_results=max(0, min(request.max_results, 50)),
+                    date_from=request.date_from,
+                    date_to=request.date_to,
+                )
+                trace = _mock_trace(
+                    query=request.query,
+                    max_results=request.max_results,
+                    date_from=request.date_from,
+                    date_to=request.date_to,
+                    returned_ids=[item.paper_id for item in items],
+                )
+        except LiteratureClientError as exc:
+            errors.append(str(exc))
+            manifest = _manifest_from_trace(
+                retrieval_id=retrieval_id,
+                request=request,
+                compiled_query=compiled_query,
+                normalized_filters=normalized_filters,
+                unsupported_filters=unsupported_filters,
+                started_at=started_at,
+                trace={},
+                returned_ids=[],
+                duplicate_ids=[],
+                warnings=warnings,
+                errors=errors,
             )
-        except LiteratureClientError:
+            self.storage.save_retrieval_manifest(manifest)
             raise
+        returned_ids = [item.paper_id for item in items]
+        duplicate_ids = cast(list[str], trace.get("duplicate_ids", []))
+        manifest = _manifest_from_trace(
+            retrieval_id=retrieval_id,
+            request=request,
+            compiled_query=compiled_query,
+            normalized_filters=normalized_filters,
+            unsupported_filters=unsupported_filters,
+            started_at=started_at,
+            trace=trace,
+            returned_ids=returned_ids,
+            duplicate_ids=duplicate_ids,
+            warnings=warnings,
+            errors=errors,
+        )
+        self.storage.save_retrieval_manifest(manifest)
+        self.storage.link_retrieval_papers(
+            manifest.retrieval_id,
+            source=request.source,
+            paper_ids=returned_ids,
+        )
         for item in items:
-            paper = await client.fetch(item.paper_id)
+            stored = self.storage.get_paper(item.paper_id, source=request.source)
+            paper = stored or await client.fetch(item.paper_id)
             if paper is not None:
                 self.storage.upsert_paper(paper)
-        return items
+        return SearchBiomedicalLiteratureResult(
+            items=items,
+            retrieval_manifest=manifest,
+        )
 
     async def fetch(self, request: FetchBiomedicalPaperRequest) -> BiomedicalPaper | None:
         stored = self.storage.get_paper(request.paper_id, source=request.source)
-        if stored is not None and request.source == "mock":
+        if stored is not None:
             return stored
         paper = await self._client(request.source).fetch(request.paper_id)
         if paper is not None:
@@ -103,6 +177,8 @@ class BiomedEvidenceService:
     def extract_evidence(
         self,
         request: EvidenceExtractionRequest,
+        *,
+        retrieval_id: str | None = None,
     ) -> EvidenceExtractionResult:
         self.storage.upsert_paper(request.paper)
         result = self.extractor.extract(
@@ -110,7 +186,11 @@ class BiomedEvidenceService:
             research_question=request.research_question,
         )
         for item in result.evidence:
-            self.storage.upsert_evidence(item, paper_source=request.paper.source)
+            self.storage.upsert_evidence(
+                item,
+                paper_source=request.paper.source,
+                retrieval_id=retrieval_id,
+            )
         return result
 
     async def answer_with_evidence(
@@ -145,7 +225,9 @@ class BiomedEvidenceService:
             max_results=request.max_papers,
             source=request.source,
         )
-        metadata = await self.search(search_request)
+        search_result = await self.search_with_manifest(search_request)
+        metadata = search_result.items
+        retrieval_manifest = search_result.retrieval_manifest
         evidence: list[EvidenceItem] = []
         papers: dict[str, BiomedicalPaper] = {}
         for item in metadata:
@@ -159,7 +241,8 @@ class BiomedEvidenceService:
                 EvidenceExtractionRequest(
                     paper=paper,
                     research_question=request.question,
-                )
+                ),
+                retrieval_id=retrieval_manifest.retrieval_id,
             )
             evidence.extend(extracted.evidence)
 
@@ -199,6 +282,8 @@ class BiomedEvidenceService:
             uncertainty = _uncertainty(evidence)
         result = AnswerWithEvidenceResult(
             run_id=run_id,
+            retrieval_id=retrieval_manifest.retrieval_id,
+            retrieval_manifest=retrieval_manifest,
             answer=answer,
             citations=citations,
             evidence_summary=evidence,
@@ -399,12 +484,25 @@ class BiomedEvidenceService:
         existing, _ = self.storage.list_watch_decisions(watch_id=watch_id, page=1, page_size=500)
         existing_paper_ids = {item.paper_id for item in existing}
         query = " ".join([watch.topic, *watch.include_keywords]).strip()
-        metadata = await self.search(
+        search_result = await self.search_with_manifest(
             SearchBiomedicalLiteratureRequest(query=query, max_results=10, source=source)  # type: ignore[arg-type]
         )
+        metadata = search_result.items
+        retrieval_manifest = search_result.retrieval_manifest
+        paper_ids = [item.paper_id for item in metadata]
+        new_paper_ids = [paper_id for paper_id in paper_ids if paper_id not in existing_paper_ids]
+        snapshot = WatchSnapshot(
+            snapshot_id=f"watch-snapshot-{uuid.uuid4().hex[:12]}",
+            watch_id=watch.watch_id,
+            retrieval_id=retrieval_manifest.retrieval_id,
+            paper_ids=paper_ids,
+            new_paper_ids=new_paper_ids,
+            created_at=checked_at,
+        )
+        self.storage.save_watch_snapshot(snapshot)
         decisions: list[WatchDecisionDetail] = []
         for meta in metadata:
-            if meta.paper_id in existing_paper_ids:
+            if meta.paper_id not in new_paper_ids:
                 continue
             paper = await self.fetch(
                 FetchBiomedicalPaperRequest(paper_id=meta.paper_id, source=source)  # type: ignore[arg-type]
@@ -431,15 +529,20 @@ class BiomedEvidenceService:
                 "key_evidence_claim": key_claim,
                 "limitation_or_uncertainty": limitation,
                 "dashboard_path": f"/?view=plugin:biomed_evidence&paper_id={paper.paper_id}",
+                "retrieval_id": retrieval_manifest.retrieval_id,
+                "snapshot_id": snapshot.snapshot_id,
             }
             decision = WatchDecisionDetail(
                 decision_id=_decision_id(watch.watch_id, paper.paper_id),
                 watch_id=watch.watch_id,
                 paper_id=paper.paper_id,
+                retrieval_id=retrieval_manifest.retrieval_id,
+                snapshot_id=snapshot.snapshot_id,
                 relevance_score=round(score, 3),
                 decision=decision_value,
                 rationale=rationale,
                 uncertainty=uncertainty,
+                dedupe_reason=None,
                 created_at=checked_at,
                 title=paper.title,
                 source=paper.source,
@@ -455,7 +558,13 @@ class BiomedEvidenceService:
             }
         )
         self.storage.update_watch(updated_watch)
-        return WatchCheckResult(watch=updated_watch, decisions=decisions, checked_at=checked_at)
+        return WatchCheckResult(
+            watch=updated_watch,
+            decisions=decisions,
+            checked_at=checked_at,
+            retrieval_manifest=retrieval_manifest,
+            snapshot=snapshot,
+        )
 
     def list_watch_decisions(
         self,
@@ -472,6 +581,9 @@ class BiomedEvidenceService:
 
     def get_answer_run(self, run_id: str) -> AnswerWithEvidenceResult | None:
         return self.storage.get_answer_run(run_id)
+
+    def get_retrieval_manifest(self, retrieval_id: str) -> RetrievalManifest | None:
+        return self.storage.get_retrieval_manifest(retrieval_id)
 
     async def export_report(self, request: ExportEvidenceReportRequest) -> str:
         result: AnswerWithEvidenceResult | None = None
@@ -491,6 +603,194 @@ class BiomedEvidenceService:
         if source == "pubmed":
             return self.pubmed_client
         return self.mock_client
+
+
+def _compile_query(
+    request: SearchBiomedicalLiteratureRequest,
+) -> tuple[str, dict[str, object], list[str]]:
+    normalized_query = re.sub(r"\s+", " ", request.query or "").strip()
+    filters: dict[str, object] = {
+        "max_results": max(0, min(request.max_results, 50)),
+        "date_from": request.date_from,
+        "date_to": request.date_to,
+        "publication_types": _clean_list(request.publication_types),
+        "study_types": _clean_list(request.study_types),
+        "mesh_terms": _clean_list(request.mesh_terms),
+        "species_terms": _clean_list(request.species_terms),
+        "exclude_terms": _clean_list(request.exclude_terms),
+    }
+    unsupported: list[str] = []
+    if request.source == "mock":
+        for key in (
+            "publication_types",
+            "study_types",
+            "mesh_terms",
+            "species_terms",
+            "exclude_terms",
+        ):
+            if filters[key]:
+                unsupported.append(f"mock:{key}")
+        return normalized_query, filters, unsupported
+
+    parts = [normalized_query] if normalized_query else []
+    for term in cast(list[str], filters["mesh_terms"]):
+        parts.append(f'"{_pubmed_term(term)}"[MeSH Terms]')
+    for term in cast(list[str], filters["species_terms"]):
+        parts.append(f'"{_pubmed_term(term)}"[MeSH Terms]')
+    for term in cast(list[str], filters["publication_types"]):
+        parts.append(f'"{_pubmed_term(term)}"[Publication Type]')
+    if filters["study_types"]:
+        unsupported.append("pubmed:study_types")
+    compiled = " AND ".join(parts) if parts else ""
+    exclude_terms = cast(list[str], filters["exclude_terms"])
+    if exclude_terms:
+        excludes = " OR ".join(
+            f'"{_pubmed_term(term)}"[All Fields]' for term in exclude_terms
+        )
+        compiled = f"({compiled}) NOT ({excludes})" if compiled else f"NOT ({excludes})"
+    return compiled, filters, unsupported
+
+
+def _manifest_from_trace(
+    *,
+    retrieval_id: str,
+    request: SearchBiomedicalLiteratureRequest,
+    compiled_query: str,
+    normalized_filters: dict[str, object],
+    unsupported_filters: list[str],
+    started_at: str,
+    trace: dict[str, object],
+    returned_ids: list[str],
+    duplicate_ids: list[str],
+    warnings: list[str],
+    errors: list[str],
+) -> RetrievalManifest:
+    raw_result_count = _safe_int(trace.get("raw_result_count"), len(returned_ids))
+    pages_requested = _safe_int(trace.get("pages_requested"), 1)
+    pages_completed = _safe_int(trace.get("pages_completed"), 0)
+    if pages_completed < pages_requested and raw_result_count > len(returned_ids):
+        warnings = [
+            *warnings,
+            "Search completed fewer pages than requested; inspect external source limits.",
+        ]
+    request_parameters = [
+        cast(dict[str, object], item)
+        for item in cast(list[object], trace.get("request_parameters", []))
+        if isinstance(item, dict)
+    ]
+    api_endpoints = [
+        str(item)
+        for item in cast(list[object], trace.get("api_endpoints", []))
+        if str(item)
+    ]
+    return RetrievalManifest(
+        retrieval_id=retrieval_id,
+        source=request.source,
+        original_query=request.query,
+        compiled_query=compiled_query,
+        normalized_filters=normalized_filters,
+        unsupported_filters=unsupported_filters,
+        api_endpoints=api_endpoints,
+        request_parameters=request_parameters,
+        page_size=_safe_int(
+            trace.get("page_size"),
+            max(1, min(request.max_results, 50)),
+        ),
+        pages_requested=pages_requested,
+        pages_completed=pages_completed,
+        raw_result_count=raw_result_count,
+        deduped_result_count=len(returned_ids),
+        returned_paper_ids=returned_ids,
+        dropped_or_duplicate_ids=duplicate_ids,
+        started_at=started_at,
+        finished_at=_now_iso(),
+        warnings=warnings,
+        errors=errors,
+    )
+
+
+def _mock_trace(
+    *,
+    query: str,
+    max_results: int,
+    date_from: str | None,
+    date_to: str | None,
+    returned_ids: list[str],
+) -> dict[str, object]:
+    return {
+        "api_endpoints": ["mock://biomed_evidence/search"],
+        "request_parameters": [
+            {
+                "query": query,
+                "max_results": max(0, min(max_results, 50)),
+                "date_from": date_from,
+                "date_to": date_to,
+            }
+        ],
+        "page_size": max(1, min(max_results, 50)) if max_results else 1,
+        "pages_requested": 1,
+        "pages_completed": 1,
+        "raw_result_count": len(returned_ids),
+        "duplicate_ids": [],
+    }
+
+
+def _safe_int(value: object, fallback: int) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return fallback
+    try:
+        return int(cast(float, value)) if isinstance(value, float) else fallback
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def _retrieval_id(request: SearchBiomedicalLiteratureRequest, started_at: str) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "source": request.source,
+                "query": request.query,
+                "max_results": request.max_results,
+                "date_from": request.date_from,
+                "date_to": request.date_to,
+                "publication_types": request.publication_types,
+                "study_types": request.study_types,
+                "mesh_terms": request.mesh_terms,
+                "species_terms": request.species_terms,
+                "exclude_terms": request.exclude_terms,
+                "started_at": started_at,
+                "nonce": uuid.uuid4().hex,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"retrieval-{digest}"
+
+
+def _clean_list(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        clean = re.sub(r"\s+", " ", value).strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(clean)
+    return result
+
+
+def _pubmed_term(value: str) -> str:
+    return value.replace('"', "").strip()
 
 
 def _compose_answer(
@@ -663,6 +963,27 @@ def _render_markdown_report(result: AnswerWithEvidenceResult) -> str:
         if citation.url:
             parts.append(citation.url)
         lines.append("- " + " | ".join(parts))
+    if result.retrieval_manifest is not None:
+        manifest = result.retrieval_manifest
+        lines.extend(
+            [
+                "",
+                "## Retrieval Provenance",
+                "",
+                f"- Retrieval ID: `{manifest.retrieval_id}`",
+                f"- Source: `{manifest.source}`",
+                f"- Original query: `{manifest.original_query}`",
+                f"- Compiled query: `{manifest.compiled_query}`",
+                f"- Result count: `{manifest.deduped_result_count}`",
+                f"- Pages completed: `{manifest.pages_completed}`",
+            ]
+        )
+        if manifest.warnings:
+            lines.append(f"- Warnings: {'; '.join(manifest.warnings)}")
+        if manifest.unsupported_filters:
+            lines.append(
+                f"- Unsupported filters: {'; '.join(manifest.unsupported_filters)}"
+            )
     lines.extend(["", "## Limitations", ""])
     for limitation in result.limitations:
         lines.append(f"- {limitation}")

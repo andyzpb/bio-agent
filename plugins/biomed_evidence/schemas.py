@@ -114,10 +114,13 @@ class WatchDecision(BaseModel):
     decision_id: str
     watch_id: str
     paper_id: str
+    retrieval_id: str | None = None
+    snapshot_id: str | None = None
     relevance_score: float
     decision: WatchDecisionValue
     rationale: str
     uncertainty: ConfidenceLevel
+    dedupe_reason: str | None = None
     created_at: str
 
 
@@ -135,6 +138,54 @@ class SearchBiomedicalLiteratureRequest(BaseModel):
     date_from: str | None = None
     date_to: str | None = None
     source: Literal["pubmed", "mock"] = "mock"
+    publication_types: list[str] = Field(default_factory=list)
+    study_types: list[str] = Field(default_factory=list)
+    mesh_terms: list[str] = Field(default_factory=list)
+    species_terms: list[str] = Field(default_factory=list)
+    exclude_terms: list[str] = Field(default_factory=list)
+
+
+class RetrievalManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    retrieval_id: str
+    source: Literal["pubmed", "mock"]
+    original_query: str
+    compiled_query: str
+    normalized_filters: dict[str, object] = Field(default_factory=dict)
+    unsupported_filters: list[str] = Field(default_factory=list)
+    api_endpoints: list[str] = Field(default_factory=list)
+    request_parameters: list[dict[str, object]] = Field(default_factory=list)
+    page_size: int
+    pages_requested: int
+    pages_completed: int
+    raw_result_count: int
+    deduped_result_count: int
+    returned_paper_ids: list[str] = Field(default_factory=list)
+    dropped_or_duplicate_ids: list[str] = Field(default_factory=list)
+    started_at: str
+    finished_at: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    software_version: str = "biomed-evidence-v1.2"
+
+
+class SearchBiomedicalLiteratureResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[PaperMetadata] = Field(default_factory=list)
+    retrieval_manifest: RetrievalManifest
+
+
+class WatchSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: str
+    watch_id: str
+    retrieval_id: str
+    paper_ids: list[str] = Field(default_factory=list)
+    new_paper_ids: list[str] = Field(default_factory=list)
+    created_at: str
 
 
 class FetchBiomedicalPaperRequest(BaseModel):
@@ -173,6 +224,8 @@ class AnswerWithEvidenceResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str
+    retrieval_id: str | None = None
+    retrieval_manifest: RetrievalManifest | None = None
     answer: str
     citations: list[Citation] = Field(default_factory=list)
     evidence_summary: list[EvidenceItem] = Field(default_factory=list)
@@ -216,6 +269,8 @@ class WatchCheckResult(BaseModel):
     watch: WatchTopic
     decisions: list[WatchDecisionDetail] = Field(default_factory=list)
     checked_at: str
+    retrieval_manifest: RetrievalManifest | None = None
+    snapshot: WatchSnapshot | None = None
 
 
 class GraphNode(BaseModel):

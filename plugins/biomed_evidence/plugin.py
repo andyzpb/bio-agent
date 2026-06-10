@@ -53,7 +53,7 @@ class BiomedEvidencePlugin(Plugin):
             date_to: Optional publication date upper bound.
             source: Literature source, default mock for deterministic demos.
         """
-        items = await self._service.search(
+        result = await self._service.search_with_manifest(
             SearchBiomedicalLiteratureRequest(
                 query=query,
                 max_results=max_results,
@@ -62,7 +62,12 @@ class BiomedEvidencePlugin(Plugin):
                 source=source,
             )
         )
-        return _dump({"items": [item.model_dump(mode="json") for item in items]})
+        return _dump(
+            {
+                "items": [item.model_dump(mode="json") for item in result.items],
+                "retrieval_manifest": result.retrieval_manifest.model_dump(mode="json"),
+            }
+        )
 
     @tool(
         name="fetch_biomedical_paper",

@@ -70,6 +70,21 @@ class MockLiteratureClient:
 
 
 @dataclass
+class LiteratureSearchResult:
+    items: list[PaperMetadata]
+    trace: dict[str, object]
+    papers: list[BiomedicalPaper]
+
+
+@dataclass
+class PubMedSearchPage:
+    ids: list[str]
+    count: int
+    endpoint: str
+    params: dict[str, ParamValue]
+
+
+@dataclass
 class PubMedLiteratureClient:
     client: httpx.AsyncClient | None = None
     base_url: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -93,34 +108,99 @@ class PubMedLiteratureClient:
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> list[PaperMetadata]:
-        ids = await self._esearch(
+        result = await self.search_with_trace(
             query=query,
             max_results=max_results,
             date_from=date_from,
             date_to=date_to,
         )
+        return result.items
+
+    async def search_with_trace(
+        self,
+        query: str,
+        *,
+        max_results: int = 10,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        page_size: int = 20,
+    ) -> LiteratureSearchResult:
+        limit = max(0, min(int(max_results), 50))
+        safe_page_size = max(1, min(int(page_size), 50, limit or 1))
+        ids: list[str] = []
+        request_parameters: list[dict[str, object]] = []
+        endpoints: list[str] = []
+        pages_completed = 0
+        raw_result_count = 0
+        for retstart in range(0, limit, safe_page_size):
+            page = await self._esearch_page(
+                query=query,
+                retstart=retstart,
+                retmax=min(safe_page_size, limit - retstart),
+                date_from=date_from,
+                date_to=date_to,
+            )
+            pages_completed += 1
+            raw_result_count = page.count
+            endpoints.append(page.endpoint)
+            request_parameters.append(dict(page.params))
+            ids.extend(page.ids)
+            if len(ids) >= min(limit, page.count) or not page.ids:
+                break
+        deduped_ids, duplicate_ids = _dedupe_ids(ids)
         if not ids:
-            return []
-        papers = await self._efetch(ids)
-        return [_paper_to_metadata(paper, source="pubmed") for paper in papers]
+            return LiteratureSearchResult(
+                items=[],
+                papers=[],
+                trace={
+                    "api_endpoints": endpoints,
+                    "request_parameters": request_parameters,
+                    "page_size": safe_page_size,
+                    "pages_requested": 0 if limit == 0 else (limit + safe_page_size - 1) // safe_page_size,
+                    "pages_completed": pages_completed,
+                    "raw_result_count": raw_result_count,
+                    "deduped_ids": [],
+                    "duplicate_ids": duplicate_ids,
+                },
+            )
+        fetch_params = self._efetch_params(deduped_ids[:limit])
+        endpoints.append(f"{self.base_url.rstrip('/')}/efetch.fcgi")
+        request_parameters.append(dict(fetch_params))
+        papers = await self._efetch(deduped_ids[:limit], params=fetch_params)
+        return LiteratureSearchResult(
+            items=[_paper_to_metadata(paper, source="pubmed") for paper in papers],
+            papers=papers,
+            trace={
+                "api_endpoints": endpoints,
+                "request_parameters": request_parameters,
+                "page_size": safe_page_size,
+                "pages_requested": 0 if limit == 0 else (limit + safe_page_size - 1) // safe_page_size,
+                "pages_completed": pages_completed,
+                "raw_result_count": raw_result_count,
+                "deduped_ids": deduped_ids[:limit],
+                "duplicate_ids": duplicate_ids,
+            },
+        )
 
     async def fetch(self, paper_id: str) -> BiomedicalPaper | None:
         papers = await self._efetch([paper_id.strip()])
         return papers[0] if papers else None
 
-    async def _esearch(
+    async def _esearch_page(
         self,
         *,
         query: str,
-        max_results: int,
+        retstart: int,
+        retmax: int,
         date_from: str | None,
         date_to: str | None,
-    ) -> list[str]:
+    ) -> PubMedSearchPage:
         params: dict[str, ParamValue] = {
             "db": "pubmed",
             "term": query,
             "retmode": "xml",
-            "retmax": max(0, min(int(max_results), 50)),
+            "retmax": max(0, min(int(retmax), 50)),
+            "retstart": max(0, int(retstart)),
             "sort": "relevance",
         }
         if date_from:
@@ -135,22 +215,44 @@ class PubMedLiteratureClient:
             root = ET.fromstring(text)
         except ET.ParseError as exc:
             raise LiteratureClientError("PubMed search returned invalid XML") from exc
-        return [
+        ids = [
             (node.text or "").strip()
             for node in root.findall(".//IdList/Id")
             if (node.text or "").strip()
         ]
+        count_text = (root.findtext(".//Count") or "0").strip()
+        try:
+            count = int(count_text)
+        except ValueError:
+            count = len(ids)
+        return PubMedSearchPage(
+            ids=ids,
+            count=count,
+            endpoint=f"{self.base_url.rstrip('/')}/esearch.fcgi",
+            params=params,
+        )
 
-    async def _efetch(self, ids: list[str]) -> list[BiomedicalPaper]:
+    def _efetch_params(self, ids: list[str]) -> dict[str, ParamValue]:
         clean_ids = [item.strip() for item in ids if item.strip()]
-        if not clean_ids:
-            return []
         params: dict[str, ParamValue] = {
             "db": "pubmed",
             "id": ",".join(clean_ids),
             "retmode": "xml",
         }
         self._add_identity_params(params)
+        return params
+
+    async def _efetch(
+        self,
+        ids: list[str],
+        *,
+        params: dict[str, ParamValue] | None = None,
+    ) -> list[BiomedicalPaper]:
+        clean_ids = [item.strip() for item in ids if item.strip()]
+        if not clean_ids:
+            return []
+        if params is None:
+            params = self._efetch_params(clean_ids)
         text = await self._get_text("efetch.fcgi", params=params)
         return parse_pubmed_articles(text)
 
@@ -245,6 +347,19 @@ def _tokens(value: str) -> list[str]:
         for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{2,}", value or "")
         if token.lower() not in {"the", "and", "for", "with", "what", "how", "does"}
     ]
+
+
+def _dedupe_ids(ids: list[str]) -> tuple[list[str], list[str]]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    duplicates: list[str] = []
+    for item in ids:
+        if item in seen:
+            duplicates.append(item)
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique, duplicates
 
 
 def _within_date(value: str | None, date_from: str | None, date_to: str | None) -> bool:

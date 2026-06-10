@@ -32,7 +32,7 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         source: Literal["pubmed", "mock"] = "mock",
     ) -> dict[str, Any]:
         try:
-            items = await service.search(
+            result = await service.search_with_manifest(
                 SearchBiomedicalLiteratureRequest(
                     query=query,
                     max_results=max_results,
@@ -43,7 +43,17 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             )
         except LiteratureClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"items": [item.model_dump(mode="json") for item in items]}
+        return {
+            "items": [item.model_dump(mode="json") for item in result.items],
+            "retrieval_manifest": result.retrieval_manifest.model_dump(mode="json"),
+        }
+
+    @app.get("/api/biomed/retrievals/{retrieval_id}")
+    def get_retrieval_manifest(retrieval_id: str) -> dict[str, Any]:
+        manifest = service.get_retrieval_manifest(retrieval_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="retrieval manifest not found")
+        return manifest.model_dump(mode="json")
 
     @app.get("/api/biomed/papers")
     def list_biomed_papers(

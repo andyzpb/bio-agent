@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
+import httpx
 import pytest
 
 from agent.plugins.decorators import _derive_params_schema
-from plugins.biomed_evidence.literature_client import parse_pubmed_articles
+from plugins.biomed_evidence.literature_client import (
+    PubMedLiteratureClient,
+    parse_pubmed_articles,
+)
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     EvidenceExtractionRequest,
@@ -32,6 +37,9 @@ async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
         await service.aclose()
 
     assert result.not_medical_advice is True
+    assert result.retrieval_id
+    assert result.retrieval_manifest is not None
+    assert result.retrieval_manifest.returned_paper_ids
     assert result.citations
     assert result.evidence_summary
     assert "research support only" in result.disclaimer
@@ -59,13 +67,17 @@ async def test_clinical_question_is_refused(tmp_path: Path) -> None:
 async def test_mock_search_fetch_extract_and_storage_idempotency(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
-        items = await service.search(
+        search_result = await service.search_with_manifest(
             SearchBiomedicalLiteratureRequest(
                 query="microglial activation Alzheimer's disease",
                 max_results=3,
             )
         )
+        items = search_result.items
         assert items
+        assert search_result.retrieval_manifest.source == "mock"
+        assert search_result.retrieval_manifest.compiled_query
+        assert search_result.retrieval_manifest.deduped_result_count == len(items)
         paper = await service.fetch(
             service_module_fetch_request(items[0].paper_id)
         )
@@ -143,6 +155,79 @@ def test_pubmed_xml_parser_extracts_metadata() -> None:
     assert papers[0].authors == ["Ada Lovelace"]
 
 
+class _FakePubMedResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _FakePubMedClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def get(self, url: str, *, params: dict[str, Any]):
+        self.calls.append((url, dict(params)))
+        if url.endswith("esearch.fcgi"):
+            retstart = int(params.get("retstart", 0))
+            pmid = "9001" if retstart == 0 else "9002"
+            return _FakePubMedResponse(
+                f"""
+                <eSearchResult>
+                  <Count>2</Count>
+                  <IdList><Id>{pmid}</Id></IdList>
+                </eSearchResult>
+                """
+            )
+        return _FakePubMedResponse(
+            """
+            <PubmedArticleSet>
+              <PubmedArticle>
+                <MedlineCitation>
+                  <PMID>9001</PMID>
+                  <Article>
+                    <ArticleTitle>Microglia page one</ArticleTitle>
+                    <Abstract><AbstractText>Microglia activation was observed.</AbstractText></Abstract>
+                  </Article>
+                </MedlineCitation>
+              </PubmedArticle>
+              <PubmedArticle>
+                <MedlineCitation>
+                  <PMID>9002</PMID>
+                  <Article>
+                    <ArticleTitle>Microglia page two</ArticleTitle>
+                    <Abstract><AbstractText>Microglia activation was replicated.</AbstractText></Abstract>
+                  </Article>
+                </MedlineCitation>
+              </PubmedArticle>
+            </PubmedArticleSet>
+            """
+        )
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_trace_records_pagination_with_fake_http() -> None:
+    fake = _FakePubMedClient()
+    client = PubMedLiteratureClient(client=cast(httpx.AsyncClient, fake))
+
+    result = await client.search_with_trace(
+        "microglia",
+        max_results=2,
+        page_size=1,
+    )
+
+    assert [item.paper_id for item in result.items] == ["9001", "9002"]
+    assert result.trace["pages_completed"] == 2
+    assert result.trace["raw_result_count"] == 2
+    starts = [
+        params["retstart"]
+        for url, params in fake.calls
+        if url.endswith("esearch.fcgi")
+    ]
+    assert starts == [0, 1]
+
+
 @pytest.mark.asyncio
 async def test_watch_check_scores_and_dedupes_decisions(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
@@ -162,10 +247,16 @@ async def test_watch_check_scores_and_dedupes_decisions(tmp_path: Path) -> None:
         await service.aclose()
 
     assert first is not None
+    assert first.retrieval_manifest is not None
+    assert first.snapshot is not None
+    assert first.snapshot.new_paper_ids
     assert first.decisions
     assert second is not None
+    assert second.snapshot is not None
+    assert second.snapshot.new_paper_ids == []
     assert second.decisions == []
     assert total == len(decisions)
+    assert all(item.retrieval_id and item.snapshot_id for item in decisions)
     assert any(item.decision == "push" for item in decisions)
 
 
