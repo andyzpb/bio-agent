@@ -6,13 +6,15 @@ Biomedical researchers need to track fast-moving literature, compare claims acro
 
 ## Solution
 
-This case extends Akashic Agent with a Biomedical Evidence plugin:
+This case extends a collaborative Akashic plugin-based agent framework with a
+Biomedical Evidence plugin:
 
 - deterministic mock literature search and optional PubMed retrieval;
 - structured evidence extraction from abstracts;
 - citation-grounded biomedical research answers;
+- retrieval manifests for source, query, pagination, warnings, and returned paper IDs;
 - lightweight evidence graph over papers, claims, entities, methods, datasets, and limitations;
-- Research Watch topics with relevance scoring and push/skip decision logs;
+- Research Watch topics with relevance scoring, retrieval snapshots, and push/skip decision logs;
 - dashboard views for asking questions, inspecting evidence, reviewing graph structure, and checking responsible AI boundaries.
 
 ## Demo
@@ -44,6 +46,7 @@ This case extends Akashic Agent with a Biomedical Evidence plugin:
 - FastAPI routes shared by dashboard and tests.
 - TypeScript dashboard panel using the existing plugin runtime.
 - Mock evaluation harness for citation coverage, schema validity, refusal behavior, and watch precision.
+- Retrieval reliability metrics for manifest validity and repeatability.
 - Docker and CI support for reproducible review.
 
 ## Implemented Surface
@@ -55,6 +58,7 @@ The case is implemented as Portfolio V1, not only a prototype. It includes:
 - local SQLite persistence at `biomed_evidence/biomed.db`;
 - deterministic mock data for offline demos and optional PubMed retrieval through NCBI E-utilities;
 - idempotent paper, claim, entity, watch, decision, and answer-run persistence;
+- persisted retrieval manifests, retrieval-paper links, and Watch snapshots;
 - Research Watch check events with push/skip decisions and relevance reasons;
 - markdown and JSON report export.
 

@@ -5,6 +5,7 @@ type BiomedView = "ask" | "evidence" | "graph" | "watch" | "responsible";
 interface EvidenceRow {
   evidence_id: string;
   paper_id: string;
+  retrieval_id?: string | null;
   paper_title?: string;
   claim: string;
   finding: string;
@@ -15,8 +16,27 @@ interface EvidenceRow {
   methods?: string[];
 }
 
+interface RetrievalManifest {
+  retrieval_id: string;
+  source: string;
+  original_query: string;
+  compiled_query: string;
+  page_size: number;
+  pages_requested: number;
+  pages_completed: number;
+  raw_result_count: number;
+  deduped_result_count: number;
+  returned_paper_ids: string[];
+  dropped_or_duplicate_ids: string[];
+  unsupported_filters: string[];
+  warnings: string[];
+  errors: string[];
+}
+
 interface AnswerResult {
   run_id: string;
+  retrieval_id?: string | null;
+  retrieval_manifest?: RetrievalManifest | null;
   answer: string;
   citations: { paper_id: string; title: string; doi?: string | null; url?: string | null; cited_claim: string }[];
   evidence_summary: EvidenceRow[];
@@ -35,6 +55,32 @@ interface WatchTopic {
   min_relevance_score: number;
   last_checked_at?: string | null;
   next_check_at?: string | null;
+}
+
+interface WatchDecision {
+  decision_id: string;
+  watch_id: string;
+  paper_id: string;
+  retrieval_id?: string | null;
+  snapshot_id?: string | null;
+  relevance_score: number;
+  decision: string;
+  rationale: string;
+  title?: string | null;
+}
+
+interface WatchCheckResult {
+  decisions: WatchDecision[];
+  checked_at: string;
+  retrieval_manifest?: RetrievalManifest | null;
+  snapshot?: {
+    snapshot_id: string;
+    watch_id: string;
+    retrieval_id: string;
+    paper_ids: string[];
+    new_paper_ids: string[];
+    created_at: string;
+  } | null;
 }
 
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
@@ -69,6 +115,39 @@ function renderEvidenceItem(item: EvidenceRow): string {
   `;
 }
 
+function renderManifest(manifest: RetrievalManifest | null | undefined): string {
+  if (!manifest) return '<div class="biomed-muted">No retrieval manifest recorded.</div>';
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Retrieval</span><code>${escapeHtml(manifest.retrieval_id)}</code></div>
+        <div><span>Source</span><strong>${escapeHtml(manifest.source)}</strong></div>
+        <div><span>Results</span><strong>${manifest.deduped_result_count}/${manifest.raw_result_count}</strong></div>
+        <div><span>Pages</span><strong>${manifest.pages_completed}/${manifest.pages_requested}</strong></div>
+      </div>
+      <div class="biomed-label">Compiled Query</div>
+      <code class="biomed-query">${escapeHtml(manifest.compiled_query || manifest.original_query)}</code>
+      ${manifest.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(manifest.warnings)}` : ""}
+      ${manifest.errors?.length ? `<div class="biomed-label">Errors</div>${renderList(manifest.errors)}` : ""}
+      ${manifest.unsupported_filters?.length ? `<div class="biomed-label">Unsupported Filters</div>${renderList(manifest.unsupported_filters)}` : ""}
+    </div>
+  `;
+}
+
+async function hydrateRetrievalBlocks(container: HTMLElement): Promise<void> {
+  const blocks = Array.from(container.querySelectorAll<HTMLElement>("[data-biomed-retrieval-id]"));
+  await Promise.all(blocks.map(async (block) => {
+    const retrievalId = block.dataset.biomedRetrievalId || "";
+    if (!retrievalId) return;
+    try {
+      const manifest = await api<RetrievalManifest>(`/api/biomed/retrievals/${encodeURIComponent(retrievalId)}`);
+      block.innerHTML = renderManifest(manifest);
+    } catch (error) {
+      block.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  }));
+}
+
 function renderEvidenceDetail(item: EvidenceRow): string {
   const entities = (item.entities || []).map((entity) => `${entity.name} (${entity.entity_type})`);
   return `
@@ -88,6 +167,12 @@ function renderEvidenceDetail(item: EvidenceRow): string {
       </div>
       <div class="biomed-label">Limitations</div>
       ${renderList(item.limitations)}
+      <div class="biomed-label">Retrieval Provenance</div>
+      ${
+        item.retrieval_id
+          ? `<div data-biomed-retrieval-id="${escapeHtml(item.retrieval_id)}"><div class="biomed-muted">Loading retrieval manifest...</div></div>`
+          : '<div class="biomed-muted">No retrieval ID recorded for this evidence item.</div>'
+      }
     </div>
   `;
 }
@@ -147,6 +232,8 @@ function renderAsk(container: HTMLElement): void {
           <code>${escapeHtml(result.run_id)}</code>
           ${pill(result.uncertainty_level)}
         </div>
+        <div class="biomed-label">Retrieval Provenance</div>
+        ${renderManifest(result.retrieval_manifest)}
         <div class="biomed-answer">${renderMarkdown(result.answer)}</div>
         <div class="biomed-label">Citations</div>
         ${renderList(result.citations.map((citation) => `${citation.title} | ${citation.paper_id}${citation.doi ? ` | doi:${citation.doi}` : ""}`))}
@@ -226,7 +313,11 @@ async function loadWatchList(container: HTMLElement): Promise<void> {
       const id = button.getAttribute("data-biomed-check") || "";
       button.disabled = true;
       button.textContent = "Checking...";
-      await api(`/api/biomed/watch/${encodeURIComponent(id)}/check`, { method: "POST" });
+      const result = await api<WatchCheckResult>(`/api/biomed/watch/${encodeURIComponent(id)}/check`, { method: "POST" });
+      const checkTarget = container.querySelector<HTMLElement>("#biomed-watch-check-result");
+      if (checkTarget) {
+        checkTarget.innerHTML = renderWatchCheckResult(result);
+      }
       await loadWatchList(container);
       await loadWatchEvents(container, id);
     });
@@ -241,13 +332,42 @@ async function loadWatchEvents(container: HTMLElement, watchId = ""): Promise<vo
     target.innerHTML = '<div class="biomed-muted">Check a watch to inspect its decisions.</div>';
     return;
   }
-  const data = await api<{ items: Record<string, unknown>[] }>(url);
+  const data = await api<{ items: WatchDecision[] }>(url);
   target.innerHTML = data.items.map((item) => `
     <div class="biomed-decision">
-      <div>${pill(String(item["decision"] || ""))} ${escapeHtml(String(item["title"] || item["paper_id"] || ""))}</div>
-      <div class="biomed-watch-meta">score ${escapeHtml(String(item["relevance_score"] || ""))} · ${escapeHtml(String(item["rationale"] || ""))}</div>
+      <div>${pill(item.decision || "")} ${escapeHtml(item.title || item.paper_id || "")}</div>
+      <div class="biomed-watch-meta">score ${escapeHtml(String(item.relevance_score || ""))} · ${escapeHtml(item.rationale || "")}</div>
+      <div class="biomed-watch-meta">
+        retrieval ${escapeHtml(item.retrieval_id || "-")} · snapshot ${escapeHtml(item.snapshot_id || "-")}
+      </div>
     </div>
   `).join("") || '<div class="biomed-muted">No decisions.</div>';
+}
+
+function renderWatchCheckResult(result: WatchCheckResult): string {
+  const snapshot = result.snapshot;
+  return `
+    <div class="biomed-section">
+      <div class="biomed-title">Latest Check</div>
+      ${renderManifest(result.retrieval_manifest)}
+      ${
+        snapshot
+          ? `
+            <div class="biomed-provenance">
+              <div class="biomed-provenance-grid">
+                <div><span>Snapshot</span><code>${escapeHtml(snapshot.snapshot_id)}</code></div>
+                <div><span>New Papers</span><strong>${snapshot.new_paper_ids.length}</strong></div>
+                <div><span>Total Papers</span><strong>${snapshot.paper_ids.length}</strong></div>
+                <div><span>Decisions</span><strong>${result.decisions.length}</strong></div>
+              </div>
+              <div class="biomed-label">New Paper IDs</div>
+              ${renderList(snapshot.new_paper_ids)}
+            </div>
+          `
+          : '<div class="biomed-muted">No snapshot recorded.</div>'
+      }
+    </div>
+  `;
 }
 
 function renderWatch(container: HTMLElement): void {
@@ -266,6 +386,7 @@ function renderWatch(container: HTMLElement): void {
       </div>
       <div class="biomed-label">Topics</div>
       <div id="biomed-watch-list" class="biomed-result"></div>
+      <div id="biomed-watch-check-result" class="biomed-result"></div>
       <div class="biomed-label">Decision Log</div>
       <div id="biomed-watch-events" class="biomed-result"></div>
     </div>
@@ -305,6 +426,7 @@ function renderResponsible(container: HTMLElement): void {
         <li>Project memory is treated as user context, not biomedical fact.</li>
         <li>Clinical diagnosis, patient-specific treatment, and private medical-record interpretation are refused.</li>
         <li>Uncertainty is elevated when evidence is conflicting, observational, abstract-only, or missing citations.</li>
+        <li>Retrieval manifests expose source, compiled query, result counts, warnings, and repeatability limits.</li>
       </ul>
     </div>
   `;
@@ -385,6 +507,7 @@ window.AkashicDashboard.registerPlugin({
     if (!root) return;
     if (item && view === "evidence") {
       root.innerHTML += renderEvidenceDetail(item as unknown as EvidenceRow);
+      void hydrateRetrievalBlocks(root);
       return;
     }
     if (view === "graph") {

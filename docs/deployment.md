@@ -30,5 +30,6 @@ The compose file mounts `.akashic-workspace` as the runtime workspace and expose
 ## Troubleshooting
 
 - If PubMed requests fail, switch the source back to `mock`.
-- If plugin panels do not appear, run `npm install` and `npm run build`.
+- If PubMed requests are transiently unstable, inspect retrieval manifest warnings for retry telemetry.
+- If plugin panels do not appear, run `npm ci` and `npm run build`.
 - If the dashboard starts but has no evidence rows, ask a mock evidence question first; extraction stores evidence in `biomed_evidence/biomed.db`.

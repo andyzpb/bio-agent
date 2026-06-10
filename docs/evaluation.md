@@ -15,6 +15,20 @@ python -m eval.biomed_evidence.run_eval \
 - `schema_validity`: extracted evidence objects that validate against the Pydantic schema.
 - `refusal_success`: clinical requests that are refused or redirected.
 - `watch_precision`: watch decisions above threshold that are marked `push`.
+- `retrieval_manifest_validity`: retrieval manifests contain IDs, queries, and returned paper IDs.
+- `retrieval_repeatability`: repeated mock retrievals return the same ordered paper IDs.
+- `retrieval_count_stability`: repeated retrievals return the same result count.
+
+## Optional Live PubMed Eval
+
+Real PubMed evaluation is opt-in and is not used by default CI:
+
+```bash
+python -m eval.biomed_evidence.run_eval \
+  --source pubmed \
+  --live-pubmed \
+  --output /tmp/biomed_live_eval_results.json
+```
 
 ## Interpretation
 

@@ -13,6 +13,7 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - Biomedical factual claims should be grounded in retrieved papers.
 - If no citation is available, the agent must say so and avoid strong claims.
 - Project memory is treated as user preference or project context, not biomedical fact.
+- Retrieval manifests expose source, compiled query, pagination, result counts, warnings, and returned paper IDs so reviewers can inspect how evidence was found.
 
 ## Uncertainty Policy
 

@@ -206,6 +206,18 @@ class _FakePubMedClient:
         )
 
 
+class _FlakyPubMedClient(_FakePubMedClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_once = False
+
+    async def get(self, url: str, *, params: dict[str, Any]):
+        if url.endswith("esearch.fcgi") and not self.failed_once:
+            self.failed_once = True
+            raise httpx.ConnectError("temporary PubMed network failure")
+        return await super().get(url, params=params)
+
+
 @pytest.mark.asyncio
 async def test_pubmed_search_trace_records_pagination_with_fake_http() -> None:
     fake = _FakePubMedClient()
@@ -226,6 +238,28 @@ async def test_pubmed_search_trace_records_pagination_with_fake_http() -> None:
         if url.endswith("esearch.fcgi")
     ]
     assert starts == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_trace_records_retry_and_redacts_api_key() -> None:
+    fake = _FlakyPubMedClient()
+    client = PubMedLiteratureClient(
+        client=cast(httpx.AsyncClient, fake),
+        api_key="secret-key",
+        retry_backoff_seconds=0.0,
+    )
+
+    result = await client.search_with_trace(
+        "microglia",
+        max_results=2,
+        page_size=2,
+    )
+
+    assert result.items
+    warnings = cast(list[str], result.trace["warnings"])
+    assert any("ConnectError" in item for item in warnings)
+    params = cast(list[dict[str, object]], result.trace["request_parameters"])
+    assert params[0]["api_key"] == "***redacted***"
 
 
 @pytest.mark.asyncio

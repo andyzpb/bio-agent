@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -90,6 +91,8 @@ class PubMedLiteratureClient:
     base_url: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
     email: str | None = None
     api_key: str | None = None
+    max_retries: int = 2
+    retry_backoff_seconds: float = 0.25
 
     def __post_init__(self) -> None:
         self._owns_client = self.client is None
@@ -130,6 +133,7 @@ class PubMedLiteratureClient:
         ids: list[str] = []
         request_parameters: list[dict[str, object]] = []
         endpoints: list[str] = []
+        request_events: list[dict[str, object]] = []
         pages_completed = 0
         raw_result_count = 0
         for retstart in range(0, limit, safe_page_size):
@@ -139,11 +143,12 @@ class PubMedLiteratureClient:
                 retmax=min(safe_page_size, limit - retstart),
                 date_from=date_from,
                 date_to=date_to,
+                request_events=request_events,
             )
             pages_completed += 1
             raw_result_count = page.count
             endpoints.append(page.endpoint)
-            request_parameters.append(dict(page.params))
+            request_parameters.append(_redact_params(page.params))
             ids.extend(page.ids)
             if len(ids) >= min(limit, page.count) or not page.ids:
                 break
@@ -161,12 +166,19 @@ class PubMedLiteratureClient:
                     "raw_result_count": raw_result_count,
                     "deduped_ids": [],
                     "duplicate_ids": duplicate_ids,
+                    "warnings": _retry_warnings(request_events),
+                    "errors": [],
+                    "request_events": request_events,
                 },
             )
         fetch_params = self._efetch_params(deduped_ids[:limit])
         endpoints.append(f"{self.base_url.rstrip('/')}/efetch.fcgi")
-        request_parameters.append(dict(fetch_params))
-        papers = await self._efetch(deduped_ids[:limit], params=fetch_params)
+        request_parameters.append(_redact_params(fetch_params))
+        papers = await self._efetch(
+            deduped_ids[:limit],
+            params=fetch_params,
+            request_events=request_events,
+        )
         return LiteratureSearchResult(
             items=[_paper_to_metadata(paper, source="pubmed") for paper in papers],
             papers=papers,
@@ -179,6 +191,9 @@ class PubMedLiteratureClient:
                 "raw_result_count": raw_result_count,
                 "deduped_ids": deduped_ids[:limit],
                 "duplicate_ids": duplicate_ids,
+                "warnings": _retry_warnings(request_events),
+                "errors": [],
+                "request_events": request_events,
             },
         )
 
@@ -194,6 +209,7 @@ class PubMedLiteratureClient:
         retmax: int,
         date_from: str | None,
         date_to: str | None,
+        request_events: list[dict[str, object]] | None = None,
     ) -> PubMedSearchPage:
         params: dict[str, ParamValue] = {
             "db": "pubmed",
@@ -210,7 +226,11 @@ class PubMedLiteratureClient:
         if date_from or date_to:
             params["datetype"] = "pdat"
         self._add_identity_params(params)
-        text = await self._get_text("esearch.fcgi", params=params)
+        text = await self._get_text(
+            "esearch.fcgi",
+            params=params,
+            request_events=request_events,
+        )
         try:
             root = ET.fromstring(text)
         except ET.ParseError as exc:
@@ -247,25 +267,82 @@ class PubMedLiteratureClient:
         ids: list[str],
         *,
         params: dict[str, ParamValue] | None = None,
+        request_events: list[dict[str, object]] | None = None,
     ) -> list[BiomedicalPaper]:
         clean_ids = [item.strip() for item in ids if item.strip()]
         if not clean_ids:
             return []
         if params is None:
             params = self._efetch_params(clean_ids)
-        text = await self._get_text("efetch.fcgi", params=params)
+        text = await self._get_text(
+            "efetch.fcgi",
+            params=params,
+            request_events=request_events,
+        )
         return parse_pubmed_articles(text)
 
-    async def _get_text(self, endpoint: str, *, params: dict[str, ParamValue]) -> str:
+    async def _get_text(
+        self,
+        endpoint: str,
+        *,
+        params: dict[str, ParamValue],
+        request_events: list[dict[str, object]] | None = None,
+    ) -> str:
         assert self.client is not None
         url = f"{self.base_url.rstrip('/')}/{endpoint}"
-        try:
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.warning("PubMed request failed: %s", exc)
-            raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
-        return response.text
+        attempts = max(0, int(self.max_retries)) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                if request_events is not None and attempt > 1:
+                    request_events.append(
+                        {
+                            "endpoint": endpoint,
+                            "attempt": attempt,
+                            "event": "success_after_retry",
+                        }
+                    )
+                return response.text
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                retryable = status == 429 or 500 <= status < 600
+                _record_request_failure(
+                    request_events,
+                    endpoint=endpoint,
+                    attempt=attempt,
+                    exc=exc,
+                    retryable=retryable,
+                    status_code=status,
+                )
+                if not retryable or attempt >= attempts:
+                    logger.warning("PubMed request failed: %s", exc)
+                    raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
+            except httpx.TransportError as exc:
+                _record_request_failure(
+                    request_events,
+                    endpoint=endpoint,
+                    attempt=attempt,
+                    exc=exc,
+                    retryable=True,
+                    status_code=None,
+                )
+                if attempt >= attempts:
+                    logger.warning("PubMed request failed: %s", exc)
+                    raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
+            except httpx.HTTPError as exc:
+                _record_request_failure(
+                    request_events,
+                    endpoint=endpoint,
+                    attempt=attempt,
+                    exc=exc,
+                    retryable=False,
+                    status_code=None,
+                )
+                logger.warning("PubMed request failed: %s", exc)
+                raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
+            await asyncio.sleep(self.retry_backoff_seconds * (2 ** (attempt - 1)))
+        raise LiteratureClientError("PubMed request failed after retry exhaustion")
 
     def _add_identity_params(self, params: dict[str, ParamValue]) -> None:
         if self.email:
@@ -360,6 +437,53 @@ def _dedupe_ids(ids: list[str]) -> tuple[list[str], list[str]]:
         seen.add(item)
         unique.append(item)
     return unique, duplicates
+
+
+def _record_request_failure(
+    events: list[dict[str, object]] | None,
+    *,
+    endpoint: str,
+    attempt: int,
+    exc: httpx.HTTPError,
+    retryable: bool,
+    status_code: int | None,
+) -> None:
+    if events is None:
+        return
+    event: dict[str, object] = {
+        "endpoint": endpoint,
+        "attempt": attempt,
+        "event": "failure",
+        "error_type": exc.__class__.__name__,
+        "retryable": retryable,
+    }
+    if status_code is not None:
+        event["status_code"] = status_code
+    events.append(event)
+
+
+def _retry_warnings(events: list[dict[str, object]]) -> list[str]:
+    warnings: list[str] = []
+    for event in events:
+        if event.get("event") != "failure":
+            continue
+        retryable = bool(event.get("retryable"))
+        action = "retrying" if retryable else "not retryable"
+        status = event.get("status_code")
+        status_part = f" status={status}" if status is not None else ""
+        warnings.append(
+            "PubMed request failure on "
+            f"{event.get('endpoint')} attempt {event.get('attempt')}: "
+            f"{event.get('error_type')}{status_part}; {action}."
+        )
+    return warnings
+
+
+def _redact_params(params: dict[str, ParamValue]) -> dict[str, object]:
+    redacted: dict[str, object] = {}
+    for key, value in params.items():
+        redacted[key] = "***redacted***" if key == "api_key" else value
+    return redacted
 
 
 def _within_date(value: str | None, date_from: str | None, date_to: str | None) -> bool:

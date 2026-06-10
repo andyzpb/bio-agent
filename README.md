@@ -5,10 +5,11 @@ reach out when subscribed information sources become relevant. It combines a
 plugin-driven agent loop, long-term memory, background workflows, channel
 integrations, and a FastAPI dashboard.
 
-This repository also includes a portfolio-grade **Biomedical Evidence** demo:
-a research-only biomedical literature assistant with deterministic mock data,
-optional PubMed retrieval, citation-grounded answers, evidence extraction,
-Research Watch decision logs, dashboard views, evaluation, Docker, and CI.
+This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
+research-only biomedical literature tooling built on the collaborative Akashic
+plugin framework, with deterministic mock data, optional PubMed retrieval,
+citation-grounded answers, evidence extraction, retrieval provenance, Research
+Watch decision logs, dashboard views, evaluation, Docker, and CI.
 
 ## Quickstart
 
@@ -112,9 +113,10 @@ Useful docs:
 
 ## Biomedical Evidence Demo
 
-The `Biomedical Evidence` plugin demonstrates a biomedical research assistant
+The `Biomedical Evidence` plugin demonstrates research-only biomedical tooling
 for literature search, structured evidence extraction, citation-grounded
-answers, lightweight evidence graphs, and Research Watch decision logs.
+answers, lightweight evidence graphs, retrieval manifests, and Research Watch
+decision logs.
 
 Entry points:
 
@@ -170,6 +172,11 @@ Runtime biomedical data is stored under the active workspace:
 biomed_evidence/biomed.db
 ```
 
+Search and answer runs record retrieval manifests with source, original query,
+compiled query, API parameters, pagination, result counts, warnings, and
+returned paper IDs. Research Watch checks also record retrieval snapshots for
+push/skip audit.
+
 ## Validation
 
 Run targeted biomedical checks:
@@ -177,6 +184,7 @@ Run targeted biomedical checks:
 ```bash
 python -m pytest -q tests/test_biomed_evidence.py tests/test_biomed_api.py
 python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
+python -m eval.biomed_evidence.run_eval --source pubmed --live-pubmed --output /tmp/biomed_live_eval_results.json
 npm run typecheck
 npm run build
 docker build -t bio-agent-biomed:latest .

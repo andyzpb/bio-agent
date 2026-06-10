@@ -665,6 +665,18 @@ def _manifest_from_trace(
     warnings: list[str],
     errors: list[str],
 ) -> RetrievalManifest:
+    trace_warnings = [
+        str(item)
+        for item in cast(list[object], trace.get("warnings", []))
+        if str(item)
+    ]
+    trace_errors = [
+        str(item)
+        for item in cast(list[object], trace.get("errors", []))
+        if str(item)
+    ]
+    warnings = [*warnings, *trace_warnings]
+    errors = [*errors, *trace_errors]
     raw_result_count = _safe_int(trace.get("raw_result_count"), len(returned_ids))
     pages_requested = _safe_int(trace.get("pages_requested"), 1)
     pages_completed = _safe_int(trace.get("pages_completed"), 0)

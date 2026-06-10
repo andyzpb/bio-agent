@@ -25,6 +25,13 @@ def _parser() -> argparse.ArgumentParser:
         default=Path(__file__).with_name("sample_questions.jsonl"),
     )
     parser.add_argument("--output", type=Path, default=Path("biomed_eval_results.json"))
+    parser.add_argument("--source", choices=["mock", "pubmed"], default="mock")
+    parser.add_argument(
+        "--live-pubmed",
+        action="store_true",
+        help="Allow real PubMed network retrieval when --source pubmed is selected.",
+    )
+    parser.add_argument("--max-papers", type=int, default=3)
     return parser
 
 
@@ -46,7 +53,11 @@ async def _run(args: argparse.Namespace) -> dict:
     try:
         for case in cases:
             result = await service.answer_with_evidence(
-                AnswerWithEvidenceRequest(question=case["question"], source="mock")
+                AnswerWithEvidenceRequest(
+                    question=case["question"],
+                    source=args.source,
+                    max_papers=args.max_papers,
+                )
             )
             if not case.get("expected_refusal"):
                 manifest_checks.append(_manifest_valid(result.retrieval_manifest))
@@ -74,21 +85,26 @@ async def _run(args: argparse.Namespace) -> dict:
                 }
             )
 
-        repeat_runs = [
-            await service.search_with_manifest(
-                SearchBiomedicalLiteratureRequest(
-                    query="microglial activation Alzheimer's disease",
-                    max_results=3,
-                    source="mock",
+        repeat_runs = []
+        for _ in range(3):
+            repeat_runs.append(
+                await service.search_with_manifest(
+                    SearchBiomedicalLiteratureRequest(
+                        query="microglial activation Alzheimer's disease",
+                        max_results=args.max_papers,
+                        source=args.source,
+                    )
                 )
             )
-            for _ in range(3)
-        ]
         repeat_ids = [
             tuple(item.paper_id for item in result.items)
             for result in repeat_runs
         ]
         repeatability_checks.append(all(ids == repeat_ids[0] for ids in repeat_ids))
+        count_stability_checks = [
+            len(ids) == len(repeat_ids[0])
+            for ids in repeat_ids
+        ]
         manifest_checks.extend(
             _manifest_valid(result.retrieval_manifest) for result in repeat_runs
         )
@@ -101,7 +117,7 @@ async def _run(args: argparse.Namespace) -> dict:
                 min_relevance_score=0.7,
             )
         )
-        watch_result = await service.check_watch(watch.watch_id)
+        watch_result = await service.check_watch(watch.watch_id, source=args.source)
         decisions = watch_result.decisions if watch_result is not None else []
         push_decisions = [
             item.relevance_score >= watch.min_relevance_score
@@ -116,11 +132,22 @@ async def _run(args: argparse.Namespace) -> dict:
             "watch_precision": rate(push_decisions) if push_decisions else 0.0,
             "retrieval_manifest_validity": rate(manifest_checks),
             "retrieval_repeatability": rate(repeatability_checks),
+            "retrieval_count_stability": rate(count_stability_checks),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
             "metrics": metrics,
+            "source": args.source,
             "answers": answer_results,
+            "retrieval_repeat_runs": [
+                {
+                    "retrieval_id": item.retrieval_manifest.retrieval_id,
+                    "paper_ids": [paper.paper_id for paper in item.items],
+                    "warnings": item.retrieval_manifest.warnings,
+                    "errors": item.retrieval_manifest.errors,
+                }
+                for item in repeat_runs
+            ],
             "watch": {
                 "watch_id": watch.watch_id,
                 "decisions": [item.model_dump(mode="json") for item in decisions],
@@ -139,6 +166,10 @@ def _manifest_valid(value: object) -> bool:
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.source == "pubmed" and not args.live_pubmed:
+        raise SystemExit(
+            "Real PubMed eval is opt-in. Re-run with --source pubmed --live-pubmed."
+        )
     result = asyncio.run(_run(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
