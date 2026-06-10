@@ -1,25 +1,58 @@
 # Akashic Agent
 
-Akashic Agent is an AI agent that can both respond to messages and proactively
-reach out when subscribed information sources become relevant. It combines a
-plugin-driven agent loop, long-term memory, background workflows, channel
-integrations, and a FastAPI dashboard.
+Akashic Agent is a collaborative, plugin-based AI agent framework. It combines
+an agent loop, long-term memory, background/proactive workflows, channel
+integrations, tool plugins, and a FastAPI dashboard.
 
 This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
-research-only biomedical literature tooling built on the collaborative Akashic
-plugin framework, with deterministic mock data, optional PubMed retrieval,
-citation-grounded answers, evidence extraction, retrieval provenance, Research
-Watch decision logs, dashboard views, evaluation, Docker, and CI.
+a research-only biomedical literature assistant built on top of the framework.
+The plugin currently supports deterministic mock retrieval, optional PubMed
+retrieval, evidence extraction, citation-grounded answers, retrieval
+provenance, Research Watch decision logs, dashboard views, evaluation, Docker,
+and CI-friendly checks.
+
+The next roadmap direction is **claim-level evidence trustworthiness**: moving
+from "answers with citations" toward a biomedical research agent that can audit
+whether each generated claim is actually supported by cited evidence.
+
+## Status
+
+Implemented today:
+
+- Plugin-driven agent framework with memory, background workflows, channels,
+  and dashboard.
+- Biomedical Evidence plugin with mock/PubMed literature retrieval.
+- Pydantic schemas, SQLite persistence, FastAPI routes, and dashboard panel.
+- Structured evidence extraction, citation-grounded answers, evidence graph,
+  and report export.
+- Retrieval manifests with compiled queries, pagination, warnings, errors, and
+  returned paper IDs.
+- Research Watch topics with relevance scoring, retrieval snapshots, and
+  push/skip decision logs.
+- Responsible-AI guardrails for research-only use.
+- Mock biomedical eval, Python tests, Node typecheck/build, Docker, and CI
+  support.
+
+Planned next:
+
+- Claim-level citation audit.
+- Overclaim detection.
+- Conflict-aware evidence checks.
+- Audit/revise answer loop.
+- Project memory for research preferences.
+- Structured biomedical query planner.
+- Claim-level eval gates in CI.
 
 ## Quickstart
 
-Requires Python 3.12.
+Requires Python 3.12. Node/npm is needed for dashboard/plugin panel builds.
 
 ```bash
 git clone <this-repo>
 cd bio-agent
 uv venv
 uv pip install -r requirements.txt
+npm ci
 ```
 
 If `uv` is not installed:
@@ -92,17 +125,34 @@ allow_from = ["your_username"]
 ## Architecture
 
 ```text
-User message -> passive reply -> agent loop -> response
-                         |
-                         +-> memory retrieval and consolidation
-                         +-> plugin lifecycle, tool registration, guards
+User message
+  -> passive reply
+  -> agent loop
+       -> memory retrieval and consolidation
+       -> plugin lifecycle, tool registration, guards
+       -> tool calls
+       -> response
 
-Proactive loop -> alert/content/context sources -> LLM decision -> push or skip
-                         |
-                         +-> Drift background tasks when there is nothing to push
+Proactive loop
+  -> alert/content/context sources
+  -> LLM decision
+  -> push or skip
+  -> Drift background tasks when there is nothing to push
 ```
 
-Useful docs:
+Biomedical Evidence currently sits inside the plugin layer:
+
+```text
+Question
+  -> research/clinical boundary guardrail
+  -> literature search with retrieval manifest
+  -> paper fetch
+  -> evidence extraction
+  -> citation-grounded answer
+  -> answer run / report / dashboard audit trail
+```
+
+Useful framework docs:
 
 | Topic | Document |
 | --- | --- |
@@ -111,7 +161,7 @@ Useful docs:
 | Long-term memory flow | [_handbook/memory-markdown.md](./_handbook/memory-markdown.md) |
 | Plugin lifecycle and tool registration | [_handbook/plugins-tutorial.md](./_handbook/plugins-tutorial.md) |
 
-## Biomedical Evidence Demo
+## Biomedical Evidence Plugin
 
 The `Biomedical Evidence` plugin demonstrates research-only biomedical tooling
 for literature search, structured evidence extraction, citation-grounded
@@ -121,6 +171,7 @@ decision logs.
 Entry points:
 
 - Plugin code: [plugins/biomed_evidence](./plugins/biomed_evidence)
+- Plugin README: [plugins/biomed_evidence/README.md](./plugins/biomed_evidence/README.md)
 - Case study: [cases/ki-biomed-research-assistant/README.md](./cases/ki-biomed-research-assistant/README.md)
 - Responsible AI: [docs/responsible_ai.md](./docs/responsible_ai.md)
 - Deployment: [docs/deployment.md](./docs/deployment.md)
@@ -128,7 +179,8 @@ Entry points:
 
 The default source is deterministic `mock` data, so the demo works without
 external API keys. Use `source=pubmed` for optional NCBI E-utilities retrieval.
-Optional environment variables:
+
+Optional PubMed environment variables:
 
 ```bash
 NCBI_EMAIL=you@example.com
@@ -153,7 +205,7 @@ patient-specific medical guidance.
 
 ## Biomedical Tools
 
-The plugin registers these agent tools:
+The plugin currently registers these agent tools:
 
 - `search_biomedical_literature`
 - `fetch_biomedical_paper`
@@ -173,9 +225,133 @@ biomed_evidence/biomed.db
 ```
 
 Search and answer runs record retrieval manifests with source, original query,
-compiled query, API parameters, pagination, result counts, warnings, and
-returned paper IDs. Research Watch checks also record retrieval snapshots for
-push/skip audit.
+compiled query, API parameters, pagination, result counts, warnings, errors,
+and returned paper IDs. Research Watch checks also record retrieval snapshots
+for push/skip audit.
+
+## Frontier Roadmap
+
+Plain RAG with citations is not enough for biomedical research support. The
+next higher-trust direction is a **claim-level evidence audit pipeline**:
+
+```text
+Question
+  -> research/clinical boundary classifier
+  -> structured query planner
+  -> retrieval
+       -> supporting evidence query
+       -> refuting evidence query
+       -> neutral/review evidence query
+  -> evidence extraction
+       -> paper metadata
+       -> evidence span
+       -> claim
+       -> direction
+       -> method/cohort/species
+       -> limitation
+  -> draft answer
+  -> post-hoc audit
+       -> atomic claim extraction
+       -> citation existence check
+       -> claim-citation support check
+       -> overclaim check
+       -> conflict check
+       -> uncertainty calibration check
+       -> clinical safety check
+  -> pass / revise / refuse
+  -> final answer with trace
+```
+
+The key design principle is generator/verifier separation. The answer generator
+drafts the response; an independent verifier audits claims against evidence
+spans and citations. The roadmap favors deterministic checks first, with
+optional model-based graders only after schema validation and rule-based
+baselines.
+
+Target audit labels:
+
+- `supported`
+- `partial_support`
+- `overclaimed`
+- `contradicted`
+- `insufficient_evidence`
+- `irrelevant_citation`
+- `not_cited`
+
+Target audit metrics:
+
+- `claim_support_rate`
+- `citation_precision`
+- `unsupported_claim_rate`
+- `overclaim_rate`
+- `conflict_awareness_rate`
+- `uncertainty_calibration_rate`
+- `clinical_boundary_robustness`
+- `audit_trace_completeness`
+- `revision_success_rate`
+
+## TODO Roadmap
+
+V1.3 Citation & Evidence Audit Layer:
+
+- [ ] Add `AtomicClaim`, `ClaimAuditItem`, `CitationAuditResult`,
+  `ConflictAuditResult`, and `UncertaintyAudit` schemas.
+- [ ] Implement deterministic `extract_atomic_claims`.
+- [ ] Implement `validate_citation_support` with claim-to-citation/evidence
+  span alignment.
+- [ ] Implement overclaim detection for association-to-causation,
+  animal-to-human, in-vitro-to-clinical, single-study-to-consensus,
+  abstract-only-to-established, and mechanism-to-treatment errors.
+- [ ] Implement conflict-aware checks using supporting, refuting, and
+  inconclusive evidence.
+- [ ] Persist answer audits and claim audits in SQLite.
+- [ ] Add audit API routes and plugin tools.
+- [ ] Add dashboard audit view with failed-claim table.
+- [ ] Extend mock eval with claim-level metrics and thresholds.
+
+Audit/revise loop:
+
+- [ ] Add `answer_with_audit` without breaking `answer_with_evidence`.
+- [ ] Save agent trace steps: classify, plan, retrieve, extract, draft, audit,
+  revise, finalize.
+- [ ] Downgrade unsupported or overclaimed language before final answer.
+- [ ] Refuse or abstain when clinical or evidence-insufficient boundaries are
+  triggered.
+
+Structured biomedical planner:
+
+- [ ] Add `BiomedicalQueryPlan`.
+- [ ] Route requests into `research_ok`, `clinical_refuse`, or
+  `needs_clarification`.
+- [ ] Generate primary, support, refute, and uncertainty queries.
+- [ ] Use existing `mesh_terms`, `species_terms`, `publication_types`, and
+  `exclude_terms` search fields.
+
+Project memory:
+
+- [ ] Add project memory records for preferred methods, excluded terms/species,
+  saved papers, rejected papers, known conflicts, and open questions.
+- [ ] Inject project memory into query planning as preference context only.
+- [ ] Keep memory out of biomedical factual citation paths.
+- [ ] Add dashboard controls to edit, disable, and delete memory entries.
+
+Claim-level evaluation:
+
+- [ ] Add golden biomedical question cases.
+- [ ] Add overclaim, conflict, clinical-boundary, and memory eval cases.
+- [ ] Add CI gates for claim support, citation precision, overclaim rate,
+  clinical robustness, and trace completeness.
+- [ ] Keep live PubMed eval opt-in and out of default CI.
+
+Dashboard and portfolio polish:
+
+- [ ] Add Evidence Audit panel.
+- [ ] Add Agent Trace panel.
+- [ ] Add Conflict Evidence panel.
+- [ ] Add Project Memory panel.
+- [ ] Add docs for evidence audit, project memory, and claim-level eval after
+  implementation.
+- [ ] Add screenshots or a demo GIF once the UI stabilizes.
 
 ## Validation
 
@@ -197,6 +373,12 @@ pytest tests/
 akashic_RUN_SCENARIOS=1 pytest -c pytest-scenarios.ini tests_scenarios/
 ```
 
+For reproducible Node installs, use:
+
+```bash
+npm ci
+```
+
 ## Docker
 
 Build and run locally:
@@ -207,6 +389,9 @@ docker compose up --build
 
 The compose file mounts `.akashic-workspace` as the runtime workspace and
 exposes the dashboard on port `2236`.
+
+CI builds the Docker image as `akashic-biomed-agent`. Local docs use
+`bio-agent-biomed:latest`.
 
 ## Common Commands
 
@@ -224,5 +409,23 @@ Default runtime data lives under:
 ~/.akashic/workspace/
 ```
 
+Biomedical runtime data lives under the active workspace:
+
+```text
+biomed_evidence/biomed.db
+```
+
 Local configuration files, workspace databases, logs, and generated artifacts
 are excluded from Git.
+
+## Responsible AI Boundary
+
+Biomedical Evidence is a research support plugin, not a clinical decision
+system. It should:
+
+- cite retrieved papers for factual biomedical claims when possible;
+- avoid strong claims when citations or evidence are missing;
+- surface uncertainty and limitations;
+- refuse diagnosis, treatment, medication, prognosis, and patient-specific
+  medical-record interpretation;
+- treat project memory as user/project context, not biomedical fact.
