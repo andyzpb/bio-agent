@@ -223,13 +223,14 @@ async def test_answer_with_audit_persists_revision_and_trace(tmp_path: Path) -> 
         "extract",
         "draft",
         "audit",
+        "advisory_verify",
         "revise",
         "post_audit",
         "finalize",
     }
     assert trace_payload is not None
     assert trace_payload["revision"] is not None
-    assert len(trace_again) == 10
+    assert len(trace_again) == 11
 
 
 def test_answer_revision_softens_overclaim() -> None:
@@ -317,6 +318,141 @@ class _FakeUncitedRevisionProvider:
                 }
             )
         )
+
+
+class _FakeAdvisoryVerifierProvider:
+    def __init__(self, *, disagree: bool = False) -> None:
+        self.disagree = disagree
+        self.calls = 0
+
+    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        claim_audits = payload["deterministic_audit"]["claim_audits"]
+        first = claim_audits[0]
+        if self.disagree:
+            action = "revise"
+            verdict = "overclaimed"
+            risk = "high"
+            rationale = "Advisory verifier judged the claim as stronger than the supplied evidence."
+        else:
+            action = "pass"
+            verdict = first["verdict"]
+            risk = "low"
+            rationale = "Advisory verifier agreed with deterministic audit."
+        return _FakeRevisionResponse(
+            json.dumps(
+                {
+                    "advisory_action": action,
+                    "claim_reviews": [
+                        {
+                            "claim_id": first["claim_id"],
+                            "claim": first["claim"],
+                            "advisory_verdict": verdict,
+                            "advisory_action": action,
+                            "risk_level": risk,
+                            "cited_paper_ids": first["cited_paper_ids"],
+                            "rationale": rationale,
+                        }
+                    ],
+                    "warnings": [],
+                    "errors": [],
+                }
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_answer_with_audit_records_verifier_fallback_without_provider(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_verifier=True,
+            )
+        )
+        trace_payload = service.get_answer_trace(audited.answer_result.run_id)
+    finally:
+        await service.aclose()
+
+    assert audited.advisory_verifier is not None
+    assert audited.advisory_verifier.verifier_mode == "fallback"
+    assert audited.advisory_verifier.fallback_reason
+    assert trace_payload is not None
+    latest_advisory = trace_payload["latest_advisory_verifier"]
+    assert isinstance(latest_advisory, dict)
+    assert latest_advisory["verifier_mode"] == "fallback"
+    assert any(
+        step.step == "advisory_verify" and step.status == "completed"
+        for step in audited.trace
+    )
+
+
+@pytest.mark.asyncio
+async def test_answer_with_audit_can_use_advisory_verifier_provider(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeAdvisoryVerifierProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-advisory-verifier",
+    )
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_verifier=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert audited.advisory_verifier is not None
+    assert audited.advisory_verifier.verifier_mode == "llm"
+    assert audited.advisory_verifier.llm_model == "fake-advisory-verifier"
+    assert audited.advisory_verifier.claim_reviews
+    assert audited.advisory_verifier.high_risk_disagreement_count == 0
+
+
+@pytest.mark.asyncio
+async def test_advisory_verifier_records_high_risk_disagreement(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeAdvisoryVerifierProvider(disagree=True)
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-advisory-verifier",
+    )
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_verifier=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert audited.advisory_verifier is not None
+    assert audited.advisory_verifier.high_risk_disagreement_count >= 1
+    assert audited.advisory_verifier.disagreements[0].high_risk is True
+    assert any(
+        "Advisory verifier flagged high-risk disagreement" in item
+        for item in audited.revision.added_limitations
+    )
 
 
 @pytest.mark.asyncio

@@ -286,6 +286,12 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         payload["latest_citation_audit"] = (
             latest_audit.model_dump(mode="json") if latest_audit is not None else None
         )
+        latest_advisory = service.storage.get_latest_advisory_verifier_for_run(run_id)
+        payload["latest_advisory_verifier"] = (
+            latest_advisory.model_dump(mode="json")
+            if latest_advisory is not None
+            else None
+        )
         trace = service.get_answer_trace(run_id)
         if trace is not None:
             payload["latest_revision"] = trace.get("revision")

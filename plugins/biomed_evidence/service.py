@@ -28,6 +28,9 @@ from plugins.biomed_evidence.literature_client import (
     PubMedLiteratureClient,
 )
 from plugins.biomed_evidence.schemas import (
+    AdvisoryClaimReview,
+    AdvisoryVerifierDisagreement,
+    AdvisoryVerifierResult,
     AgentTraceStep,
     AnswerWithEvidenceRequest,
     AnswerWithEvidenceResult,
@@ -831,11 +834,18 @@ class BiomedEvidenceService:
                 retrieval_manifest=draft_result.retrieval_manifest,
             )
         )
+        advisory_verifier = await self._llm_advisory_verifier_or_fallback(
+            request=request,
+            draft_result=draft_result,
+            audit=audit,
+            clinical_boundary=clinical_boundary,
+        )
         revision = await self._llm_revision_or_none(
             request=request,
             draft_result=draft_result,
             audit=audit,
             clinical_boundary=clinical_boundary,
+            advisory_verifier=advisory_verifier,
         )
         if revision is None:
             revision = _build_answer_revision(
@@ -843,6 +853,7 @@ class BiomedEvidenceService:
                 audit=audit,
                 clinical_boundary=clinical_boundary,
                 use_llm_revision=request.use_llm_revision,
+                advisory_verifier=advisory_verifier,
                 fallback_reason_override=(
                     None
                     if not request.use_llm_revision
@@ -869,9 +880,12 @@ class BiomedEvidenceService:
             request=request,
             result=final_result,
             audit=audit,
+            advisory_verifier=advisory_verifier,
             revision=revision,
             clinical_boundary=clinical_boundary,
         )
+        if advisory_verifier is not None:
+            self.storage.save_advisory_verifier(advisory_verifier)
         self.storage.save_answer_revision(revision)
         self.storage.save_agent_trace_steps(trace)
         self.storage.save_answer_run(final_result, question=request.question)
@@ -880,10 +894,77 @@ class BiomedEvidenceService:
             draft_answer=revision.draft_answer,
             final_answer=revision.final_answer,
             audit=audit,
+            advisory_verifier=advisory_verifier,
             revision=revision,
             trace=trace,
             final_action=revision.revision_action,
         )
+
+    async def _llm_advisory_verifier_or_fallback(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        draft_result: AnswerWithEvidenceResult,
+        audit: CitationAuditResult,
+        clinical_boundary: bool,
+    ) -> AdvisoryVerifierResult | None:
+        if not request.use_llm_verifier or clinical_boundary:
+            return None
+        if self.revision_provider is None or not self.revision_model:
+            return _fallback_advisory_verifier(
+                draft_result=draft_result,
+                audit=audit,
+                provider=self.revision_provider,
+                model=self.revision_model,
+            )
+        prompt_payload = _llm_advisory_verifier_payload(
+            request=request,
+            draft_result=draft_result,
+            audit=audit,
+        )
+        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        try:
+            response = await self.revision_provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advisory biomedical claim verifier. "
+                            "Return one valid JSON object only. You may flag risks "
+                            "or disagreement with the deterministic audit, but you "
+                            "must not override deterministic audit failures. Use only "
+                            "the supplied answer, citations, evidence items, and audit."
+                        ),
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+                tools=[],
+                model=self.revision_model,
+                max_tokens=2200,
+                tool_choice="none",
+                disable_thinking=True,
+            )
+            parsed = _parse_json_object(str(getattr(response, "content", "") or ""))
+            return _advisory_verifier_from_llm(
+                parsed,
+                draft_result=draft_result,
+                audit=audit,
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+            )
+        except Exception:
+            return _fallback_advisory_verifier(
+                draft_result=draft_result,
+                audit=audit,
+                provider=self.revision_provider,
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+                fallback_reason=(
+                    "LLM verifier was requested, but the advisory verifier adapter "
+                    "fell back to deterministic audit only."
+                ),
+            )
 
     async def _llm_revision_or_none(
         self,
@@ -892,6 +973,7 @@ class BiomedEvidenceService:
         draft_result: AnswerWithEvidenceResult,
         audit: CitationAuditResult,
         clinical_boundary: bool,
+        advisory_verifier: AdvisoryVerifierResult | None = None,
     ) -> AnswerRevision | None:
         if (
             not request.use_llm_revision
@@ -904,6 +986,7 @@ class BiomedEvidenceService:
             request=request,
             draft_result=draft_result,
             audit=audit,
+            advisory_verifier=advisory_verifier,
         )
         prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
         prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
@@ -1519,6 +1602,7 @@ class BiomedEvidenceService:
         trace = self.storage.list_agent_trace_steps(run_id)
         revision = self.storage.get_answer_revision(run_id)
         latest_audit = self.storage.get_latest_citation_audit_for_run(run_id)
+        latest_advisory = self.storage.get_latest_advisory_verifier_for_run(run_id)
         return {
             "run_id": run_id,
             "answer_run": result.model_dump(mode="json"),
@@ -1529,6 +1613,11 @@ class BiomedEvidenceService:
             "latest_citation_audit": (
                 latest_audit.model_dump(mode="json")
                 if latest_audit is not None
+                else None
+            ),
+            "latest_advisory_verifier": (
+                latest_advisory.model_dump(mode="json")
+                if latest_advisory is not None
                 else None
             ),
         }
@@ -2682,12 +2771,327 @@ def _suggest_next_steps(evidence: list[EvidenceItem], has_context: bool) -> list
     return steps
 
 
+def _llm_advisory_verifier_payload(
+    *,
+    request: AnswerWithEvidenceRequest,
+    draft_result: AnswerWithEvidenceResult,
+    audit: CitationAuditResult,
+) -> dict[str, object]:
+    return {
+        "instructions": [
+            "Review the answer as an advisory verifier only.",
+            "The deterministic audit is the verifier of record and cannot be overridden.",
+            "Use only supplied answer, citations, evidence_items, and deterministic_audit.",
+            "Flag possible unsupported claims, overclaims, missing uncertainty, or clinical drift.",
+            "Return JSON with advisory_action, claim_reviews, warnings, and errors.",
+            "Allowed advisory_action values: pass, pass_with_limitations, revise, refuse_or_abstain, needs_expert_review.",
+            "Allowed advisory_verdict values: supported, partial_support, overclaimed, contradicted, insufficient_evidence, irrelevant_citation, not_cited, uncertain, not_assessed.",
+        ],
+        "question": request.question,
+        "research_only_boundary": RESEARCH_USE_DISCLAIMER,
+        "answer": draft_result.answer,
+        "citations": [item.model_dump(mode="json") for item in draft_result.citations],
+        "evidence_items": [
+            item.model_dump(mode="json") for item in draft_result.evidence_summary
+        ],
+        "retrieval_manifest": (
+            draft_result.retrieval_manifest.model_dump(mode="json")
+            if draft_result.retrieval_manifest is not None
+            else None
+        ),
+        "deterministic_audit": audit.model_dump(mode="json"),
+        "output_schema": {
+            "advisory_action": "pass|pass_with_limitations|revise|refuse_or_abstain|needs_expert_review",
+            "claim_reviews": [
+                {
+                    "claim_id": "optional deterministic claim id",
+                    "claim": "claim text",
+                    "advisory_verdict": "supported|partial_support|overclaimed|contradicted|insufficient_evidence|irrelevant_citation|not_cited|uncertain|not_assessed",
+                    "advisory_action": "pass|pass_with_limitations|revise|refuse_or_abstain|needs_expert_review",
+                    "risk_level": "low|medium|high",
+                    "cited_paper_ids": ["paper ids"],
+                    "rationale": "brief grounded rationale",
+                    "suggested_revision": "optional concise suggestion",
+                }
+            ],
+            "warnings": ["optional warnings"],
+            "errors": ["optional errors"],
+        },
+    }
+
+
+def _fallback_advisory_verifier(
+    *,
+    draft_result: AnswerWithEvidenceResult,
+    audit: CitationAuditResult,
+    provider: object | None,
+    model: str,
+    prompt_hash: str | None = None,
+    fallback_reason: str | None = None,
+) -> AdvisoryVerifierResult:
+    return AdvisoryVerifierResult(
+        verifier_id=_advisory_verifier_id(draft_result.run_id, audit.audit_id),
+        run_id=draft_result.run_id,
+        audit_id=audit.audit_id,
+        retrieval_id=draft_result.retrieval_id,
+        verifier_mode="fallback",
+        llm_model=model or None,
+        llm_prompt_hash=prompt_hash,
+        fallback_reason=fallback_reason
+        or _llm_verifier_unavailable_reason(provider, model),
+        deterministic_action=audit.recommended_action,
+        advisory_action=cast(Any, _advisory_action_from_audit(audit.recommended_action)),
+        claim_reviews=[],
+        disagreements=[],
+        high_risk_disagreement_count=0,
+        created_at=_now_iso(),
+    )
+
+
+def _advisory_verifier_from_llm(
+    parsed: dict[str, object],
+    *,
+    draft_result: AnswerWithEvidenceResult,
+    audit: CitationAuditResult,
+    model: str,
+    prompt_hash: str,
+) -> AdvisoryVerifierResult:
+    claim_reviews = _coerce_advisory_claim_reviews(parsed.get("claim_reviews"))
+    advisory_action = _coerce_advisory_action(
+        parsed.get("advisory_action"),
+        default=_aggregate_advisory_action(claim_reviews, audit),
+    )
+    disagreements = _advisory_disagreements(
+        claim_reviews,
+        audit=audit,
+    )
+    return AdvisoryVerifierResult(
+        verifier_id=_advisory_verifier_id(draft_result.run_id, audit.audit_id),
+        run_id=draft_result.run_id,
+        audit_id=audit.audit_id,
+        retrieval_id=draft_result.retrieval_id,
+        verifier_mode="llm",
+        llm_model=model,
+        llm_prompt_hash=prompt_hash,
+        llm_raw_response=parsed,
+        deterministic_action=audit.recommended_action,
+        advisory_action=cast(Any, advisory_action),
+        claim_reviews=claim_reviews,
+        disagreements=disagreements,
+        high_risk_disagreement_count=sum(1 for item in disagreements if item.high_risk),
+        created_at=_now_iso(),
+        warnings=_coerce_string_list(parsed.get("warnings")),
+        errors=_coerce_string_list(parsed.get("errors")),
+    )
+
+
+def _coerce_advisory_claim_reviews(value: object) -> list[AdvisoryClaimReview]:
+    if not isinstance(value, list):
+        return []
+    reviews: list[AdvisoryClaimReview] = []
+    for raw in value[:20]:
+        if not isinstance(raw, dict):
+            continue
+        claim = _normalize_space(str(raw.get("claim") or ""))
+        if not claim:
+            continue
+        reviews.append(
+            AdvisoryClaimReview(
+                claim_id=_optional_string(raw.get("claim_id")),
+                claim=claim,
+                advisory_verdict=cast(
+                    Any, _coerce_advisory_verdict(raw.get("advisory_verdict"))
+                ),
+                advisory_action=cast(
+                    Any, _coerce_advisory_action(raw.get("advisory_action"))
+                ),
+                risk_level=cast(Any, _coerce_confidence(raw.get("risk_level"))),
+                cited_paper_ids=_coerce_string_list(raw.get("cited_paper_ids")),
+                rationale=_normalize_space(str(raw.get("rationale") or "")),
+                suggested_revision=_optional_string(raw.get("suggested_revision")),
+            )
+        )
+    return reviews
+
+
+def _advisory_disagreements(
+    reviews: list[AdvisoryClaimReview],
+    *,
+    audit: CitationAuditResult,
+) -> list[AdvisoryVerifierDisagreement]:
+    by_id = {item.claim_id: item for item in audit.claim_audits}
+    by_claim = {_norm_claim(item.claim): item for item in audit.claim_audits}
+    disagreements: list[AdvisoryVerifierDisagreement] = []
+    for review in reviews:
+        deterministic = (
+            by_id.get(review.claim_id or "")
+            or by_claim.get(_norm_claim(review.claim))
+        )
+        if not _is_advisory_disagreement(review, deterministic, audit):
+            continue
+        high_risk = _is_high_risk_advisory_disagreement(
+            review,
+            deterministic,
+            audit,
+        )
+        disagreements.append(
+            AdvisoryVerifierDisagreement(
+                claim_id=deterministic.claim_id if deterministic else review.claim_id,
+                claim=deterministic.claim if deterministic else review.claim,
+                deterministic_verdict=(
+                    deterministic.verdict if deterministic is not None else None
+                ),
+                deterministic_action=audit.recommended_action,
+                advisory_verdict=review.advisory_verdict,
+                advisory_action=review.advisory_action,
+                risk_level=review.risk_level,
+                high_risk=high_risk,
+                reason=review.rationale
+                or "Advisory verifier disagreed with deterministic audit.",
+            )
+        )
+    return disagreements
+
+
+def _is_advisory_disagreement(
+    review: AdvisoryClaimReview,
+    deterministic: ClaimAuditItem | None,
+    audit: CitationAuditResult,
+) -> bool:
+    advisory_problem = review.advisory_verdict in {
+        "overclaimed",
+        "contradicted",
+        "insufficient_evidence",
+        "irrelevant_citation",
+        "not_cited",
+        "uncertain",
+    } or review.advisory_action in {
+        "revise",
+        "refuse_or_abstain",
+        "needs_expert_review",
+    }
+    if deterministic is None:
+        return advisory_problem
+    deterministic_problem = deterministic.verdict not in {
+        "supported",
+        "partial_support",
+    } or audit.recommended_action in {"revise", "refuse_or_abstain"}
+    if deterministic_problem:
+        return review.advisory_action in {"pass", "pass_with_limitations"} or (
+            review.advisory_verdict in {"supported", "partial_support"}
+        )
+    return advisory_problem
+
+
+def _is_high_risk_advisory_disagreement(
+    review: AdvisoryClaimReview,
+    deterministic: ClaimAuditItem | None,
+    audit: CitationAuditResult,
+) -> bool:
+    if review.risk_level == "high" or review.advisory_action == "refuse_or_abstain":
+        return True
+    if deterministic is None:
+        return review.advisory_action in {"revise", "needs_expert_review"}
+    deterministic_passed = (
+        deterministic.verdict in {"supported", "partial_support"}
+        and audit.recommended_action in {"pass", "pass_with_limitations"}
+    )
+    return deterministic_passed and review.advisory_action in {
+        "revise",
+        "needs_expert_review",
+    } and review.risk_level in {"medium", "high"}
+
+
+def _aggregate_advisory_action(
+    reviews: list[AdvisoryClaimReview],
+    audit: CitationAuditResult,
+) -> str:
+    actions = {item.advisory_action for item in reviews}
+    if "refuse_or_abstain" in actions:
+        return "refuse_or_abstain"
+    if "revise" in actions:
+        return "revise"
+    if "needs_expert_review" in actions:
+        return "needs_expert_review"
+    if audit.recommended_action == "pass_with_limitations":
+        return "pass_with_limitations"
+    return "pass"
+
+
+def _coerce_advisory_action(value: object, *, default: str = "pass") -> str:
+    action = str(value or "").strip()
+    if action in {
+        "pass",
+        "pass_with_limitations",
+        "revise",
+        "refuse_or_abstain",
+        "needs_expert_review",
+    }:
+        return action
+    return default
+
+
+def _coerce_advisory_verdict(value: object) -> str:
+    verdict = str(value or "").strip()
+    if verdict in {
+        "supported",
+        "partial_support",
+        "overclaimed",
+        "contradicted",
+        "insufficient_evidence",
+        "irrelevant_citation",
+        "not_cited",
+        "uncertain",
+        "not_assessed",
+    }:
+        return verdict
+    return "not_assessed"
+
+
+def _advisory_action_from_audit(value: str) -> str:
+    if value in {"pass", "pass_with_limitations", "revise", "refuse_or_abstain"}:
+        return value
+    return "pass"
+
+
+def _advisory_revision_limitations(
+    advisory_verifier: AdvisoryVerifierResult | None,
+) -> list[str]:
+    if advisory_verifier is None or not advisory_verifier.disagreements:
+        return []
+    return [
+        (
+            "Advisory verifier flagged high-risk disagreement: "
+            f"{item.reason}"
+        )
+        for item in advisory_verifier.disagreements
+        if item.high_risk
+    ]
+
+
+def _advisory_verifier_id(run_id: str, audit_id: str) -> str:
+    digest = hashlib.sha256(f"{run_id}:{audit_id}:advisory".encode("utf-8")).hexdigest()[
+        :16
+    ]
+    return f"adv-{digest}"
+
+
+def _optional_string(value: object) -> str | None:
+    text = _normalize_space(str(value or ""))
+    return text or None
+
+
+def _norm_claim(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
 def _build_answer_revision(
     *,
     draft_result: AnswerWithEvidenceResult,
     audit: CitationAuditResult,
     clinical_boundary: bool,
     use_llm_revision: bool = False,
+    advisory_verifier: AdvisoryVerifierResult | None = None,
     fallback_reason_override: str | None = None,
 ) -> AnswerRevision:
     now = _now_iso()
@@ -2719,8 +3123,13 @@ def _build_answer_revision(
             created_at=now,
         )
 
+    advisory_limitations = _advisory_revision_limitations(advisory_verifier)
     failed_by_claim = {item.claim_id: item for item in audit.failed_claims}
-    if not failed_by_claim and audit.recommended_action == "pass":
+    if (
+        not failed_by_claim
+        and audit.recommended_action == "pass"
+        and not advisory_limitations
+    ):
         return AnswerRevision(
             revision_id=_revision_id(draft_result.run_id, audit.audit_id),
             run_id=draft_result.run_id,
@@ -2736,7 +3145,7 @@ def _build_answer_revision(
     removed_claims: list[str] = []
     softened_claims: list[str] = []
     changed_claims: list[str] = []
-    added_limitations: list[str] = []
+    added_limitations: list[str] = list(advisory_limitations)
     revised_lines: list[str] = []
     for raw_line in draft_result.answer.splitlines():
         match = _matching_failed_claim(raw_line, failed_by_claim.values())
@@ -2905,6 +3314,7 @@ def _build_trace_steps(
     request: AnswerWithEvidenceRequest,
     result: AnswerWithEvidenceResult,
     audit: CitationAuditResult,
+    advisory_verifier: AdvisoryVerifierResult | None,
     revision: AnswerRevision,
     clinical_boundary: bool,
 ) -> list[AgentTraceStep]:
@@ -3069,6 +3479,52 @@ def _build_trace_steps(
         },
     )
     add(
+        "advisory_verify",
+        (
+            "skipped"
+            if not request.use_llm_verifier or clinical_boundary
+            else "completed"
+        ),
+        audit.recommended_action,
+        (
+            advisory_verifier.advisory_action
+            if advisory_verifier is not None
+            else "LLM verifier not requested"
+        ),
+        warnings=advisory_verifier.warnings if advisory_verifier is not None else [],
+        metadata={
+            "verifier_mode": (
+                advisory_verifier.verifier_mode
+                if advisory_verifier is not None
+                else None
+            ),
+            "verifier_model": (
+                advisory_verifier.llm_model if advisory_verifier is not None else None
+            ),
+            "deterministic_action": audit.recommended_action,
+            "advisory_action": (
+                advisory_verifier.advisory_action
+                if advisory_verifier is not None
+                else None
+            ),
+            "disagreement_count": (
+                len(advisory_verifier.disagreements)
+                if advisory_verifier is not None
+                else 0
+            ),
+            "high_risk_disagreement_count": (
+                advisory_verifier.high_risk_disagreement_count
+                if advisory_verifier is not None
+                else 0
+            ),
+            "fallback_reason": (
+                advisory_verifier.fallback_reason
+                if advisory_verifier is not None
+                else None
+            ),
+        },
+    )
+    add(
         "revise",
         "completed",
         audit.recommended_action,
@@ -3103,6 +3559,7 @@ def _llm_revision_payload(
     request: AnswerWithEvidenceRequest,
     draft_result: AnswerWithEvidenceResult,
     audit: CitationAuditResult,
+    advisory_verifier: AdvisoryVerifierResult | None = None,
 ) -> dict[str, object]:
     manifest = draft_result.retrieval_manifest
     return {
@@ -3134,6 +3591,11 @@ def _llm_revision_payload(
             manifest.model_dump(mode="json") if manifest is not None else None
         ),
         "audit": audit.model_dump(mode="json"),
+        "advisory_verifier": (
+            advisory_verifier.model_dump(mode="json")
+            if advisory_verifier is not None
+            else None
+        ),
     }
 
 
@@ -3173,6 +3635,14 @@ def _llm_synthesis_unavailable_reason(provider: object | None, model: str) -> st
     if not model:
         return "LLM synthesis was requested, but no synthesis model is configured."
     return "LLM synthesis was requested, but the LLM synthesis adapter fell back to deterministic synthesis."
+
+
+def _llm_verifier_unavailable_reason(provider: object | None, model: str) -> str:
+    if provider is None:
+        return "LLM verifier was requested, but no framework provider is configured for this service instance."
+    if not model:
+        return "LLM verifier was requested, but no verifier model is configured."
+    return "LLM verifier was requested, but the LLM verifier adapter fell back to deterministic audit only."
 
 
 def _llm_planner_unavailable_reason(provider: object | None, model: str) -> str:

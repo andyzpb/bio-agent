@@ -55,6 +55,25 @@ AuditRecommendedAction = Literal[
     "revise",
     "refuse_or_abstain",
 ]
+AdvisoryVerifierMode = Literal["llm", "fallback"]
+AdvisoryAction = Literal[
+    "pass",
+    "pass_with_limitations",
+    "revise",
+    "refuse_or_abstain",
+    "needs_expert_review",
+]
+AdvisoryVerdict = Literal[
+    "supported",
+    "partial_support",
+    "overclaimed",
+    "contradicted",
+    "insufficient_evidence",
+    "irrelevant_citation",
+    "not_cited",
+    "uncertain",
+    "not_assessed",
+]
 ConflictVerdict = Literal[
     "no_conflict_found",
     "mixed_evidence",
@@ -69,6 +88,7 @@ TraceStepName = Literal[
     "extract",
     "draft",
     "audit",
+    "advisory_verify",
     "post_audit",
     "revise",
     "finalize",
@@ -392,6 +412,7 @@ class AnswerWithEvidenceRequest(BaseModel):
     execute_support_refute: bool = False
     use_llm_extractor: bool = False
     use_llm_synthesis: bool = False
+    use_llm_verifier: bool = False
 
 
 class AnswerWithEvidenceResult(BaseModel):
@@ -516,6 +537,55 @@ class CitationAuditResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class AdvisoryClaimReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str | None = None
+    claim: str
+    advisory_verdict: AdvisoryVerdict
+    advisory_action: AdvisoryAction
+    risk_level: ConfidenceLevel
+    cited_paper_ids: list[str] = Field(default_factory=list)
+    rationale: str
+    suggested_revision: str | None = None
+
+
+class AdvisoryVerifierDisagreement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str | None = None
+    claim: str
+    deterministic_verdict: CitationSupportVerdict | None = None
+    deterministic_action: AuditRecommendedAction
+    advisory_verdict: AdvisoryVerdict
+    advisory_action: AdvisoryAction
+    risk_level: ConfidenceLevel
+    high_risk: bool = False
+    reason: str
+
+
+class AdvisoryVerifierResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verifier_id: str
+    run_id: str
+    audit_id: str
+    retrieval_id: str | None = None
+    verifier_mode: AdvisoryVerifierMode
+    llm_model: str | None = None
+    llm_prompt_hash: str | None = None
+    llm_raw_response: dict[str, object] | None = None
+    fallback_reason: str | None = None
+    deterministic_action: AuditRecommendedAction
+    advisory_action: AdvisoryAction
+    claim_reviews: list[AdvisoryClaimReview] = Field(default_factory=list)
+    disagreements: list[AdvisoryVerifierDisagreement] = Field(default_factory=list)
+    high_risk_disagreement_count: int = 0
+    created_at: str
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
 class AuditedAnswerResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -523,6 +593,7 @@ class AuditedAnswerResult(BaseModel):
     draft_answer: str
     final_answer: str
     audit: CitationAuditResult
+    advisory_verifier: AdvisoryVerifierResult | None = None
     revision: AnswerRevision
     trace: list[AgentTraceStep] = Field(default_factory=list)
     final_action: RevisionAction

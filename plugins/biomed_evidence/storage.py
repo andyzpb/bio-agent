@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from plugins.biomed_evidence.schemas import (
+    AdvisoryVerifierResult,
     AgentTraceStep,
     AnswerWithEvidenceResult,
     AnswerRevision,
@@ -374,9 +375,10 @@ class BiomedStorage:
                         WHEN 'extract' THEN 5
                         WHEN 'draft' THEN 6
                         WHEN 'audit' THEN 7
-                        WHEN 'revise' THEN 8
-                        WHEN 'post_audit' THEN 9
-                        WHEN 'finalize' THEN 10
+                        WHEN 'advisory_verify' THEN 8
+                        WHEN 'revise' THEN 9
+                        WHEN 'post_audit' THEN 10
+                        WHEN 'finalize' THEN 11
                         ELSE 99
                     END,
                     created_at ASC
@@ -456,6 +458,66 @@ class BiomedStorage:
         if row is None:
             return None
         return AnswerRevision.model_validate_json(str(row["revision_json"]))
+
+    def save_advisory_verifier(self, result: AdvisoryVerifierResult) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_advisory_verifiers(
+                    verifier_id, run_id, audit_id, retrieval_id, verifier_mode,
+                    llm_model, llm_prompt_hash, deterministic_action,
+                    advisory_action, high_risk_disagreement_count,
+                    fallback_reason, verifier_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(verifier_id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    audit_id=excluded.audit_id,
+                    retrieval_id=excluded.retrieval_id,
+                    verifier_mode=excluded.verifier_mode,
+                    llm_model=excluded.llm_model,
+                    llm_prompt_hash=excluded.llm_prompt_hash,
+                    deterministic_action=excluded.deterministic_action,
+                    advisory_action=excluded.advisory_action,
+                    high_risk_disagreement_count=excluded.high_risk_disagreement_count,
+                    fallback_reason=excluded.fallback_reason,
+                    verifier_json=excluded.verifier_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    result.verifier_id,
+                    result.run_id,
+                    result.audit_id,
+                    result.retrieval_id,
+                    result.verifier_mode,
+                    result.llm_model,
+                    result.llm_prompt_hash,
+                    result.deterministic_action,
+                    result.advisory_action,
+                    result.high_risk_disagreement_count,
+                    result.fallback_reason,
+                    result.model_dump_json(),
+                    result.created_at,
+                ),
+            )
+            self._db.commit()
+
+    def get_latest_advisory_verifier_for_run(
+        self, run_id: str
+    ) -> AdvisoryVerifierResult | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT verifier_json
+                FROM biomed_advisory_verifiers
+                WHERE run_id=?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AdvisoryVerifierResult.model_validate_json(str(row["verifier_json"]))
 
     def save_citation_audit(self, audit: CitationAuditResult) -> None:
         with self._lock:
@@ -1166,6 +1228,21 @@ class BiomedStorage:
                 fallback_reason TEXT,
                 refusal_reason TEXT,
                 revision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_advisory_verifiers(
+                verifier_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                audit_id TEXT NOT NULL,
+                retrieval_id TEXT,
+                verifier_mode TEXT NOT NULL,
+                llm_model TEXT,
+                llm_prompt_hash TEXT,
+                deterministic_action TEXT NOT NULL,
+                advisory_action TEXT NOT NULL,
+                high_risk_disagreement_count INTEGER NOT NULL DEFAULT 0,
+                fallback_reason TEXT,
+                verifier_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
             """)

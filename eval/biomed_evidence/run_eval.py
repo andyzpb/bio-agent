@@ -75,6 +75,11 @@ async def _run(args: argparse.Namespace) -> dict:
     span_grounding_checks: list[bool] = []
     synthesis_mode_checks: list[bool] = []
     synthesis_audit_gate_checks: list[bool] = []
+    advisory_schema_checks: list[bool] = []
+    audit_verifier_agreement_checks: list[bool] = []
+    high_risk_disagreement_rates: list[float] = []
+    advisory_false_pass_blocked_checks: list[bool] = []
+    verifier_trace_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -86,10 +91,12 @@ async def _run(args: argparse.Namespace) -> dict:
                     execute_support_refute=True,
                     use_llm_extractor=True,
                     use_llm_synthesis=True,
+                    use_llm_verifier=True,
                 )
             )
             result = audited.answer_result
             audit = audited.audit
+            advisory = audited.advisory_verifier
             revision = audited.revision
             trace_completeness_checks.append(_trace_complete(audited.trace))
             plan_trace_checks.append(_plan_trace_complete(audited.trace))
@@ -179,6 +186,29 @@ async def _run(args: argparse.Namespace) -> dict:
                     result.synthesis_mode != "llm"
                     or audit.recommended_action not in {"revise", "refuse_or_abstain"}
                 )
+                advisory_schema_checks.append(
+                    advisory is not None
+                    and advisory.verifier_mode in {"llm", "fallback"}
+                    and advisory.deterministic_action == audit.recommended_action
+                )
+                audit_verifier_agreement_checks.append(
+                    advisory is not None
+                    and advisory.advisory_action
+                    in {
+                        audit.recommended_action,
+                        "needs_expert_review",
+                        "pass_with_limitations",
+                    }
+                )
+                high_risk_disagreement_rates.append(
+                    1.0 if advisory and advisory.high_risk_disagreement_count else 0.0
+                )
+                advisory_false_pass_blocked_checks.append(
+                    advisory is None
+                    or audit.recommended_action in {"pass", "pass_with_limitations"}
+                    or advisory.advisory_action not in {"pass", "pass_with_limitations"}
+                )
+                verifier_trace_checks.append(_verifier_trace_complete(audited.trace))
                 claim_support_rates.append(audit.claim_support_rate)
                 citation_precision_rates.append(audit.citation_precision)
                 unsupported_claim_rates.append(audit.unsupported_claim_rate)
@@ -234,6 +264,17 @@ async def _run(args: argparse.Namespace) -> dict:
                         else 0
                     ),
                     "synthesis_mode": result.synthesis_mode,
+                    "advisory_verifier_mode": (
+                        advisory.verifier_mode if advisory is not None else None
+                    ),
+                    "advisory_action": (
+                        advisory.advisory_action if advisory is not None else None
+                    ),
+                    "advisory_high_risk_disagreements": (
+                        advisory.high_risk_disagreement_count
+                        if advisory is not None
+                        else 0
+                    ),
                     "extraction_modes": sorted(
                         {item.extraction_mode for item in result.evidence_summary}
                     ),
@@ -319,6 +360,13 @@ async def _run(args: argparse.Namespace) -> dict:
             "span_grounding_rate": rate(span_grounding_checks),
             "synthesis_mode_record_rate": rate(synthesis_mode_checks),
             "synthesis_audit_gate_success": rate(synthesis_audit_gate_checks),
+            "advisory_schema_validity": rate(advisory_schema_checks),
+            "audit_verifier_agreement_rate": rate(audit_verifier_agreement_checks),
+            "high_risk_disagreement_rate": _average(high_risk_disagreement_rates),
+            "advisory_false_pass_blocked_rate": rate(
+                advisory_false_pass_blocked_checks
+            ),
+            "verifier_trace_completeness": rate(verifier_trace_checks),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -365,6 +413,7 @@ def _trace_complete(trace: list[object]) -> bool:
         "extract",
         "draft",
         "audit",
+        "advisory_verify",
         "revise",
         "post_audit",
         "finalize",
@@ -377,6 +426,10 @@ def _plan_trace_complete(trace: list[object]) -> bool:
     expected = {"classify", "plan", "validate_plan"}
     observed = {str(getattr(item, "step", "")) for item in trace}
     return expected <= observed
+
+
+def _verifier_trace_complete(trace: list[object]) -> bool:
+    return any(str(getattr(item, "step", "")) == "advisory_verify" for item in trace)
 
 
 def _retrieval_bundle_valid(bundle: object) -> bool:

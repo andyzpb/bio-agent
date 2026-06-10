@@ -139,6 +139,33 @@ interface CitationAuditResult {
   failed_claims: ClaimAuditItem[];
 }
 
+interface AdvisoryVerifierDisagreement {
+  claim_id?: string | null;
+  claim: string;
+  deterministic_verdict?: string | null;
+  deterministic_action: string;
+  advisory_verdict: string;
+  advisory_action: string;
+  risk_level: string;
+  high_risk: boolean;
+  reason: string;
+}
+
+interface AdvisoryVerifierResult {
+  verifier_id: string;
+  run_id: string;
+  audit_id: string;
+  verifier_mode: string;
+  llm_model?: string | null;
+  fallback_reason?: string | null;
+  deterministic_action: string;
+  advisory_action: string;
+  disagreements: AdvisoryVerifierDisagreement[];
+  high_risk_disagreement_count: number;
+  warnings: string[];
+  errors: string[];
+}
+
 interface AgentTraceStep {
   step_id: string;
   run_id: string;
@@ -173,6 +200,7 @@ interface AuditedAnswerResult {
   draft_answer: string;
   final_answer: string;
   audit: CitationAuditResult;
+  advisory_verifier?: AdvisoryVerifierResult | null;
   revision: AnswerRevision;
   trace: AgentTraceStep[];
   final_action: string;
@@ -184,6 +212,7 @@ interface TracePayload {
   trace: AgentTraceStep[];
   revision?: AnswerRevision | null;
   latest_citation_audit?: CitationAuditResult | null;
+  latest_advisory_verifier?: AdvisoryVerifierResult | null;
 }
 
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
@@ -347,9 +376,46 @@ function renderAuditResult(result: CitationAuditResult): string {
   `;
 }
 
+function renderAdvisoryVerifier(result: AdvisoryVerifierResult | null | undefined): string {
+  if (!result) return '<div class="biomed-muted">No advisory verifier recorded.</div>';
+  const rows = (result.disagreements || []).map((item) => `
+    <div class="biomed-audit-row ${item.high_risk ? "is-failed" : ""}">
+      <div class="biomed-audit-row-head">
+        ${pill(item.risk_level)}
+        ${pill(item.advisory_action)}
+        ${item.high_risk ? pill("high-risk") : ""}
+      </div>
+      <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
+      <div class="biomed-evidence-finding">${escapeHtml(item.reason)}</div>
+      <div class="biomed-watch-meta">
+        deterministic ${escapeHtml(item.deterministic_verdict || item.deterministic_action)} · advisory ${escapeHtml(item.advisory_verdict)}
+      </div>
+    </div>
+  `).join("");
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Verifier</span><code>${escapeHtml(result.verifier_id)}</code></div>
+        <div><span>Mode</span><strong>${escapeHtml(result.verifier_mode)}</strong></div>
+        <div><span>Model</span><strong>${escapeHtml(result.llm_model || "-")}</strong></div>
+        <div><span>Deterministic</span><strong>${escapeHtml(result.deterministic_action)}</strong></div>
+        <div><span>Advisory</span><strong>${escapeHtml(result.advisory_action)}</strong></div>
+        <div><span>High Risk</span><strong>${result.high_risk_disagreement_count}</strong></div>
+      </div>
+      ${result.fallback_reason ? `<div class="biomed-label">Fallback</div><div class="biomed-muted">${escapeHtml(result.fallback_reason)}</div>` : ""}
+      ${result.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(result.warnings)}` : ""}
+    </div>
+    <div class="biomed-label">Advisory Disagreements</div>
+    <div class="biomed-audit-table">
+      ${rows || '<div class="biomed-muted">No disagreements recorded.</div>'}
+    </div>
+  `;
+}
+
 function renderTraceResult(payload: TracePayload): string {
   const revision = payload.revision;
   const audit = payload.latest_citation_audit;
+  const advisory = payload.latest_advisory_verifier;
   return `
     <div class="biomed-provenance">
       <div class="biomed-provenance-grid">
@@ -357,9 +423,12 @@ function renderTraceResult(payload: TracePayload): string {
         <div><span>Action</span><strong>${escapeHtml(revision?.revision_action || "-")}</strong></div>
         <div><span>Mode</span><strong>${escapeHtml(revision?.revision_mode || "-")}</strong></div>
         <div><span>Audit</span><code>${escapeHtml(audit?.audit_id || "-")}</code></div>
+        <div><span>Verifier</span><strong>${escapeHtml(advisory?.verifier_mode || "-")}</strong></div>
         <div><span>Trace</span><strong>${payload.trace.length}</strong></div>
       </div>
     </div>
+    <div class="biomed-label">Advisory Verifier</div>
+    ${renderAdvisoryVerifier(advisory)}
     ${
       revision
         ? `
@@ -424,6 +493,8 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
     <div class="biomed-answer">${renderMarkdown(result.final_answer)}</div>
     <div class="biomed-label">Audit</div>
     ${renderAuditResult(result.audit)}
+    <div class="biomed-label">Advisory Verifier</div>
+    ${renderAdvisoryVerifier(result.advisory_verifier)}
     <div class="biomed-label">Trace Summary</div>
     ${renderTraceResult({
       run_id: result.answer_result.run_id,
@@ -431,6 +502,7 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
       trace: result.trace,
       revision: result.revision,
       latest_citation_audit: result.audit,
+      latest_advisory_verifier: result.advisory_verifier,
     })}
   `;
 }
@@ -472,6 +544,7 @@ function renderAsk(container: HTMLElement): void {
           <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
           <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
           <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
+          <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
           <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
@@ -558,6 +631,7 @@ function renderAsk(container: HTMLElement): void {
     const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
     const useSynthesis = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked);
     const useRevision = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked);
+    const useVerifier = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-verifier")?.checked);
     try {
       const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
         method: "POST",
@@ -570,6 +644,7 @@ function renderAsk(container: HTMLElement): void {
           execute_support_refute: executeSupportRefute,
           use_llm_extractor: useExtractor,
           use_llm_synthesis: useSynthesis,
+          use_llm_verifier: useVerifier,
           use_llm_revision: useRevision,
         }),
       });

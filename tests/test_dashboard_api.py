@@ -984,7 +984,7 @@ def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
         assert audited.status_code == 200
         assert audited.json()["trace"]
         assert audited.json()["answer_result"]["retrieval_bundle"]["executed_multi_query"] is True
-        assert len(audited.json()["trace"]) == 10
+        assert len(audited.json()["trace"]) == 11
 
         graph = client.get("/api/biomed/graph", params={"topic": "microglia"})
         assert graph.status_code == 200

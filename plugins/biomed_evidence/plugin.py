@@ -221,6 +221,7 @@ class BiomedEvidencePlugin(Plugin):
         execute_support_refute: bool = False,
         use_llm_extractor: bool = False,
         use_llm_synthesis: bool = False,
+        use_llm_verifier: bool = False,
     ) -> str:
         """Answer a biomedical research question, audit claims, revise, and return trace.
 
@@ -235,6 +236,7 @@ class BiomedEvidencePlugin(Plugin):
             execute_support_refute: Execute planner support/refute queries and bundle manifests.
             use_llm_extractor: Request framework-governed span-grounded evidence extraction.
             use_llm_synthesis: Request framework-governed evidence-constrained synthesis.
+            use_llm_verifier: Request framework-governed advisory verifier review.
         """
         result = await self._service.answer_with_audit(
             AnswerWithEvidenceRequest(
@@ -248,6 +250,7 @@ class BiomedEvidencePlugin(Plugin):
                 execute_support_refute=execute_support_refute,
                 use_llm_extractor=use_llm_extractor,
                 use_llm_synthesis=use_llm_synthesis,
+                use_llm_verifier=use_llm_verifier,
             )
         )
         return _dump(result.model_dump(mode="json"))

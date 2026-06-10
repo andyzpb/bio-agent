@@ -128,23 +128,26 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
                 "max_papers": 5,
                 "use_llm_planner": True,
                 "execute_support_refute": True,
+                "use_llm_verifier": True,
             },
         )
         assert audited.status_code == 200
         audited_payload = audited.json()
         audited_run_id = audited_payload["answer_result"]["run_id"]
         assert audited_payload["audit"]["audit_id"]
+        assert audited_payload["advisory_verifier"]["verifier_mode"] == "fallback"
         assert audited_payload["revision"]["revision_id"]
         assert audited_payload["final_action"] in {"pass", "revise", "refuse", "abstain"}
         assert audited_payload["answer_result"]["retrieval_bundle"]["executed_multi_query"] is True
         assert len(audited_payload["answer_result"]["retrieval_bundle"]["records"]) >= 3
-        assert len(audited_payload["trace"]) == 10
+        assert len(audited_payload["trace"]) == 11
 
         trace = client.get(f"/api/biomed/answer-runs/{audited_run_id}/trace")
         assert trace.status_code == 200
         trace_payload = trace.json()
         assert trace_payload["run_id"] == audited_run_id
         assert trace_payload["revision"]["revision_id"] == audited_payload["revision"]["revision_id"]
+        assert trace_payload["latest_advisory_verifier"]["verifier_mode"] == "fallback"
         assert {step["step"] for step in trace_payload["trace"]} == {
             "classify",
             "plan",
@@ -153,6 +156,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
             "extract",
             "draft",
             "audit",
+            "advisory_verify",
             "revise",
             "post_audit",
             "finalize",

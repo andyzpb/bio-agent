@@ -40,6 +40,10 @@ Implemented today:
   LLM synthesis behind `use_llm_extractor` and `use_llm_synthesis`; deterministic
   span validation and citation audit remain the acceptance gates, with safe
   fallback to deterministic extraction/synthesis.
+- V1.8 optional advisory verifier model behind `use_llm_verifier`, with
+  persisted disagreement records, `advisory_verify` trace step, dashboard
+  display, and eval metrics. Deterministic citation audit remains the verifier
+  of record.
 - Research Watch topics with relevance scoring, retrieval snapshots, and
   push/skip decision logs.
 - V1.3 claim-level citation audit with atomic claims, support verdicts,
@@ -57,8 +61,6 @@ Implemented today:
 
 Planned next:
 
-- Optional verifier-model advisory signal after deterministic audit remains the
-  verifier of record.
 - Project memory for research preferences.
 - Claim-level eval gates in CI and a larger golden dataset.
 
@@ -427,8 +429,8 @@ npm run build
 docker build -t bio-agent-biomed:latest .
 ```
 
-Run a local dashboard API smoke for planner, V1.7 extractor/synthesis,
-audit/revision, trace, and multi-query retrieval bundles:
+Run a local dashboard API smoke for planner, V1.7 extractor/synthesis, V1.8
+advisory verifier, audit/revision, trace, and multi-query retrieval bundles:
 
 ```bash
 uv run python main.py dashboard
@@ -442,6 +444,7 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     "use_llm_planner": true,
     "use_llm_extractor": true,
     "use_llm_synthesis": true,
+    "use_llm_verifier": true,
     "use_llm_revision": true,
     "execute_support_refute": true
   }' | jq '{
@@ -451,6 +454,10 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     synthesis_mode: .answer_result.synthesis_mode,
     synthesis_model: .answer_result.synthesis_model,
     synthesis_fallback_reason: .answer_result.synthesis_fallback_reason,
+    verifier_mode: .advisory_verifier.verifier_mode,
+    verifier_model: .advisory_verifier.llm_model,
+    advisory_action: .advisory_verifier.advisory_action,
+    high_risk_disagreements: .advisory_verifier.high_risk_disagreement_count,
     revision_mode: .revision.revision_mode,
     revision_model: .revision.llm_model,
     multi_query: .answer_result.retrieval_bundle.executed_multi_query,
@@ -468,7 +475,9 @@ With a reachable local Ollama/OpenAI-compatible provider, `planner_mode` and
 extractor and synthesis are independently gated: individual papers may fall
 back to deterministic extraction when returned spans are not grounded, and
 `synthesis_mode` may be `fallback` when deterministic citation audit rejects
-the model-generated draft.
+the model-generated draft. The advisory verifier is also gated: it records
+disagreements and revision pressure, but it cannot convert a deterministic audit
+failure into a pass.
 
 Run the broader test suite:
 
