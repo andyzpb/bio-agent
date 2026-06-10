@@ -62,6 +62,20 @@ ConflictVerdict = Literal[
     "contradicted",
     "insufficient_search",
 ]
+TraceStepName = Literal[
+    "classify",
+    "plan",
+    "retrieve",
+    "extract",
+    "draft",
+    "audit",
+    "post_audit",
+    "revise",
+    "finalize",
+]
+TraceStepStatus = Literal["started", "completed", "skipped", "failed"]
+RevisionAction = Literal["pass", "revise", "refuse", "abstain"]
+RevisionMode = Literal["deterministic", "llm", "fallback"]
 
 
 class BiomedicalPaper(BaseModel):
@@ -258,6 +272,7 @@ class AnswerWithEvidenceRequest(BaseModel):
     project_context: str | None = None
     require_citations: bool = True
     source: Literal["pubmed", "mock"] = "mock"
+    use_llm_revision: bool = False
 
 
 class AnswerWithEvidenceResult(BaseModel):
@@ -276,6 +291,43 @@ class AnswerWithEvidenceResult(BaseModel):
     not_medical_advice: bool = True
     disclaimer: str
     project_context_used: str | None = None
+
+
+class AgentTraceStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    run_id: str
+    step: TraceStepName
+    status: TraceStepStatus
+    input_summary: str = ""
+    output_summary: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
+    created_at: str
+
+
+class AnswerRevision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision_id: str
+    run_id: str
+    audit_id: str | None = None
+    post_revision_audit_id: str | None = None
+    revision_mode: RevisionMode = "deterministic"
+    llm_model: str | None = None
+    llm_prompt_hash: str | None = None
+    llm_raw_response: dict[str, object] | None = None
+    draft_answer: str
+    final_answer: str
+    changed_claims: list[str] = Field(default_factory=list)
+    removed_claims: list[str] = Field(default_factory=list)
+    softened_claims: list[str] = Field(default_factory=list)
+    added_limitations: list[str] = Field(default_factory=list)
+    fallback_reason: str | None = None
+    refusal_reason: str | None = None
+    revision_action: RevisionAction
+    created_at: str
 
 
 class AtomicClaim(BaseModel):
@@ -335,6 +387,18 @@ class CitationAuditResult(BaseModel):
     created_at: str
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+
+class AuditedAnswerResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer_result: AnswerWithEvidenceResult
+    draft_answer: str
+    final_answer: str
+    audit: CitationAuditResult
+    revision: AnswerRevision
+    trace: list[AgentTraceStep] = Field(default_factory=list)
+    final_action: RevisionAction
 
 
 class CitationAuditRequest(BaseModel):

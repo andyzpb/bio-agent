@@ -34,6 +34,7 @@ data/
 plugins/**/.data/
 /data
 /memory/
+/.docker-workspace/
 
 # IDE
 .idea/

@@ -23,7 +23,11 @@ from plugins.biomed_evidence.service import BiomedEvidenceService
 
 def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
     _ = plugin_dir
-    service = BiomedEvidenceService(workspace)
+    service = BiomedEvidenceService(
+        workspace,
+        revision_provider=getattr(app.state, "biomed_revision_provider", None),
+        revision_model=str(getattr(app.state, "biomed_revision_model", "") or ""),
+    )
 
     @app.get("/api/biomed/search")
     async def search_biomedical_literature(
@@ -127,6 +131,14 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return result.model_dump(mode="json")
 
+    @app.post("/api/biomed/answer/audited")
+    async def answer_with_audit(payload: AnswerWithEvidenceRequest) -> dict[str, Any]:
+        try:
+            result = await service.answer_with_audit(payload)
+        except LiteratureClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
+
     @app.get("/api/biomed/answer-runs")
     def list_answer_runs(page: int = 1, page_size: int = 25) -> dict[str, Any]:
         items, total = service.storage.list_answer_runs(page=page, page_size=page_size)
@@ -148,6 +160,13 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         if result is None:
             raise HTTPException(status_code=404, detail="answer run not found")
         return result.model_dump(mode="json")
+
+    @app.get("/api/biomed/answer-runs/{run_id}/trace")
+    def get_answer_trace(run_id: str) -> dict[str, Any]:
+        result = service.get_answer_trace(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="answer run not found")
+        return result
 
     @app.get("/api/biomed/audits")
     def list_answer_audits(
@@ -261,6 +280,10 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         payload["latest_citation_audit"] = (
             latest_audit.model_dump(mode="json") if latest_audit is not None else None
         )
+        trace = service.get_answer_trace(run_id)
+        if trace is not None:
+            payload["latest_revision"] = trace.get("revision")
+            payload["trace"] = trace.get("trace")
         return payload
 
     @app.get("/api/biomed/export")

@@ -1,10 +1,12 @@
 services:
   akashic-biomed:
     build: .
+    command: ["python", "main.py", "dashboard", "--config", "config.toml", "--host", "0.0.0.0", "--workspace", "/workspace"]
     ports:
       - "2236:2236"
     environment:
       NCBI_EMAIL: ${NCBI_EMAIL:-}
       NCBI_API_KEY: ${NCBI_API_KEY:-}
     volumes:
+      - ./config.toml:/app/config.toml:ro
       - ./.akashic-workspace:/workspace

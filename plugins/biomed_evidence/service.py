@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Iterable, cast
 
 import httpx
 
@@ -27,12 +27,16 @@ from plugins.biomed_evidence.literature_client import (
     PubMedLiteratureClient,
 )
 from plugins.biomed_evidence.schemas import (
+    AgentTraceStep,
     AnswerWithEvidenceRequest,
     AnswerWithEvidenceResult,
+    AnswerRevision,
+    AuditedAnswerResult,
     BiomedicalPaper,
     Citation,
     CitationAuditRequest,
     CitationAuditResult,
+    ClaimAuditItem,
     ConfidenceLevel,
     ConflictAuditRequest,
     ConflictAuditResult,
@@ -64,9 +68,13 @@ class BiomedEvidenceService:
         workspace: Path,
         *,
         http_client: httpx.AsyncClient | None = None,
+        revision_provider: Any | None = None,
+        revision_model: str | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.storage = BiomedStorage(self.workspace / "biomed_evidence" / "biomed.db")
+        self.revision_provider = revision_provider
+        self.revision_model = revision_model or ""
         self.mock_client = MockLiteratureClient()
         self.pubmed_client = PubMedLiteratureClient(
             client=http_client,
@@ -305,6 +313,171 @@ class BiomedEvidenceService:
         )
         self.storage.save_answer_run(result, question=request.question)
         return result
+
+    async def answer_with_audit(
+        self,
+        request: AnswerWithEvidenceRequest,
+    ) -> AuditedAnswerResult:
+        clinical_boundary = is_clinical_request(request.question)
+        draft_result = await self.answer_with_evidence(request)
+        audit = self.audit_answer(
+            CitationAuditRequest(
+                answer=draft_result.answer,
+                citations=draft_result.citations,
+                evidence_items=draft_result.evidence_summary,
+                run_id=draft_result.run_id,
+                retrieval_id=draft_result.retrieval_id,
+                observed_uncertainty=draft_result.uncertainty_level,
+                retrieval_manifest=draft_result.retrieval_manifest,
+            )
+        )
+        revision = await self._llm_revision_or_none(
+            request=request,
+            draft_result=draft_result,
+            audit=audit,
+            clinical_boundary=clinical_boundary,
+        )
+        if revision is None:
+            revision = _build_answer_revision(
+                draft_result=draft_result,
+                audit=audit,
+                clinical_boundary=clinical_boundary,
+                use_llm_revision=request.use_llm_revision,
+                fallback_reason_override=(
+                    None
+                    if not request.use_llm_revision
+                    else _llm_unavailable_reason(self.revision_provider, self.revision_model)
+                ),
+            )
+        final_result = draft_result.model_copy(
+            update={
+                "answer": revision.final_answer,
+                "limitations": _merge_unique(
+                    draft_result.limitations,
+                    revision.added_limitations,
+                ),
+                "uncertainty_level": _revised_uncertainty(
+                    draft_result.uncertainty_level,
+                    audit,
+                    revision,
+                ),
+            }
+        )
+        trace = _build_trace_steps(
+            request=request,
+            result=final_result,
+            audit=audit,
+            revision=revision,
+            clinical_boundary=clinical_boundary,
+        )
+        self.storage.save_answer_revision(revision)
+        self.storage.save_agent_trace_steps(trace)
+        self.storage.save_answer_run(final_result, question=request.question)
+        return AuditedAnswerResult(
+            answer_result=final_result,
+            draft_answer=revision.draft_answer,
+            final_answer=revision.final_answer,
+            audit=audit,
+            revision=revision,
+            trace=trace,
+            final_action=revision.revision_action,
+        )
+
+    async def _llm_revision_or_none(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        draft_result: AnswerWithEvidenceResult,
+        audit: CitationAuditResult,
+        clinical_boundary: bool,
+    ) -> AnswerRevision | None:
+        if (
+            not request.use_llm_revision
+            or clinical_boundary
+            or self.revision_provider is None
+            or not self.revision_model
+        ):
+            return None
+        prompt_payload = _llm_revision_payload(
+            request=request,
+            draft_result=draft_result,
+            audit=audit,
+        )
+        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        try:
+            response = await self.revision_provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You revise biomedical research answers using only supplied "
+                            "evidence and citations. Return one valid JSON object only. "
+                            "Every sentence in final_answer that states biomedical "
+                            "evidence, uncertainty, limitations, comparisons, or "
+                            "recommendations must include at least one supplied citation "
+                            "label. Use bracketed paper-id labels such as "
+                            "[MOCK-PMID-1001], not bare parenthetical identifiers. The "
+                            "research-use disclaimer may remain uncited. Do not add "
+                            "future-work, expert-review, or causality caveats unless "
+                            "they are directly grounded in supplied evidence and cited. "
+                            "If you cannot produce a fully cited answer, copy draft_answer."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt_text,
+                    },
+                ],
+                tools=[],
+                model=self.revision_model,
+                max_tokens=3000,
+                tool_choice="none",
+                disable_thinking=True,
+            )
+            raw = str(getattr(response, "content", "") or "")
+            parsed = _parse_json_object(raw)
+            final_answer = _normalize_llm_answer_text(
+                str(parsed.get("final_answer") or "")
+            )
+            if not final_answer:
+                return None
+            parsed["final_answer"] = final_answer
+            post_audit = self.audit_answer(
+                CitationAuditRequest(
+                    answer=final_answer,
+                    citations=draft_result.citations,
+                    evidence_items=draft_result.evidence_summary,
+                    run_id=draft_result.run_id,
+                    retrieval_id=draft_result.retrieval_id,
+                    observed_uncertainty=cast(ConfidenceLevel | None, parsed.get("uncertainty_level")),
+                    retrieval_manifest=draft_result.retrieval_manifest,
+                )
+            )
+            if post_audit.recommended_action in {"revise", "refuse_or_abstain"}:
+                return None
+            now = _now_iso()
+            final_action = "pass" if final_answer == draft_result.answer else "revise"
+            return AnswerRevision(
+                revision_id=_revision_id(draft_result.run_id, audit.audit_id),
+                run_id=draft_result.run_id,
+                audit_id=audit.audit_id,
+                post_revision_audit_id=post_audit.audit_id,
+                revision_mode="llm",
+                llm_model=self.revision_model,
+                llm_prompt_hash=prompt_hash,
+                llm_raw_response=parsed,
+                draft_answer=draft_result.answer,
+                final_answer=final_answer,
+                changed_claims=_coerce_string_list(parsed.get("changed_claims")),
+                removed_claims=_coerce_string_list(parsed.get("removed_claims")),
+                softened_claims=_coerce_string_list(parsed.get("softened_claims")),
+                added_limitations=_coerce_string_list(parsed.get("added_limitations")),
+                revision_action=cast(Any, final_action),
+                created_at=now,
+            )
+        except Exception:
+            return None
 
     def list_evidence(
         self,
@@ -627,6 +800,23 @@ class BiomedEvidenceService:
 
     def get_latest_citation_audit_for_run(self, run_id: str) -> CitationAuditResult | None:
         return self.storage.get_latest_citation_audit_for_run(run_id)
+
+    def get_answer_trace(self, run_id: str) -> dict[str, object] | None:
+        result = self.storage.get_answer_run(run_id)
+        if result is None:
+            return None
+        trace = self.storage.list_agent_trace_steps(run_id)
+        revision = self.storage.get_answer_revision(run_id)
+        latest_audit = self.storage.get_latest_citation_audit_for_run(run_id)
+        return {
+            "run_id": run_id,
+            "answer_run": result.model_dump(mode="json"),
+            "trace": [item.model_dump(mode="json") for item in trace],
+            "revision": revision.model_dump(mode="json") if revision is not None else None,
+            "latest_citation_audit": (
+                latest_audit.model_dump(mode="json") if latest_audit is not None else None
+            ),
+        }
 
     def list_answer_audits(
         self,
@@ -998,6 +1188,407 @@ def _suggest_next_steps(evidence: list[EvidenceItem], has_context: bool) -> list
     if not evidence:
         steps.append("Broaden the search query or switch to PubMed for live retrieval.")
     return steps
+
+
+def _build_answer_revision(
+    *,
+    draft_result: AnswerWithEvidenceResult,
+    audit: CitationAuditResult,
+    clinical_boundary: bool,
+    use_llm_revision: bool = False,
+    fallback_reason_override: str | None = None,
+) -> AnswerRevision:
+    now = _now_iso()
+    revision_mode = "fallback" if use_llm_revision else "deterministic"
+    fallback_reason = (
+        fallback_reason_override
+        or "LLM revision was requested, but no framework provider is configured for this service instance."
+        if use_llm_revision
+        else None
+    )
+    if clinical_boundary or audit.recommended_action == "refuse_or_abstain":
+        final_answer = clinical_refusal()
+        return AnswerRevision(
+            revision_id=_revision_id(draft_result.run_id, audit.audit_id),
+            run_id=draft_result.run_id,
+            audit_id=audit.audit_id,
+            revision_mode=cast(Any, revision_mode),
+            fallback_reason=fallback_reason,
+            draft_answer=draft_result.answer,
+            final_answer=final_answer,
+            changed_claims=[],
+            removed_claims=[item.claim for item in audit.failed_claims],
+            softened_claims=[],
+            added_limitations=[
+                "The request crossed the clinical-use boundary or contained clinical-risk claims."
+            ],
+            refusal_reason="clinical_or_patient_specific_boundary",
+            revision_action="refuse",
+            created_at=now,
+        )
+
+    failed_by_claim = {item.claim_id: item for item in audit.failed_claims}
+    if not failed_by_claim and audit.recommended_action == "pass":
+        return AnswerRevision(
+            revision_id=_revision_id(draft_result.run_id, audit.audit_id),
+            run_id=draft_result.run_id,
+            audit_id=audit.audit_id,
+            revision_mode=cast(Any, revision_mode),
+            fallback_reason=fallback_reason,
+            draft_answer=draft_result.answer,
+            final_answer=draft_result.answer,
+            revision_action="pass",
+            created_at=now,
+        )
+
+    removed_claims: list[str] = []
+    softened_claims: list[str] = []
+    changed_claims: list[str] = []
+    added_limitations: list[str] = []
+    revised_lines: list[str] = []
+    for raw_line in draft_result.answer.splitlines():
+        match = _matching_failed_claim(raw_line, failed_by_claim.values())
+        if match is None:
+            revised_lines.append(raw_line)
+            continue
+        if match.verdict in {"not_cited", "irrelevant_citation", "insufficient_evidence"}:
+            removed_claims.append(match.claim)
+            changed_claims.append(match.claim)
+            added_limitations.append(f"Removed unsupported claim: {match.claim}")
+            continue
+        if match.verdict in {"overclaimed", "contradicted"}:
+            softened = _soften_claim_line(raw_line, match)
+            revised_lines.append(softened)
+            softened_claims.append(match.claim)
+            changed_claims.append(match.claim)
+            reason = match.overclaim_reason or match.reason
+            added_limitations.append(f"Softened audited claim: {reason}")
+            continue
+        revised_lines.append(raw_line)
+
+    final_answer = "\n".join(revised_lines).strip()
+    if not final_answer or _only_policy_text(final_answer):
+        final_answer = (
+            f"{RESEARCH_USE_DISCLAIMER}\n\n"
+            "After claim-level audit, the draft did not contain enough "
+            "citation-supported evidence to answer this biomedical research "
+            "question without overclaiming."
+        )
+        added_limitations.append("The audited draft had no remaining supported research claims.")
+        action = "abstain"
+    else:
+        action = "revise"
+    conflict_or_uncertainty = (
+        not audit.conflict_awareness
+        or not audit.uncertainty_calibrated
+        or any(item.verdict == "contradicted" for item in audit.failed_claims)
+    )
+    if added_limitations or conflict_or_uncertainty:
+        final_answer = _append_audit_limitations(final_answer, added_limitations, audit)
+    return AnswerRevision(
+        revision_id=_revision_id(draft_result.run_id, audit.audit_id),
+        run_id=draft_result.run_id,
+        audit_id=audit.audit_id,
+        revision_mode=cast(Any, revision_mode),
+        fallback_reason=fallback_reason,
+        draft_answer=draft_result.answer,
+        final_answer=final_answer,
+        changed_claims=_merge_unique(changed_claims),
+        removed_claims=_merge_unique(removed_claims),
+        softened_claims=_merge_unique(softened_claims),
+        added_limitations=_merge_unique(added_limitations),
+        refusal_reason=None,
+        revision_action=cast(Any, action),
+        created_at=now,
+    )
+
+
+def _build_trace_steps(
+    *,
+    request: AnswerWithEvidenceRequest,
+    result: AnswerWithEvidenceResult,
+    audit: CitationAuditResult,
+    revision: AnswerRevision,
+    clinical_boundary: bool,
+) -> list[AgentTraceStep]:
+    steps: list[AgentTraceStep] = []
+
+    def add(
+        step: str,
+        status: str,
+        input_summary: str,
+        output_summary: str,
+        *,
+        warnings: list[str] | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        steps.append(
+            AgentTraceStep(
+                step_id=_trace_step_id(result.run_id, step),
+                run_id=result.run_id,
+                step=cast(Any, step),
+                status=cast(Any, status),
+                input_summary=input_summary,
+                output_summary=output_summary,
+                warnings=warnings or [],
+                metadata=metadata or {},
+                created_at=_now_iso(),
+            )
+        )
+
+    add(
+        "classify",
+        "completed",
+        request.question,
+        "clinical_refuse" if clinical_boundary else "research_ok",
+        metadata={"source": request.source},
+    )
+    add(
+        "plan",
+        "skipped" if clinical_boundary else "completed",
+        "answer_with_audit request",
+        "clinical boundary stopped retrieval" if clinical_boundary else "reused answer_with_evidence retrieval plan",
+    )
+    add(
+        "retrieve",
+        "skipped" if clinical_boundary else "completed",
+        request.question,
+        result.retrieval_id or "no retrieval",
+        warnings=result.retrieval_manifest.warnings if result.retrieval_manifest else [],
+        metadata={
+            "retrieval_id": result.retrieval_id,
+            "papers": (
+                result.retrieval_manifest.returned_paper_ids
+                if result.retrieval_manifest is not None
+                else []
+            ),
+        },
+    )
+    add(
+        "extract",
+        "skipped" if clinical_boundary else "completed",
+        "retrieved papers",
+        f"{len(result.evidence_summary)} evidence items",
+    )
+    add(
+        "draft",
+        "completed",
+        "evidence summary",
+        f"{len(revision.draft_answer)} draft characters",
+    )
+    add(
+        "audit",
+        "completed",
+        revision.draft_answer[:240],
+        audit.audit_id,
+        metadata={
+            "claim_support_rate": audit.claim_support_rate,
+            "citation_precision": audit.citation_precision,
+            "unsupported_claim_rate": audit.unsupported_claim_rate,
+            "overclaim_rate": audit.overclaim_rate,
+            "recommended_action": audit.recommended_action,
+        },
+    )
+    add(
+        "revise",
+        "completed",
+        audit.recommended_action,
+        revision.revision_action,
+        metadata={
+            "revision_mode": revision.revision_mode,
+            "fallback_reason": revision.fallback_reason,
+            "changed_claims": revision.changed_claims,
+            "removed_claims": revision.removed_claims,
+            "softened_claims": revision.softened_claims,
+        },
+    )
+    add(
+        "post_audit",
+        "completed" if revision.post_revision_audit_id else "skipped",
+        revision.revision_action,
+        revision.post_revision_audit_id or "deterministic revision did not require a separate post-audit",
+    )
+    add(
+        "finalize",
+        "completed",
+        revision.revision_action,
+        result.run_id,
+        metadata={"final_answer_chars": len(revision.final_answer)},
+    )
+    return steps
+
+
+def _llm_revision_payload(
+    *,
+    request: AnswerWithEvidenceRequest,
+    draft_result: AnswerWithEvidenceResult,
+    audit: CitationAuditResult,
+) -> dict[str, object]:
+    manifest = draft_result.retrieval_manifest
+    return {
+        "instructions": [
+            "Use only supplied evidence items and citations.",
+            "Keep citation labels exactly as provided.",
+            "Do not introduce uncited biomedical claims.",
+            "Every sentence that states biomedical evidence, uncertainty, limitations, comparisons, or recommendations must include at least one supplied citation label.",
+            "Only the research-use disclaimer may remain uncited.",
+            "Use bracketed paper-id labels such as [MOCK-PMID-1001]; do not use bare parenthetical identifiers such as (MOCK-PMID-1001).",
+            "Do not add future-work, expert-review, or causality caveats unless they are directly grounded in supplied evidence and cited.",
+            "Prefer concise bullets; place citation labels in the same sentence as the claim they support.",
+            "Do not provide diagnosis, treatment, dosing, prognosis, or patient-specific advice.",
+            "If evidence is insufficient, say so.",
+            "Return JSON with final_answer, changed_claims, removed_claims, softened_claims, added_limitations, and uncertainty_level.",
+        ],
+        "acceptance_gate": (
+            "The framework will run a post-revision citation audit and reject the LLM "
+            "revision if unsupported, overclaimed, or uncited biomedical claims remain."
+        ),
+        "question": request.question,
+        "draft_answer": draft_result.answer,
+        "citations": [item.model_dump(mode="json") for item in draft_result.citations],
+        "evidence_items": [
+            item.model_dump(mode="json") for item in draft_result.evidence_summary
+        ],
+        "limitations": draft_result.limitations,
+        "retrieval_manifest": manifest.model_dump(mode="json") if manifest is not None else None,
+        "audit": audit.model_dump(mode="json"),
+    }
+
+
+def _parse_json_object(raw: str) -> dict[str, object]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    loaded = json.loads(text)
+    if not isinstance(loaded, dict):
+        raise ValueError("LLM revision response must be a JSON object.")
+    return cast(dict[str, object], loaded)
+
+
+def _normalize_llm_answer_text(raw: str) -> str:
+    text = raw.strip()
+    return (
+        text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+    )
+
+
+def _coerce_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _llm_unavailable_reason(provider: object | None, model: str) -> str:
+    if provider is None:
+        return "LLM revision was requested, but no framework provider is configured for this service instance."
+    if not model:
+        return "LLM revision was requested, but no revision model is configured."
+    return "LLM revision was requested, but the LLM revision adapter fell back to deterministic revision."
+
+
+def _matching_failed_claim(
+    line: str,
+    failed_claims: Iterable[ClaimAuditItem],
+) -> ClaimAuditItem | None:
+    best: tuple[ClaimAuditItem, float] | None = None
+    for claim in failed_claims:
+        score = _claim_match_score(line, claim.claim)
+        if score < 0.55:
+            continue
+        if best is None or score > best[1]:
+            best = (claim, score)
+    return best[0] if best is not None else None
+
+
+def _claim_match_score(line: str, claim: str) -> float:
+    line_terms = set(_terms(line))
+    claim_terms = set(_terms(claim))
+    if not line_terms or not claim_terms:
+        return 0.0
+    return len(line_terms & claim_terms) / len(claim_terms)
+
+
+def _soften_claim_line(line: str, claim: ClaimAuditItem) -> str:
+    prefix = ""
+    body = line
+    if line.strip().startswith("- "):
+        prefix = "- "
+        body = line.strip()[2:]
+    softened = re.sub(r"\bcauses?\b", "is associated with", body, flags=re.IGNORECASE)
+    softened = re.sub(r"\bdrives?\b", "is linked to", softened, flags=re.IGNORECASE)
+    softened = re.sub(r"\bproves?\b", "suggests", softened, flags=re.IGNORECASE)
+    softened = re.sub(r"\bestablishes?\b", "suggests", softened, flags=re.IGNORECASE)
+    if claim.verdict == "contradicted":
+        softened = f"Audit note: retrieved evidence conflicts with this claim; {softened}"
+    elif claim.overclaim_reason:
+        softened = f"Audit-softened claim: {softened}"
+    return f"{prefix}{softened}"
+
+
+def _append_audit_limitations(
+    answer: str,
+    added_limitations: list[str],
+    audit: CitationAuditResult,
+) -> str:
+    limitations = _merge_unique(
+        added_limitations,
+        audit.uncertainty_audit.reasons,
+    )
+    if not limitations:
+        return answer
+    lines = [answer.rstrip(), "", "Audit limitations:"]
+    for limitation in limitations[:8]:
+        lines.append(f"- {limitation}")
+    return "\n".join(lines)
+
+
+def _only_policy_text(answer: str) -> bool:
+    cleaned = " ".join(answer.lower().split())
+    disclaimer = " ".join(RESEARCH_USE_DISCLAIMER.lower().split())
+    return bool(cleaned) and cleaned == disclaimer
+
+
+def _revised_uncertainty(
+    original: ConfidenceLevel,
+    audit: CitationAuditResult,
+    revision: AnswerRevision,
+) -> ConfidenceLevel:
+    if revision.revision_action in {"refuse", "abstain"}:
+        return "high"
+    expected = audit.uncertainty_audit.expected_uncertainty
+    if _uncertainty_rank_service(expected) > _uncertainty_rank_service(original):
+        return expected
+    return original
+
+
+def _uncertainty_rank_service(value: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(value, 2)
+
+
+def _merge_unique(*groups: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            clean = str(value).strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            result.append(clean)
+    return result
+
+
+def _revision_id(run_id: str, audit_id: str | None) -> str:
+    digest = hashlib.sha256(f"{run_id}:{audit_id or ''}".encode("utf-8")).hexdigest()[:16]
+    return f"revision-{digest}"
+
+
+def _trace_step_id(run_id: str, step: str) -> str:
+    digest = hashlib.sha256(f"{run_id}:{step}".encode("utf-8")).hexdigest()[:16]
+    return f"trace-{digest}"
 
 
 def _score_watch_relevance(watch: WatchTopic, paper: BiomedicalPaper) -> tuple[float, str]:

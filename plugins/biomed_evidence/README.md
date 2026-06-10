@@ -3,8 +3,8 @@
 Biomedical Evidence is a research-only Akashic plugin for citation-grounded
 biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured evidence extraction, cited answers, retrieval
-manifests, claim-level citation audit, a lightweight evidence graph, and
-Research Watch decision logs. It is implemented as a plugin on top of the
+manifests, claim-level citation audit, audit/revise traces, a lightweight
+evidence graph, and Research Watch decision logs. It is implemented as a plugin on top of the
 collaborative Akashic framework, not as a standalone clinical system.
 
 ## Default Mode
@@ -30,6 +30,7 @@ Registered agent tools:
 - `fetch_biomedical_paper`
 - `extract_evidence`
 - `answer_with_evidence`
+- `answer_with_audit`
 - `watch_research_topic`
 - `list_research_watch_topics`
 - `update_research_watch_topic`
@@ -66,14 +67,17 @@ The panel includes:
   and push/skip decisions.
 - Audit: inspect atomic claims, citation-support verdicts, overclaims,
   conflict awareness, uncertainty calibration, and recommended action.
+- Trace: inspect draft answer, final answer, deterministic revision action,
+  removed/softened claims, added limitations, and ordered agent steps.
 - Responsible AI: review the research-only operating boundary and retrieval
   limitations.
 
 ## API
 
 The plugin mounts `/api/biomed/*` routes for search, paper detail, evidence
-extraction, answer runs, claim-level citation audit, graph retrieval, watch
-CRUD/check/events, conflict checks, and export.
+extraction, answer runs, audited answer generation, claim-level citation audit,
+trace retrieval, graph retrieval, watch CRUD/check/events, conflict checks, and
+export.
 
 ## Safety Boundary
 
@@ -81,6 +85,12 @@ This plugin is not a clinical decision system. It refuses or redirects clinical
 diagnosis, treatment, prognosis, medication, and patient-specific requests.
 Project memory can personalize context, but it is never treated as biomedical
 fact.
+
+`answer_with_audit` preserves the older citation-grounded answer path as a
+draft, runs deterministic claim-level audit, revises or refuses risky claims,
+optionally uses an injected framework LLM provider for evidence-grounded
+revision, falls back to deterministic revision when no provider/model is
+configured, and persists the trace for reviewer inspection.
 
 ## Validation
 

@@ -206,6 +206,8 @@ if __name__ == "__main__":
                 host=dashboard_host,
                 port=dashboard_port,
                 memory_admin=memory_runtime.engine,
+                biomed_revision_provider=light_provider or provider,
+                biomed_revision_model=config.light_model or config.model,
             )
         finally:
             asyncio.run(memory_runtime.aclose())

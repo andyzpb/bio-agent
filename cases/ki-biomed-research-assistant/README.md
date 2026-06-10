@@ -14,11 +14,14 @@ Biomedical Evidence plugin:
 - citation-grounded biomedical research answers;
 - claim-level citation audit with support verdicts, overclaim detection, and
   uncertainty calibration;
+- audit/revise answer loop with persisted draft, final answer, revision action,
+  and trace steps;
 - retrieval manifests for source, query, pagination, warnings, and returned paper IDs;
 - lightweight evidence graph over papers, claims, entities, methods, datasets, and limitations;
 - Research Watch topics with relevance scoring, retrieval snapshots, and push/skip decision logs;
 - dashboard views for asking questions, inspecting evidence, reviewing graph
-  structure, running citation audits, and checking responsible AI boundaries.
+  structure, running citation audits, inspecting traces, and checking
+  responsible AI boundaries.
 
 ## Demo
 
@@ -50,7 +53,7 @@ Biomedical Evidence plugin:
 - TypeScript dashboard panel using the existing plugin runtime.
 - Mock evaluation harness for citation coverage, schema validity, refusal
   behavior, watch precision, retrieval reliability, and claim-level audit
-  metrics.
+  metrics, plus trace completeness and revision-success metrics.
 - Retrieval reliability metrics for manifest validity and repeatability.
 - Docker and CI support for reproducible review.
 
@@ -67,6 +70,7 @@ The case is implemented as Portfolio V1, not only a prototype. It includes:
 - idempotent paper, claim, entity, watch, decision, and answer-run persistence;
 - persisted retrieval manifests, retrieval-paper links, and Watch snapshots;
 - persisted answer audits and claim audits;
+- persisted answer revisions and agent trace steps;
 - Research Watch check events with push/skip decisions and relevance reasons;
 - markdown and JSON report export.
 

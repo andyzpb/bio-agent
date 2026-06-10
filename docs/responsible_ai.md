@@ -17,6 +17,11 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - Citation presence is not treated as sufficient. V1.3 adds claim-level audit
   that separates supported, partially supported, overclaimed, contradicted,
   insufficient, irrelevant, and uncited claims.
+- V1.4 routes draft answers through deterministic audit/revise/refuse logic and
+  persists trace steps so reviewers can inspect how the final answer changed.
+- Optional LLM revision can only be used as a framework-injected reviser over
+  supplied evidence and citations. The deterministic citation audit remains the
+  verifier of record.
 
 ## Uncertainty Policy
 
@@ -25,6 +30,10 @@ abstract-only, missing abstracts, heuristic-extracted, or based on small/animal
 cohorts. The citation audit also derives an uncertainty calibration signal from
 claim-support failures, retrieval warnings, conflicting evidence, and indirect
 animal/in-vitro evidence.
+
+When the audit detects unsupported, overclaimed, contradicted, or clinical-risk
+claims, the revised answer should remove the claim, soften it, add limitations,
+abstain, or refuse rather than present the draft as-is.
 
 ## Human Review
 

@@ -394,12 +394,18 @@ def _infer_cited_ids(
 
 def _skip_line(line: str) -> bool:
     lowered = line.lower().strip()
+    heading = _normalized_section_heading(line)
+    if _is_markdown_section_heading(line):
+        return True
     if lowered.startswith(("research question:", "project context", "##", "#")):
         return True
-    if lowered in {
+    if heading in {
         "evidence supporting the hypothesis:",
+        "evidence supporting the hypothesis",
         "evidence that contradicts or limits the hypothesis:",
+        "evidence that contradicts or limits the hypothesis",
         "inconclusive evidence:",
+        "inconclusive evidence",
         "citations",
         "limitations",
         "disclaimer",
@@ -411,6 +417,19 @@ def _skip_line(line: str) -> bool:
         or "not medical advice" in lowered
         or lowered.startswith("interpretation:")
     )
+
+
+def _normalized_section_heading(line: str) -> str:
+    heading = re.sub(r"^[#>\-\s]+", "", line).strip()
+    heading = re.sub(r"\*+", "", heading).strip().lower()
+    return heading.strip(" :")
+
+
+def _is_markdown_section_heading(line: str) -> bool:
+    stripped = line.strip()
+    if _paper_ids(stripped):
+        return False
+    return bool(re.fullmatch(r"\*{1,3}\s*[^*][^.\n]{1,140}?\s*\*{1,3}", stripped))
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -484,6 +503,8 @@ def _overclaim_reason(claim_text: str, evidence: EvidenceItem) -> str | None:
     lowered = claim_text.lower()
     evidence_text = _evidence_text(evidence).lower()
     if re.search(r"\b(causes?|caused|causal|drives?|proves?|establishes?)\b", lowered):
+        if _claim_reports_limiting_evidence(claim_text):
+            return None
         if re.search(r"\b(associated|association|correlated|cross-sectional|limits causal)\b", evidence_text):
             return "The claim upgrades association or cross-sectional evidence into causality."
     if re.search(r"\b(human|patients?|clinical|alzheimer's disease progression)\b", lowered):

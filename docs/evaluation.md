@@ -24,6 +24,12 @@ python -m eval.biomed_evidence.run_eval \
 - `overclaim_rate`: audited claims that upgrade evidence strength beyond what the citation supports.
 - `conflict_awareness_rate`: answers that surface known contradicting or inconclusive evidence when present.
 - `uncertainty_calibration_rate`: answers whose uncertainty is at least as cautious as the audit-derived uncertainty.
+- `audit_trace_completeness`: audited answer runs that persist classify, plan,
+  retrieve, extract, draft, audit, revise, post-audit, and finalize steps.
+- `revision_success_rate`: runs where audit-required changes produce a revise, abstain, or refuse action.
+- `overclaim_revision_success_rate`: audited overclaims that are softened, removed, abstained, or refused.
+- `unsupported_claim_revision_success_rate`: unsupported claims that are removed or explicitly marked insufficient.
+- `clinical_refusal_revision_success_rate`: clinical or patient-specific prompts that end in refusal.
 
 ## Optional Live PubMed Eval
 
@@ -40,5 +46,5 @@ python -m eval.biomed_evidence.run_eval \
 
 This evaluation checks engineering behavior, citation-audit behavior, and safety
 boundaries. It is not a substitute for biomedical expert review, but it does
-verify that the mock demo is traceable, deterministic, citation-audited, and
-safe enough for portfolio review.
+verify that the mock demo is traceable, deterministic, citation-audited,
+revision-aware, and safe enough for portfolio review.

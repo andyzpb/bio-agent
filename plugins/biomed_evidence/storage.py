@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from plugins.biomed_evidence.schemas import (
+    AgentTraceStep,
     AnswerWithEvidenceResult,
+    AnswerRevision,
     BiomedicalEntity,
     BiomedicalPaper,
     CitationAuditResult,
@@ -309,6 +311,139 @@ class BiomedStorage:
             page=page,
             page_size=page_size,
         )
+
+    def save_agent_trace_steps(self, steps: list[AgentTraceStep]) -> None:
+        if not steps:
+            return
+        with self._lock:
+            for step in steps:
+                self._db.execute(
+                    """
+                    INSERT INTO biomed_agent_trace_steps(
+                        step_id, run_id, step, status, input_summary,
+                        output_summary, warnings_json, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(step_id) DO UPDATE SET
+                        run_id=excluded.run_id,
+                        step=excluded.step,
+                        status=excluded.status,
+                        input_summary=excluded.input_summary,
+                        output_summary=excluded.output_summary,
+                        warnings_json=excluded.warnings_json,
+                        metadata_json=excluded.metadata_json,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        step.step_id,
+                        step.run_id,
+                        step.step,
+                        step.status,
+                        step.input_summary,
+                        step.output_summary,
+                        _json(step.warnings),
+                        _json(step.metadata),
+                        step.created_at,
+                    ),
+                )
+            self._db.commit()
+
+    def list_agent_trace_steps(self, run_id: str) -> list[AgentTraceStep]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT *
+                FROM biomed_agent_trace_steps
+                WHERE run_id=?
+                ORDER BY
+                    CASE step
+                        WHEN 'classify' THEN 1
+                        WHEN 'plan' THEN 2
+                        WHEN 'retrieve' THEN 3
+                        WHEN 'extract' THEN 4
+                        WHEN 'draft' THEN 5
+                        WHEN 'audit' THEN 6
+                        WHEN 'revise' THEN 7
+                        WHEN 'post_audit' THEN 8
+                        WHEN 'finalize' THEN 9
+                        ELSE 99
+                    END,
+                    created_at ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [_trace_step_from_row(row) for row in rows]
+
+    def save_answer_revision(self, revision: AnswerRevision) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_answer_revisions(
+                    revision_id, run_id, audit_id, post_revision_audit_id,
+                    revision_mode, llm_model, llm_prompt_hash, draft_answer,
+                    final_answer, revision_action, changed_claims_json,
+                    removed_claims_json, softened_claims_json,
+                    added_limitations_json, llm_raw_response_json,
+                    fallback_reason, refusal_reason, revision_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(revision_id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    audit_id=excluded.audit_id,
+                    post_revision_audit_id=excluded.post_revision_audit_id,
+                    revision_mode=excluded.revision_mode,
+                    llm_model=excluded.llm_model,
+                    llm_prompt_hash=excluded.llm_prompt_hash,
+                    draft_answer=excluded.draft_answer,
+                    final_answer=excluded.final_answer,
+                    revision_action=excluded.revision_action,
+                    changed_claims_json=excluded.changed_claims_json,
+                    removed_claims_json=excluded.removed_claims_json,
+                    softened_claims_json=excluded.softened_claims_json,
+                    added_limitations_json=excluded.added_limitations_json,
+                    llm_raw_response_json=excluded.llm_raw_response_json,
+                    fallback_reason=excluded.fallback_reason,
+                    refusal_reason=excluded.refusal_reason,
+                    revision_json=excluded.revision_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    revision.revision_id,
+                    revision.run_id,
+                    revision.audit_id,
+                    revision.post_revision_audit_id,
+                    revision.revision_mode,
+                    revision.llm_model,
+                    revision.llm_prompt_hash,
+                    revision.draft_answer,
+                    revision.final_answer,
+                    revision.revision_action,
+                    _json(revision.changed_claims),
+                    _json(revision.removed_claims),
+                    _json(revision.softened_claims),
+                    _json(revision.added_limitations),
+                    _json(revision.llm_raw_response or {}),
+                    revision.fallback_reason,
+                    revision.refusal_reason,
+                    revision.model_dump_json(),
+                    revision.created_at,
+                ),
+            )
+            self._db.commit()
+
+    def get_answer_revision(self, run_id: str) -> AnswerRevision | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT revision_json
+                FROM biomed_answer_revisions
+                WHERE run_id=?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AnswerRevision.model_validate_json(str(row["revision_json"]))
 
     def save_citation_audit(self, audit: CitationAuditResult) -> None:
         with self._lock:
@@ -957,6 +1092,39 @@ class BiomedStorage:
                 result_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS biomed_agent_trace_steps(
+                step_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                step TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_summary TEXT NOT NULL DEFAULT '',
+                output_summary TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(run_id, step)
+            );
+            CREATE TABLE IF NOT EXISTS biomed_answer_revisions(
+                revision_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                audit_id TEXT,
+                post_revision_audit_id TEXT,
+                revision_mode TEXT NOT NULL DEFAULT 'deterministic',
+                llm_model TEXT,
+                llm_prompt_hash TEXT,
+                draft_answer TEXT NOT NULL,
+                final_answer TEXT NOT NULL,
+                revision_action TEXT NOT NULL,
+                changed_claims_json TEXT NOT NULL DEFAULT '[]',
+                removed_claims_json TEXT NOT NULL DEFAULT '[]',
+                softened_claims_json TEXT NOT NULL DEFAULT '[]',
+                added_limitations_json TEXT NOT NULL DEFAULT '[]',
+                llm_raw_response_json TEXT NOT NULL DEFAULT '{}',
+                fallback_reason TEXT,
+                refusal_reason TEXT,
+                revision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("biomed_evidence", "retrieval_id", "TEXT")
@@ -964,6 +1132,12 @@ class BiomedStorage:
         self._ensure_column("biomed_watch_decisions", "snapshot_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "dedupe_reason", "TEXT")
         self._ensure_column("biomed_answer_runs", "retrieval_id", "TEXT")
+        self._ensure_column("biomed_answer_revisions", "post_revision_audit_id", "TEXT")
+        self._ensure_column("biomed_answer_revisions", "revision_mode", "TEXT NOT NULL DEFAULT 'deterministic'")
+        self._ensure_column("biomed_answer_revisions", "llm_model", "TEXT")
+        self._ensure_column("biomed_answer_revisions", "llm_prompt_hash", "TEXT")
+        self._ensure_column("biomed_answer_revisions", "llm_raw_response_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("biomed_answer_revisions", "fallback_reason", "TEXT")
         self._db.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -1041,6 +1215,21 @@ def _decision_from_row(row: sqlite3.Row) -> WatchDecisionDetail:
         title=row["title"] if "title" in row.keys() else None,
         source=row["source"] if "source" in row.keys() else None,
         notification=_json_dict(row["notification_json"]),
+    )
+
+
+def _trace_step_from_row(row: sqlite3.Row) -> AgentTraceStep:
+    metadata = _json_dict(row["metadata_json"])
+    return AgentTraceStep(
+        step_id=str(row["step_id"]),
+        run_id=str(row["run_id"]),
+        step=row["step"],
+        status=row["status"],
+        input_summary=str(row["input_summary"]),
+        output_summary=str(row["output_summary"]),
+        warnings=_json_list(row["warnings_json"]),
+        metadata=metadata,
+        created_at=str(row["created_at"]),
     )
 
 

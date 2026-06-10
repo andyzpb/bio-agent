@@ -940,6 +940,7 @@ def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
         panel = client.get("/plugins/biomed_evidence/dashboard_panel.js")
         assert panel.status_code == 200
         assert "Biomedical" in panel.text
+        assert "Trace" in panel.text
 
         search = client.get(
             "/api/biomed/search",
@@ -958,6 +959,18 @@ def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
         )
         assert answer.status_code == 200
         assert answer.json()["citations"]
+
+        audited = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What evidence links microglia to Alzheimer's disease?",
+                "source": "mock",
+                "max_papers": 5,
+            },
+        )
+        assert audited.status_code == 200
+        assert audited.json()["trace"]
+        assert len(audited.json()["trace"]) == 9
 
         graph = client.get("/api/biomed/graph", params={"topic": "microglia"})
         assert graph.status_code == 200

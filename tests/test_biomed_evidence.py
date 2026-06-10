@@ -64,6 +64,23 @@ async def test_clinical_question_is_refused(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_patient_specific_dose_question_is_refused(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What dose should my mother take for Alzheimer disease?"
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert not result.citations
+    assert "recommend treatment" in result.answer.lower()
+    assert result.uncertainty_level == "high"
+
+
+@pytest.mark.asyncio
 async def test_mock_search_fetch_extract_and_storage_idempotency(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
@@ -331,6 +348,7 @@ async def test_biomed_plugin_registers_tools(tmp_path: Path) -> None:
         await manager.load_all()
         assert tools.has_tool("search_biomedical_literature")
         assert tools.has_tool("answer_with_evidence")
+        assert tools.has_tool("answer_with_audit")
         assert tools.has_tool("validate_citation_support")
         assert tools.has_tool("audit_biomedical_answer")
         assert tools.has_tool("find_conflicting_evidence")
@@ -343,6 +361,17 @@ async def test_biomed_plugin_registers_tools(tmp_path: Path) -> None:
         )
         payload = json.loads(str(raw))
         assert payload["citations"]
+        audited_raw = await tools.execute(
+            "answer_with_audit",
+            {
+                "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+            },
+        )
+        audited_payload = json.loads(str(audited_raw))
+        assert audited_payload["audit"]["audit_id"]
+        assert audited_payload["revision"]["revision_id"]
+        assert audited_payload["trace"]
     finally:
         await manager.terminate_all()
         await bus.aclose()

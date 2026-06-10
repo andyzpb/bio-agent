@@ -8,8 +8,9 @@ This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
 a research-only biomedical literature assistant built on top of the framework.
 The plugin currently supports deterministic mock retrieval, optional PubMed
 retrieval, evidence extraction, citation-grounded answers, retrieval
-provenance, claim-level citation audit, Research Watch decision logs,
-dashboard views, evaluation, Docker, and CI-friendly checks.
+provenance, claim-level citation audit, audit/revise answer traces, Research
+Watch decision logs, dashboard views, evaluation, Docker, and CI-friendly
+checks.
 
 The current roadmap direction is **claim-level evidence trustworthiness**:
 moving from "answers with citations" toward a biomedical research agent that
@@ -32,15 +33,19 @@ Implemented today:
 - V1.3 claim-level citation audit with atomic claims, support verdicts,
   overclaim detection, conflict checks, uncertainty calibration, persisted
   audit records, API routes, tools, dashboard audit view, and eval metrics.
+- V1.4 audit/revise loop with `answer_with_audit`, persisted trace steps,
+  deterministic claim revision/refusal, dashboard Trace view, and revision
+  eval metrics.
+- Optional framework-provider LLM revision path is supported behind
+  `use_llm_revision`; default mock demos and CI remain deterministic/keyless.
 - Responsible-AI guardrails for research-only use.
 - Mock biomedical eval, Python tests, Node typecheck/build, Docker, and CI
   support.
 
 Planned next:
 
-- Audit/revise answer loop.
-- Project memory for research preferences.
 - Structured biomedical query planner.
+- Project memory for research preferences.
 - Claim-level eval gates in CI and a larger golden dataset.
 
 ## Quickstart
@@ -211,6 +216,7 @@ The plugin currently registers these agent tools:
 - `fetch_biomedical_paper`
 - `extract_evidence`
 - `answer_with_evidence`
+- `answer_with_audit`
 - `watch_research_topic`
 - `list_research_watch_topics`
 - `update_research_watch_topic`
@@ -314,11 +320,11 @@ V1.3 Citation & Evidence Audit Layer:
 
 Audit/revise loop:
 
-- [ ] Add `answer_with_audit` without breaking `answer_with_evidence`.
-- [ ] Save agent trace steps: classify, plan, retrieve, extract, draft, audit,
+- [x] Add `answer_with_audit` without breaking `answer_with_evidence`.
+- [x] Save agent trace steps: classify, plan, retrieve, extract, draft, audit,
   revise, finalize.
-- [ ] Downgrade unsupported or overclaimed language before final answer.
-- [ ] Refuse or abstain when clinical or evidence-insufficient boundaries are
+- [x] Downgrade unsupported or overclaimed language before final answer.
+- [x] Refuse or abstain when clinical or evidence-insufficient boundaries are
   triggered.
 
 Structured biomedical planner:
@@ -342,6 +348,7 @@ Claim-level evaluation:
 
 - [ ] Add golden biomedical question cases.
 - [ ] Add overclaim, conflict, clinical-boundary, and memory eval cases.
+- [x] Add mock eval metrics for trace completeness and revision success.
 - [ ] Add CI gates for claim support, citation precision, overclaim rate,
   clinical robustness, and trace completeness.
 - [ ] Keep live PubMed eval opt-in and out of default CI.
@@ -349,7 +356,7 @@ Claim-level evaluation:
 Dashboard and portfolio polish:
 
 - [ ] Add Evidence Audit panel.
-- [ ] Add Agent Trace panel.
+- [x] Add Agent Trace panel.
 - [ ] Add Conflict Evidence panel.
 - [ ] Add Project Memory panel.
 - [ ] Add docs for evidence audit, project memory, and claim-level eval after

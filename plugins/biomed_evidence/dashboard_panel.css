@@ -16,8 +16,10 @@
 .biomed-answer-meta button,
 #biomed-watch-create,
 #biomed-ask-btn,
+#biomed-audited-btn,
 #biomed-graph-btn,
-#biomed-audit-run-btn {
+#biomed-audit-run-btn,
+#biomed-trace-load-btn {
   border: 1px solid var(--border, #d0d7de);
   background: var(--panel-bg, #fff);
   color: var(--text, #24292f);
@@ -166,7 +168,23 @@
   gap: 8px;
 }
 
+.biomed-trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .biomed-audit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.biomed-trace-step {
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-bg, #fff);
   display: flex;
   flex-direction: column;
   gap: 6px;

@@ -1,6 +1,6 @@
 /// <reference path="../../types/akashic-dashboard.d.ts" />
 
-type BiomedView = "ask" | "evidence" | "graph" | "watch" | "audit" | "responsible";
+type BiomedView = "ask" | "evidence" | "graph" | "watch" | "audit" | "trace" | "responsible";
 
 interface EvidenceRow {
   evidence_id: string;
@@ -113,9 +113,56 @@ interface CitationAuditResult {
   failed_claims: ClaimAuditItem[];
 }
 
+interface AgentTraceStep {
+  step_id: string;
+  run_id: string;
+  step: string;
+  status: string;
+  input_summary: string;
+  output_summary: string;
+  warnings: string[];
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+interface AnswerRevision {
+  revision_id: string;
+  run_id: string;
+  audit_id?: string | null;
+  draft_answer: string;
+  final_answer: string;
+  changed_claims: string[];
+  removed_claims: string[];
+  softened_claims: string[];
+  added_limitations: string[];
+  revision_mode?: string;
+  fallback_reason?: string | null;
+  refusal_reason?: string | null;
+  revision_action: string;
+  created_at: string;
+}
+
+interface AuditedAnswerResult {
+  answer_result: AnswerResult;
+  draft_answer: string;
+  final_answer: string;
+  audit: CitationAuditResult;
+  revision: AnswerRevision;
+  trace: AgentTraceStep[];
+  final_action: string;
+}
+
+interface TracePayload {
+  run_id: string;
+  answer_run: AnswerResult;
+  trace: AgentTraceStep[];
+  revision?: AnswerRevision | null;
+  latest_citation_audit?: CitationAuditResult | null;
+}
+
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
   const value = dispatch?.filters["_view"];
-  if (value === "graph" || value === "watch" || value === "audit" || value === "responsible" || value === "evidence") {
+  if (value === "graph" || value === "watch" || value === "audit" || value === "trace" || value === "responsible" || value === "evidence") {
     return value;
   }
   return "ask";
@@ -244,6 +291,90 @@ function renderAuditResult(result: CitationAuditResult): string {
   `;
 }
 
+function renderTraceResult(payload: TracePayload): string {
+  const revision = payload.revision;
+  const audit = payload.latest_citation_audit;
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Run</span><code>${escapeHtml(payload.run_id)}</code></div>
+        <div><span>Action</span><strong>${escapeHtml(revision?.revision_action || "-")}</strong></div>
+        <div><span>Mode</span><strong>${escapeHtml(revision?.revision_mode || "-")}</strong></div>
+        <div><span>Audit</span><code>${escapeHtml(audit?.audit_id || "-")}</code></div>
+        <div><span>Trace</span><strong>${payload.trace.length}</strong></div>
+      </div>
+    </div>
+    ${
+      revision
+        ? `
+          <div class="biomed-two-col">
+            <div>
+              <div class="biomed-label">Draft Answer</div>
+              <div class="biomed-answer">${renderMarkdown(revision.draft_answer)}</div>
+            </div>
+            <div>
+              <div class="biomed-label">Final Answer</div>
+              <div class="biomed-answer">${renderMarkdown(revision.final_answer)}</div>
+            </div>
+          </div>
+          <div class="biomed-two-col">
+            <div>
+              <div class="biomed-label">Removed Claims</div>
+              ${renderList(revision.removed_claims)}
+            </div>
+            <div>
+              <div class="biomed-label">Softened Claims</div>
+              ${renderList(revision.softened_claims)}
+            </div>
+          </div>
+          <div class="biomed-label">Added Limitations</div>
+          ${renderList(revision.added_limitations)}
+          ${revision.fallback_reason ? `<div class="biomed-label">Fallback</div><div class="biomed-muted">${escapeHtml(revision.fallback_reason)}</div>` : ""}
+        `
+        : '<div class="biomed-muted">No revision recorded. Use Answer + Audit to create a trace.</div>'
+    }
+    <div class="biomed-label">Trace</div>
+    <div class="biomed-trace-list">
+      ${payload.trace.map((step) => `
+        <div class="biomed-trace-step">
+          <div class="biomed-audit-row-head">
+            ${pill(step.step)}
+            ${pill(step.status)}
+            <span>${escapeHtml(step.created_at)}</span>
+          </div>
+          <div class="biomed-evidence-claim">${escapeHtml(step.output_summary || "-")}</div>
+          <div class="biomed-evidence-finding">${escapeHtml(step.input_summary || "")}</div>
+          ${step.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(step.warnings)}` : ""}
+        </div>
+      `).join("") || '<div class="biomed-muted">No trace steps recorded.</div>'}
+    </div>
+  `;
+}
+
+function renderAuditedAnswer(result: AuditedAnswerResult): string {
+  return `
+    <div class="biomed-answer-meta">
+      <code>${escapeHtml(result.answer_result.run_id)}</code>
+      ${pill(result.answer_result.uncertainty_level)}
+      ${pill(result.final_action)}
+    </div>
+    <div class="biomed-label">Retrieval Provenance</div>
+    ${renderManifest(result.answer_result.retrieval_manifest)}
+    <div class="biomed-label">Final Answer</div>
+    <div class="biomed-answer">${renderMarkdown(result.final_answer)}</div>
+    <div class="biomed-label">Audit</div>
+    ${renderAuditResult(result.audit)}
+    <div class="biomed-label">Trace Summary</div>
+    ${renderTraceResult({
+      run_id: result.answer_result.run_id,
+      answer_run: result.answer_result,
+      trace: result.trace,
+      revision: result.revision,
+      latest_citation_audit: result.audit,
+    })}
+  `;
+}
+
 function renderTabs(view: BiomedView): string {
   const tabs: { id: BiomedView; label: string }[] = [
     { id: "ask", label: "Ask" },
@@ -251,6 +382,7 @@ function renderTabs(view: BiomedView): string {
     { id: "graph", label: "Graph" },
     { id: "watch", label: "Watch" },
     { id: "audit", label: "Audit" },
+    { id: "trace", label: "Trace" },
     { id: "responsible", label: "Responsible AI" },
   ];
   return `
@@ -277,6 +409,7 @@ function renderAsk(container: HTMLElement): void {
           </select>
           <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
           <button id="biomed-ask-btn">Answer</button>
+          <button id="biomed-audited-btn">Answer + Audit</button>
         </div>
       </div>
       <div id="biomed-ask-result" class="biomed-result"></div>
@@ -329,6 +462,24 @@ function renderAsk(container: HTMLElement): void {
           button.textContent = "Run Audit";
         }
       });
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-audited-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+    if (!resultNode) return;
+    resultNode.textContent = "Running evidence search, audit, and revision...";
+    const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
+    const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
+    const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
+    try {
+      const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, source, max_papers: maxPapers }),
+      });
+      resultNode.innerHTML = renderAuditedAnswer(result);
     } catch (error) {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
@@ -544,6 +695,33 @@ async function loadAuditList(container: HTMLElement): Promise<void> {
   }
 }
 
+function renderTrace(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Answer Trace</div>
+      <div class="biomed-form">
+        <div class="biomed-row">
+          <input id="biomed-trace-run-id" placeholder="answer run id" />
+          <button id="biomed-trace-load-btn">Load Trace</button>
+        </div>
+      </div>
+      <div id="biomed-trace-result" class="biomed-result"></div>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-trace-load-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-trace-result");
+    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
+    if (!target || !runId) return;
+    target.textContent = "Loading trace...";
+    try {
+      const trace = await api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`);
+      target.innerHTML = renderTraceResult(trace);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+}
+
 function csv(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
@@ -564,6 +742,7 @@ function renderResponsible(container: HTMLElement): void {
         <li>Uncertainty is elevated when evidence is conflicting, observational, abstract-only, or missing citations.</li>
         <li>Retrieval manifests expose source, compiled query, result counts, warnings, and repeatability limits.</li>
         <li>Citation presence is not enough; V1.3 audits claim-level support, overclaims, conflicts, and uncertainty calibration.</li>
+        <li>V1.4 routes draft answers through audit, deterministic revision, and persisted trace before final presentation.</li>
       </ul>
     </div>
   `;
@@ -653,6 +832,8 @@ window.AkashicDashboard.registerPlugin({
       renderWatch(root);
     } else if (view === "audit") {
       renderAudit(root);
+    } else if (view === "trace") {
+      renderTrace(root);
     } else if (view === "responsible") {
       renderResponsible(root);
     } else if (view === "evidence") {

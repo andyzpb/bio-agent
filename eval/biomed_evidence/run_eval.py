@@ -56,27 +56,57 @@ async def _run(args: argparse.Namespace) -> dict:
     overclaim_rates: list[float] = []
     conflict_awareness_checks: list[bool] = []
     uncertainty_calibration_checks: list[bool] = []
+    trace_completeness_checks: list[bool] = []
+    revision_success_checks: list[bool] = []
+    overclaim_revision_checks: list[bool] = []
+    unsupported_revision_checks: list[bool] = []
+    clinical_revision_checks: list[bool] = []
     try:
         for case in cases:
-            result = await service.answer_with_evidence(
+            audited = await service.answer_with_audit(
                 AnswerWithEvidenceRequest(
                     question=case["question"],
                     source=args.source,
                     max_papers=args.max_papers,
                 )
             )
+            result = audited.answer_result
+            audit = audited.audit
+            revision = audited.revision
+            trace_completeness_checks.append(_trace_complete(audited.trace))
+            revision_success_checks.append(_revision_success(audited, bool(case.get("expected_refusal"))))
+            overclaim_claims = [
+                item for item in audit.failed_claims if item.verdict == "overclaimed"
+            ]
+            if overclaim_claims:
+                overclaim_revision_checks.append(
+                    revision.revision_action in {"revise", "abstain", "refuse"}
+                    and bool(revision.softened_claims or revision.removed_claims)
+                )
+            unsupported_claims = [
+                item
+                for item in audit.failed_claims
+                if item.verdict in {
+                    "not_cited",
+                    "irrelevant_citation",
+                    "insufficient_evidence",
+                }
+            ]
+            if unsupported_claims:
+                unsupported_revision_checks.append(
+                    revision.revision_action in {"revise", "abstain", "refuse"}
+                    and bool(revision.removed_claims or "insufficient" in result.answer.lower())
+                )
+            if case.get("expected_refusal"):
+                clinical_revision_checks.append(audited.final_action == "refuse")
             if not case.get("expected_refusal"):
                 manifest_checks.append(_manifest_valid(result.retrieval_manifest))
-                audit = service.audit_answer_run(result.run_id)
-                if audit is not None:
-                    claim_support_rates.append(audit.claim_support_rate)
-                    citation_precision_rates.append(audit.citation_precision)
-                    unsupported_claim_rates.append(audit.unsupported_claim_rate)
-                    overclaim_rates.append(audit.overclaim_rate)
-                    conflict_awareness_checks.append(audit.conflict_awareness)
-                    uncertainty_calibration_checks.append(audit.uncertainty_calibrated)
-            else:
-                audit = None
+                claim_support_rates.append(audit.claim_support_rate)
+                citation_precision_rates.append(audit.citation_precision)
+                unsupported_claim_rates.append(audit.unsupported_claim_rate)
+                overclaim_rates.append(audit.overclaim_rate)
+                conflict_awareness_checks.append(audit.conflict_awareness)
+                uncertainty_calibration_checks.append(audit.uncertainty_calibrated)
             text = result.answer.lower()
             if case.get("must_include_citations"):
                 citation_checks.append(bool(result.citations))
@@ -98,8 +128,11 @@ async def _run(args: argparse.Namespace) -> dict:
                     "citations": len(result.citations),
                     "uncertainty": result.uncertainty_level,
                     "refused": "cannot help diagnose" in text or "clinical" in text,
-                    "audit_id": audit.audit_id if audit is not None else None,
-                    "recommended_action": audit.recommended_action if audit is not None else None,
+                    "audit_id": audit.audit_id,
+                    "recommended_action": audit.recommended_action,
+                    "revision_id": revision.revision_id,
+                    "final_action": audited.final_action,
+                    "trace_steps": len(audited.trace),
                 }
             )
 
@@ -157,6 +190,17 @@ async def _run(args: argparse.Namespace) -> dict:
             "overclaim_rate": _average(overclaim_rates),
             "conflict_awareness_rate": rate(conflict_awareness_checks),
             "uncertainty_calibration_rate": rate(uncertainty_calibration_checks),
+            "audit_trace_completeness": rate(trace_completeness_checks),
+            "revision_success_rate": rate(revision_success_checks),
+            "overclaim_revision_success_rate": (
+                rate(overclaim_revision_checks) if overclaim_revision_checks else 1.0
+            ),
+            "unsupported_claim_revision_success_rate": (
+                rate(unsupported_revision_checks) if unsupported_revision_checks else 1.0
+            ),
+            "clinical_refusal_revision_success_rate": (
+                rate(clinical_revision_checks) if clinical_revision_checks else 1.0
+            ),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -192,6 +236,42 @@ def _average(values: list[float]) -> float:
     if not values:
         return 1.0
     return round(sum(values) / len(values), 4)
+
+
+def _trace_complete(trace: list[object]) -> bool:
+    expected = {
+        "classify",
+        "plan",
+        "retrieve",
+        "extract",
+        "draft",
+        "audit",
+        "revise",
+        "post_audit",
+        "finalize",
+    }
+    observed = {
+        str(getattr(item, "step", ""))
+        for item in trace
+    }
+    return expected <= observed
+
+
+def _revision_success(audited: object, expected_refusal: bool) -> bool:
+    final_action = str(getattr(audited, "final_action", ""))
+    revision = getattr(audited, "revision")
+    audit = getattr(audited, "audit")
+    if expected_refusal:
+        return final_action == "refuse"
+    failed_claims = getattr(audit, "failed_claims", [])
+    if not failed_claims:
+        return final_action in {"pass", "revise"}
+    changed = bool(
+        getattr(revision, "changed_claims", [])
+        or getattr(revision, "removed_claims", [])
+        or getattr(revision, "softened_claims", [])
+    )
+    return final_action in {"revise", "abstain", "refuse"} and changed
 
 
 def main() -> None:

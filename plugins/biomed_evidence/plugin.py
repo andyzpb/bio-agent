@@ -151,6 +151,44 @@ class BiomedEvidencePlugin(Plugin):
                 project_context=project_context,
                 require_citations=require_citations,
                 source=source,
+                use_llm_revision=False,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="answer_with_audit",
+        risk="read-only",
+        search_hint="citation audited biomedical research answer with trace",
+    )
+    async def answer_with_audit(
+        self,
+        event,
+        question: str,
+        max_papers: int = 10,
+        project_context: str | None = None,
+        require_citations: bool = True,
+        source: Literal["pubmed", "mock"] = "mock",
+        use_llm_revision: bool = False,
+    ) -> str:
+        """Answer a biomedical research question, audit claims, revise, and return trace.
+
+        Args:
+            question: Biomedical research question.
+            max_papers: Maximum papers to retrieve.
+            project_context: Optional user project context, treated as preference only.
+            require_citations: Whether to avoid strong claims without citations.
+            source: Literature source.
+            use_llm_revision: Request framework-governed LLM revision when configured.
+        """
+        result = await self._service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question=question,
+                max_papers=max_papers,
+                project_context=project_context,
+                require_citations=require_citations,
+                source=source,
+                use_llm_revision=use_llm_revision,
             )
         )
         return _dump(result.model_dump(mode="json"))

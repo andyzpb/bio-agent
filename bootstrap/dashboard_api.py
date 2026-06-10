@@ -730,6 +730,8 @@ def create_dashboard_app(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    biomed_revision_provider: Any | None = None,
+    biomed_revision_model: str = "",
 ) -> FastAPI:
     workspace.mkdir(parents=True, exist_ok=True)
     store = SessionStore(workspace / "sessions.db")
@@ -770,6 +772,8 @@ def create_dashboard_app(
     app = FastAPI(title="Akashic Dashboard API", lifespan=lifespan)
     app.state.memory_admin = memory_admin
     app.state.memory_store = memory_store or MemoryStore(workspace)
+    app.state.biomed_revision_provider = biomed_revision_provider
+    app.state.biomed_revision_model = biomed_revision_model
     app.mount("/assets", StaticFiles(directory=static_dir), name="dashboard-assets")
 
     # Compile TypeScript plugin panels and mount plugin routes
@@ -1389,6 +1393,8 @@ def run_dashboard_api(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    biomed_revision_provider: Any | None = None,
+    biomed_revision_model: str = "",
 ) -> None:
     server = uvicorn.Server(
         _build_dashboard_uvicorn_config(
@@ -1399,6 +1405,8 @@ def run_dashboard_api(
             manual_memory_optimizer=manual_memory_optimizer,
             memory_admin=memory_admin,
             memory_store=memory_store,
+            biomed_revision_provider=biomed_revision_provider,
+            biomed_revision_model=biomed_revision_model,
         )
     )
     server.run()
@@ -1413,6 +1421,8 @@ def _build_dashboard_uvicorn_config(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    biomed_revision_provider: Any | None = None,
+    biomed_revision_model: str = "",
 ) -> uvicorn.Config:
     config = uvicorn.Config(
         create_dashboard_app(
@@ -1421,6 +1431,8 @@ def _build_dashboard_uvicorn_config(
             manual_memory_optimizer=manual_memory_optimizer,
             memory_admin=memory_admin,
             memory_store=memory_store,
+            biomed_revision_provider=biomed_revision_provider,
+            biomed_revision_model=biomed_revision_model,
         ),
         host=host,
         port=port,
@@ -1439,6 +1451,8 @@ def build_dashboard_server(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    biomed_revision_provider: Any | None = None,
+    biomed_revision_model: str = "",
 ) -> uvicorn.Server:
     config = _build_dashboard_uvicorn_config(
         workspace=workspace,
@@ -1448,5 +1462,7 @@ def build_dashboard_server(
         manual_memory_optimizer=manual_memory_optimizer,
         memory_admin=memory_admin,
         memory_store=memory_store,
+        biomed_revision_provider=biomed_revision_provider,
+        biomed_revision_model=biomed_revision_model,
     )
     return uvicorn.Server(config)
