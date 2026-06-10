@@ -195,6 +195,7 @@ async def test_answer_with_audit_persists_revision_and_trace(tmp_path: Path) -> 
     assert {step.step for step in audited.trace} == {
         "classify",
         "plan",
+        "validate_plan",
         "retrieve",
         "extract",
         "draft",
@@ -205,7 +206,7 @@ async def test_answer_with_audit_persists_revision_and_trace(tmp_path: Path) -> 
     }
     assert trace_payload is not None
     assert trace_payload["revision"] is not None
-    assert len(trace_again) == 9
+    assert len(trace_again) == 10
 
 
 def test_answer_revision_softens_overclaim() -> None:

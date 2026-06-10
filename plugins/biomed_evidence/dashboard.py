@@ -14,6 +14,7 @@ from plugins.biomed_evidence.schemas import (
     EvidenceExtractionRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    PlanBiomedicalSearchRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
@@ -60,6 +61,11 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         if manifest is None:
             raise HTTPException(status_code=404, detail="retrieval manifest not found")
         return manifest.model_dump(mode="json")
+
+    @app.post("/api/biomed/plan")
+    async def plan_biomedical_search(payload: PlanBiomedicalSearchRequest) -> dict[str, Any]:
+        result = await service.plan_biomedical_search(payload)
+        return result.model_dump(mode="json")
 
     @app.get("/api/biomed/papers")
     def list_biomed_papers(

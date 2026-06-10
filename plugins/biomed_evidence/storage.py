@@ -358,13 +358,14 @@ class BiomedStorage:
                     CASE step
                         WHEN 'classify' THEN 1
                         WHEN 'plan' THEN 2
-                        WHEN 'retrieve' THEN 3
-                        WHEN 'extract' THEN 4
-                        WHEN 'draft' THEN 5
-                        WHEN 'audit' THEN 6
-                        WHEN 'revise' THEN 7
-                        WHEN 'post_audit' THEN 8
-                        WHEN 'finalize' THEN 9
+                        WHEN 'validate_plan' THEN 3
+                        WHEN 'retrieve' THEN 4
+                        WHEN 'extract' THEN 5
+                        WHEN 'draft' THEN 6
+                        WHEN 'audit' THEN 7
+                        WHEN 'revise' THEN 8
+                        WHEN 'post_audit' THEN 9
+                        WHEN 'finalize' THEN 10
                         ELSE 99
                     END,
                     created_at ASC

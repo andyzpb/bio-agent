@@ -28,6 +28,22 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert retrieval.status_code == 200
         assert retrieval.json()["returned_paper_ids"]
 
+        plan = client.post(
+            "/api/biomed/plan",
+            json={
+                "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+                "max_results": 5,
+            },
+        )
+        assert plan.status_code == 200
+        plan_payload = plan.json()
+        assert plan_payload["classification"]["intent"] == "research_question"
+        assert plan_payload["query_plan"]["support_queries"]
+        assert plan_payload["query_plan"]["refute_queries"]
+        assert plan_payload["validation"]["valid"] is True
+        assert plan_payload["search_request"]["source"] == "mock"
+
         answer = client.post(
             "/api/biomed/answer",
             json={
@@ -110,6 +126,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
                 "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
                 "source": "mock",
                 "max_papers": 5,
+                "use_llm_planner": True,
             },
         )
         assert audited.status_code == 200
@@ -118,7 +135,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert audited_payload["audit"]["audit_id"]
         assert audited_payload["revision"]["revision_id"]
         assert audited_payload["final_action"] in {"pass", "revise", "refuse", "abstain"}
-        assert len(audited_payload["trace"]) == 9
+        assert len(audited_payload["trace"]) == 10
 
         trace = client.get(f"/api/biomed/answer-runs/{audited_run_id}/trace")
         assert trace.status_code == 200
@@ -128,6 +145,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert {step["step"] for step in trace_payload["trace"]} == {
             "classify",
             "plan",
+            "validate_plan",
             "retrieve",
             "extract",
             "draft",

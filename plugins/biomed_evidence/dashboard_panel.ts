@@ -345,6 +345,7 @@ function renderTraceResult(payload: TracePayload): string {
           <div class="biomed-evidence-claim">${escapeHtml(step.output_summary || "-")}</div>
           <div class="biomed-evidence-finding">${escapeHtml(step.input_summary || "")}</div>
           ${step.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(step.warnings)}` : ""}
+          ${step.metadata && Object.keys(step.metadata).length ? `<pre class="biomed-json">${escapeHtml(JSON.stringify(step.metadata, null, 2))}</pre>` : ""}
         </div>
       `).join("") || '<div class="biomed-muted">No trace steps recorded.</div>'}
     </div>
@@ -408,6 +409,8 @@ function renderAsk(container: HTMLElement): void {
             <option value="pubmed">pubmed</option>
           </select>
           <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
+          <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
+          <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
         </div>
@@ -422,11 +425,12 @@ function renderAsk(container: HTMLElement): void {
     const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
+    const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
     try {
       const result = await api<AnswerResult>("/api/biomed/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, source, max_papers: maxPapers }),
+        body: JSON.stringify({ question, source, max_papers: maxPapers, use_llm_planner: usePlanner }),
       });
       resultNode.innerHTML = `
         <div class="biomed-answer-meta">
@@ -473,11 +477,19 @@ function renderAsk(container: HTMLElement): void {
     const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
+    const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
+    const useRevision = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked);
     try {
       const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, source, max_papers: maxPapers }),
+        body: JSON.stringify({
+          question,
+          source,
+          max_papers: maxPapers,
+          use_llm_planner: usePlanner,
+          use_llm_revision: useRevision,
+        }),
       });
       resultNode.innerHTML = renderAuditedAnswer(result);
     } catch (error) {

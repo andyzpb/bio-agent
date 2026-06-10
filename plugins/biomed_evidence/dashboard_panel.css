@@ -89,6 +89,19 @@
   flex: 1;
 }
 
+.biomed-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted, #57606a);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.biomed-check input {
+  flex: 0 0 auto;
+}
+
 .biomed-result {
   display: flex;
   flex-direction: column;
@@ -200,6 +213,18 @@
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+}
+
+.biomed-json {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 6px;
+  padding: 8px;
+  background: #f6f8fa;
+  color: #24292f;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .biomed-provenance {

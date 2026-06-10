@@ -65,6 +65,7 @@ ConflictVerdict = Literal[
 TraceStepName = Literal[
     "classify",
     "plan",
+    "validate_plan",
     "retrieve",
     "extract",
     "draft",
@@ -76,6 +77,15 @@ TraceStepName = Literal[
 TraceStepStatus = Literal["started", "completed", "skipped", "failed"]
 RevisionAction = Literal["pass", "revise", "refuse", "abstain"]
 RevisionMode = Literal["deterministic", "llm", "fallback"]
+PlannerMode = Literal["deterministic", "llm", "fallback"]
+QuestionIntent = Literal[
+    "research_question",
+    "clinical_or_patient_specific",
+    "needs_clarification",
+    "out_of_scope",
+]
+AllowedNextStep = Literal["plan_retrieval", "clarify", "refuse", "abstain"]
+PlanValidationStatus = Literal["valid", "valid_with_warnings", "invalid"]
 
 
 class BiomedicalPaper(BaseModel):
@@ -264,6 +274,80 @@ class EvidenceExtractionResult(BaseModel):
     reason: str | None = None
 
 
+class BiomedicalQuestionClassification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    normalized_question: str
+    intent: QuestionIntent
+    clinical_boundary: bool = False
+    needs_clarification: bool = False
+    risk_flags: list[str] = Field(default_factory=list)
+    allowed_next_step: AllowedNextStep
+    classifier_mode: PlannerMode = "deterministic"
+    llm_model: str | None = None
+    llm_prompt_hash: str | None = None
+    rationale: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BiomedicalQueryPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    question: str
+    source: Literal["pubmed", "mock"] = "mock"
+    planner_mode: PlannerMode = "deterministic"
+    primary_query: str
+    mesh_terms: list[str] = Field(default_factory=list)
+    include_terms: list[str] = Field(default_factory=list)
+    exclude_terms: list[str] = Field(default_factory=list)
+    date_from: str | None = None
+    date_to: str | None = None
+    publication_types: list[str] = Field(default_factory=list)
+    study_types: list[str] = Field(default_factory=list)
+    species_terms: list[str] = Field(default_factory=list)
+    support_queries: list[str] = Field(default_factory=list)
+    refute_queries: list[str] = Field(default_factory=list)
+    max_results: int = 10
+    rationale: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    llm_model: str | None = None
+    llm_prompt_hash: str | None = None
+    llm_raw_response: dict[str, object] | None = None
+
+
+class QueryPlanValidation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    status: PlanValidationStatus
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    unsupported_filters: list[str] = Field(default_factory=list)
+    compiled_query: str = ""
+    executable_request: SearchBiomedicalLiteratureRequest | None = None
+
+
+class PlanBiomedicalSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    max_results: int = 10
+    source: Literal["pubmed", "mock"] = "mock"
+    project_context: str | None = None
+    use_llm_planner: bool = False
+
+
+class PlanBiomedicalSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    classification: BiomedicalQuestionClassification
+    query_plan: BiomedicalQueryPlan | None = None
+    validation: QueryPlanValidation
+    search_request: SearchBiomedicalLiteratureRequest | None = None
+
+
 class AnswerWithEvidenceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -273,6 +357,7 @@ class AnswerWithEvidenceRequest(BaseModel):
     require_citations: bool = True
     source: Literal["pubmed", "mock"] = "mock"
     use_llm_revision: bool = False
+    use_llm_planner: bool = False
 
 
 class AnswerWithEvidenceResult(BaseModel):
@@ -291,6 +376,9 @@ class AnswerWithEvidenceResult(BaseModel):
     not_medical_advice: bool = True
     disclaimer: str
     project_context_used: str | None = None
+    question_classification: BiomedicalQuestionClassification | None = None
+    query_plan: BiomedicalQueryPlan | None = None
+    query_plan_validation: QueryPlanValidation | None = None
 
 
 class AgentTraceStep(BaseModel):

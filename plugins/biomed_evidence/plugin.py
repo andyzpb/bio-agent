@@ -15,6 +15,7 @@ from plugins.biomed_evidence.schemas import (
     EvidenceItem,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    PlanBiomedicalSearchRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
@@ -33,6 +34,40 @@ class BiomedEvidencePlugin(Plugin):
         service = getattr(self, "_service", None)
         if service is not None:
             await service.aclose()
+
+    @tool(
+        name="plan_biomedical_search",
+        risk="read-only",
+        search_hint="classify biomedical question create structured retrieval plan",
+    )
+    async def plan_biomedical_search(
+        self,
+        event,
+        question: str,
+        max_results: int = 10,
+        source: Literal["pubmed", "mock"] = "mock",
+        project_context: str | None = None,
+        use_llm_planner: bool = False,
+    ) -> str:
+        """Classify a biomedical question and produce a structured retrieval plan.
+
+        Args:
+            question: Biomedical research question.
+            max_results: Maximum papers to retrieve if the plan is valid.
+            source: Literature source.
+            project_context: Optional user project context, treated as preference only.
+            use_llm_planner: Request framework-governed LLM planning when configured.
+        """
+        result = await self._service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question=question,
+                max_results=max_results,
+                source=source,
+                project_context=project_context,
+                use_llm_planner=use_llm_planner,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
 
     @tool(
         name="search_biomedical_literature",
@@ -134,6 +169,7 @@ class BiomedEvidencePlugin(Plugin):
         project_context: str | None = None,
         require_citations: bool = True,
         source: Literal["pubmed", "mock"] = "mock",
+        use_llm_planner: bool = False,
     ) -> str:
         """Answer a biomedical research question with citations and uncertainty.
 
@@ -143,6 +179,7 @@ class BiomedEvidencePlugin(Plugin):
             project_context: Optional user project context, treated as preference only.
             require_citations: Whether to avoid strong claims without citations.
             source: Literature source.
+            use_llm_planner: Request framework-governed retrieval planning when configured.
         """
         result = await self._service.answer_with_evidence(
             AnswerWithEvidenceRequest(
@@ -151,6 +188,7 @@ class BiomedEvidencePlugin(Plugin):
                 project_context=project_context,
                 require_citations=require_citations,
                 source=source,
+                use_llm_planner=use_llm_planner,
                 use_llm_revision=False,
             )
         )
@@ -170,6 +208,7 @@ class BiomedEvidencePlugin(Plugin):
         require_citations: bool = True,
         source: Literal["pubmed", "mock"] = "mock",
         use_llm_revision: bool = False,
+        use_llm_planner: bool = False,
     ) -> str:
         """Answer a biomedical research question, audit claims, revise, and return trace.
 
@@ -180,6 +219,7 @@ class BiomedEvidencePlugin(Plugin):
             require_citations: Whether to avoid strong claims without citations.
             source: Literature source.
             use_llm_revision: Request framework-governed LLM revision when configured.
+            use_llm_planner: Request framework-governed retrieval planning when configured.
         """
         result = await self._service.answer_with_audit(
             AnswerWithEvidenceRequest(
@@ -189,6 +229,7 @@ class BiomedEvidencePlugin(Plugin):
                 require_citations=require_citations,
                 source=source,
                 use_llm_revision=use_llm_revision,
+                use_llm_planner=use_llm_planner,
             )
         )
         return _dump(result.model_dump(mode="json"))

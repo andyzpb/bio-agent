@@ -33,6 +33,8 @@ from plugins.biomed_evidence.schemas import (
     AnswerRevision,
     AuditedAnswerResult,
     BiomedicalPaper,
+    BiomedicalQuestionClassification,
+    BiomedicalQueryPlan,
     Citation,
     CitationAuditRequest,
     CitationAuditResult,
@@ -49,6 +51,9 @@ from plugins.biomed_evidence.schemas import (
     GraphEdge,
     GraphNode,
     PaperMetadata,
+    PlanBiomedicalSearchRequest,
+    PlanBiomedicalSearchResult,
+    QueryPlanValidation,
     RetrievalManifest,
     SearchBiomedicalLiteratureRequest,
     SearchBiomedicalLiteratureResult,
@@ -209,12 +214,154 @@ class BiomedEvidenceService:
             )
         return result
 
+    async def plan_biomedical_search(
+        self,
+        request: PlanBiomedicalSearchRequest,
+    ) -> PlanBiomedicalSearchResult:
+        classification = _classify_biomedical_question(
+            request.question,
+            mode="deterministic",
+        )
+        query_plan: BiomedicalQueryPlan | None = None
+        if classification.allowed_next_step == "plan_retrieval":
+            query_plan = _deterministic_query_plan(
+                request=request,
+                classification=classification,
+            )
+            if request.use_llm_planner:
+                llm_result = await self._llm_plan_or_none(
+                    request=request,
+                    fallback_classification=classification,
+                    fallback_plan=query_plan,
+                )
+                if llm_result is not None:
+                    classification, query_plan = llm_result
+                else:
+                    classification = classification.model_copy(
+                        update={
+                            "classifier_mode": "fallback",
+                            "warnings": _merge_unique(
+                                classification.warnings,
+                                [
+                                    _llm_planner_unavailable_reason(
+                                        self.revision_provider,
+                                        self.revision_model,
+                                    )
+                                ],
+                            ),
+                        }
+                    )
+                    query_plan = query_plan.model_copy(
+                        update={
+                            "planner_mode": "fallback",
+                            "warnings": _merge_unique(
+                                query_plan.warnings,
+                                [
+                                    _llm_planner_unavailable_reason(
+                                        self.revision_provider,
+                                        self.revision_model,
+                                    )
+                                ],
+                            ),
+                        }
+                    )
+        validation = _validate_query_plan(
+            classification=classification,
+            query_plan=query_plan,
+        )
+        return PlanBiomedicalSearchResult(
+            classification=classification,
+            query_plan=query_plan,
+            validation=validation,
+            search_request=validation.executable_request if validation.valid else None,
+        )
+
+    async def _llm_plan_or_none(
+        self,
+        *,
+        request: PlanBiomedicalSearchRequest,
+        fallback_classification: BiomedicalQuestionClassification,
+        fallback_plan: BiomedicalQueryPlan,
+    ) -> tuple[BiomedicalQuestionClassification, BiomedicalQueryPlan] | None:
+        if self.revision_provider is None or not self.revision_model:
+            return None
+        prompt_payload = _llm_planner_payload(
+            request=request,
+            fallback_classification=fallback_classification,
+            fallback_plan=fallback_plan,
+        )
+        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        try:
+            response = await self.revision_provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You classify biomedical user questions and produce "
+                            "structured retrieval plans. Return one valid JSON object "
+                            "only. Never override deterministic clinical guardrails. "
+                            "Do not answer the biomedical question."
+                        ),
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+                tools=[],
+                model=self.revision_model,
+                max_tokens=1600,
+                tool_choice="none",
+                disable_thinking=True,
+            )
+            raw = str(getattr(response, "content", "") or "")
+            parsed = _parse_json_object(raw)
+            classification = _classification_from_llm(
+                parsed.get("classification"),
+                fallback=fallback_classification,
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+            )
+            if classification.clinical_boundary or classification.allowed_next_step != "plan_retrieval":
+                return classification, fallback_plan.model_copy(
+                    update={
+                        "planner_mode": "fallback",
+                        "warnings": _merge_unique(
+                            fallback_plan.warnings,
+                            ["LLM classification blocked retrieval; deterministic plan was not executed."],
+                        ),
+                    }
+                )
+            plan = _query_plan_from_llm(
+                parsed.get("query_plan"),
+                fallback=fallback_plan,
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+                raw_response=parsed,
+            )
+            return classification, plan
+        except Exception:
+            return None
+
     async def answer_with_evidence(
         self,
         request: AnswerWithEvidenceRequest,
     ) -> AnswerWithEvidenceResult:
         run_id = f"biomed-run-{uuid.uuid4().hex[:12]}"
-        if is_clinical_request(request.question):
+        planning_result: PlanBiomedicalSearchResult | None = None
+        if request.use_llm_planner:
+            planning_result = await self.plan_biomedical_search(
+                PlanBiomedicalSearchRequest(
+                    question=request.question,
+                    max_results=request.max_papers,
+                    source=request.source,
+                    project_context=request.project_context,
+                    use_llm_planner=request.use_llm_planner,
+                )
+            )
+        clinical_boundary = (
+            is_clinical_request(request.question)
+            or bool(planning_result and planning_result.classification.clinical_boundary)
+        )
+        if clinical_boundary:
             result = AnswerWithEvidenceResult(
                 run_id=run_id,
                 answer=clinical_refusal(),
@@ -232,14 +379,47 @@ class BiomedEvidenceService:
                 not_medical_advice=True,
                 disclaimer=RESEARCH_USE_DISCLAIMER,
                 project_context_used=request.project_context,
+                question_classification=(
+                    planning_result.classification if planning_result is not None else None
+                ),
+                query_plan=planning_result.query_plan if planning_result is not None else None,
+                query_plan_validation=(
+                    planning_result.validation if planning_result is not None else None
+                ),
             )
             self.storage.save_answer_run(result, question=request.question)
             return result
 
-        search_request = SearchBiomedicalLiteratureRequest(
-            query=request.question,
-            max_results=request.max_papers,
-            source=request.source,
+        if planning_result is not None and not planning_result.validation.valid:
+            result = AnswerWithEvidenceResult(
+                run_id=run_id,
+                answer=_planning_abstention(planning_result.classification),
+                citations=[],
+                evidence_summary=[],
+                conflicting_evidence=[],
+                limitations=planning_result.validation.errors
+                or planning_result.validation.warnings
+                or ["The retrieval plan was not valid enough to execute."],
+                uncertainty_level="high",
+                suggested_next_steps=_planner_next_steps(planning_result.classification),
+                not_medical_advice=True,
+                disclaimer=RESEARCH_USE_DISCLAIMER,
+                project_context_used=request.project_context,
+                question_classification=planning_result.classification,
+                query_plan=planning_result.query_plan,
+                query_plan_validation=planning_result.validation,
+            )
+            self.storage.save_answer_run(result, question=request.question)
+            return result
+
+        search_request = (
+            planning_result.search_request
+            if planning_result is not None and planning_result.search_request is not None
+            else SearchBiomedicalLiteratureRequest(
+                query=request.question,
+                max_results=request.max_papers,
+                source=request.source,
+            )
         )
         search_result = await self.search_with_manifest(search_request)
         metadata = search_result.items
@@ -310,6 +490,13 @@ class BiomedEvidenceService:
             not_medical_advice=True,
             disclaimer=RESEARCH_USE_DISCLAIMER,
             project_context_used=request.project_context,
+            question_classification=(
+                planning_result.classification if planning_result is not None else None
+            ),
+            query_plan=planning_result.query_plan if planning_result is not None else None,
+            query_plan_validation=(
+                planning_result.validation if planning_result is not None else None
+            ),
         )
         self.storage.save_answer_run(result, question=request.question)
         return result
@@ -318,8 +505,11 @@ class BiomedEvidenceService:
         self,
         request: AnswerWithEvidenceRequest,
     ) -> AuditedAnswerResult:
-        clinical_boundary = is_clinical_request(request.question)
         draft_result = await self.answer_with_evidence(request)
+        clinical_boundary = is_clinical_request(request.question) or bool(
+            draft_result.question_classification
+            and draft_result.question_classification.clinical_boundary
+        )
         audit = self.audit_answer(
             CitationAuditRequest(
                 answer=draft_result.answer,
@@ -1036,6 +1226,462 @@ def _mock_trace(
     }
 
 
+def _classify_biomedical_question(
+    question: str,
+    *,
+    mode: str,
+    model: str | None = None,
+    prompt_hash: str | None = None,
+    rationale: str = "",
+    warnings: list[str] | None = None,
+) -> BiomedicalQuestionClassification:
+    normalized = re.sub(r"\s+", " ", question or "").strip()
+    risk_flags: list[str] = []
+    if is_clinical_request(normalized):
+        risk_flags.append("clinical_or_patient_specific")
+        return BiomedicalQuestionClassification(
+            question=question,
+            normalized_question=normalized,
+            intent="clinical_or_patient_specific",
+            clinical_boundary=True,
+            needs_clarification=False,
+            risk_flags=risk_flags,
+            allowed_next_step="refuse",
+            classifier_mode=cast(Any, mode),
+            llm_model=model,
+            llm_prompt_hash=prompt_hash,
+            rationale=rationale or "Deterministic clinical guardrail matched.",
+            warnings=warnings or [],
+        )
+    terms = _terms(normalized)
+    if len(terms) < 2:
+        return BiomedicalQuestionClassification(
+            question=question,
+            normalized_question=normalized,
+            intent="needs_clarification",
+            clinical_boundary=False,
+            needs_clarification=True,
+            risk_flags=[],
+            allowed_next_step="clarify",
+            classifier_mode=cast(Any, mode),
+            llm_model=model,
+            llm_prompt_hash=prompt_hash,
+            rationale=rationale or "Question is too short to form a reliable retrieval plan.",
+            warnings=warnings or [],
+        )
+    if not _looks_biomedical(normalized):
+        return BiomedicalQuestionClassification(
+            question=question,
+            normalized_question=normalized,
+            intent="out_of_scope",
+            clinical_boundary=False,
+            needs_clarification=False,
+            risk_flags=["non_biomedical"],
+            allowed_next_step="abstain",
+            classifier_mode=cast(Any, mode),
+            llm_model=model,
+            llm_prompt_hash=prompt_hash,
+            rationale=rationale or "Question does not appear to ask about biomedical literature.",
+            warnings=warnings or [],
+        )
+    return BiomedicalQuestionClassification(
+        question=question,
+        normalized_question=normalized,
+        intent="research_question",
+        clinical_boundary=False,
+        needs_clarification=False,
+        risk_flags=[],
+        allowed_next_step="plan_retrieval",
+        classifier_mode=cast(Any, mode),
+        llm_model=model,
+        llm_prompt_hash=prompt_hash,
+        rationale=rationale or "Question is suitable for research literature retrieval.",
+        warnings=warnings or [],
+    )
+
+
+def _deterministic_query_plan(
+    *,
+    request: PlanBiomedicalSearchRequest,
+    classification: BiomedicalQuestionClassification,
+) -> BiomedicalQueryPlan:
+    primary_query = _planner_primary_query(classification.normalized_question)
+    mesh_terms = _infer_mesh_terms(classification.normalized_question)
+    include_terms = _infer_include_terms(classification.normalized_question)
+    refute_seed = primary_query or classification.normalized_question
+    warnings = (
+        ["Project context was treated as retrieval preference only, not biomedical evidence."]
+        if request.project_context
+        else []
+    )
+    return BiomedicalQueryPlan(
+        plan_id=_plan_id(classification.normalized_question, request.source, "deterministic"),
+        question=request.question,
+        source=request.source,
+        planner_mode="deterministic",
+        primary_query=primary_query or classification.normalized_question,
+        mesh_terms=mesh_terms,
+        include_terms=include_terms,
+        exclude_terms=[
+            "dosage",
+            "dose",
+            "treatment recommendation",
+            "case report",
+        ],
+        study_types=_infer_study_types(classification.normalized_question),
+        species_terms=_infer_species_terms(classification.normalized_question),
+        support_queries=[
+            f"{refute_seed} association evidence",
+            f"{refute_seed} mechanism evidence",
+        ],
+        refute_queries=[
+            f"{refute_seed} contradictory evidence",
+            f"{refute_seed} negative results limitations",
+        ],
+        max_results=max(1, min(request.max_results, 50)),
+        rationale="Deterministic query plan derived from biomedical terms in the question.",
+        warnings=warnings,
+    )
+
+
+def _validate_query_plan(
+    *,
+    classification: BiomedicalQuestionClassification,
+    query_plan: BiomedicalQueryPlan | None,
+) -> QueryPlanValidation:
+    warnings: list[str] = []
+    errors: list[str] = []
+    if classification.allowed_next_step != "plan_retrieval":
+        errors.append(f"Classifier allowed next step is {classification.allowed_next_step}.")
+        return QueryPlanValidation(
+            valid=False,
+            status="invalid",
+            warnings=classification.warnings,
+            errors=errors,
+        )
+    if query_plan is None:
+        return QueryPlanValidation(
+            valid=False,
+            status="invalid",
+            warnings=classification.warnings,
+            errors=["No query plan was produced."],
+        )
+    primary_query = re.sub(r"\s+", " ", query_plan.primary_query).strip()
+    if not primary_query:
+        errors.append("Primary query is empty.")
+    if len(primary_query) > 300:
+        errors.append("Primary query exceeds 300 characters.")
+    if is_clinical_request(primary_query):
+        errors.append("Primary query contains clinical or patient-specific intent.")
+    if not query_plan.support_queries:
+        warnings.append("Planner did not produce support queries.")
+    if not query_plan.refute_queries:
+        warnings.append("Planner did not produce refute queries.")
+    executable_request: SearchBiomedicalLiteratureRequest | None = None
+    compiled_query = ""
+    unsupported_filters: list[str] = []
+    if not errors:
+        executable_request = SearchBiomedicalLiteratureRequest(
+            query=_executable_query(query_plan),
+            max_results=max(1, min(query_plan.max_results, 50)),
+            date_from=query_plan.date_from,
+            date_to=query_plan.date_to,
+            source=query_plan.source,
+            publication_types=_clean_list(query_plan.publication_types),
+            study_types=_clean_list(query_plan.study_types),
+            mesh_terms=_clean_list(query_plan.mesh_terms),
+            species_terms=_clean_list(query_plan.species_terms),
+            exclude_terms=_clean_list(query_plan.exclude_terms),
+        )
+        compiled_query, _, unsupported_filters = _compile_query(executable_request)
+        if unsupported_filters:
+            warnings.extend(f"Unsupported filter: {item}" for item in unsupported_filters)
+    warnings = _merge_unique(classification.warnings, query_plan.warnings, warnings)
+    status = "invalid" if errors else "valid_with_warnings" if warnings else "valid"
+    return QueryPlanValidation(
+        valid=not errors,
+        status=cast(Any, status),
+        warnings=warnings,
+        errors=errors,
+        unsupported_filters=unsupported_filters,
+        compiled_query=compiled_query,
+        executable_request=executable_request,
+    )
+
+
+def _llm_planner_payload(
+    *,
+    request: PlanBiomedicalSearchRequest,
+    fallback_classification: BiomedicalQuestionClassification,
+    fallback_plan: BiomedicalQueryPlan,
+) -> dict[str, object]:
+    return {
+        "instructions": [
+            "Classify the user question and produce a biomedical literature retrieval plan.",
+            "Return JSON with classification and query_plan objects only.",
+            "Do not answer the biomedical question.",
+            "Do not override deterministic clinical guardrails.",
+            "Use only these intents: research_question, clinical_or_patient_specific, needs_clarification, out_of_scope.",
+            "The query plan must include primary_query, mesh_terms, include_terms, exclude_terms, support_queries, refute_queries, max_results, and rationale.",
+            "Keep queries concise and suitable for PubMed or deterministic mock retrieval.",
+        ],
+        "question": request.question,
+        "source": request.source,
+        "max_results": request.max_results,
+        "project_context": request.project_context,
+        "deterministic_classification": fallback_classification.model_dump(mode="json"),
+        "deterministic_query_plan": fallback_plan.model_dump(mode="json"),
+    }
+
+
+def _classification_from_llm(
+    value: object,
+    *,
+    fallback: BiomedicalQuestionClassification,
+    model: str,
+    prompt_hash: str,
+) -> BiomedicalQuestionClassification:
+    if not isinstance(value, dict):
+        return fallback.model_copy(
+            update={
+                "classifier_mode": "fallback",
+                "warnings": _merge_unique(fallback.warnings, ["LLM classification was not an object."]),
+            }
+        )
+    intent = str(value.get("intent") or fallback.intent)
+    if intent not in {
+        "research_question",
+        "clinical_or_patient_specific",
+        "needs_clarification",
+        "out_of_scope",
+    }:
+        intent = fallback.intent
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        str(value.get("normalized_question") or fallback.normalized_question),
+    ).strip()
+    clinical_boundary = fallback.clinical_boundary or bool(value.get("clinical_boundary"))
+    if clinical_boundary:
+        intent = "clinical_or_patient_specific"
+        allowed_next_step = "refuse"
+        needs_clarification = False
+    else:
+        needs_clarification = bool(value.get("needs_clarification")) or intent == "needs_clarification"
+        allowed_next_step = str(value.get("allowed_next_step") or fallback.allowed_next_step)
+        if allowed_next_step not in {"plan_retrieval", "clarify", "refuse", "abstain"}:
+            allowed_next_step = fallback.allowed_next_step
+        if intent == "needs_clarification":
+            allowed_next_step = "clarify"
+        elif intent == "out_of_scope":
+            allowed_next_step = "abstain"
+        elif intent == "research_question":
+            allowed_next_step = "plan_retrieval"
+    return BiomedicalQuestionClassification(
+        question=fallback.question,
+        normalized_question=normalized,
+        intent=cast(Any, intent),
+        clinical_boundary=clinical_boundary,
+        needs_clarification=needs_clarification,
+        risk_flags=_merge_unique(
+            fallback.risk_flags,
+            _coerce_string_list(value.get("risk_flags")),
+        ),
+        allowed_next_step=cast(Any, allowed_next_step),
+        classifier_mode="llm",
+        llm_model=model,
+        llm_prompt_hash=prompt_hash,
+        rationale=str(value.get("rationale") or fallback.rationale),
+        warnings=_coerce_string_list(value.get("warnings")),
+    )
+
+
+def _query_plan_from_llm(
+    value: object,
+    *,
+    fallback: BiomedicalQueryPlan,
+    model: str,
+    prompt_hash: str,
+    raw_response: dict[str, object],
+) -> BiomedicalQueryPlan:
+    if not isinstance(value, dict):
+        return fallback.model_copy(
+            update={
+                "planner_mode": "fallback",
+                "warnings": _merge_unique(fallback.warnings, ["LLM query_plan was not an object."]),
+            }
+        )
+    primary_query = re.sub(
+        r"\s+",
+        " ",
+        str(value.get("primary_query") or fallback.primary_query),
+    ).strip()
+    return BiomedicalQueryPlan(
+        plan_id=_plan_id(fallback.question, fallback.source, "llm", prompt_hash),
+        question=fallback.question,
+        source=fallback.source,
+        planner_mode="llm",
+        primary_query=primary_query or fallback.primary_query,
+        mesh_terms=_coerce_string_list(value.get("mesh_terms")) or fallback.mesh_terms,
+        include_terms=_coerce_string_list(value.get("include_terms")) or fallback.include_terms,
+        exclude_terms=_coerce_string_list(value.get("exclude_terms")) or fallback.exclude_terms,
+        date_from=str(value.get("date_from") or "") or fallback.date_from,
+        date_to=str(value.get("date_to") or "") or fallback.date_to,
+        publication_types=_coerce_string_list(value.get("publication_types")),
+        study_types=_coerce_string_list(value.get("study_types")) or fallback.study_types,
+        species_terms=_coerce_string_list(value.get("species_terms")) or fallback.species_terms,
+        support_queries=_coerce_string_list(value.get("support_queries")) or fallback.support_queries,
+        refute_queries=_coerce_string_list(value.get("refute_queries")) or fallback.refute_queries,
+        max_results=max(1, min(_safe_int(value.get("max_results"), fallback.max_results), 50)),
+        rationale=str(value.get("rationale") or fallback.rationale),
+        warnings=_coerce_string_list(value.get("warnings")),
+        llm_model=model,
+        llm_prompt_hash=prompt_hash,
+        llm_raw_response=raw_response,
+    )
+
+
+def _planner_primary_query(question: str) -> str:
+    stopwords = {
+        "what",
+        "which",
+        "recent",
+        "evidence",
+        "links",
+        "link",
+        "does",
+        "between",
+        "role",
+        "roles",
+        "study",
+        "studies",
+    }
+    terms = [term for term in _terms(question) if term not in stopwords]
+    return " ".join(_merge_unique(terms))[:240].strip()
+
+
+def _infer_mesh_terms(question: str) -> list[str]:
+    lowered = question.lower()
+    terms: list[str] = []
+    if "alzheimer" in lowered:
+        terms.append("Alzheimer Disease")
+    if "microglia" in lowered or "microglial" in lowered:
+        terms.append("Microglia")
+    if "amyloid" in lowered:
+        terms.append("Amyloid beta-Peptides")
+    if "cancer" in lowered or "tumor" in lowered or "tumour" in lowered:
+        terms.append("Neoplasms")
+    if "melanoma" in lowered:
+        terms.append("Melanoma")
+    return _merge_unique(terms)
+
+
+def _infer_include_terms(question: str) -> list[str]:
+    lowered = question.lower()
+    candidates = [
+        "TREM2",
+        "neuroinflammation",
+        "amyloid",
+        "spatial transcriptomics",
+        "single-nucleus RNA-seq",
+        "CSF",
+        "cognitive decline",
+    ]
+    return [term for term in candidates if term.lower() in lowered]
+
+
+def _infer_study_types(question: str) -> list[str]:
+    lowered = question.lower()
+    result: list[str] = []
+    if "longitudinal" in lowered or "progression" in lowered:
+        result.append("longitudinal")
+    if "human" in lowered or "patient" in lowered:
+        result.append("human")
+    if "mouse" in lowered or "animal" in lowered:
+        result.append("animal")
+    return result
+
+
+def _infer_species_terms(question: str) -> list[str]:
+    lowered = question.lower()
+    if "mouse" in lowered or "mice" in lowered:
+        return ["Mice"]
+    if "human" in lowered or "patient" in lowered:
+        return ["Humans"]
+    return []
+
+
+def _looks_biomedical(question: str) -> bool:
+    lowered = question.lower()
+    markers = {
+        "alzheimer",
+        "microglia",
+        "microglial",
+        "amyloid",
+        "protein",
+        "gene",
+        "cell",
+        "disease",
+        "clinical",
+        "biomedical",
+        "cancer",
+        "tumor",
+        "cohort",
+        "transcriptomics",
+        "neuroinflammation",
+        "csf",
+        "trem2",
+    }
+    return any(marker in lowered for marker in markers)
+
+
+def _executable_query(plan: BiomedicalQueryPlan) -> str:
+    return " ".join(
+        _merge_unique(
+            [plan.primary_query],
+            plan.include_terms,
+        )
+    ).strip()
+
+
+def _planning_abstention(classification: BiomedicalQuestionClassification) -> str:
+    if classification.intent == "needs_clarification":
+        return (
+            f"{RESEARCH_USE_DISCLAIMER}\n\n"
+            "I need a more specific biomedical research question before I can "
+            "retrieve and cite literature safely."
+        )
+    if classification.intent == "out_of_scope":
+        return (
+            f"{RESEARCH_USE_DISCLAIMER}\n\n"
+            "This request does not appear to be a biomedical literature research "
+            "question, so I will not fabricate a biomedical evidence answer."
+        )
+    return (
+        f"{RESEARCH_USE_DISCLAIMER}\n\n"
+        "The retrieval plan did not pass validation, so I will not answer with "
+        "unsupported biomedical claims."
+    )
+
+
+def _planner_next_steps(classification: BiomedicalQuestionClassification) -> list[str]:
+    if classification.intent == "needs_clarification":
+        return [
+            "Add the disease, biological mechanism, population, or study type of interest.",
+            "Ask for evidence rather than diagnosis or treatment advice.",
+        ]
+    if classification.intent == "out_of_scope":
+        return ["Reframe the request as a biomedical literature research question."]
+    return ["Inspect planner warnings and revise the search question."]
+
+
+def _plan_id(question: str, source: str, mode: str, nonce: str = "") -> str:
+    digest = hashlib.sha256(
+        f"{question.lower()}:{source}:{mode}:{nonce}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"plan-{digest}"
+
+
 def _safe_int(value: object, fallback: int) -> int:
     if isinstance(value, bool):
         return int(value)
@@ -1340,14 +1986,78 @@ def _build_trace_steps(
         "classify",
         "completed",
         request.question,
-        "clinical_refuse" if clinical_boundary else "research_ok",
-        metadata={"source": request.source},
+        (
+            result.question_classification.intent
+            if result.question_classification is not None
+            else "clinical_refuse" if clinical_boundary else "research_ok"
+        ),
+        warnings=(
+            result.question_classification.warnings
+            if result.question_classification is not None
+            else []
+        ),
+        metadata={
+            "source": request.source,
+            "classification": (
+                result.question_classification.model_dump(mode="json")
+                if result.question_classification is not None
+                else None
+            ),
+        },
     )
     add(
         "plan",
-        "skipped" if clinical_boundary else "completed",
-        "answer_with_audit request",
-        "clinical boundary stopped retrieval" if clinical_boundary else "reused answer_with_evidence retrieval plan",
+        (
+            "skipped"
+            if clinical_boundary
+            else "completed" if result.query_plan is not None else "skipped"
+        ),
+        "structured planner" if result.query_plan is not None else "answer_with_audit request",
+        (
+            result.query_plan.primary_query
+            if result.query_plan is not None
+            else "clinical boundary stopped retrieval" if clinical_boundary else "reused answer_with_evidence retrieval plan"
+        ),
+        warnings=result.query_plan.warnings if result.query_plan is not None else [],
+        metadata={
+            "query_plan": (
+                result.query_plan.model_dump(mode="json")
+                if result.query_plan is not None
+                else None
+            ),
+            "support_query_count": (
+                len(result.query_plan.support_queries) if result.query_plan else 0
+            ),
+            "refute_query_count": (
+                len(result.query_plan.refute_queries) if result.query_plan else 0
+            ),
+        },
+    )
+    add(
+        "validate_plan",
+        (
+            "completed"
+            if result.query_plan_validation is not None
+            else "skipped"
+        ),
+        result.query_plan.primary_query if result.query_plan is not None else "",
+        (
+            result.query_plan_validation.status
+            if result.query_plan_validation is not None
+            else "no structured planner requested"
+        ),
+        warnings=(
+            result.query_plan_validation.warnings
+            if result.query_plan_validation is not None
+            else []
+        ),
+        metadata={
+            "validation": (
+                result.query_plan_validation.model_dump(mode="json")
+                if result.query_plan_validation is not None
+                else None
+            ),
+        },
     )
     add(
         "retrieve",
@@ -1487,6 +2197,14 @@ def _llm_unavailable_reason(provider: object | None, model: str) -> str:
     if not model:
         return "LLM revision was requested, but no revision model is configured."
     return "LLM revision was requested, but the LLM revision adapter fell back to deterministic revision."
+
+
+def _llm_planner_unavailable_reason(provider: object | None, model: str) -> str:
+    if provider is None:
+        return "LLM planner was requested, but no framework provider is configured for this service instance."
+    if not model:
+        return "LLM planner was requested, but no planner model is configured."
+    return "LLM planner was requested, but the planner adapter fell back to deterministic planning."
 
 
 def _matching_failed_claim(

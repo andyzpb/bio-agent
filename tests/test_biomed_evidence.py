@@ -15,6 +15,7 @@ from plugins.biomed_evidence.literature_client import (
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     EvidenceExtractionRequest,
+    PlanBiomedicalSearchRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
 )
@@ -78,6 +79,51 @@ async def test_patient_specific_dose_question_is_refused(tmp_path: Path) -> None
     assert not result.citations
     assert "recommend treatment" in result.answer.lower()
     assert result.uncertainty_level == "high"
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_builds_valid_retrieval_plan(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                source="mock",
+                max_results=5,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.classification.intent == "research_question"
+    assert result.query_plan is not None
+    assert result.query_plan.primary_query
+    assert result.query_plan.support_queries
+    assert result.query_plan.refute_queries
+    assert result.validation.valid is True
+    assert result.search_request is not None
+    assert result.search_request.source == "mock"
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_refuses_clinical_query_before_retrieval(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What dose should my mother take for Alzheimer disease?",
+                source="mock",
+                max_results=5,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.classification.intent == "clinical_or_patient_specific"
+    assert result.classification.clinical_boundary is True
+    assert result.query_plan is None
+    assert result.validation.valid is False
+    assert result.search_request is None
 
 
 @pytest.mark.asyncio
@@ -178,6 +224,77 @@ class _FakePubMedResponse:
 
     def raise_for_status(self) -> None:
         return None
+
+
+class _FakePlannerResponse:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _FakePlannerProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        return _FakePlannerResponse(
+            json.dumps(
+                {
+                    "classification": {
+                        "intent": "research_question",
+                        "normalized_question": payload["question"],
+                        "clinical_boundary": False,
+                        "needs_clarification": False,
+                        "risk_flags": [],
+                        "allowed_next_step": "plan_retrieval",
+                        "rationale": "fake planner classification",
+                    },
+                    "query_plan": {
+                        "primary_query": "microglial activation Alzheimer disease progression",
+                        "mesh_terms": ["Alzheimer Disease", "Microglia"],
+                        "include_terms": ["neuroinflammation"],
+                        "exclude_terms": ["dosage"],
+                        "study_types": ["longitudinal"],
+                        "species_terms": [],
+                        "support_queries": ["microglial activation Alzheimer disease progression association"],
+                        "refute_queries": ["microglial activation Alzheimer disease progression negative results"],
+                        "max_results": 5,
+                        "rationale": "fake planner query plan",
+                    },
+                }
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_can_use_injected_llm_planner(tmp_path: Path) -> None:
+    provider = _FakePlannerProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-light-router",
+    )
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                source="mock",
+                max_results=5,
+                use_llm_planner=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert result.classification.classifier_mode == "llm"
+    assert result.query_plan is not None
+    assert result.query_plan.planner_mode == "llm"
+    assert result.query_plan.llm_model == "fake-light-router"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+    assert "microglial activation" in result.search_request.query
 
 
 class _FakePubMedClient:
@@ -347,6 +464,7 @@ async def test_biomed_plugin_registers_tools(tmp_path: Path) -> None:
     try:
         await manager.load_all()
         assert tools.has_tool("search_biomedical_literature")
+        assert tools.has_tool("plan_biomedical_search")
         assert tools.has_tool("answer_with_evidence")
         assert tools.has_tool("answer_with_audit")
         assert tools.has_tool("validate_citation_support")

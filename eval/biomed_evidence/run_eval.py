@@ -61,6 +61,12 @@ async def _run(args: argparse.Namespace) -> dict:
     overclaim_revision_checks: list[bool] = []
     unsupported_revision_checks: list[bool] = []
     clinical_revision_checks: list[bool] = []
+    router_schema_checks: list[bool] = []
+    clinical_router_checks: list[bool] = []
+    planner_schema_checks: list[bool] = []
+    query_plan_checks: list[bool] = []
+    support_refute_checks: list[bool] = []
+    plan_trace_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -68,12 +74,38 @@ async def _run(args: argparse.Namespace) -> dict:
                     question=case["question"],
                     source=args.source,
                     max_papers=args.max_papers,
+                    use_llm_planner=True,
                 )
             )
             result = audited.answer_result
             audit = audited.audit
             revision = audited.revision
             trace_completeness_checks.append(_trace_complete(audited.trace))
+            plan_trace_checks.append(_plan_trace_complete(audited.trace))
+            router_schema_checks.append(result.question_classification is not None)
+            planner_schema_checks.append(
+                bool(case.get("expected_refusal")) or result.query_plan is not None
+            )
+            query_plan_checks.append(
+                bool(case.get("expected_refusal"))
+                or bool(result.query_plan_validation and result.query_plan_validation.valid)
+            )
+            support_refute_checks.append(
+                bool(case.get("expected_refusal"))
+                or bool(
+                    result.query_plan
+                    and result.query_plan.support_queries
+                    and result.query_plan.refute_queries
+                )
+            )
+            if case.get("expected_refusal"):
+                clinical_router_checks.append(
+                    bool(
+                        result.question_classification
+                        and result.question_classification.clinical_boundary
+                        and result.question_classification.allowed_next_step == "refuse"
+                    )
+                )
             revision_success_checks.append(_revision_success(audited, bool(case.get("expected_refusal"))))
             overclaim_claims = [
                 item for item in audit.failed_claims if item.verdict == "overclaimed"
@@ -133,6 +165,12 @@ async def _run(args: argparse.Namespace) -> dict:
                     "revision_id": revision.revision_id,
                     "final_action": audited.final_action,
                     "trace_steps": len(audited.trace),
+                    "planner_mode": result.query_plan.planner_mode if result.query_plan else None,
+                    "planner_valid": (
+                        result.query_plan_validation.valid
+                        if result.query_plan_validation is not None
+                        else None
+                    ),
                 }
             )
 
@@ -201,6 +239,14 @@ async def _run(args: argparse.Namespace) -> dict:
             "clinical_refusal_revision_success_rate": (
                 rate(clinical_revision_checks) if clinical_revision_checks else 1.0
             ),
+            "router_schema_validity": rate(router_schema_checks),
+            "clinical_router_accuracy": (
+                rate(clinical_router_checks) if clinical_router_checks else 1.0
+            ),
+            "planner_schema_validity": rate(planner_schema_checks),
+            "query_plan_validity": rate(query_plan_checks),
+            "support_refute_query_presence": rate(support_refute_checks),
+            "plan_trace_completeness": rate(plan_trace_checks),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -242,6 +288,7 @@ def _trace_complete(trace: list[object]) -> bool:
     expected = {
         "classify",
         "plan",
+        "validate_plan",
         "retrieve",
         "extract",
         "draft",
@@ -254,6 +301,12 @@ def _trace_complete(trace: list[object]) -> bool:
         str(getattr(item, "step", ""))
         for item in trace
     }
+    return expected <= observed
+
+
+def _plan_trace_complete(trace: list[object]) -> bool:
+    expected = {"classify", "plan", "validate_plan"}
+    observed = {str(getattr(item, "step", "")) for item in trace}
     return expected <= observed
 
 

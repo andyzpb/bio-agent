@@ -949,6 +949,17 @@ def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
         assert search.status_code == 200
         assert search.json()["items"]
 
+        plan = client.post(
+            "/api/biomed/plan",
+            json={
+                "question": "What evidence links microglia to Alzheimer's disease?",
+                "source": "mock",
+                "max_results": 5,
+            },
+        )
+        assert plan.status_code == 200
+        assert plan.json()["validation"]["valid"] is True
+
         answer = client.post(
             "/api/biomed/answer",
             json={
@@ -970,7 +981,7 @@ def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
         )
         assert audited.status_code == 200
         assert audited.json()["trace"]
-        assert len(audited.json()["trace"]) == 9
+        assert len(audited.json()["trace"]) == 10
 
         graph = client.get("/api/biomed/graph", params={"topic": "microglia"})
         assert graph.status_code == 200
