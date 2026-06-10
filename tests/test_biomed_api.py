@@ -127,6 +127,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
                 "source": "mock",
                 "max_papers": 5,
                 "use_llm_planner": True,
+                "execute_support_refute": True,
             },
         )
         assert audited.status_code == 200
@@ -135,6 +136,8 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert audited_payload["audit"]["audit_id"]
         assert audited_payload["revision"]["revision_id"]
         assert audited_payload["final_action"] in {"pass", "revise", "refuse", "abstain"}
+        assert audited_payload["answer_result"]["retrieval_bundle"]["executed_multi_query"] is True
+        assert len(audited_payload["answer_result"]["retrieval_bundle"]["records"]) >= 3
         assert len(audited_payload["trace"]) == 10
 
         trace = client.get(f"/api/biomed/answer-runs/{audited_run_id}/trace")
@@ -154,6 +157,8 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
             "post_audit",
             "finalize",
         }
+        retrieve_step = next(step for step in trace_payload["trace"] if step["step"] == "retrieve")
+        assert retrieve_step["metadata"]["retrieval_bundle"]["executed_multi_query"] is True
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:

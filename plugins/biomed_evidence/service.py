@@ -54,6 +54,9 @@ from plugins.biomed_evidence.schemas import (
     PlanBiomedicalSearchRequest,
     PlanBiomedicalSearchResult,
     QueryPlanValidation,
+    RetrievalBundle,
+    RetrievalBundleRecord,
+    RetrievalIntent,
     RetrievalManifest,
     SearchBiomedicalLiteratureRequest,
     SearchBiomedicalLiteratureResult,
@@ -200,12 +203,22 @@ class BiomedEvidenceService:
         request: EvidenceExtractionRequest,
         *,
         retrieval_id: str | None = None,
+        retrieval_intent: RetrievalIntent = "unknown",
     ) -> EvidenceExtractionResult:
         self.storage.upsert_paper(request.paper)
         result = self.extractor.extract(
             request.paper,
             research_question=request.research_question,
         )
+        if result.evidence:
+            result = result.model_copy(
+                update={
+                    "evidence": [
+                        item.model_copy(update={"retrieval_intent": retrieval_intent})
+                        for item in result.evidence
+                    ]
+                }
+            )
         for item in result.evidence:
             self.storage.upsert_evidence(
                 item,
@@ -421,9 +434,18 @@ class BiomedEvidenceService:
                 source=request.source,
             )
         )
-        search_result = await self.search_with_manifest(search_request)
-        metadata = search_result.items
-        retrieval_manifest = search_result.retrieval_manifest
+        (
+            metadata,
+            retrieval_manifest,
+            retrieval_bundle,
+            paper_intents,
+            paper_retrieval_ids,
+        ) = await self._retrieve_answer_papers(
+            request=request,
+            planning_result=planning_result,
+            search_request=search_request,
+            run_id=run_id,
+        )
         evidence: list[EvidenceItem] = []
         papers: dict[str, BiomedicalPaper] = {}
         for item in metadata:
@@ -438,7 +460,11 @@ class BiomedEvidenceService:
                     paper=paper,
                     research_question=request.question,
                 ),
-                retrieval_id=retrieval_manifest.retrieval_id,
+                retrieval_id=paper_retrieval_ids.get(
+                    item.paper_id,
+                    retrieval_manifest.retrieval_id,
+                ),
+                retrieval_intent=paper_intents.get(item.paper_id, "unknown"),
             )
             evidence.extend(extracted.evidence)
 
@@ -480,6 +506,7 @@ class BiomedEvidenceService:
             run_id=run_id,
             retrieval_id=retrieval_manifest.retrieval_id,
             retrieval_manifest=retrieval_manifest,
+            retrieval_bundle=retrieval_bundle,
             answer=answer,
             citations=citations,
             evidence_summary=evidence,
@@ -500,6 +527,103 @@ class BiomedEvidenceService:
         )
         self.storage.save_answer_run(result, question=request.question)
         return result
+
+    async def _retrieve_answer_papers(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        planning_result: PlanBiomedicalSearchResult | None,
+        search_request: SearchBiomedicalLiteratureRequest,
+        run_id: str,
+    ) -> tuple[
+        list[PaperMetadata],
+        RetrievalManifest,
+        RetrievalBundle | None,
+        dict[str, RetrievalIntent],
+        dict[str, str],
+    ]:
+        if (
+            not request.execute_support_refute
+            or planning_result is None
+            or planning_result.query_plan is None
+        ):
+            search_result = await self.search_with_manifest(search_request)
+            intent: RetrievalIntent = (
+                "primary" if planning_result is not None and planning_result.query_plan else "unknown"
+            )
+            return (
+                search_result.items,
+                search_result.retrieval_manifest,
+                None,
+                {item.paper_id: intent for item in search_result.items},
+                {
+                    item.paper_id: search_result.retrieval_manifest.retrieval_id
+                    for item in search_result.items
+                },
+            )
+
+        specs, bundle_warnings = _planned_retrieval_specs(
+            base_request=search_request,
+            query_plan=planning_result.query_plan,
+        )
+        records: list[RetrievalBundleRecord] = []
+        unique_items: list[PaperMetadata] = []
+        seen_paper_ids: set[str] = set()
+        duplicate_paper_ids: list[str] = []
+        paper_intents: dict[str, RetrievalIntent] = {}
+        paper_retrieval_ids: dict[str, str] = {}
+        primary_manifest: RetrievalManifest | None = None
+        for intent, retrieval_request in specs:
+            search_result = await self.search_with_manifest(retrieval_request)
+            manifest = search_result.retrieval_manifest
+            if primary_manifest is None:
+                primary_manifest = manifest
+            returned_ids = [item.paper_id for item in search_result.items]
+            records.append(
+                RetrievalBundleRecord(
+                    intent=intent,
+                    query=retrieval_request.query,
+                    retrieval_id=manifest.retrieval_id,
+                    manifest=manifest,
+                    returned_paper_ids=returned_ids,
+                    warnings=manifest.warnings,
+                    errors=manifest.errors,
+                )
+            )
+            for item in search_result.items:
+                if item.paper_id in seen_paper_ids:
+                    duplicate_paper_ids.append(item.paper_id)
+                    continue
+                seen_paper_ids.add(item.paper_id)
+                unique_items.append(item)
+                paper_intents[item.paper_id] = intent
+                paper_retrieval_ids[item.paper_id] = manifest.retrieval_id
+
+        if primary_manifest is None:
+            primary_result = await self.search_with_manifest(search_request)
+            primary_manifest = primary_result.retrieval_manifest
+            unique_items = primary_result.items
+            paper_intents = {item.paper_id: "primary" for item in primary_result.items}
+            paper_retrieval_ids = {
+                item.paper_id: primary_manifest.retrieval_id for item in primary_result.items
+            }
+
+        bundle = RetrievalBundle(
+            bundle_id=f"{run_id}-retrieval-bundle",
+            source=search_request.source,
+            executed_multi_query=len(records) > 1,
+            records=records,
+            deduped_paper_ids=[item.paper_id for item in unique_items],
+            duplicate_paper_ids=duplicate_paper_ids,
+            warnings=bundle_warnings,
+        )
+        return (
+            unique_items,
+            primary_manifest,
+            bundle,
+            paper_intents,
+            paper_retrieval_ids,
+        )
 
     async def answer_with_audit(
         self,
@@ -1409,6 +1533,52 @@ def _validate_query_plan(
     )
 
 
+def _planned_retrieval_specs(
+    *,
+    base_request: SearchBiomedicalLiteratureRequest,
+    query_plan: BiomedicalQueryPlan,
+) -> tuple[list[tuple[RetrievalIntent, SearchBiomedicalLiteratureRequest]], list[str]]:
+    specs: list[tuple[RetrievalIntent, SearchBiomedicalLiteratureRequest]] = []
+    warnings: list[str] = []
+    seen_queries: set[str] = set()
+    max_results = max(1, min(base_request.max_results, query_plan.max_results, 20))
+
+    def add(intent: RetrievalIntent, query: str) -> None:
+        compiled = re.sub(r"\s+", " ", query).strip()
+        if not compiled:
+            warnings.append(f"Skipped empty {intent} query.")
+            return
+        if len(compiled) > 300:
+            warnings.append(f"Truncated overlong {intent} query to 300 characters.")
+            compiled = compiled[:300].rstrip()
+        key = compiled.lower()
+        if key in seen_queries:
+            warnings.append(f"Skipped duplicate {intent} query: {compiled[:120]}")
+            return
+        seen_queries.add(key)
+        specs.append(
+            (
+                intent,
+                base_request.model_copy(
+                    update={"query": compiled, "max_results": max_results}
+                ),
+            )
+        )
+
+    add("primary", base_request.query or query_plan.primary_query)
+    support_queries = _clean_list(query_plan.support_queries)
+    refute_queries = _clean_list(query_plan.refute_queries)
+    if len(support_queries) > 2:
+        warnings.append("Support queries were capped at 2 for V1.6 retrieval.")
+    if len(refute_queries) > 2:
+        warnings.append("Refute queries were capped at 2 for V1.6 retrieval.")
+    for query in support_queries[:2]:
+        add("support", query)
+    for query in refute_queries[:2]:
+        add("refute", query)
+    return specs, warnings
+
+
 def _llm_planner_payload(
     *,
     request: PlanBiomedicalSearchRequest,
@@ -1949,6 +2119,38 @@ def _build_answer_revision(
     )
 
 
+def _retrieval_bundle_trace(bundle: RetrievalBundle | None) -> dict[str, object] | None:
+    if bundle is None:
+        return None
+    return {
+        "bundle_id": bundle.bundle_id,
+        "source": bundle.source,
+        "executed_multi_query": bundle.executed_multi_query,
+        "deduped_paper_ids": bundle.deduped_paper_ids,
+        "duplicate_paper_ids": bundle.duplicate_paper_ids,
+        "warnings": bundle.warnings,
+        "records": [
+            {
+                "intent": record.intent,
+                "query": record.query,
+                "retrieval_id": record.retrieval_id,
+                "returned_paper_ids": record.returned_paper_ids,
+                "warnings": record.warnings,
+                "errors": record.errors,
+                "skipped_reason": record.skipped_reason,
+            }
+            for record in bundle.records
+        ],
+    }
+
+
+def _evidence_intent_counts(evidence: list[EvidenceItem]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in evidence:
+        counts[item.retrieval_intent] = counts.get(item.retrieval_intent, 0) + 1
+    return counts
+
+
 def _build_trace_steps(
     *,
     request: AnswerWithEvidenceRequest,
@@ -2064,7 +2266,10 @@ def _build_trace_steps(
         "skipped" if clinical_boundary else "completed",
         request.question,
         result.retrieval_id or "no retrieval",
-        warnings=result.retrieval_manifest.warnings if result.retrieval_manifest else [],
+        warnings=_merge_unique(
+            result.retrieval_manifest.warnings if result.retrieval_manifest else [],
+            result.retrieval_bundle.warnings if result.retrieval_bundle else [],
+        ),
         metadata={
             "retrieval_id": result.retrieval_id,
             "papers": (
@@ -2072,6 +2277,7 @@ def _build_trace_steps(
                 if result.retrieval_manifest is not None
                 else []
             ),
+            "retrieval_bundle": _retrieval_bundle_trace(result.retrieval_bundle),
         },
     )
     add(
@@ -2079,6 +2285,9 @@ def _build_trace_steps(
         "skipped" if clinical_boundary else "completed",
         "retrieved papers",
         f"{len(result.evidence_summary)} evidence items",
+        metadata={
+            "evidence_intent_counts": _evidence_intent_counts(result.evidence_summary),
+        },
     )
     add(
         "draft",

@@ -67,6 +67,10 @@ async def _run(args: argparse.Namespace) -> dict:
     query_plan_checks: list[bool] = []
     support_refute_checks: list[bool] = []
     plan_trace_checks: list[bool] = []
+    retrieval_bundle_checks: list[bool] = []
+    support_refute_execution_checks: list[bool] = []
+    evidence_intent_checks: list[bool] = []
+    retrieval_bundle_trace_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -75,6 +79,7 @@ async def _run(args: argparse.Namespace) -> dict:
                     source=args.source,
                     max_papers=args.max_papers,
                     use_llm_planner=True,
+                    execute_support_refute=True,
                 )
             )
             result = audited.answer_result
@@ -133,6 +138,12 @@ async def _run(args: argparse.Namespace) -> dict:
                 clinical_revision_checks.append(audited.final_action == "refuse")
             if not case.get("expected_refusal"):
                 manifest_checks.append(_manifest_valid(result.retrieval_manifest))
+                retrieval_bundle_checks.append(_retrieval_bundle_valid(result.retrieval_bundle))
+                support_refute_execution_checks.append(
+                    _support_refute_executed(result.retrieval_bundle)
+                )
+                evidence_intent_checks.append(_evidence_intents_labeled(result.evidence_summary))
+                retrieval_bundle_trace_checks.append(_retrieval_bundle_trace_complete(audited.trace))
                 claim_support_rates.append(audit.claim_support_rate)
                 citation_precision_rates.append(audit.citation_precision)
                 unsupported_claim_rates.append(audit.unsupported_claim_rate)
@@ -170,6 +181,16 @@ async def _run(args: argparse.Namespace) -> dict:
                         result.query_plan_validation.valid
                         if result.query_plan_validation is not None
                         else None
+                    ),
+                    "retrieval_bundle_id": (
+                        result.retrieval_bundle.bundle_id
+                        if result.retrieval_bundle is not None
+                        else None
+                    ),
+                    "retrieval_records": (
+                        len(result.retrieval_bundle.records)
+                        if result.retrieval_bundle is not None
+                        else 0
                     ),
                 }
             )
@@ -247,6 +268,10 @@ async def _run(args: argparse.Namespace) -> dict:
             "query_plan_validity": rate(query_plan_checks),
             "support_refute_query_presence": rate(support_refute_checks),
             "plan_trace_completeness": rate(plan_trace_checks),
+            "multi_query_bundle_validity": rate(retrieval_bundle_checks),
+            "support_refute_execution_rate": rate(support_refute_execution_checks),
+            "evidence_intent_label_rate": rate(evidence_intent_checks),
+            "retrieval_bundle_trace_completeness": rate(retrieval_bundle_trace_checks),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -308,6 +333,47 @@ def _plan_trace_complete(trace: list[object]) -> bool:
     expected = {"classify", "plan", "validate_plan"}
     observed = {str(getattr(item, "step", "")) for item in trace}
     return expected <= observed
+
+
+def _retrieval_bundle_valid(bundle: object) -> bool:
+    if bundle is None:
+        return False
+    records = getattr(bundle, "records", [])
+    deduped = getattr(bundle, "deduped_paper_ids", [])
+    if not isinstance(records, list) or not isinstance(deduped, list):
+        return False
+    if not records or not deduped:
+        return False
+    return all(_manifest_valid(getattr(record, "manifest", None)) for record in records)
+
+
+def _support_refute_executed(bundle: object) -> bool:
+    if bundle is None:
+        return False
+    intents = {str(getattr(record, "intent", "")) for record in getattr(bundle, "records", [])}
+    return {"primary", "support", "refute"} <= intents
+
+
+def _evidence_intents_labeled(evidence: list[object]) -> bool:
+    if not evidence:
+        return False
+    valid = {"primary", "support", "refute"}
+    return all(str(getattr(item, "retrieval_intent", "")) in valid for item in evidence)
+
+
+def _retrieval_bundle_trace_complete(trace: list[object]) -> bool:
+    for item in trace:
+        if str(getattr(item, "step", "")) != "retrieve":
+            continue
+        metadata = getattr(item, "metadata", {})
+        if not isinstance(metadata, dict):
+            return False
+        bundle = metadata.get("retrieval_bundle")
+        if not isinstance(bundle, dict):
+            return False
+        records = bundle.get("records")
+        return isinstance(records, list) and len(records) >= 3
+    return False
 
 
 def _revision_success(audited: object, expected_refusal: bool) -> bool:

@@ -977,10 +977,13 @@ def test_biomed_dashboard_api_smoke_path(tmp_path) -> None:
                 "question": "What evidence links microglia to Alzheimer's disease?",
                 "source": "mock",
                 "max_papers": 5,
+                "use_llm_planner": True,
+                "execute_support_refute": True,
             },
         )
         assert audited.status_code == 200
         assert audited.json()["trace"]
+        assert audited.json()["answer_result"]["retrieval_bundle"]["executed_multi_query"] is True
         assert len(audited.json()["trace"]) == 10
 
         graph = client.get("/api/biomed/graph", params={"topic": "microglia"})

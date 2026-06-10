@@ -127,6 +127,40 @@ async def test_plan_biomedical_search_refuses_clinical_query_before_retrieval(tm
 
 
 @pytest.mark.asyncio
+async def test_answer_with_planner_executes_support_refute_bundle(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                source="mock",
+                max_papers=5,
+                use_llm_planner=True,
+                execute_support_refute=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.retrieval_bundle is not None
+    assert result.retrieval_bundle.executed_multi_query is True
+    intents = {record.intent for record in result.retrieval_bundle.records}
+    assert {"primary", "support", "refute"} <= intents
+    assert result.retrieval_manifest is not None
+    assert result.retrieval_bundle.records[0].retrieval_id == result.retrieval_manifest.retrieval_id
+    assert len(result.retrieval_bundle.deduped_paper_ids) == len(
+        set(result.retrieval_bundle.deduped_paper_ids)
+    )
+    assert result.retrieval_bundle.duplicate_paper_ids
+    assert result.evidence_summary
+    assert {item.retrieval_intent for item in result.evidence_summary} <= {
+        "primary",
+        "support",
+        "refute",
+    }
+
+
+@pytest.mark.asyncio
 async def test_mock_search_fetch_extract_and_storage_idempotency(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:

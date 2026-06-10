@@ -6,6 +6,7 @@ interface EvidenceRow {
   evidence_id: string;
   paper_id: string;
   retrieval_id?: string | null;
+  retrieval_intent?: string;
   paper_title?: string;
   claim: string;
   finding: string;
@@ -33,10 +34,31 @@ interface RetrievalManifest {
   errors: string[];
 }
 
+interface RetrievalBundleRecord {
+  intent: string;
+  query: string;
+  retrieval_id?: string | null;
+  returned_paper_ids: string[];
+  warnings: string[];
+  errors: string[];
+  skipped_reason?: string | null;
+}
+
+interface RetrievalBundle {
+  bundle_id: string;
+  source: string;
+  executed_multi_query: boolean;
+  records: RetrievalBundleRecord[];
+  deduped_paper_ids: string[];
+  duplicate_paper_ids: string[];
+  warnings: string[];
+}
+
 interface AnswerResult {
   run_id: string;
   retrieval_id?: string | null;
   retrieval_manifest?: RetrievalManifest | null;
+  retrieval_bundle?: RetrievalBundle | null;
   answer: string;
   citations: { paper_id: string; title: string; doi?: string | null; url?: string | null; cited_claim: string }[];
   evidence_summary: EvidenceRow[];
@@ -184,10 +206,39 @@ function renderEvidenceItem(item: EvidenceRow): string {
       <div class="biomed-evidence-head">
         ${pill(item.evidence_direction)}
         ${pill(item.confidence)}
+        ${item.retrieval_intent ? pill(item.retrieval_intent) : ""}
         <code>${escapeHtml(item.paper_id)}</code>
       </div>
       <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
       <div class="biomed-evidence-finding">${escapeHtml(item.finding)}</div>
+    </div>
+  `;
+}
+
+function renderRetrievalBundle(bundle: RetrievalBundle | null | undefined): string {
+  if (!bundle) return '<div class="biomed-muted">No retrieval bundle recorded.</div>';
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Bundle</span><code>${escapeHtml(bundle.bundle_id)}</code></div>
+        <div><span>Source</span><strong>${escapeHtml(bundle.source)}</strong></div>
+        <div><span>Mode</span><strong>${bundle.executed_multi_query ? "multi-query" : "single-query"}</strong></div>
+        <div><span>Papers</span><strong>${bundle.deduped_paper_ids.length}</strong></div>
+      </div>
+      ${bundle.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(bundle.warnings)}` : ""}
+      <div class="biomed-label">Retrieval Records</div>
+      ${bundle.records.map((record) => `
+        <div class="biomed-evidence-item">
+          <div class="biomed-evidence-head">
+            ${pill(record.intent)}
+            ${record.retrieval_id ? `<code>${escapeHtml(record.retrieval_id)}</code>` : ""}
+          </div>
+          <code class="biomed-query">${escapeHtml(record.query)}</code>
+          ${record.returned_paper_ids.length ? renderList(record.returned_paper_ids) : '<div class="biomed-muted">No papers returned.</div>'}
+          ${record.skipped_reason ? `<div class="biomed-muted">${escapeHtml(record.skipped_reason)}</div>` : ""}
+        </div>
+      `).join("")}
+      ${bundle.duplicate_paper_ids.length ? `<div class="biomed-label">Duplicates</div>${renderList(bundle.duplicate_paper_ids)}` : ""}
     </div>
   `;
 }
@@ -361,6 +412,8 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
     </div>
     <div class="biomed-label">Retrieval Provenance</div>
     ${renderManifest(result.answer_result.retrieval_manifest)}
+    <div class="biomed-label">Retrieval Bundle</div>
+    ${renderRetrievalBundle(result.answer_result.retrieval_bundle)}
     <div class="biomed-label">Final Answer</div>
     <div class="biomed-answer">${renderMarkdown(result.final_answer)}</div>
     <div class="biomed-label">Audit</div>
@@ -410,6 +463,7 @@ function renderAsk(container: HTMLElement): void {
           </select>
           <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
           <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
+          <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
           <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
@@ -426,11 +480,18 @@ function renderAsk(container: HTMLElement): void {
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
     const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
+    const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
     try {
       const result = await api<AnswerResult>("/api/biomed/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, source, max_papers: maxPapers, use_llm_planner: usePlanner }),
+        body: JSON.stringify({
+          question,
+          source,
+          max_papers: maxPapers,
+          use_llm_planner: usePlanner,
+          execute_support_refute: executeSupportRefute,
+        }),
       });
       resultNode.innerHTML = `
         <div class="biomed-answer-meta">
@@ -440,6 +501,8 @@ function renderAsk(container: HTMLElement): void {
         </div>
         <div class="biomed-label">Retrieval Provenance</div>
         ${renderManifest(result.retrieval_manifest)}
+        <div class="biomed-label">Retrieval Bundle</div>
+        ${renderRetrievalBundle(result.retrieval_bundle)}
         <div class="biomed-answer">${renderMarkdown(result.answer)}</div>
         <div class="biomed-label">Citations</div>
         ${renderList(result.citations.map((citation) => `${citation.title} | ${citation.paper_id}${citation.doi ? ` | doi:${citation.doi}` : ""}`))}
@@ -478,6 +541,7 @@ function renderAsk(container: HTMLElement): void {
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
     const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
+    const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
     const useRevision = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked);
     try {
       const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
@@ -488,6 +552,7 @@ function renderAsk(container: HTMLElement): void {
           source,
           max_papers: maxPapers,
           use_llm_planner: usePlanner,
+          execute_support_refute: executeSupportRefute,
           use_llm_revision: useRevision,
         }),
       });

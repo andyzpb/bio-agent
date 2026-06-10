@@ -138,9 +138,9 @@ class BiomedStorage:
                 INSERT INTO biomed_evidence(
                     evidence_id, paper_id, source, claim_hash, claim, finding,
                     evidence_direction, methods_json, datasets_json, limitations_json,
-                    confidence, evidence_span, requires_expert_review, retrieval_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, evidence_span, retrieval_intent,
+                    requires_expert_review, retrieval_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(paper_id, claim_hash) DO UPDATE SET
                     source=excluded.source,
                     claim=excluded.claim,
@@ -151,6 +151,7 @@ class BiomedStorage:
                     limitations_json=excluded.limitations_json,
                     confidence=excluded.confidence,
                     evidence_span=excluded.evidence_span,
+                    retrieval_intent=excluded.retrieval_intent,
                     requires_expert_review=excluded.requires_expert_review,
                     retrieval_id=COALESCE(excluded.retrieval_id, biomed_evidence.retrieval_id),
                     updated_at=excluded.updated_at
@@ -168,6 +169,7 @@ class BiomedStorage:
                     _json(item.limitations),
                     item.confidence,
                     item.evidence_span,
+                    item.retrieval_intent,
                     1 if item.requires_expert_review else 0,
                     retrieval_id,
                     now,
@@ -853,6 +855,9 @@ class BiomedStorage:
             limitations=_json_list(row["limitations_json"]),
             confidence=row["confidence"],
             evidence_span=row["evidence_span"],
+            retrieval_intent=(
+                row["retrieval_intent"] if "retrieval_intent" in row.keys() else "unknown"
+            ),
             requires_expert_review=bool(row["requires_expert_review"]),
         )
 
@@ -982,6 +987,7 @@ class BiomedStorage:
                 limitations_json TEXT NOT NULL DEFAULT '[]',
                 confidence TEXT NOT NULL,
                 evidence_span TEXT,
+                retrieval_intent TEXT NOT NULL DEFAULT 'unknown',
                 requires_expert_review INTEGER NOT NULL DEFAULT 1,
                 retrieval_id TEXT,
                 created_at TEXT NOT NULL,
@@ -1129,6 +1135,7 @@ class BiomedStorage:
             """
         )
         self._ensure_column("biomed_evidence", "retrieval_id", "TEXT")
+        self._ensure_column("biomed_evidence", "retrieval_intent", "TEXT NOT NULL DEFAULT 'unknown'")
         self._ensure_column("biomed_watch_decisions", "retrieval_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "snapshot_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "dedupe_reason", "TEXT")

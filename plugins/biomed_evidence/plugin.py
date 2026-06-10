@@ -170,6 +170,7 @@ class BiomedEvidencePlugin(Plugin):
         require_citations: bool = True,
         source: Literal["pubmed", "mock"] = "mock",
         use_llm_planner: bool = False,
+        execute_support_refute: bool = False,
     ) -> str:
         """Answer a biomedical research question with citations and uncertainty.
 
@@ -180,6 +181,7 @@ class BiomedEvidencePlugin(Plugin):
             require_citations: Whether to avoid strong claims without citations.
             source: Literature source.
             use_llm_planner: Request framework-governed retrieval planning when configured.
+            execute_support_refute: Execute planner support/refute queries and bundle manifests.
         """
         result = await self._service.answer_with_evidence(
             AnswerWithEvidenceRequest(
@@ -189,6 +191,7 @@ class BiomedEvidencePlugin(Plugin):
                 require_citations=require_citations,
                 source=source,
                 use_llm_planner=use_llm_planner,
+                execute_support_refute=execute_support_refute,
                 use_llm_revision=False,
             )
         )
@@ -209,6 +212,7 @@ class BiomedEvidencePlugin(Plugin):
         source: Literal["pubmed", "mock"] = "mock",
         use_llm_revision: bool = False,
         use_llm_planner: bool = False,
+        execute_support_refute: bool = False,
     ) -> str:
         """Answer a biomedical research question, audit claims, revise, and return trace.
 
@@ -220,6 +224,7 @@ class BiomedEvidencePlugin(Plugin):
             source: Literature source.
             use_llm_revision: Request framework-governed LLM revision when configured.
             use_llm_planner: Request framework-governed retrieval planning when configured.
+            execute_support_refute: Execute planner support/refute queries and bundle manifests.
         """
         result = await self._service.answer_with_audit(
             AnswerWithEvidenceRequest(
@@ -230,6 +235,7 @@ class BiomedEvidencePlugin(Plugin):
                 source=source,
                 use_llm_revision=use_llm_revision,
                 use_llm_planner=use_llm_planner,
+                execute_support_refute=execute_support_refute,
             )
         )
         return _dump(result.model_dump(mode="json"))

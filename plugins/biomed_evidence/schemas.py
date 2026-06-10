@@ -78,6 +78,7 @@ TraceStepStatus = Literal["started", "completed", "skipped", "failed"]
 RevisionAction = Literal["pass", "revise", "refuse", "abstain"]
 RevisionMode = Literal["deterministic", "llm", "fallback"]
 PlannerMode = Literal["deterministic", "llm", "fallback"]
+RetrievalIntent = Literal["primary", "support", "refute", "unknown"]
 QuestionIntent = Literal[
     "research_question",
     "clinical_or_patient_specific",
@@ -140,6 +141,7 @@ class EvidenceItem(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     confidence: ConfidenceLevel
     evidence_span: str | None = None
+    retrieval_intent: RetrievalIntent = "unknown"
     requires_expert_review: bool = True
 
 
@@ -239,6 +241,31 @@ class SearchBiomedicalLiteratureResult(BaseModel):
 
     items: list[PaperMetadata] = Field(default_factory=list)
     retrieval_manifest: RetrievalManifest
+
+
+class RetrievalBundleRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: RetrievalIntent
+    query: str
+    retrieval_id: str | None = None
+    manifest: RetrievalManifest | None = None
+    returned_paper_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    skipped_reason: str | None = None
+
+
+class RetrievalBundle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bundle_id: str
+    source: Literal["pubmed", "mock"]
+    executed_multi_query: bool = False
+    records: list[RetrievalBundleRecord] = Field(default_factory=list)
+    deduped_paper_ids: list[str] = Field(default_factory=list)
+    duplicate_paper_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class WatchSnapshot(BaseModel):
@@ -358,6 +385,7 @@ class AnswerWithEvidenceRequest(BaseModel):
     source: Literal["pubmed", "mock"] = "mock"
     use_llm_revision: bool = False
     use_llm_planner: bool = False
+    execute_support_refute: bool = False
 
 
 class AnswerWithEvidenceResult(BaseModel):
@@ -366,6 +394,7 @@ class AnswerWithEvidenceResult(BaseModel):
     run_id: str
     retrieval_id: str | None = None
     retrieval_manifest: RetrievalManifest | None = None
+    retrieval_bundle: RetrievalBundle | None = None
     answer: str
     citations: list[Citation] = Field(default_factory=list)
     evidence_summary: list[EvidenceItem] = Field(default_factory=list)
