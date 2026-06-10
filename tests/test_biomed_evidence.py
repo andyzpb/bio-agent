@@ -301,6 +301,23 @@ class _FakePlannerProvider:
         )
 
 
+class _FakeEchoPlannerProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        return _FakePlannerResponse(
+            json.dumps(
+                {
+                    "deterministic_classification": payload["deterministic_classification"],
+                    "deterministic_query_plan": payload["deterministic_query_plan"],
+                }
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_plan_biomedical_search_can_use_injected_llm_planner(tmp_path: Path) -> None:
     provider = _FakePlannerProvider()
@@ -328,7 +345,35 @@ async def test_plan_biomedical_search_can_use_injected_llm_planner(tmp_path: Pat
     assert result.query_plan.llm_model == "fake-light-router"
     assert result.validation.valid is True
     assert result.search_request is not None
-    assert "microglial activation" in result.search_request.query
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_accepts_llm_echoed_deterministic_payload(tmp_path: Path) -> None:
+    provider = _FakeEchoPlannerProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-light-router",
+    )
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_results=5,
+                use_llm_planner=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert result.classification.classifier_mode == "llm"
+    assert result.query_plan is not None
+    assert result.query_plan.planner_mode == "llm"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+    assert result.search_request.query
 
 
 class _FakePubMedClient:

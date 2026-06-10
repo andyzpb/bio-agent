@@ -327,8 +327,14 @@ class BiomedEvidenceService:
             )
             raw = str(getattr(response, "content", "") or "")
             parsed = _parse_json_object(raw)
+            classification_payload = parsed.get("classification")
+            if not isinstance(classification_payload, dict):
+                classification_payload = parsed.get("deterministic_classification")
+            query_plan_payload = parsed.get("query_plan")
+            if not isinstance(query_plan_payload, dict):
+                query_plan_payload = parsed.get("deterministic_query_plan")
             classification = _classification_from_llm(
-                parsed.get("classification"),
+                classification_payload,
                 fallback=fallback_classification,
                 model=self.revision_model,
                 prompt_hash=prompt_hash,
@@ -344,7 +350,7 @@ class BiomedEvidenceService:
                     }
                 )
             plan = _query_plan_from_llm(
-                parsed.get("query_plan"),
+                query_plan_payload,
                 fallback=fallback_plan,
                 model=self.revision_model,
                 prompt_hash=prompt_hash,
@@ -768,8 +774,39 @@ class BiomedEvidenceService:
                     retrieval_manifest=draft_result.retrieval_manifest,
                 )
             )
+            repair_changed_claims: list[str] = []
+            repair_removed_claims: list[str] = []
+            repair_added_limitations: list[str] = []
             if post_audit.recommended_action in {"revise", "refuse_or_abstain"}:
-                return None
+                repaired_answer, removed_claims = _remove_failed_claim_lines(
+                    final_answer,
+                    post_audit.failed_claims,
+                )
+                if not repaired_answer or repaired_answer == final_answer:
+                    return None
+                repaired_audit = self.audit_answer(
+                    CitationAuditRequest(
+                        answer=repaired_answer,
+                        citations=draft_result.citations,
+                        evidence_items=draft_result.evidence_summary,
+                        run_id=draft_result.run_id,
+                        retrieval_id=draft_result.retrieval_id,
+                        observed_uncertainty=cast(
+                            ConfidenceLevel | None,
+                            parsed.get("uncertainty_level"),
+                        ),
+                        retrieval_manifest=draft_result.retrieval_manifest,
+                    )
+                )
+                if repaired_audit.recommended_action in {"revise", "refuse_or_abstain"}:
+                    return None
+                final_answer = repaired_answer
+                post_audit = repaired_audit
+                repair_changed_claims = removed_claims
+                repair_removed_claims = removed_claims
+                repair_added_limitations = [
+                    "Removed unsupported or overclaimed LLM-generated lines during post-audit repair."
+                ]
             now = _now_iso()
             final_action = "pass" if final_answer == draft_result.answer else "revise"
             return AnswerRevision(
@@ -783,10 +820,21 @@ class BiomedEvidenceService:
                 llm_raw_response=parsed,
                 draft_answer=draft_result.answer,
                 final_answer=final_answer,
-                changed_claims=_coerce_string_list(parsed.get("changed_claims")),
-                removed_claims=_coerce_string_list(parsed.get("removed_claims")),
-                softened_claims=_coerce_string_list(parsed.get("softened_claims")),
-                added_limitations=_coerce_string_list(parsed.get("added_limitations")),
+                changed_claims=_merge_unique(
+                    _coerce_string_list(parsed.get("changed_claims")),
+                    repair_changed_claims,
+                ),
+                removed_claims=_merge_unique(
+                    _coerce_string_list(parsed.get("removed_claims")),
+                    repair_removed_claims,
+                ),
+                softened_claims=_merge_unique(
+                    _coerce_string_list(parsed.get("softened_claims")),
+                ),
+                added_limitations=_merge_unique(
+                    _coerce_string_list(parsed.get("added_limitations")),
+                    repair_added_limitations,
+                ),
                 revision_action=cast(Any, final_action),
                 created_at=now,
             )
@@ -2073,6 +2121,11 @@ def _build_answer_revision(
             added_limitations.append(f"Removed unsupported claim: {match.claim}")
             continue
         if match.verdict in {"overclaimed", "contradicted"}:
+            if not match.cited_paper_ids:
+                removed_claims.append(match.claim)
+                changed_claims.append(match.claim)
+                added_limitations.append(f"Removed uncited audited claim: {match.claim}")
+                continue
             softened = _soften_claim_line(raw_line, match)
             revised_lines.append(softened)
             softened_claims.append(match.claim)
@@ -2149,6 +2202,24 @@ def _evidence_intent_counts(evidence: list[EvidenceItem]) -> dict[str, int]:
     for item in evidence:
         counts[item.retrieval_intent] = counts.get(item.retrieval_intent, 0) + 1
     return counts
+
+
+def _remove_failed_claim_lines(
+    answer: str,
+    failed_claims: Iterable[ClaimAuditItem],
+) -> tuple[str, list[str]]:
+    failed = list(failed_claims)
+    if not failed:
+        return answer.strip(), []
+    kept_lines: list[str] = []
+    removed_claims: list[str] = []
+    for line in answer.splitlines():
+        match = _matching_failed_claim(line, failed)
+        if match is None:
+            kept_lines.append(line)
+            continue
+        removed_claims.append(match.claim)
+    return "\n".join(kept_lines).strip(), _merge_unique(removed_claims)
 
 
 def _build_trace_steps(

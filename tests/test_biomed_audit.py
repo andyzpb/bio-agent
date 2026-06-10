@@ -272,6 +272,30 @@ class _FakeRevisionProvider:
         )
 
 
+class _FakeUncitedRevisionProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        return _FakeRevisionResponse(
+            json.dumps(
+                {
+                    "final_answer": (
+                        payload["draft_answer"]
+                        + "\n\nMicroglial activation causes Alzheimer's disease progression."
+                    ),
+                    "changed_claims": ["Added interpretation sentence."],
+                    "removed_claims": [],
+                    "softened_claims": [],
+                    "added_limitations": [],
+                    "uncertainty_level": "high",
+                }
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_answer_with_audit_can_use_injected_revision_provider(tmp_path: Path) -> None:
     provider = _FakeRevisionProvider()
@@ -298,3 +322,29 @@ async def test_answer_with_audit_can_use_injected_revision_provider(tmp_path: Pa
     assert audited.revision.llm_prompt_hash
     assert audited.revision.post_revision_audit_id
     assert any(step.step == "post_audit" and step.status == "completed" for step in audited.trace)
+
+
+@pytest.mark.asyncio
+async def test_llm_revision_repairs_uncited_model_sentence(tmp_path: Path) -> None:
+    provider = _FakeUncitedRevisionProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-biomed-reviser",
+    )
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_revision=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert audited.revision.revision_mode == "llm"
+    assert "causes Alzheimer's disease progression" not in audited.final_answer
+    assert audited.audit.recommended_action in {"pass", "pass_with_limitations"}
