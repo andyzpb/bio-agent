@@ -171,6 +171,8 @@ class BiomedEvidencePlugin(Plugin):
         source: Literal["pubmed", "mock"] = "mock",
         use_llm_planner: bool = False,
         execute_support_refute: bool = False,
+        use_llm_extractor: bool = False,
+        use_llm_synthesis: bool = False,
     ) -> str:
         """Answer a biomedical research question with citations and uncertainty.
 
@@ -182,6 +184,8 @@ class BiomedEvidencePlugin(Plugin):
             source: Literature source.
             use_llm_planner: Request framework-governed retrieval planning when configured.
             execute_support_refute: Execute planner support/refute queries and bundle manifests.
+            use_llm_extractor: Request framework-governed span-grounded evidence extraction.
+            use_llm_synthesis: Request framework-governed evidence-constrained synthesis.
         """
         result = await self._service.answer_with_evidence(
             AnswerWithEvidenceRequest(
@@ -192,6 +196,8 @@ class BiomedEvidencePlugin(Plugin):
                 source=source,
                 use_llm_planner=use_llm_planner,
                 execute_support_refute=execute_support_refute,
+                use_llm_extractor=use_llm_extractor,
+                use_llm_synthesis=use_llm_synthesis,
                 use_llm_revision=False,
             )
         )
@@ -213,6 +219,8 @@ class BiomedEvidencePlugin(Plugin):
         use_llm_revision: bool = False,
         use_llm_planner: bool = False,
         execute_support_refute: bool = False,
+        use_llm_extractor: bool = False,
+        use_llm_synthesis: bool = False,
     ) -> str:
         """Answer a biomedical research question, audit claims, revise, and return trace.
 
@@ -225,6 +233,8 @@ class BiomedEvidencePlugin(Plugin):
             use_llm_revision: Request framework-governed LLM revision when configured.
             use_llm_planner: Request framework-governed retrieval planning when configured.
             execute_support_refute: Execute planner support/refute queries and bundle manifests.
+            use_llm_extractor: Request framework-governed span-grounded evidence extraction.
+            use_llm_synthesis: Request framework-governed evidence-constrained synthesis.
         """
         result = await self._service.answer_with_audit(
             AnswerWithEvidenceRequest(
@@ -236,6 +246,8 @@ class BiomedEvidencePlugin(Plugin):
                 use_llm_revision=use_llm_revision,
                 use_llm_planner=use_llm_planner,
                 execute_support_refute=execute_support_refute,
+                use_llm_extractor=use_llm_extractor,
+                use_llm_synthesis=use_llm_synthesis,
             )
         )
         return _dump(result.model_dump(mode="json"))
@@ -268,13 +280,9 @@ class BiomedEvidencePlugin(Plugin):
         result = self._service.audit_answer(
             CitationAuditRequest(
                 answer=answer,
-                citations=[
-                    Citation.model_validate(item)
-                    for item in (citations or [])
-                ],
+                citations=[Citation.model_validate(item) for item in (citations or [])],
                 evidence_items=[
-                    EvidenceItem.model_validate(item)
-                    for item in (evidence_items or [])
+                    EvidenceItem.model_validate(item) for item in (evidence_items or [])
                 ],
                 run_id=run_id,
                 retrieval_id=retrieval_id,
@@ -332,8 +340,7 @@ class BiomedEvidencePlugin(Plugin):
                 topic=topic,
                 source=source,
                 evidence_items=[
-                    EvidenceItem.model_validate(item)
-                    for item in (evidence_items or [])
+                    EvidenceItem.model_validate(item) for item in (evidence_items or [])
                 ],
                 retrieval_id=retrieval_id,
             )
@@ -470,7 +477,9 @@ class BiomedEvidencePlugin(Plugin):
         Args:
             watch_id: Watch topic id.
         """
-        return _dump({"deleted": self._service.delete_watch(watch_id), "watch_id": watch_id})
+        return _dump(
+            {"deleted": self._service.delete_watch(watch_id), "watch_id": watch_id}
+        )
 
     @tool(
         name="get_evidence_graph",

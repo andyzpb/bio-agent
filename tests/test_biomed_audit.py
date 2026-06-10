@@ -22,6 +22,7 @@ from plugins.biomed_evidence.service import (
     BiomedEvidenceService,
     _build_answer_revision,
     _normalize_llm_answer_text,
+    _remove_failed_claim_lines,
 )
 from plugins.biomed_evidence.guardrails import RESEARCH_USE_DISCLAIMER
 
@@ -125,6 +126,28 @@ def test_citation_audit_marks_uncited_claim() -> None:
     assert result.unsupported_claim_rate == 1.0
     assert result.claim_audits[0].verdict == "not_cited"
     assert result.recommended_action == "revise"
+
+
+def test_post_audit_repair_removes_empty_markdown_section() -> None:
+    answer = (
+        f"{RESEARCH_USE_DISCLAIMER}\n\n"
+        "**Evidence**\n"
+        "- The abundance of activated microglia correlated with Braak stage and amyloid pathology [MOCK-PMID-1001].\n\n"
+        "**Interpretation**\n"
+        "Microglial activation causes Alzheimer's disease progression."
+    )
+    audit = validate_citation_support(
+        answer=answer,
+        citations=[_citation("MOCK-PMID-1001")],
+        evidence_items=MOCK_EVIDENCE["MOCK-PMID-1001"],
+    )
+
+    repaired, removed = _remove_failed_claim_lines(answer, audit.failed_claims)
+
+    assert removed == ["Microglial activation causes Alzheimer's disease progression."]
+    assert "**Evidence**" in repaired
+    assert "**Interpretation**" not in repaired
+    assert "causes Alzheimer's disease progression" not in repaired
 
 
 def test_conflict_audit_returns_mixed_evidence() -> None:

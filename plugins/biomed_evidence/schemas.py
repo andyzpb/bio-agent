@@ -4,7 +4,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 BiomedicalSource = Literal["pubmed", "europe_pmc", "biorxiv", "mock"]
 EvidenceDirection = Literal["supports", "contradicts", "inconclusive", "background"]
 ConfidenceLevel = Literal["low", "medium", "high"]
@@ -78,6 +77,8 @@ TraceStepStatus = Literal["started", "completed", "skipped", "failed"]
 RevisionAction = Literal["pass", "revise", "refuse", "abstain"]
 RevisionMode = Literal["deterministic", "llm", "fallback"]
 PlannerMode = Literal["deterministic", "llm", "fallback"]
+ExtractionMode = Literal["deterministic", "llm", "fallback"]
+SynthesisMode = Literal["deterministic", "llm", "fallback"]
 RetrievalIntent = Literal["primary", "support", "refute", "unknown"]
 QuestionIntent = Literal[
     "research_question",
@@ -142,6 +143,9 @@ class EvidenceItem(BaseModel):
     confidence: ConfidenceLevel
     evidence_span: str | None = None
     retrieval_intent: RetrievalIntent = "unknown"
+    extraction_mode: ExtractionMode = "deterministic"
+    extractor_model: str | None = None
+    extractor_prompt_hash: str | None = None
     requires_expert_review: bool = True
 
 
@@ -386,6 +390,8 @@ class AnswerWithEvidenceRequest(BaseModel):
     use_llm_revision: bool = False
     use_llm_planner: bool = False
     execute_support_refute: bool = False
+    use_llm_extractor: bool = False
+    use_llm_synthesis: bool = False
 
 
 class AnswerWithEvidenceResult(BaseModel):
@@ -408,6 +414,10 @@ class AnswerWithEvidenceResult(BaseModel):
     question_classification: BiomedicalQuestionClassification | None = None
     query_plan: BiomedicalQueryPlan | None = None
     query_plan_validation: QueryPlanValidation | None = None
+    synthesis_mode: SynthesisMode = "deterministic"
+    synthesis_model: str | None = None
+    synthesis_prompt_hash: str | None = None
+    synthesis_fallback_reason: str | None = None
 
 
 class AgentTraceStep(BaseModel):

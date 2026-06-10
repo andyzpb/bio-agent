@@ -7,6 +7,7 @@ interface EvidenceRow {
   paper_id: string;
   retrieval_id?: string | null;
   retrieval_intent?: string;
+  extraction_mode?: string;
   paper_title?: string;
   claim: string;
   finding: string;
@@ -67,6 +68,9 @@ interface AnswerResult {
   uncertainty_level: string;
   suggested_next_steps: string[];
   disclaimer: string;
+  synthesis_mode?: string;
+  synthesis_model?: string | null;
+  synthesis_fallback_reason?: string | null;
 }
 
 interface WatchTopic {
@@ -207,6 +211,7 @@ function renderEvidenceItem(item: EvidenceRow): string {
         ${pill(item.evidence_direction)}
         ${pill(item.confidence)}
         ${item.retrieval_intent ? pill(item.retrieval_intent) : ""}
+        ${item.extraction_mode ? pill(item.extraction_mode) : ""}
         <code>${escapeHtml(item.paper_id)}</code>
       </div>
       <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
@@ -409,6 +414,7 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
       <code>${escapeHtml(result.answer_result.run_id)}</code>
       ${pill(result.answer_result.uncertainty_level)}
       ${pill(result.final_action)}
+      ${result.answer_result.synthesis_mode ? pill(result.answer_result.synthesis_mode) : ""}
     </div>
     <div class="biomed-label">Retrieval Provenance</div>
     ${renderManifest(result.answer_result.retrieval_manifest)}
@@ -464,6 +470,8 @@ function renderAsk(container: HTMLElement): void {
           <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
           <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
           <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
+          <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
+          <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
           <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
@@ -481,6 +489,8 @@ function renderAsk(container: HTMLElement): void {
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
     const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
     const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
+    const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
+    const useSynthesis = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked);
     try {
       const result = await api<AnswerResult>("/api/biomed/answer", {
         method: "POST",
@@ -491,12 +501,15 @@ function renderAsk(container: HTMLElement): void {
           max_papers: maxPapers,
           use_llm_planner: usePlanner,
           execute_support_refute: executeSupportRefute,
+          use_llm_extractor: useExtractor,
+          use_llm_synthesis: useSynthesis,
         }),
       });
       resultNode.innerHTML = `
         <div class="biomed-answer-meta">
           <code>${escapeHtml(result.run_id)}</code>
           ${pill(result.uncertainty_level)}
+          ${result.synthesis_mode ? pill(result.synthesis_mode) : ""}
           <button data-biomed-audit-run="${escapeHtml(result.run_id)}">Run Audit</button>
         </div>
         <div class="biomed-label">Retrieval Provenance</div>
@@ -542,6 +555,8 @@ function renderAsk(container: HTMLElement): void {
     const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
     const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
     const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
+    const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
+    const useSynthesis = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked);
     const useRevision = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked);
     try {
       const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
@@ -553,6 +568,8 @@ function renderAsk(container: HTMLElement): void {
           max_papers: maxPapers,
           use_llm_planner: usePlanner,
           execute_support_refute: executeSupportRefute,
+          use_llm_extractor: useExtractor,
+          use_llm_synthesis: useSynthesis,
           use_llm_revision: useRevision,
         }),
       });

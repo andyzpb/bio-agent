@@ -5,6 +5,7 @@ import json
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, cast
@@ -32,6 +33,7 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     AnswerRevision,
     AuditedAnswerResult,
+    BiomedicalEntity,
     BiomedicalPaper,
     BiomedicalQuestionClassification,
     BiomedicalQueryPlan,
@@ -44,6 +46,7 @@ from plugins.biomed_evidence.schemas import (
     ConflictAuditResult,
     EvidenceExtractionRequest,
     EvidenceExtractionResult,
+    ExtractionMode,
     EvidenceGraph,
     EvidenceItem,
     ExportEvidenceReportRequest,
@@ -68,6 +71,15 @@ from plugins.biomed_evidence.schemas import (
     WatchTopicUpdateRequest,
 )
 from plugins.biomed_evidence.storage import BiomedStorage
+
+
+@dataclass(frozen=True)
+class _SynthesisOutcome:
+    answer: str
+    mode: str
+    model: str | None
+    prompt_hash: str | None
+    fallback_reason: str | None = None
 
 
 class BiomedEvidenceService:
@@ -111,7 +123,9 @@ class BiomedEvidenceService:
         client = self._client(request.source)
         started_at = _now_iso()
         retrieval_id = _retrieval_id(request, started_at)
-        compiled_query, normalized_filters, unsupported_filters = _compile_query(request)
+        compiled_query, normalized_filters, unsupported_filters = _compile_query(
+            request
+        )
         warnings: list[str] = []
         errors: list[str] = []
         trace: dict[str, object]
@@ -189,7 +203,9 @@ class BiomedEvidenceService:
             retrieval_manifest=manifest,
         )
 
-    async def fetch(self, request: FetchBiomedicalPaperRequest) -> BiomedicalPaper | None:
+    async def fetch(
+        self, request: FetchBiomedicalPaperRequest
+    ) -> BiomedicalPaper | None:
         stored = self.storage.get_paper(request.paper_id, source=request.source)
         if stored is not None:
             return stored
@@ -204,6 +220,7 @@ class BiomedEvidenceService:
         *,
         retrieval_id: str | None = None,
         retrieval_intent: RetrievalIntent = "unknown",
+        extraction_mode: ExtractionMode = "deterministic",
     ) -> EvidenceExtractionResult:
         self.storage.upsert_paper(request.paper)
         result = self.extractor.extract(
@@ -214,7 +231,12 @@ class BiomedEvidenceService:
             result = result.model_copy(
                 update={
                     "evidence": [
-                        item.model_copy(update={"retrieval_intent": retrieval_intent})
+                        item.model_copy(
+                            update={
+                                "retrieval_intent": retrieval_intent,
+                                "extraction_mode": extraction_mode,
+                            }
+                        )
                         for item in result.evidence
                     ]
                 }
@@ -226,6 +248,108 @@ class BiomedEvidenceService:
                 retrieval_id=retrieval_id,
             )
         return result
+
+    async def _extract_evidence_for_answer(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        paper: BiomedicalPaper,
+        retrieval_id: str | None,
+        retrieval_intent: RetrievalIntent,
+    ) -> EvidenceExtractionResult:
+        if request.use_llm_extractor:
+            llm_result = await self._llm_extract_evidence_or_none(
+                paper=paper,
+                research_question=request.question,
+                retrieval_id=retrieval_id,
+                retrieval_intent=retrieval_intent,
+            )
+            if llm_result is not None:
+                return llm_result
+        return self.extract_evidence(
+            EvidenceExtractionRequest(
+                paper=paper,
+                research_question=request.question,
+            ),
+            retrieval_id=retrieval_id,
+            retrieval_intent=retrieval_intent,
+            extraction_mode=(
+                "fallback" if request.use_llm_extractor else "deterministic"
+            ),
+        )
+
+    async def _llm_extract_evidence_or_none(
+        self,
+        *,
+        paper: BiomedicalPaper,
+        research_question: str,
+        retrieval_id: str | None,
+        retrieval_intent: RetrievalIntent,
+    ) -> EvidenceExtractionResult | None:
+        if self.revision_provider is None or not self.revision_model:
+            return None
+        prompt_payload = _llm_extraction_payload(
+            paper=paper,
+            research_question=research_question,
+            retrieval_intent=retrieval_intent,
+        )
+        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        try:
+            response = await self.revision_provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Extract biomedical evidence from one retrieved paper. "
+                            "Return one valid JSON object only. Use only exact spans "
+                            "from the supplied title or abstract. Do not infer beyond "
+                            "the supplied paper text."
+                        ),
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+                tools=[],
+                model=self.revision_model,
+                max_tokens=1600,
+                tool_choice="none",
+                disable_thinking=True,
+            )
+            parsed = _parse_json_object(str(getattr(response, "content", "") or ""))
+            raw_items = parsed.get("evidence")
+            if not isinstance(raw_items, list):
+                return None
+            evidence: list[EvidenceItem] = []
+            for index, raw_item in enumerate(raw_items[:3]):
+                if not isinstance(raw_item, dict):
+                    continue
+                item = _evidence_item_from_llm(
+                    raw_item,
+                    paper=paper,
+                    index=index,
+                    model=self.revision_model,
+                    prompt_hash=prompt_hash,
+                    retrieval_intent=retrieval_intent,
+                )
+                if item is not None:
+                    evidence.append(item)
+            if not evidence:
+                return None
+            result = EvidenceExtractionResult(
+                paper_id=paper.paper_id,
+                evidence=evidence,
+                reason=None,
+            )
+            self.storage.upsert_paper(paper)
+            for item in result.evidence:
+                self.storage.upsert_evidence(
+                    item,
+                    paper_source=paper.source,
+                    retrieval_id=retrieval_id,
+                )
+            return result
+        except Exception:
+            return None
 
     async def plan_biomedical_search(
         self,
@@ -339,13 +463,18 @@ class BiomedEvidenceService:
                 model=self.revision_model,
                 prompt_hash=prompt_hash,
             )
-            if classification.clinical_boundary or classification.allowed_next_step != "plan_retrieval":
+            if (
+                classification.clinical_boundary
+                or classification.allowed_next_step != "plan_retrieval"
+            ):
                 return classification, fallback_plan.model_copy(
                     update={
                         "planner_mode": "fallback",
                         "warnings": _merge_unique(
                             fallback_plan.warnings,
-                            ["LLM classification blocked retrieval; deterministic plan was not executed."],
+                            [
+                                "LLM classification blocked retrieval; deterministic plan was not executed."
+                            ],
                         ),
                     }
                 )
@@ -376,9 +505,8 @@ class BiomedEvidenceService:
                     use_llm_planner=request.use_llm_planner,
                 )
             )
-        clinical_boundary = (
-            is_clinical_request(request.question)
-            or bool(planning_result and planning_result.classification.clinical_boundary)
+        clinical_boundary = is_clinical_request(request.question) or bool(
+            planning_result and planning_result.classification.clinical_boundary
         )
         if clinical_boundary:
             result = AnswerWithEvidenceResult(
@@ -399,9 +527,13 @@ class BiomedEvidenceService:
                 disclaimer=RESEARCH_USE_DISCLAIMER,
                 project_context_used=request.project_context,
                 question_classification=(
-                    planning_result.classification if planning_result is not None else None
+                    planning_result.classification
+                    if planning_result is not None
+                    else None
                 ),
-                query_plan=planning_result.query_plan if planning_result is not None else None,
+                query_plan=(
+                    planning_result.query_plan if planning_result is not None else None
+                ),
                 query_plan_validation=(
                     planning_result.validation if planning_result is not None else None
                 ),
@@ -420,7 +552,9 @@ class BiomedEvidenceService:
                 or planning_result.validation.warnings
                 or ["The retrieval plan was not valid enough to execute."],
                 uncertainty_level="high",
-                suggested_next_steps=_planner_next_steps(planning_result.classification),
+                suggested_next_steps=_planner_next_steps(
+                    planning_result.classification
+                ),
                 not_medical_advice=True,
                 disclaimer=RESEARCH_USE_DISCLAIMER,
                 project_context_used=request.project_context,
@@ -433,7 +567,8 @@ class BiomedEvidenceService:
 
         search_request = (
             planning_result.search_request
-            if planning_result is not None and planning_result.search_request is not None
+            if planning_result is not None
+            and planning_result.search_request is not None
             else SearchBiomedicalLiteratureRequest(
                 query=request.question,
                 max_results=request.max_papers,
@@ -456,16 +591,16 @@ class BiomedEvidenceService:
         papers: dict[str, BiomedicalPaper] = {}
         for item in metadata:
             paper = await self.fetch(
-                FetchBiomedicalPaperRequest(paper_id=item.paper_id, source=request.source)
+                FetchBiomedicalPaperRequest(
+                    paper_id=item.paper_id, source=request.source
+                )
             )
             if paper is None:
                 continue
             papers[paper.paper_id] = paper
-            extracted = self.extract_evidence(
-                EvidenceExtractionRequest(
-                    paper=paper,
-                    research_question=request.question,
-                ),
+            extracted = await self._extract_evidence_for_answer(
+                request=request,
+                paper=paper,
                 retrieval_id=paper_retrieval_ids.get(
                     item.paper_id,
                     retrieval_manifest.retrieval_id,
@@ -477,12 +612,19 @@ class BiomedEvidenceService:
         citations = [
             Citation(
                 paper_id=item.paper_id,
-                title=papers.get(item.paper_id, BiomedicalPaper(
-                    paper_id=item.paper_id,
-                    source=request.source,
-                    title=item.paper_id,
-                )).title,
-                source=papers[item.paper_id].source if item.paper_id in papers else request.source,
+                title=papers.get(
+                    item.paper_id,
+                    BiomedicalPaper(
+                        paper_id=item.paper_id,
+                        source=request.source,
+                        title=item.paper_id,
+                    ),
+                ).title,
+                source=(
+                    papers[item.paper_id].source
+                    if item.paper_id in papers
+                    else request.source
+                ),
                 doi=papers[item.paper_id].doi if item.paper_id in papers else None,
                 url=papers[item.paper_id].url if item.paper_id in papers else None,
                 cited_claim=item.claim,
@@ -490,7 +632,9 @@ class BiomedEvidenceService:
             for item in evidence
             if item.paper_id in papers
         ]
-        conflicting = [item for item in evidence if item.evidence_direction == "contradicts"]
+        conflicting = [
+            item for item in evidence if item.evidence_direction == "contradicts"
+        ]
         limitations = _collect_limitations(evidence)
         if not citations and request.require_citations:
             answer = (
@@ -500,14 +644,39 @@ class BiomedEvidenceService:
                 "retrieved citations."
             )
             uncertainty: ConfidenceLevel = "high"
+            synthesis_outcome = _SynthesisOutcome(
+                answer=answer,
+                mode="deterministic",
+                model=None,
+                prompt_hash=None,
+            )
         else:
-            answer = _compose_answer(
+            deterministic_answer = _compose_answer(
                 question=request.question,
                 evidence=evidence,
                 papers=papers,
                 project_context=request.project_context,
             )
             uncertainty = _uncertainty(evidence)
+            synthesis_outcome = _SynthesisOutcome(
+                answer=deterministic_answer,
+                mode="deterministic",
+                model=None,
+                prompt_hash=None,
+            )
+            if request.use_llm_synthesis:
+                synthesis_outcome = await self._llm_synthesis_or_fallback(
+                    request=request,
+                    deterministic_answer=deterministic_answer,
+                    citations=citations,
+                    evidence=evidence,
+                    papers=papers,
+                    retrieval_manifest=retrieval_manifest,
+                    retrieval_bundle=retrieval_bundle,
+                    uncertainty=uncertainty,
+                    run_id=run_id,
+                )
+            answer = synthesis_outcome.answer
         result = AnswerWithEvidenceResult(
             run_id=run_id,
             retrieval_id=retrieval_manifest.retrieval_id,
@@ -519,17 +688,25 @@ class BiomedEvidenceService:
             conflicting_evidence=conflicting,
             limitations=limitations,
             uncertainty_level=uncertainty,
-            suggested_next_steps=_suggest_next_steps(evidence, bool(request.project_context)),
+            suggested_next_steps=_suggest_next_steps(
+                evidence, bool(request.project_context)
+            ),
             not_medical_advice=True,
             disclaimer=RESEARCH_USE_DISCLAIMER,
             project_context_used=request.project_context,
             question_classification=(
                 planning_result.classification if planning_result is not None else None
             ),
-            query_plan=planning_result.query_plan if planning_result is not None else None,
+            query_plan=(
+                planning_result.query_plan if planning_result is not None else None
+            ),
             query_plan_validation=(
                 planning_result.validation if planning_result is not None else None
             ),
+            synthesis_mode=cast(Any, synthesis_outcome.mode),
+            synthesis_model=synthesis_outcome.model,
+            synthesis_prompt_hash=synthesis_outcome.prompt_hash,
+            synthesis_fallback_reason=synthesis_outcome.fallback_reason,
         )
         self.storage.save_answer_run(result, question=request.question)
         return result
@@ -555,7 +732,9 @@ class BiomedEvidenceService:
         ):
             search_result = await self.search_with_manifest(search_request)
             intent: RetrievalIntent = (
-                "primary" if planning_result is not None and planning_result.query_plan else "unknown"
+                "primary"
+                if planning_result is not None and planning_result.query_plan
+                else "unknown"
             )
             return (
                 search_result.items,
@@ -611,7 +790,8 @@ class BiomedEvidenceService:
             unique_items = primary_result.items
             paper_intents = {item.paper_id: "primary" for item in primary_result.items}
             paper_retrieval_ids = {
-                item.paper_id: primary_manifest.retrieval_id for item in primary_result.items
+                item.paper_id: primary_manifest.retrieval_id
+                for item in primary_result.items
             }
 
         bundle = RetrievalBundle(
@@ -666,7 +846,9 @@ class BiomedEvidenceService:
                 fallback_reason_override=(
                     None
                     if not request.use_llm_revision
-                    else _llm_unavailable_reason(self.revision_provider, self.revision_model)
+                    else _llm_unavailable_reason(
+                        self.revision_provider, self.revision_model
+                    )
                 ),
             )
         final_result = draft_result.model_copy(
@@ -770,7 +952,9 @@ class BiomedEvidenceService:
                     evidence_items=draft_result.evidence_summary,
                     run_id=draft_result.run_id,
                     retrieval_id=draft_result.retrieval_id,
-                    observed_uncertainty=cast(ConfidenceLevel | None, parsed.get("uncertainty_level")),
+                    observed_uncertainty=cast(
+                        ConfidenceLevel | None, parsed.get("uncertainty_level")
+                    ),
                     retrieval_manifest=draft_result.retrieval_manifest,
                 )
             )
@@ -841,6 +1025,110 @@ class BiomedEvidenceService:
         except Exception:
             return None
 
+    async def _llm_synthesis_or_fallback(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        deterministic_answer: str,
+        citations: list[Citation],
+        evidence: list[EvidenceItem],
+        papers: dict[str, BiomedicalPaper],
+        retrieval_manifest: RetrievalManifest,
+        retrieval_bundle: RetrievalBundle | None,
+        uncertainty: ConfidenceLevel,
+        run_id: str,
+    ) -> _SynthesisOutcome:
+        if self.revision_provider is None or not self.revision_model:
+            return _SynthesisOutcome(
+                answer=deterministic_answer,
+                mode="fallback",
+                model=None,
+                prompt_hash=None,
+                fallback_reason=_llm_synthesis_unavailable_reason(
+                    self.revision_provider,
+                    self.revision_model,
+                ),
+            )
+        prompt_payload = _llm_synthesis_payload(
+            request=request,
+            evidence=evidence,
+            citations=citations,
+            papers=papers,
+            retrieval_manifest=retrieval_manifest,
+            retrieval_bundle=retrieval_bundle,
+            uncertainty=uncertainty,
+        )
+        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        try:
+            response = await self.revision_provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Synthesize a biomedical research answer using only supplied "
+                            "evidence items and citations. Return one valid JSON object "
+                            "only with final_answer. Every biomedical claim, limitation, "
+                            "uncertainty statement, comparison, or interpretation must "
+                            "include at least one supplied bracket citation such as "
+                            "[MOCK-PMID-1001]. Do not add clinical advice or uncited "
+                            "future-work claims."
+                        ),
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+                tools=[],
+                model=self.revision_model,
+                max_tokens=2600,
+                tool_choice="none",
+                disable_thinking=True,
+            )
+            parsed = _parse_json_object(str(getattr(response, "content", "") or ""))
+            final_answer = _normalize_llm_answer_text(
+                str(parsed.get("final_answer") or "")
+            )
+            if not final_answer:
+                raise ValueError("LLM synthesis returned empty final_answer.")
+            synthesis_audit = self.audit_answer(
+                CitationAuditRequest(
+                    answer=final_answer,
+                    citations=citations,
+                    evidence_items=evidence,
+                    run_id=run_id,
+                    retrieval_id=retrieval_manifest.retrieval_id,
+                    observed_uncertainty=cast(
+                        ConfidenceLevel | None,
+                        parsed.get("uncertainty_level") or uncertainty,
+                    ),
+                    retrieval_manifest=retrieval_manifest,
+                )
+            )
+            if synthesis_audit.recommended_action in {"revise", "refuse_or_abstain"}:
+                return _SynthesisOutcome(
+                    answer=deterministic_answer,
+                    mode="fallback",
+                    model=self.revision_model,
+                    prompt_hash=prompt_hash,
+                    fallback_reason=(
+                        "LLM synthesis failed deterministic citation audit and was "
+                        "not accepted."
+                    ),
+                )
+            return _SynthesisOutcome(
+                answer=final_answer,
+                mode="llm",
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+            )
+        except Exception:
+            return _SynthesisOutcome(
+                answer=deterministic_answer,
+                mode="fallback",
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+                fallback_reason="LLM synthesis was requested, but the adapter fell back to deterministic synthesis.",
+            )
+
     def list_evidence(
         self,
         *,
@@ -890,7 +1178,10 @@ class BiomedEvidenceService:
                     id=paper_node,
                     label=str(row.get("paper_title") or row["paper_id"]),
                     kind="paper",
-                    data={"paper_id": str(row["paper_id"]), "url": row.get("paper_url")},
+                    data={
+                        "paper_id": str(row["paper_id"]),
+                        "url": row.get("paper_url"),
+                    },
                 ),
             )
             claim_node = f"claim:{row['evidence_id']}"
@@ -903,14 +1194,20 @@ class BiomedEvidenceService:
                     "confidence": str(row["confidence"]),
                 },
             )
-            edges.append(GraphEdge(source=paper_node, target=claim_node, type="PAPER_REPORTS_CLAIM"))
+            edges.append(
+                GraphEdge(
+                    source=paper_node, target=claim_node, type="PAPER_REPORTS_CLAIM"
+                )
+            )
             if topic_id:
                 edge_type = (
                     "CLAIM_CONTRADICTS_TOPIC"
                     if row["evidence_direction"] == "contradicts"
                     else "CLAIM_SUPPORTS_TOPIC"
                 )
-                edges.append(GraphEdge(source=claim_node, target=topic_id, type=edge_type))
+                edges.append(
+                    GraphEdge(source=claim_node, target=topic_id, type=edge_type)
+                )
             for raw_entity in cast(list[object], row.get("entities", [])):
                 if not isinstance(raw_entity, dict):
                     continue
@@ -927,22 +1224,52 @@ class BiomedEvidenceService:
                         data={"entity_type": str(raw_entity.get("entity_type") or "")},
                     ),
                 )
-                edges.append(GraphEdge(source=claim_node, target=entity_node, type="CLAIM_MENTIONS_ENTITY"))
+                edges.append(
+                    GraphEdge(
+                        source=claim_node,
+                        target=entity_node,
+                        type="CLAIM_MENTIONS_ENTITY",
+                    )
+                )
             for method in cast(list[object], row.get("methods", [])):
                 method_node = f"method:{_slug(str(method))}"
-                nodes.setdefault(method_node, GraphNode(id=method_node, label=str(method), kind="method"))
-                edges.append(GraphEdge(source=claim_node, target=method_node, type="CLAIM_USES_METHOD"))
+                nodes.setdefault(
+                    method_node,
+                    GraphNode(id=method_node, label=str(method), kind="method"),
+                )
+                edges.append(
+                    GraphEdge(
+                        source=claim_node, target=method_node, type="CLAIM_USES_METHOD"
+                    )
+                )
             for dataset in cast(list[object], row.get("datasets_or_cohorts", [])):
                 dataset_node = f"dataset:{_slug(str(dataset))}"
-                nodes.setdefault(dataset_node, GraphNode(id=dataset_node, label=str(dataset), kind="dataset"))
-                edges.append(GraphEdge(source=claim_node, target=dataset_node, type="CLAIM_BASED_ON_DATASET"))
+                nodes.setdefault(
+                    dataset_node,
+                    GraphNode(id=dataset_node, label=str(dataset), kind="dataset"),
+                )
+                edges.append(
+                    GraphEdge(
+                        source=claim_node,
+                        target=dataset_node,
+                        type="CLAIM_BASED_ON_DATASET",
+                    )
+                )
             for limitation in cast(list[object], row.get("limitations", [])):
                 limitation_node = f"limitation:{_slug(str(limitation))}"
                 nodes.setdefault(
                     limitation_node,
-                    GraphNode(id=limitation_node, label=str(limitation), kind="limitation"),
+                    GraphNode(
+                        id=limitation_node, label=str(limitation), kind="limitation"
+                    ),
                 )
-                edges.append(GraphEdge(source=claim_node, target=limitation_node, type="CLAIM_HAS_LIMITATION"))
+                edges.append(
+                    GraphEdge(
+                        source=claim_node,
+                        target=limitation_node,
+                        type="CLAIM_HAS_LIMITATION",
+                    )
+                )
         return EvidenceGraph(nodes=list(nodes.values()), edges=edges)
 
     def create_watch(self, request: WatchTopicCreateRequest) -> WatchTopic:
@@ -999,8 +1326,14 @@ class BiomedEvidenceService:
                     if request.min_relevance_score is not None
                     else current.min_relevance_score
                 ),
-                "schedule": request.schedule if request.schedule is not None else current.schedule,
-                "enabled": request.enabled if request.enabled is not None else current.enabled,
+                "schedule": (
+                    request.schedule
+                    if request.schedule is not None
+                    else current.schedule
+                ),
+                "enabled": (
+                    request.enabled if request.enabled is not None else current.enabled
+                ),
                 "updated_at": _now_iso(),
             }
         )
@@ -1017,14 +1350,18 @@ class BiomedEvidenceService:
     def delete_watch(self, watch_id: str) -> bool:
         return self.storage.delete_watch(watch_id)
 
-    async def check_watch(self, watch_id: str, *, source: str = "mock") -> WatchCheckResult | None:
+    async def check_watch(
+        self, watch_id: str, *, source: str = "mock"
+    ) -> WatchCheckResult | None:
         watch = self.storage.get_watch(watch_id)
         if watch is None:
             return None
         checked_at = _now_iso()
         if not watch.enabled:
             return WatchCheckResult(watch=watch, decisions=[], checked_at=checked_at)
-        existing, _ = self.storage.list_watch_decisions(watch_id=watch_id, page=1, page_size=500)
+        existing, _ = self.storage.list_watch_decisions(
+            watch_id=watch_id, page=1, page_size=500
+        )
         existing_paper_ids = {item.paper_id for item in existing}
         query = " ".join([watch.topic, *watch.include_keywords]).strip()
         search_result = await self.search_with_manifest(
@@ -1033,7 +1370,9 @@ class BiomedEvidenceService:
         metadata = search_result.items
         retrieval_manifest = search_result.retrieval_manifest
         paper_ids = [item.paper_id for item in metadata]
-        new_paper_ids = [paper_id for paper_id in paper_ids if paper_id not in existing_paper_ids]
+        new_paper_ids = [
+            paper_id for paper_id in paper_ids if paper_id not in existing_paper_ids
+        ]
         snapshot = WatchSnapshot(
             snapshot_id=f"watch-snapshot-{uuid.uuid4().hex[:12]}",
             watch_id=watch.watch_id,
@@ -1054,13 +1393,21 @@ class BiomedEvidenceService:
                 continue
             score, rationale = _score_watch_relevance(watch, paper)
             decision_value = "push" if score >= watch.min_relevance_score else "skip"
-            uncertainty = "low" if score >= 0.85 else "medium" if score >= 0.5 else "high"
+            uncertainty = (
+                "low" if score >= 0.85 else "medium" if score >= 0.5 else "high"
+            )
             if decision_value == "push":
                 extracted = self.extract_evidence(
-                    EvidenceExtractionRequest(paper=paper, research_question=watch.topic)
+                    EvidenceExtractionRequest(
+                        paper=paper, research_question=watch.topic
+                    )
                 )
                 key_claim = extracted.evidence[0].claim if extracted.evidence else ""
-                limitation = extracted.evidence[0].limitations[0] if extracted.evidence and extracted.evidence[0].limitations else "No explicit limitation extracted."
+                limitation = (
+                    extracted.evidence[0].limitations[0]
+                    if extracted.evidence and extracted.evidence[0].limitations
+                    else "No explicit limitation extracted."
+                )
             else:
                 key_claim = ""
                 limitation = "Below relevance threshold."
@@ -1160,7 +1507,9 @@ class BiomedEvidenceService:
     def get_citation_audit(self, audit_id: str) -> CitationAuditResult | None:
         return self.storage.get_citation_audit(audit_id)
 
-    def get_latest_citation_audit_for_run(self, run_id: str) -> CitationAuditResult | None:
+    def get_latest_citation_audit_for_run(
+        self, run_id: str
+    ) -> CitationAuditResult | None:
         return self.storage.get_latest_citation_audit_for_run(run_id)
 
     def get_answer_trace(self, run_id: str) -> dict[str, object] | None:
@@ -1174,9 +1523,13 @@ class BiomedEvidenceService:
             "run_id": run_id,
             "answer_run": result.model_dump(mode="json"),
             "trace": [item.model_dump(mode="json") for item in trace],
-            "revision": revision.model_dump(mode="json") if revision is not None else None,
+            "revision": (
+                revision.model_dump(mode="json") if revision is not None else None
+            ),
             "latest_citation_audit": (
-                latest_audit.model_dump(mode="json") if latest_audit is not None else None
+                latest_audit.model_dump(mode="json")
+                if latest_audit is not None
+                else None
             ),
         }
 
@@ -1247,7 +1600,9 @@ class BiomedEvidenceService:
                             "limitations": row.get("limitations", []),
                             "confidence": row["confidence"],
                             "evidence_span": row.get("evidence_span"),
-                            "requires_expert_review": row.get("requires_expert_review", True),
+                            "requires_expert_review": row.get(
+                                "requires_expert_review", True
+                            ),
                         }
                     )
                 )
@@ -1317,14 +1672,10 @@ def _manifest_from_trace(
     errors: list[str],
 ) -> RetrievalManifest:
     trace_warnings = [
-        str(item)
-        for item in cast(list[object], trace.get("warnings", []))
-        if str(item)
+        str(item) for item in cast(list[object], trace.get("warnings", [])) if str(item)
     ]
     trace_errors = [
-        str(item)
-        for item in cast(list[object], trace.get("errors", []))
-        if str(item)
+        str(item) for item in cast(list[object], trace.get("errors", [])) if str(item)
     ]
     warnings = [*warnings, *trace_warnings]
     errors = [*errors, *trace_errors]
@@ -1438,7 +1789,8 @@ def _classify_biomedical_question(
             classifier_mode=cast(Any, mode),
             llm_model=model,
             llm_prompt_hash=prompt_hash,
-            rationale=rationale or "Question is too short to form a reliable retrieval plan.",
+            rationale=rationale
+            or "Question is too short to form a reliable retrieval plan.",
             warnings=warnings or [],
         )
     if not _looks_biomedical(normalized):
@@ -1453,7 +1805,8 @@ def _classify_biomedical_question(
             classifier_mode=cast(Any, mode),
             llm_model=model,
             llm_prompt_hash=prompt_hash,
-            rationale=rationale or "Question does not appear to ask about biomedical literature.",
+            rationale=rationale
+            or "Question does not appear to ask about biomedical literature.",
             warnings=warnings or [],
         )
     return BiomedicalQuestionClassification(
@@ -1467,7 +1820,8 @@ def _classify_biomedical_question(
         classifier_mode=cast(Any, mode),
         llm_model=model,
         llm_prompt_hash=prompt_hash,
-        rationale=rationale or "Question is suitable for research literature retrieval.",
+        rationale=rationale
+        or "Question is suitable for research literature retrieval.",
         warnings=warnings or [],
     )
 
@@ -1482,12 +1836,16 @@ def _deterministic_query_plan(
     include_terms = _infer_include_terms(classification.normalized_question)
     refute_seed = primary_query or classification.normalized_question
     warnings = (
-        ["Project context was treated as retrieval preference only, not biomedical evidence."]
+        [
+            "Project context was treated as retrieval preference only, not biomedical evidence."
+        ]
         if request.project_context
         else []
     )
     return BiomedicalQueryPlan(
-        plan_id=_plan_id(classification.normalized_question, request.source, "deterministic"),
+        plan_id=_plan_id(
+            classification.normalized_question, request.source, "deterministic"
+        ),
         question=request.question,
         source=request.source,
         planner_mode="deterministic",
@@ -1524,7 +1882,9 @@ def _validate_query_plan(
     warnings: list[str] = []
     errors: list[str] = []
     if classification.allowed_next_step != "plan_retrieval":
-        errors.append(f"Classifier allowed next step is {classification.allowed_next_step}.")
+        errors.append(
+            f"Classifier allowed next step is {classification.allowed_next_step}."
+        )
         return QueryPlanValidation(
             valid=False,
             status="invalid",
@@ -1567,7 +1927,9 @@ def _validate_query_plan(
         )
         compiled_query, _, unsupported_filters = _compile_query(executable_request)
         if unsupported_filters:
-            warnings.extend(f"Unsupported filter: {item}" for item in unsupported_filters)
+            warnings.extend(
+                f"Unsupported filter: {item}" for item in unsupported_filters
+            )
     warnings = _merge_unique(classification.warnings, query_plan.warnings, warnings)
     status = "invalid" if errors else "valid_with_warnings" if warnings else "valid"
     return QueryPlanValidation(
@@ -1627,6 +1989,248 @@ def _planned_retrieval_specs(
     return specs, warnings
 
 
+def _llm_extraction_payload(
+    *,
+    paper: BiomedicalPaper,
+    research_question: str,
+    retrieval_intent: RetrievalIntent,
+) -> dict[str, object]:
+    return {
+        "instructions": [
+            "Extract at most two evidence items from this one paper.",
+            "Use only the supplied title and abstract.",
+            "Each evidence_span must be an exact substring of title or abstract after whitespace normalization.",
+            "If no relevant evidence is present, return an empty evidence list.",
+            "Do not infer beyond the paper text.",
+        ],
+        "research_question": research_question,
+        "retrieval_intent": retrieval_intent,
+        "paper": {
+            "paper_id": paper.paper_id,
+            "title": paper.title,
+            "abstract": paper.abstract or "",
+            "source": paper.source,
+            "mesh_terms": paper.mesh_terms,
+            "keywords": paper.keywords,
+        },
+        "output_schema": {
+            "evidence": [
+                {
+                    "claim": "short claim grounded in the span",
+                    "finding": "short finding; preferably the span itself",
+                    "evidence_direction": "supports|contradicts|inconclusive|background",
+                    "evidence_span": "exact title/abstract substring",
+                    "confidence": "low|medium|high",
+                    "entities": [
+                        {
+                            "name": "entity",
+                            "entity_type": "gene|protein|cell_type|disease|pathway|drug|method|dataset|organism|other",
+                        }
+                    ],
+                    "methods": ["method strings"],
+                    "datasets_or_cohorts": ["dataset/cohort strings"],
+                    "limitations": ["limitation strings"],
+                }
+            ]
+        },
+    }
+
+
+def _evidence_item_from_llm(
+    value: dict[str, object],
+    *,
+    paper: BiomedicalPaper,
+    index: int,
+    model: str,
+    prompt_hash: str,
+    retrieval_intent: RetrievalIntent,
+) -> EvidenceItem | None:
+    span = _grounded_span(
+        str(value.get("evidence_span") or value.get("finding") or ""),
+        paper,
+    )
+    if span is None:
+        return None
+    claim = re.sub(r"\s+", " ", str(value.get("claim") or "")).strip()
+    if not claim:
+        claim = _claim_from_span(paper, span)
+    return EvidenceItem(
+        evidence_id=_llm_evidence_id(paper.paper_id, span, index),
+        paper_id=paper.paper_id,
+        claim=claim,
+        finding=span,
+        evidence_direction=_coerce_evidence_direction(
+            value.get("evidence_direction"), span
+        ),
+        entities=_coerce_entities(value.get("entities")),
+        methods=_coerce_string_list(value.get("methods")),
+        datasets_or_cohorts=_coerce_string_list(value.get("datasets_or_cohorts")),
+        limitations=_coerce_string_list(value.get("limitations"))
+        or ["LLM span-grounded extraction from title/abstract only."],
+        confidence=_coerce_confidence(value.get("confidence")),
+        evidence_span=span,
+        retrieval_intent=retrieval_intent,
+        extraction_mode="llm",
+        extractor_model=model,
+        extractor_prompt_hash=prompt_hash,
+        requires_expert_review=True,
+    )
+
+
+def _llm_synthesis_payload(
+    *,
+    request: AnswerWithEvidenceRequest,
+    evidence: list[EvidenceItem],
+    citations: list[Citation],
+    papers: dict[str, BiomedicalPaper],
+    retrieval_manifest: RetrievalManifest,
+    retrieval_bundle: RetrievalBundle | None,
+    uncertainty: ConfidenceLevel,
+) -> dict[str, object]:
+    return {
+        "instructions": [
+            "Answer only from supplied evidence_items.",
+            "Use bracket paper-id citations like [MOCK-PMID-1001] on every biomedical claim.",
+            "Do not include uncited future-work, clinical, dosing, diagnosis, treatment, or patient-specific advice.",
+            "Mention uncertainty and limitations only when supported by supplied evidence.",
+            "Return JSON with final_answer, uncertainty_level, and optional added_limitations.",
+        ],
+        "question": request.question,
+        "project_context": request.project_context,
+        "research_only_boundary": RESEARCH_USE_DISCLAIMER,
+        "observed_uncertainty": uncertainty,
+        "retrieval": {
+            "retrieval_id": retrieval_manifest.retrieval_id,
+            "source": retrieval_manifest.source,
+            "compiled_query": retrieval_manifest.compiled_query,
+            "bundle": _retrieval_bundle_trace(retrieval_bundle),
+        },
+        "citations": [citation.model_dump(mode="json") for citation in citations],
+        "evidence_items": [
+            {
+                **item.model_dump(mode="json"),
+                "paper_title": (
+                    papers[item.paper_id].title
+                    if item.paper_id in papers
+                    else item.paper_id
+                ),
+            }
+            for item in evidence[:12]
+        ],
+    }
+
+
+def _grounded_span(raw_span: str, paper: BiomedicalPaper) -> str | None:
+    target = _normalize_space(raw_span)
+    if len(target) < 8:
+        return None
+    candidates = [target]
+    trimmed = target.rstrip(".,;: ")
+    if trimmed and trimmed != target:
+        candidates.append(trimmed)
+    for source in (paper.title, paper.abstract or ""):
+        normalized_source = _normalize_space(source)
+        lowered_source = normalized_source.lower()
+        for candidate in candidates:
+            if candidate.lower() in lowered_source:
+                return candidate
+    return None
+
+
+def _normalize_space(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _claim_from_span(paper: BiomedicalPaper, span: str) -> str:
+    clean = span.rstrip(".")
+    if len(clean) > 180:
+        clean = clean[:177].rstrip() + "..."
+    return f"{paper.title}: {clean}"
+
+
+def _llm_evidence_id(paper_id: str, span: str, index: int) -> str:
+    digest = hashlib.sha256(f"{paper_id}:{index}:{span}".encode("utf-8")).hexdigest()[
+        :16
+    ]
+    return f"ev-llm-{digest}"
+
+
+def _coerce_evidence_direction(value: object, span: str) -> Any:
+    direction = str(value or "").strip()
+    if direction in {"supports", "contradicts", "inconclusive", "background"}:
+        return direction
+    low = span.lower()
+    if any(
+        marker in low
+        for marker in (
+            "did not",
+            "failed to",
+            "no association",
+            "not associated",
+            "contradict",
+        )
+    ):
+        return "contradicts"
+    if any(
+        marker in low for marker in ("inconclusive", "weakened", "limited", "ambiguous")
+    ):
+        return "inconclusive"
+    if any(
+        marker in low
+        for marker in (
+            "associated",
+            "correlated",
+            "linked",
+            "identified",
+            "enriched",
+            "suggest",
+        )
+    ):
+        return "supports"
+    return "background"
+
+
+def _coerce_confidence(value: object) -> Any:
+    confidence = str(value or "").strip()
+    if confidence in {"low", "medium", "high"}:
+        return confidence
+    return "low"
+
+
+def _coerce_entities(value: object) -> list[BiomedicalEntity]:
+    if not isinstance(value, list):
+        return []
+    result: list[BiomedicalEntity] = []
+    seen: set[str] = set()
+    for raw in value[:12]:
+        name = ""
+        entity_type = "other"
+        if isinstance(raw, dict):
+            name = _normalize_space(str(raw.get("name") or ""))
+            entity_type = str(raw.get("entity_type") or "other").strip()
+        elif isinstance(raw, str):
+            name = _normalize_space(raw)
+        if entity_type not in {
+            "gene",
+            "protein",
+            "cell_type",
+            "disease",
+            "pathway",
+            "drug",
+            "method",
+            "dataset",
+            "organism",
+            "other",
+        }:
+            entity_type = "other"
+        key = f"{entity_type}:{name.lower()}"
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        result.append(BiomedicalEntity(name=name, entity_type=cast(Any, entity_type)))
+    return result
+
+
 def _llm_planner_payload(
     *,
     request: PlanBiomedicalSearchRequest,
@@ -1663,7 +2267,9 @@ def _classification_from_llm(
         return fallback.model_copy(
             update={
                 "classifier_mode": "fallback",
-                "warnings": _merge_unique(fallback.warnings, ["LLM classification was not an object."]),
+                "warnings": _merge_unique(
+                    fallback.warnings, ["LLM classification was not an object."]
+                ),
             }
         )
     intent = str(value.get("intent") or fallback.intent)
@@ -1679,14 +2285,20 @@ def _classification_from_llm(
         " ",
         str(value.get("normalized_question") or fallback.normalized_question),
     ).strip()
-    clinical_boundary = fallback.clinical_boundary or bool(value.get("clinical_boundary"))
+    clinical_boundary = fallback.clinical_boundary or bool(
+        value.get("clinical_boundary")
+    )
     if clinical_boundary:
         intent = "clinical_or_patient_specific"
         allowed_next_step = "refuse"
         needs_clarification = False
     else:
-        needs_clarification = bool(value.get("needs_clarification")) or intent == "needs_clarification"
-        allowed_next_step = str(value.get("allowed_next_step") or fallback.allowed_next_step)
+        needs_clarification = (
+            bool(value.get("needs_clarification")) or intent == "needs_clarification"
+        )
+        allowed_next_step = str(
+            value.get("allowed_next_step") or fallback.allowed_next_step
+        )
         if allowed_next_step not in {"plan_retrieval", "clarify", "refuse", "abstain"}:
             allowed_next_step = fallback.allowed_next_step
         if intent == "needs_clarification":
@@ -1726,7 +2338,9 @@ def _query_plan_from_llm(
         return fallback.model_copy(
             update={
                 "planner_mode": "fallback",
-                "warnings": _merge_unique(fallback.warnings, ["LLM query_plan was not an object."]),
+                "warnings": _merge_unique(
+                    fallback.warnings, ["LLM query_plan was not an object."]
+                ),
             }
         )
     primary_query = re.sub(
@@ -1741,16 +2355,24 @@ def _query_plan_from_llm(
         planner_mode="llm",
         primary_query=primary_query or fallback.primary_query,
         mesh_terms=_coerce_string_list(value.get("mesh_terms")) or fallback.mesh_terms,
-        include_terms=_coerce_string_list(value.get("include_terms")) or fallback.include_terms,
-        exclude_terms=_coerce_string_list(value.get("exclude_terms")) or fallback.exclude_terms,
+        include_terms=_coerce_string_list(value.get("include_terms"))
+        or fallback.include_terms,
+        exclude_terms=_coerce_string_list(value.get("exclude_terms"))
+        or fallback.exclude_terms,
         date_from=str(value.get("date_from") or "") or fallback.date_from,
         date_to=str(value.get("date_to") or "") or fallback.date_to,
         publication_types=_coerce_string_list(value.get("publication_types")),
-        study_types=_coerce_string_list(value.get("study_types")) or fallback.study_types,
-        species_terms=_coerce_string_list(value.get("species_terms")) or fallback.species_terms,
-        support_queries=_coerce_string_list(value.get("support_queries")) or fallback.support_queries,
-        refute_queries=_coerce_string_list(value.get("refute_queries")) or fallback.refute_queries,
-        max_results=max(1, min(_safe_int(value.get("max_results"), fallback.max_results), 50)),
+        study_types=_coerce_string_list(value.get("study_types"))
+        or fallback.study_types,
+        species_terms=_coerce_string_list(value.get("species_terms"))
+        or fallback.species_terms,
+        support_queries=_coerce_string_list(value.get("support_queries"))
+        or fallback.support_queries,
+        refute_queries=_coerce_string_list(value.get("refute_queries"))
+        or fallback.refute_queries,
+        max_results=max(
+            1, min(_safe_int(value.get("max_results"), fallback.max_results), 50)
+        ),
         rationale=str(value.get("rationale") or fallback.rationale),
         warnings=_coerce_string_list(value.get("warnings")),
         llm_model=model,
@@ -2027,14 +2649,18 @@ def _collect_limitations(evidence: list[EvidenceItem]) -> list[str]:
                 seen.add(limitation)
                 result.append(limitation)
     if not result:
-        result.append("No explicit limitations were extracted from retrieved abstracts.")
+        result.append(
+            "No explicit limitations were extracted from retrieved abstracts."
+        )
     return result
 
 
 def _uncertainty(evidence: list[EvidenceItem]) -> ConfidenceLevel:
     if not evidence:
         return "high"
-    if any(item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence):
+    if any(
+        item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence
+    ):
         return "high"
     if any(item.confidence == "low" for item in evidence):
         return "medium"
@@ -2048,7 +2674,9 @@ def _suggest_next_steps(evidence: list[EvidenceItem], has_context: bool) -> list
         "Track contradictory and inconclusive findings separately.",
     ]
     if not has_context:
-        steps.append("Add project context such as preferred methods or exclusion criteria.")
+        steps.append(
+            "Add project context such as preferred methods or exclusion criteria."
+        )
     if not evidence:
         steps.append("Broaden the search query or switch to PubMed for live retrieval.")
     return steps
@@ -2115,7 +2743,11 @@ def _build_answer_revision(
         if match is None:
             revised_lines.append(raw_line)
             continue
-        if match.verdict in {"not_cited", "irrelevant_citation", "insufficient_evidence"}:
+        if match.verdict in {
+            "not_cited",
+            "irrelevant_citation",
+            "insufficient_evidence",
+        }:
             removed_claims.append(match.claim)
             changed_claims.append(match.claim)
             added_limitations.append(f"Removed unsupported claim: {match.claim}")
@@ -2124,7 +2756,9 @@ def _build_answer_revision(
             if not match.cited_paper_ids:
                 removed_claims.append(match.claim)
                 changed_claims.append(match.claim)
-                added_limitations.append(f"Removed uncited audited claim: {match.claim}")
+                added_limitations.append(
+                    f"Removed uncited audited claim: {match.claim}"
+                )
                 continue
             softened = _soften_claim_line(raw_line, match)
             revised_lines.append(softened)
@@ -2143,7 +2777,9 @@ def _build_answer_revision(
             "citation-supported evidence to answer this biomedical research "
             "question without overclaiming."
         )
-        added_limitations.append("The audited draft had no remaining supported research claims.")
+        added_limitations.append(
+            "The audited draft had no remaining supported research claims."
+        )
         action = "abstain"
     else:
         action = "revise"
@@ -2204,6 +2840,13 @@ def _evidence_intent_counts(evidence: list[EvidenceItem]) -> dict[str, int]:
     return counts
 
 
+def _extraction_mode_counts(evidence: list[EvidenceItem]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in evidence:
+        counts[item.extraction_mode] = counts.get(item.extraction_mode, 0) + 1
+    return counts
+
+
 def _remove_failed_claim_lines(
     answer: str,
     failed_claims: Iterable[ClaimAuditItem],
@@ -2219,7 +2862,42 @@ def _remove_failed_claim_lines(
             kept_lines.append(line)
             continue
         removed_claims.append(match.claim)
-    return "\n".join(kept_lines).strip(), _merge_unique(removed_claims)
+    return _drop_empty_markdown_sections("\n".join(kept_lines)), _merge_unique(
+        removed_claims
+    )
+
+
+def _drop_empty_markdown_sections(answer: str) -> str:
+    lines = answer.strip().splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not _is_markdown_section_heading(line):
+            kept.append(line)
+            index += 1
+            continue
+
+        next_index = index + 1
+        while next_index < len(lines) and not _is_markdown_section_heading(
+            lines[next_index]
+        ):
+            next_index += 1
+        body = lines[index + 1 : next_index]
+        if any(item.strip() for item in body):
+            kept.extend(lines[index:next_index])
+        else:
+            while kept and not kept[-1].strip():
+                kept.pop()
+        index = next_index
+    return "\n".join(kept).strip()
+
+
+def _is_markdown_section_heading(line: str) -> bool:
+    stripped = line.strip()
+    if re.match(r"^#{1,6}\s+\S", stripped):
+        return True
+    return stripped.startswith("**") and stripped.endswith("**") and stripped.count("**") == 2
 
 
 def _build_trace_steps(
@@ -2285,11 +2963,19 @@ def _build_trace_steps(
             if clinical_boundary
             else "completed" if result.query_plan is not None else "skipped"
         ),
-        "structured planner" if result.query_plan is not None else "answer_with_audit request",
+        (
+            "structured planner"
+            if result.query_plan is not None
+            else "answer_with_audit request"
+        ),
         (
             result.query_plan.primary_query
             if result.query_plan is not None
-            else "clinical boundary stopped retrieval" if clinical_boundary else "reused answer_with_evidence retrieval plan"
+            else (
+                "clinical boundary stopped retrieval"
+                if clinical_boundary
+                else "reused answer_with_evidence retrieval plan"
+            )
         ),
         warnings=result.query_plan.warnings if result.query_plan is not None else [],
         metadata={
@@ -2308,11 +2994,7 @@ def _build_trace_steps(
     )
     add(
         "validate_plan",
-        (
-            "completed"
-            if result.query_plan_validation is not None
-            else "skipped"
-        ),
+        ("completed" if result.query_plan_validation is not None else "skipped"),
         result.query_plan.primary_query if result.query_plan is not None else "",
         (
             result.query_plan_validation.status
@@ -2358,6 +3040,7 @@ def _build_trace_steps(
         f"{len(result.evidence_summary)} evidence items",
         metadata={
             "evidence_intent_counts": _evidence_intent_counts(result.evidence_summary),
+            "extraction_mode_counts": _extraction_mode_counts(result.evidence_summary),
         },
     )
     add(
@@ -2365,6 +3048,12 @@ def _build_trace_steps(
         "completed",
         "evidence summary",
         f"{len(revision.draft_answer)} draft characters",
+        metadata={
+            "synthesis_mode": result.synthesis_mode,
+            "synthesis_model": result.synthesis_model,
+            "synthesis_prompt_hash": result.synthesis_prompt_hash,
+            "synthesis_fallback_reason": result.synthesis_fallback_reason,
+        },
     )
     add(
         "audit",
@@ -2396,7 +3085,8 @@ def _build_trace_steps(
         "post_audit",
         "completed" if revision.post_revision_audit_id else "skipped",
         revision.revision_action,
-        revision.post_revision_audit_id or "deterministic revision did not require a separate post-audit",
+        revision.post_revision_audit_id
+        or "deterministic revision did not require a separate post-audit",
     )
     add(
         "finalize",
@@ -2440,7 +3130,9 @@ def _llm_revision_payload(
             item.model_dump(mode="json") for item in draft_result.evidence_summary
         ],
         "limitations": draft_result.limitations,
-        "retrieval_manifest": manifest.model_dump(mode="json") if manifest is not None else None,
+        "retrieval_manifest": (
+            manifest.model_dump(mode="json") if manifest is not None else None
+        ),
         "audit": audit.model_dump(mode="json"),
     }
 
@@ -2458,11 +3150,7 @@ def _parse_json_object(raw: str) -> dict[str, object]:
 
 def _normalize_llm_answer_text(raw: str) -> str:
     text = raw.strip()
-    return (
-        text.replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-    )
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
 
 
 def _coerce_string_list(value: object) -> list[str]:
@@ -2477,6 +3165,14 @@ def _llm_unavailable_reason(provider: object | None, model: str) -> str:
     if not model:
         return "LLM revision was requested, but no revision model is configured."
     return "LLM revision was requested, but the LLM revision adapter fell back to deterministic revision."
+
+
+def _llm_synthesis_unavailable_reason(provider: object | None, model: str) -> str:
+    if provider is None:
+        return "LLM synthesis was requested, but no framework provider is configured for this service instance."
+    if not model:
+        return "LLM synthesis was requested, but no synthesis model is configured."
+    return "LLM synthesis was requested, but the LLM synthesis adapter fell back to deterministic synthesis."
 
 
 def _llm_planner_unavailable_reason(provider: object | None, model: str) -> str:
@@ -2520,7 +3216,9 @@ def _soften_claim_line(line: str, claim: ClaimAuditItem) -> str:
     softened = re.sub(r"\bproves?\b", "suggests", softened, flags=re.IGNORECASE)
     softened = re.sub(r"\bestablishes?\b", "suggests", softened, flags=re.IGNORECASE)
     if claim.verdict == "contradicted":
-        softened = f"Audit note: retrieved evidence conflicts with this claim; {softened}"
+        softened = (
+            f"Audit note: retrieved evidence conflicts with this claim; {softened}"
+        )
     elif claim.overclaim_reason:
         softened = f"Audit-softened claim: {softened}"
     return f"{prefix}{softened}"
@@ -2580,7 +3278,9 @@ def _merge_unique(*groups: Iterable[str]) -> list[str]:
 
 
 def _revision_id(run_id: str, audit_id: str | None) -> str:
-    digest = hashlib.sha256(f"{run_id}:{audit_id or ''}".encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(f"{run_id}:{audit_id or ''}".encode("utf-8")).hexdigest()[
+        :16
+    ]
     return f"revision-{digest}"
 
 
@@ -2589,7 +3289,9 @@ def _trace_step_id(run_id: str, step: str) -> str:
     return f"trace-{digest}"
 
 
-def _score_watch_relevance(watch: WatchTopic, paper: BiomedicalPaper) -> tuple[float, str]:
+def _score_watch_relevance(
+    watch: WatchTopic, paper: BiomedicalPaper
+) -> tuple[float, str]:
     haystack = " ".join(
         [
             paper.title,
@@ -2605,8 +3307,12 @@ def _score_watch_relevance(watch: WatchTopic, paper: BiomedicalPaper) -> tuple[f
     if not topic_terms:
         return 0.0, "No topic terms configured."
     hits = [term for term in topic_terms if term in haystack]
-    method_hits = [method for method in watch.preferred_methods if method.lower() in haystack]
-    score = min(1.0, (len(hits) / len(topic_terms)) * 0.85 + min(0.15, len(method_hits) * 0.05))
+    method_hits = [
+        method for method in watch.preferred_methods if method.lower() in haystack
+    ]
+    score = min(
+        1.0, (len(hits) / len(topic_terms)) * 0.85 + min(0.15, len(method_hits) * 0.05)
+    )
     if score >= watch.min_relevance_score:
         reason = f"Matched topic terms: {', '.join(hits[:8]) or 'none'}"
         if method_hits:

@@ -139,8 +139,9 @@ class BiomedStorage:
                     evidence_id, paper_id, source, claim_hash, claim, finding,
                     evidence_direction, methods_json, datasets_json, limitations_json,
                     confidence, evidence_span, retrieval_intent,
+                    extraction_mode, extractor_model, extractor_prompt_hash,
                     requires_expert_review, retrieval_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(paper_id, claim_hash) DO UPDATE SET
                     source=excluded.source,
                     claim=excluded.claim,
@@ -152,6 +153,9 @@ class BiomedStorage:
                     confidence=excluded.confidence,
                     evidence_span=excluded.evidence_span,
                     retrieval_intent=excluded.retrieval_intent,
+                    extraction_mode=excluded.extraction_mode,
+                    extractor_model=excluded.extractor_model,
+                    extractor_prompt_hash=excluded.extractor_prompt_hash,
                     requires_expert_review=excluded.requires_expert_review,
                     retrieval_id=COALESCE(excluded.retrieval_id, biomed_evidence.retrieval_id),
                     updated_at=excluded.updated_at
@@ -170,6 +174,9 @@ class BiomedStorage:
                     item.confidence,
                     item.evidence_span,
                     item.retrieval_intent,
+                    item.extraction_mode,
+                    item.extractor_model,
+                    item.extractor_prompt_hash,
                     1 if item.requires_expert_review else 0,
                     retrieval_id,
                     now,
@@ -180,7 +187,9 @@ class BiomedStorage:
                 "SELECT evidence_id FROM biomed_evidence WHERE paper_id=? AND claim_hash=?",
                 (item.paper_id, claim_hash),
             ).fetchone()
-            evidence_id = str(row["evidence_id"] if row is not None else item.evidence_id)
+            evidence_id = str(
+                row["evidence_id"] if row is not None else item.evidence_id
+            )
             self._db.execute(
                 "DELETE FROM biomed_evidence_entities WHERE evidence_id=?",
                 (evidence_id,),
@@ -220,15 +229,13 @@ class BiomedStorage:
             params.append(direction.strip())
         if entity.strip():
             needle = f"%{entity.strip()}%"
-            clauses.append(
-                """
+            clauses.append("""
                 EXISTS (
                     SELECT 1 FROM biomed_evidence_entities ee
                     JOIN biomed_entities be ON be.entity_id = ee.entity_id
                     WHERE ee.evidence_id = e.evidence_id AND be.name LIKE ?
                 )
-                """
-            )
+                """)
             params.append(needle)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
@@ -264,7 +271,9 @@ class BiomedStorage:
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
 
-    def save_answer_run(self, result: AnswerWithEvidenceResult, *, question: str) -> None:
+    def save_answer_run(
+        self, result: AnswerWithEvidenceResult, *, question: str
+    ) -> None:
         now = _now_iso()
         with self._lock:
             self._db.execute(
@@ -526,7 +535,9 @@ class BiomedStorage:
             return None
         return CitationAuditResult.model_validate_json(str(row["audit_json"]))
 
-    def get_latest_citation_audit_for_run(self, run_id: str) -> CitationAuditResult | None:
+    def get_latest_citation_audit_for_run(
+        self, run_id: str
+    ) -> CitationAuditResult | None:
         with self._lock:
             row = self._db.execute(
                 """
@@ -655,7 +666,9 @@ class BiomedStorage:
         where = "" if include_disabled else " WHERE enabled = 1"
         with self._lock:
             total = int(
-                self._db.execute(f"SELECT COUNT(*) FROM biomed_watch_topics{where}").fetchone()[0]
+                self._db.execute(
+                    f"SELECT COUNT(*) FROM biomed_watch_topics{where}"
+                ).fetchone()[0]
             )
             rows = self._db.execute(
                 f"""
@@ -856,7 +869,22 @@ class BiomedStorage:
             confidence=row["confidence"],
             evidence_span=row["evidence_span"],
             retrieval_intent=(
-                row["retrieval_intent"] if "retrieval_intent" in row.keys() else "unknown"
+                row["retrieval_intent"]
+                if "retrieval_intent" in row.keys()
+                else "unknown"
+            ),
+            extraction_mode=(
+                row["extraction_mode"]
+                if "extraction_mode" in row.keys()
+                else "deterministic"
+            ),
+            extractor_model=(
+                row["extractor_model"] if "extractor_model" in row.keys() else None
+            ),
+            extractor_prompt_hash=(
+                row["extractor_prompt_hash"]
+                if "extractor_prompt_hash" in row.keys()
+                else None
             ),
             requires_expert_review=bool(row["requires_expert_review"]),
         )
@@ -868,7 +896,9 @@ class BiomedStorage:
         data["paper_url"] = row["paper_url"]
         data["paper_doi"] = row["paper_doi"]
         data["source"] = row["source"]
-        data["retrieval_id"] = row["retrieval_id"] if "retrieval_id" in row.keys() else None
+        data["retrieval_id"] = (
+            row["retrieval_id"] if "retrieval_id" in row.keys() else None
+        )
         return data
 
     def _entities_for_evidence(self, evidence_id: str) -> list[BiomedicalEntity]:
@@ -923,7 +953,9 @@ class BiomedStorage:
         offset = _offset(page, page_size)
         with self._lock:
             total = int(
-                self._db.execute(f"SELECT COUNT(*) FROM {table}{where}", params).fetchone()[0]
+                self._db.execute(
+                    f"SELECT COUNT(*) FROM {table}{where}", params
+                ).fetchone()[0]
             )
             rows = self._db.execute(
                 f"""
@@ -937,7 +969,9 @@ class BiomedStorage:
         return [_row_to_dict(row) for row in rows], total
 
     @staticmethod
-    def _build_filters(*filters: tuple[str, tuple[Any, ...] | None]) -> tuple[str, tuple[Any, ...]]:
+    def _build_filters(
+        *filters: tuple[str, tuple[Any, ...] | None]
+    ) -> tuple[str, tuple[Any, ...]]:
         clauses: list[str] = []
         params: list[Any] = []
         for clause, values in filters:
@@ -949,8 +983,7 @@ class BiomedStorage:
         return where, tuple(params)
 
     def _ensure_schema(self) -> None:
-        self._db.executescript(
-            """
+        self._db.executescript("""
             CREATE TABLE IF NOT EXISTS biomed_papers(
                 paper_id TEXT NOT NULL,
                 source TEXT NOT NULL,
@@ -988,6 +1021,9 @@ class BiomedStorage:
                 confidence TEXT NOT NULL,
                 evidence_span TEXT,
                 retrieval_intent TEXT NOT NULL DEFAULT 'unknown',
+                extraction_mode TEXT NOT NULL DEFAULT 'deterministic',
+                extractor_model TEXT,
+                extractor_prompt_hash TEXT,
                 requires_expert_review INTEGER NOT NULL DEFAULT 1,
                 retrieval_id TEXT,
                 created_at TEXT NOT NULL,
@@ -1132,19 +1168,35 @@ class BiomedStorage:
                 revision_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-            """
-        )
+            """)
         self._ensure_column("biomed_evidence", "retrieval_id", "TEXT")
-        self._ensure_column("biomed_evidence", "retrieval_intent", "TEXT NOT NULL DEFAULT 'unknown'")
+        self._ensure_column(
+            "biomed_evidence", "retrieval_intent", "TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        self._ensure_column(
+            "biomed_evidence",
+            "extraction_mode",
+            "TEXT NOT NULL DEFAULT 'deterministic'",
+        )
+        self._ensure_column("biomed_evidence", "extractor_model", "TEXT")
+        self._ensure_column("biomed_evidence", "extractor_prompt_hash", "TEXT")
         self._ensure_column("biomed_watch_decisions", "retrieval_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "snapshot_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "dedupe_reason", "TEXT")
         self._ensure_column("biomed_answer_runs", "retrieval_id", "TEXT")
         self._ensure_column("biomed_answer_revisions", "post_revision_audit_id", "TEXT")
-        self._ensure_column("biomed_answer_revisions", "revision_mode", "TEXT NOT NULL DEFAULT 'deterministic'")
+        self._ensure_column(
+            "biomed_answer_revisions",
+            "revision_mode",
+            "TEXT NOT NULL DEFAULT 'deterministic'",
+        )
         self._ensure_column("biomed_answer_revisions", "llm_model", "TEXT")
         self._ensure_column("biomed_answer_revisions", "llm_prompt_hash", "TEXT")
-        self._ensure_column("biomed_answer_revisions", "llm_raw_response_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(
+            "biomed_answer_revisions",
+            "llm_raw_response_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
         self._ensure_column("biomed_answer_revisions", "fallback_reason", "TEXT")
         self._db.commit()
 

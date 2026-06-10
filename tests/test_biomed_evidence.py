@@ -44,7 +44,9 @@ async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
     assert result.citations
     assert result.evidence_summary
     assert "research support only" in result.disclaimer
-    assert any(item.evidence_direction == "supports" for item in result.evidence_summary)
+    assert any(
+        item.evidence_direction == "supports" for item in result.evidence_summary
+    )
 
 
 @pytest.mark.asyncio
@@ -82,7 +84,9 @@ async def test_patient_specific_dose_question_is_refused(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_plan_biomedical_search_builds_valid_retrieval_plan(tmp_path: Path) -> None:
+async def test_plan_biomedical_search_builds_valid_retrieval_plan(
+    tmp_path: Path,
+) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
         result = await service.plan_biomedical_search(
@@ -106,7 +110,9 @@ async def test_plan_biomedical_search_builds_valid_retrieval_plan(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_plan_biomedical_search_refuses_clinical_query_before_retrieval(tmp_path: Path) -> None:
+async def test_plan_biomedical_search_refuses_clinical_query_before_retrieval(
+    tmp_path: Path,
+) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
         result = await service.plan_biomedical_search(
@@ -127,7 +133,9 @@ async def test_plan_biomedical_search_refuses_clinical_query_before_retrieval(tm
 
 
 @pytest.mark.asyncio
-async def test_answer_with_planner_executes_support_refute_bundle(tmp_path: Path) -> None:
+async def test_answer_with_planner_executes_support_refute_bundle(
+    tmp_path: Path,
+) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
         result = await service.answer_with_evidence(
@@ -147,7 +155,10 @@ async def test_answer_with_planner_executes_support_refute_bundle(tmp_path: Path
     intents = {record.intent for record in result.retrieval_bundle.records}
     assert {"primary", "support", "refute"} <= intents
     assert result.retrieval_manifest is not None
-    assert result.retrieval_bundle.records[0].retrieval_id == result.retrieval_manifest.retrieval_id
+    assert (
+        result.retrieval_bundle.records[0].retrieval_id
+        == result.retrieval_manifest.retrieval_id
+    )
     assert len(result.retrieval_bundle.deduped_paper_ids) == len(
         set(result.retrieval_bundle.deduped_paper_ids)
     )
@@ -161,7 +172,9 @@ async def test_answer_with_planner_executes_support_refute_bundle(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_mock_search_fetch_extract_and_storage_idempotency(tmp_path: Path) -> None:
+async def test_mock_search_fetch_extract_and_storage_idempotency(
+    tmp_path: Path,
+) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
         search_result = await service.search_with_manifest(
@@ -175,9 +188,7 @@ async def test_mock_search_fetch_extract_and_storage_idempotency(tmp_path: Path)
         assert search_result.retrieval_manifest.source == "mock"
         assert search_result.retrieval_manifest.compiled_query
         assert search_result.retrieval_manifest.deduped_result_count == len(items)
-        paper = await service.fetch(
-            service_module_fetch_request(items[0].paper_id)
-        )
+        paper = await service.fetch(service_module_fetch_request(items[0].paper_id))
         assert paper is not None
         request = EvidenceExtractionRequest(
             paper=paper,
@@ -269,7 +280,15 @@ class _FakePlannerProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
         self.calls += 1
         payload = json.loads(messages[-1]["content"])
         return _FakePlannerResponse(
@@ -291,8 +310,12 @@ class _FakePlannerProvider:
                         "exclude_terms": ["dosage"],
                         "study_types": ["longitudinal"],
                         "species_terms": [],
-                        "support_queries": ["microglial activation Alzheimer disease progression association"],
-                        "refute_queries": ["microglial activation Alzheimer disease progression negative results"],
+                        "support_queries": [
+                            "microglial activation Alzheimer disease progression association"
+                        ],
+                        "refute_queries": [
+                            "microglial activation Alzheimer disease progression negative results"
+                        ],
                         "max_results": 5,
                         "rationale": "fake planner query plan",
                     },
@@ -305,21 +328,117 @@ class _FakeEchoPlannerProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
         self.calls += 1
         payload = json.loads(messages[-1]["content"])
         return _FakePlannerResponse(
             json.dumps(
                 {
-                    "deterministic_classification": payload["deterministic_classification"],
+                    "deterministic_classification": payload[
+                        "deterministic_classification"
+                    ],
                     "deterministic_query_plan": payload["deterministic_query_plan"],
                 }
             )
         )
 
 
+class _FakeExtractorProvider:
+    def __init__(
+        self,
+        *,
+        grounded: bool = True,
+        terminal_punctuation_trim: bool = False,
+    ) -> None:
+        self.grounded = grounded
+        self.terminal_punctuation_trim = terminal_punctuation_trim
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        abstract = str(payload["paper"]["abstract"])
+        if self.grounded and abstract and self.terminal_punctuation_trim and ", although" in abstract:
+            span = abstract.split(", although")[0].split(". ")[-1].strip() + "."
+        elif self.grounded and abstract:
+            span = abstract.split(".")[0].strip() + "."
+        else:
+            span = "This sentence is not present in the supplied abstract."
+        return _FakePlannerResponse(
+            json.dumps(
+                {
+                    "evidence": [
+                        {
+                            "claim": "LLM extracted span-grounded evidence.",
+                            "finding": span,
+                            "evidence_direction": "supports",
+                            "evidence_span": span,
+                            "confidence": "medium",
+                            "entities": [
+                                {"name": "microglia", "entity_type": "cell_type"}
+                            ],
+                            "methods": [],
+                            "datasets_or_cohorts": [],
+                            "limitations": ["Abstract-only extraction."],
+                        }
+                    ]
+                }
+            )
+        )
+
+
+class _FakeSynthesisProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        evidence = payload["evidence_items"][0]
+        paper_id = evidence["paper_id"]
+        finding = evidence["finding"]
+        return _FakePlannerResponse(
+            json.dumps(
+                {
+                    "final_answer": (
+                        f"{payload['research_only_boundary']}\n\n"
+                        f"- {finding} [{paper_id}]"
+                    ),
+                    "uncertainty_level": "high",
+                    "added_limitations": [],
+                }
+            )
+        )
+
+
 @pytest.mark.asyncio
-async def test_plan_biomedical_search_can_use_injected_llm_planner(tmp_path: Path) -> None:
+async def test_plan_biomedical_search_can_use_injected_llm_planner(
+    tmp_path: Path,
+) -> None:
     provider = _FakePlannerProvider()
     service = BiomedEvidenceService(
         tmp_path,
@@ -348,7 +467,130 @@ async def test_plan_biomedical_search_can_use_injected_llm_planner(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_plan_biomedical_search_accepts_llm_echoed_deterministic_payload(tmp_path: Path) -> None:
+async def test_answer_can_use_span_grounded_llm_extractor(tmp_path: Path) -> None:
+    provider = _FakeExtractorProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-extractor",
+    )
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=2,
+                use_llm_extractor=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls >= 1
+    assert result.evidence_summary
+    assert {item.extraction_mode for item in result.evidence_summary} == {"llm"}
+    assert all(
+        item.extractor_model == "fake-extractor" for item in result.evidence_summary
+    )
+    assert all(
+        item.evidence_span and item.evidence_span == item.finding
+        for item in result.evidence_summary
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_extractor_accepts_trimmed_terminal_punctuation(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeExtractorProvider(terminal_punctuation_trim=True)
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-extractor",
+    )
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_extractor=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    items = [
+        item
+        for item in result.evidence_summary
+        if item.paper_id == "MOCK-PMID-1001"
+    ]
+    assert items
+    assert items[0].extraction_mode == "llm"
+    assert items[0].evidence_span.endswith("amyloid pathology")
+    assert not items[0].evidence_span.endswith(".")
+
+
+@pytest.mark.asyncio
+async def test_answer_falls_back_when_llm_extractor_span_is_ungrounded(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeExtractorProvider(grounded=False)
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-extractor",
+    )
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=2,
+                use_llm_extractor=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls >= 1
+    assert result.evidence_summary
+    assert {item.extraction_mode for item in result.evidence_summary} == {"fallback"}
+    assert all(item.extractor_model is None for item in result.evidence_summary)
+
+
+@pytest.mark.asyncio
+async def test_answer_can_use_audit_gated_llm_synthesis(tmp_path: Path) -> None:
+    provider = _FakeSynthesisProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-synthesizer",
+    )
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=2,
+                use_llm_synthesis=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert result.synthesis_mode == "llm"
+    assert result.synthesis_model == "fake-synthesizer"
+    assert result.synthesis_prompt_hash
+    assert result.synthesis_fallback_reason is None
+    assert "[MOCK-PMID-" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_accepts_llm_echoed_deterministic_payload(
+    tmp_path: Path,
+) -> None:
     provider = _FakeEchoPlannerProvider()
     service = BiomedEvidenceService(
         tmp_path,
@@ -385,16 +627,13 @@ class _FakePubMedClient:
         if url.endswith("esearch.fcgi"):
             retstart = int(params.get("retstart", 0))
             pmid = "9001" if retstart == 0 else "9002"
-            return _FakePubMedResponse(
-                f"""
+            return _FakePubMedResponse(f"""
                 <eSearchResult>
                   <Count>2</Count>
                   <IdList><Id>{pmid}</Id></IdList>
                 </eSearchResult>
-                """
-            )
-        return _FakePubMedResponse(
-            """
+                """)
+        return _FakePubMedResponse("""
             <PubmedArticleSet>
               <PubmedArticle>
                 <MedlineCitation>
@@ -415,8 +654,7 @@ class _FakePubMedClient:
                 </MedlineCitation>
               </PubmedArticle>
             </PubmedArticleSet>
-            """
-        )
+            """)
 
 
 class _FlakyPubMedClient(_FakePubMedClient):
@@ -446,9 +684,7 @@ async def test_pubmed_search_trace_records_pagination_with_fake_http() -> None:
     assert result.trace["pages_completed"] == 2
     assert result.trace["raw_result_count"] == 2
     starts = [
-        params["retstart"]
-        for url, params in fake.calls
-        if url.endswith("esearch.fcgi")
+        params["retstart"] for url, params in fake.calls if url.endswith("esearch.fcgi")
     ]
     assert starts == [0, 1]
 
@@ -510,7 +746,13 @@ async def test_watch_check_scores_and_dedupes_decisions(tmp_path: Path) -> None:
 def test_tool_schema_derives_literal_and_list_types() -> None:
     from typing import Literal
 
-    async def sample(self, event, source: Literal["pubmed", "mock"], tags: list[str], enabled: bool = True):
+    async def sample(
+        self,
+        event,
+        source: Literal["pubmed", "mock"],
+        tags: list[str],
+        enabled: bool = True,
+    ):
         return ""
 
     schema = _derive_params_schema(sample)

@@ -35,6 +35,7 @@ plugins/**/.data/
 /data
 /memory/
 /.docker-workspace/
+/.akashic-workspace/
 
 # IDE
 .idea/

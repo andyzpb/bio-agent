@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from plugins.biomed_evidence.schemas import BiomedicalEntity, BiomedicalPaper, EvidenceItem
-
+from plugins.biomed_evidence.schemas import (
+    BiomedicalEntity,
+    BiomedicalPaper,
+    EvidenceItem,
+)
 
 MOCK_PAPERS: list[BiomedicalPaper] = [
     BiomedicalPaper(
@@ -125,7 +128,7 @@ MOCK_EVIDENCE: dict[str, list[EvidenceItem]] = {
             confidence="high",
             evidence_span=(
                 "The abundance of activated microglia correlated with Braak stage "
-                "and amyloid pathology."
+                "and amyloid pathology"
             ),
             requires_expert_review=True,
         )
@@ -175,7 +178,7 @@ MOCK_EVIDENCE: dict[str, list[EvidenceItem]] = {
             datasets_or_cohorts=["longitudinal CSF cohort"],
             limitations=["Associations weakened after confounder adjustment."],
             confidence="medium",
-            evidence_span="Associations weakened after adjustment for vascular comorbidity.",
+            evidence_span="Associations weakened after adjustment for vascular comorbidity",
             requires_expert_review=True,
         )
     ],

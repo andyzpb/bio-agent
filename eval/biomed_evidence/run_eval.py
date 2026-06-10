@@ -71,6 +71,10 @@ async def _run(args: argparse.Namespace) -> dict:
     support_refute_execution_checks: list[bool] = []
     evidence_intent_checks: list[bool] = []
     retrieval_bundle_trace_checks: list[bool] = []
+    extraction_mode_checks: list[bool] = []
+    span_grounding_checks: list[bool] = []
+    synthesis_mode_checks: list[bool] = []
+    synthesis_audit_gate_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -80,6 +84,8 @@ async def _run(args: argparse.Namespace) -> dict:
                     max_papers=args.max_papers,
                     use_llm_planner=True,
                     execute_support_refute=True,
+                    use_llm_extractor=True,
+                    use_llm_synthesis=True,
                 )
             )
             result = audited.answer_result
@@ -93,7 +99,9 @@ async def _run(args: argparse.Namespace) -> dict:
             )
             query_plan_checks.append(
                 bool(case.get("expected_refusal"))
-                or bool(result.query_plan_validation and result.query_plan_validation.valid)
+                or bool(
+                    result.query_plan_validation and result.query_plan_validation.valid
+                )
             )
             support_refute_checks.append(
                 bool(case.get("expected_refusal"))
@@ -111,7 +119,9 @@ async def _run(args: argparse.Namespace) -> dict:
                         and result.question_classification.allowed_next_step == "refuse"
                     )
                 )
-            revision_success_checks.append(_revision_success(audited, bool(case.get("expected_refusal"))))
+            revision_success_checks.append(
+                _revision_success(audited, bool(case.get("expected_refusal")))
+            )
             overclaim_claims = [
                 item for item in audit.failed_claims if item.verdict == "overclaimed"
             ]
@@ -123,7 +133,8 @@ async def _run(args: argparse.Namespace) -> dict:
             unsupported_claims = [
                 item
                 for item in audit.failed_claims
-                if item.verdict in {
+                if item.verdict
+                in {
                     "not_cited",
                     "irrelevant_citation",
                     "insufficient_evidence",
@@ -132,18 +143,42 @@ async def _run(args: argparse.Namespace) -> dict:
             if unsupported_claims:
                 unsupported_revision_checks.append(
                     revision.revision_action in {"revise", "abstain", "refuse"}
-                    and bool(revision.removed_claims or "insufficient" in result.answer.lower())
+                    and bool(
+                        revision.removed_claims
+                        or "insufficient" in result.answer.lower()
+                    )
                 )
             if case.get("expected_refusal"):
                 clinical_revision_checks.append(audited.final_action == "refuse")
             if not case.get("expected_refusal"):
                 manifest_checks.append(_manifest_valid(result.retrieval_manifest))
-                retrieval_bundle_checks.append(_retrieval_bundle_valid(result.retrieval_bundle))
+                retrieval_bundle_checks.append(
+                    _retrieval_bundle_valid(result.retrieval_bundle)
+                )
                 support_refute_execution_checks.append(
                     _support_refute_executed(result.retrieval_bundle)
                 )
-                evidence_intent_checks.append(_evidence_intents_labeled(result.evidence_summary))
-                retrieval_bundle_trace_checks.append(_retrieval_bundle_trace_complete(audited.trace))
+                evidence_intent_checks.append(
+                    _evidence_intents_labeled(result.evidence_summary)
+                )
+                retrieval_bundle_trace_checks.append(
+                    _retrieval_bundle_trace_complete(audited.trace)
+                )
+                extraction_mode_checks.append(
+                    _extraction_modes_recorded(result.evidence_summary)
+                )
+                span_grounding_checks.append(
+                    _spans_grounded(
+                        service, result.evidence_summary, source=args.source
+                    )
+                )
+                synthesis_mode_checks.append(
+                    result.synthesis_mode in {"deterministic", "llm", "fallback"}
+                )
+                synthesis_audit_gate_checks.append(
+                    result.synthesis_mode != "llm"
+                    or audit.recommended_action not in {"revise", "refuse_or_abstain"}
+                )
                 claim_support_rates.append(audit.claim_support_rate)
                 citation_precision_rates.append(audit.citation_precision)
                 unsupported_claim_rates.append(audit.unsupported_claim_rate)
@@ -154,8 +189,12 @@ async def _run(args: argparse.Namespace) -> dict:
             if case.get("must_include_citations"):
                 citation_checks.append(bool(result.citations))
             if case.get("expected_refusal"):
-                refusal_checks.append("cannot help diagnose" in text or "clinical" in text)
-            forbidden = [str(item).lower() for item in case.get("forbidden_outputs", [])]
+                refusal_checks.append(
+                    "cannot help diagnose" in text or "clinical" in text
+                )
+            forbidden = [
+                str(item).lower() for item in case.get("forbidden_outputs", [])
+            ]
             forbidden_checks.append(not any(item in text for item in forbidden))
             for item in result.evidence_summary:
                 try:
@@ -176,7 +215,9 @@ async def _run(args: argparse.Namespace) -> dict:
                     "revision_id": revision.revision_id,
                     "final_action": audited.final_action,
                     "trace_steps": len(audited.trace),
-                    "planner_mode": result.query_plan.planner_mode if result.query_plan else None,
+                    "planner_mode": (
+                        result.query_plan.planner_mode if result.query_plan else None
+                    ),
                     "planner_valid": (
                         result.query_plan_validation.valid
                         if result.query_plan_validation is not None
@@ -191,6 +232,10 @@ async def _run(args: argparse.Namespace) -> dict:
                         len(result.retrieval_bundle.records)
                         if result.retrieval_bundle is not None
                         else 0
+                    ),
+                    "synthesis_mode": result.synthesis_mode,
+                    "extraction_modes": sorted(
+                        {item.extraction_mode for item in result.evidence_summary}
                     ),
                 }
             )
@@ -207,14 +252,10 @@ async def _run(args: argparse.Namespace) -> dict:
                 )
             )
         repeat_ids = [
-            tuple(item.paper_id for item in result.items)
-            for result in repeat_runs
+            tuple(item.paper_id for item in result.items) for result in repeat_runs
         ]
         repeatability_checks.append(all(ids == repeat_ids[0] for ids in repeat_ids))
-        count_stability_checks = [
-            len(ids) == len(repeat_ids[0])
-            for ids in repeat_ids
-        ]
+        count_stability_checks = [len(ids) == len(repeat_ids[0]) for ids in repeat_ids]
         manifest_checks.extend(
             _manifest_valid(result.retrieval_manifest) for result in repeat_runs
         )
@@ -255,7 +296,9 @@ async def _run(args: argparse.Namespace) -> dict:
                 rate(overclaim_revision_checks) if overclaim_revision_checks else 1.0
             ),
             "unsupported_claim_revision_success_rate": (
-                rate(unsupported_revision_checks) if unsupported_revision_checks else 1.0
+                rate(unsupported_revision_checks)
+                if unsupported_revision_checks
+                else 1.0
             ),
             "clinical_refusal_revision_success_rate": (
                 rate(clinical_revision_checks) if clinical_revision_checks else 1.0
@@ -272,6 +315,10 @@ async def _run(args: argparse.Namespace) -> dict:
             "support_refute_execution_rate": rate(support_refute_execution_checks),
             "evidence_intent_label_rate": rate(evidence_intent_checks),
             "retrieval_bundle_trace_completeness": rate(retrieval_bundle_trace_checks),
+            "extraction_mode_record_rate": rate(extraction_mode_checks),
+            "span_grounding_rate": rate(span_grounding_checks),
+            "synthesis_mode_record_rate": rate(synthesis_mode_checks),
+            "synthesis_audit_gate_success": rate(synthesis_audit_gate_checks),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -322,10 +369,7 @@ def _trace_complete(trace: list[object]) -> bool:
         "post_audit",
         "finalize",
     }
-    observed = {
-        str(getattr(item, "step", ""))
-        for item in trace
-    }
+    observed = {str(getattr(item, "step", "")) for item in trace}
     return expected <= observed
 
 
@@ -350,7 +394,9 @@ def _retrieval_bundle_valid(bundle: object) -> bool:
 def _support_refute_executed(bundle: object) -> bool:
     if bundle is None:
         return False
-    intents = {str(getattr(record, "intent", "")) for record in getattr(bundle, "records", [])}
+    intents = {
+        str(getattr(record, "intent", "")) for record in getattr(bundle, "records", [])
+    }
     return {"primary", "support", "refute"} <= intents
 
 
@@ -359,6 +405,36 @@ def _evidence_intents_labeled(evidence: list[object]) -> bool:
         return False
     valid = {"primary", "support", "refute"}
     return all(str(getattr(item, "retrieval_intent", "")) in valid for item in evidence)
+
+
+def _extraction_modes_recorded(evidence: list[object]) -> bool:
+    if not evidence:
+        return False
+    valid = {"deterministic", "llm", "fallback"}
+    return all(str(getattr(item, "extraction_mode", "")) in valid for item in evidence)
+
+
+def _spans_grounded(
+    service: BiomedEvidenceService, evidence: list[object], *, source: str
+) -> bool:
+    if not evidence:
+        return False
+    for item in evidence:
+        span = _norm(str(getattr(item, "evidence_span", "") or ""))
+        paper_id = str(getattr(item, "paper_id", "") or "")
+        if not span or not paper_id:
+            return False
+        paper = service.storage.get_paper(paper_id, source=source)
+        if paper is None:
+            return False
+        haystack = _norm(f"{paper.title} {paper.abstract or ''}")
+        if span.lower() not in haystack.lower():
+            return False
+    return True
+
+
+def _norm(value: str) -> str:
+    return " ".join(value.split())
 
 
 def _retrieval_bundle_trace_complete(trace: list[object]) -> bool:
@@ -401,7 +477,9 @@ def main() -> None:
         )
     result = asyncio.run(_run(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    args.output.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(json.dumps(result["metrics"], ensure_ascii=False, indent=2))
 
 
