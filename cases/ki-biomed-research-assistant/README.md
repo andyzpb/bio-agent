@@ -12,10 +12,13 @@ Biomedical Evidence plugin:
 - deterministic mock literature search and optional PubMed retrieval;
 - structured evidence extraction from abstracts;
 - citation-grounded biomedical research answers;
+- claim-level citation audit with support verdicts, overclaim detection, and
+  uncertainty calibration;
 - retrieval manifests for source, query, pagination, warnings, and returned paper IDs;
 - lightweight evidence graph over papers, claims, entities, methods, datasets, and limitations;
 - Research Watch topics with relevance scoring, retrieval snapshots, and push/skip decision logs;
-- dashboard views for asking questions, inspecting evidence, reviewing graph structure, and checking responsible AI boundaries.
+- dashboard views for asking questions, inspecting evidence, reviewing graph
+  structure, running citation audits, and checking responsible AI boundaries.
 
 ## Demo
 
@@ -45,7 +48,9 @@ Biomedical Evidence plugin:
 - Typed Pydantic schemas and SQLite storage.
 - FastAPI routes shared by dashboard and tests.
 - TypeScript dashboard panel using the existing plugin runtime.
-- Mock evaluation harness for citation coverage, schema validity, refusal behavior, and watch precision.
+- Mock evaluation harness for citation coverage, schema validity, refusal
+  behavior, watch precision, retrieval reliability, and claim-level audit
+  metrics.
 - Retrieval reliability metrics for manifest validity and repeatability.
 - Docker and CI support for reproducible review.
 
@@ -53,12 +58,15 @@ Biomedical Evidence plugin:
 
 The case is implemented as Portfolio V1, not only a prototype. It includes:
 
-- ten registered agent tools for biomedical search, paper fetch, extraction, answering, watch management, graph retrieval, and export;
+- registered agent tools for biomedical search, paper fetch, extraction,
+  answering, citation audit, conflict checks, watch management, graph
+  retrieval, and export;
 - `/api/biomed/*` FastAPI routes for dashboard use and automated tests;
 - local SQLite persistence at `biomed_evidence/biomed.db`;
 - deterministic mock data for offline demos and optional PubMed retrieval through NCBI E-utilities;
 - idempotent paper, claim, entity, watch, decision, and answer-run persistence;
 - persisted retrieval manifests, retrieval-paper links, and Watch snapshots;
+- persisted answer audits and claim audits;
 - Research Watch check events with push/skip decisions and relevance reasons;
 - markdown and JSON report export.
 

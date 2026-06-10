@@ -3,9 +3,9 @@
 Biomedical Evidence is a research-only Akashic plugin for citation-grounded
 biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured evidence extraction, cited answers, retrieval
-manifests, a lightweight evidence graph, and Research Watch decision logs. It is
-implemented as a plugin on top of the collaborative Akashic framework, not as a
-standalone clinical system.
+manifests, claim-level citation audit, a lightweight evidence graph, and
+Research Watch decision logs. It is implemented as a plugin on top of the
+collaborative Akashic framework, not as a standalone clinical system.
 
 ## Default Mode
 
@@ -36,6 +36,9 @@ Registered agent tools:
 - `delete_research_watch_topic`
 - `get_evidence_graph`
 - `export_evidence_report`
+- `validate_citation_support`
+- `audit_biomedical_answer`
+- `find_conflicting_evidence`
 
 All tool outputs are JSON-compatible envelopes so they can be used by the agent,
 FastAPI routes, tests, and the dashboard panel.
@@ -61,14 +64,16 @@ The panel includes:
 - Graph: inspect paper, claim, and entity links.
 - Watch: create, update, check, and review research-watch topics, snapshots,
   and push/skip decisions.
+- Audit: inspect atomic claims, citation-support verdicts, overclaims,
+  conflict awareness, uncertainty calibration, and recommended action.
 - Responsible AI: review the research-only operating boundary and retrieval
   limitations.
 
 ## API
 
 The plugin mounts `/api/biomed/*` routes for search, paper detail, evidence
-extraction, answer runs, graph retrieval, watch CRUD/check/events, audit, and
-export.
+extraction, answer runs, claim-level citation audit, graph retrieval, watch
+CRUD/check/events, conflict checks, and export.
 
 ## Safety Boundary
 

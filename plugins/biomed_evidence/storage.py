@@ -12,6 +12,8 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     BiomedicalEntity,
     BiomedicalPaper,
+    CitationAuditResult,
+    ConflictAuditResult,
     EvidenceItem,
     RetrievalManifest,
     WatchDecisionDetail,
@@ -307,6 +309,150 @@ class BiomedStorage:
             page=page,
             page_size=page_size,
         )
+
+    def save_citation_audit(self, audit: CitationAuditResult) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_answer_audits(
+                    audit_id, run_id, retrieval_id, metrics_json,
+                    recommended_action, audit_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    retrieval_id=excluded.retrieval_id,
+                    metrics_json=excluded.metrics_json,
+                    recommended_action=excluded.recommended_action,
+                    audit_json=excluded.audit_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    audit.audit_id,
+                    audit.run_id,
+                    audit.retrieval_id,
+                    _json(
+                        {
+                            "claim_support_rate": audit.claim_support_rate,
+                            "citation_precision": audit.citation_precision,
+                            "unsupported_claim_rate": audit.unsupported_claim_rate,
+                            "overclaim_rate": audit.overclaim_rate,
+                            "conflict_awareness": audit.conflict_awareness,
+                            "uncertainty_calibrated": audit.uncertainty_calibrated,
+                        }
+                    ),
+                    audit.recommended_action,
+                    audit.model_dump_json(),
+                    audit.created_at,
+                ),
+            )
+            self._db.execute(
+                "DELETE FROM biomed_claim_audits WHERE audit_id=?",
+                (audit.audit_id,),
+            )
+            for item in audit.claim_audits:
+                self._db.execute(
+                    """
+                    INSERT INTO biomed_claim_audits(
+                        claim_audit_id, audit_id, run_id, claim_text, claim_type,
+                        verdict, support_score, cited_paper_ids_json,
+                        evidence_ids_json, reason, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"{audit.audit_id}:{item.claim_id}",
+                        audit.audit_id,
+                        audit.run_id,
+                        item.claim,
+                        item.claim_type,
+                        item.verdict,
+                        item.support_score,
+                        _json(item.cited_paper_ids),
+                        _json(item.evidence_ids),
+                        item.reason,
+                        audit.created_at,
+                    ),
+                )
+            self._db.commit()
+
+    def get_citation_audit(self, audit_id: str) -> CitationAuditResult | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT audit_json
+                FROM biomed_answer_audits
+                WHERE audit_id=?
+                """,
+                (audit_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CitationAuditResult.model_validate_json(str(row["audit_json"]))
+
+    def get_latest_citation_audit_for_run(self, run_id: str) -> CitationAuditResult | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT audit_json
+                FROM biomed_answer_audits
+                WHERE run_id=?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CitationAuditResult.model_validate_json(str(row["audit_json"]))
+
+    def list_citation_audits(
+        self,
+        *,
+        run_id: str = "",
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[dict[str, object]], int]:
+        where = " WHERE run_id=?" if run_id else ""
+        params: tuple[Any, ...] = (run_id,) if run_id else ()
+        rows, total = self._list_rows(
+            table="biomed_answer_audits",
+            columns=(
+                "audit_id, run_id, retrieval_id, metrics_json, "
+                "recommended_action, created_at"
+            ),
+            where=where,
+            params=params,
+            order_by="created_at DESC",
+            page=page,
+            page_size=page_size,
+        )
+        for row in rows:
+            row["metrics"] = _json_dict(row.pop("metrics_json", "{}"))
+        return rows, total
+
+    def save_conflict_audit(self, audit: ConflictAuditResult) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_conflict_audits(
+                    conflict_audit_id, claim_hash, topic, retrieval_id,
+                    result_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conflict_audit_id) DO UPDATE SET
+                    topic=excluded.topic,
+                    retrieval_id=excluded.retrieval_id,
+                    result_json=excluded.result_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    audit.conflict_audit_id,
+                    _claim_hash(audit.claim),
+                    audit.topic,
+                    audit.retrieval_id,
+                    audit.model_dump_json(),
+                    audit.created_at,
+                ),
+            )
+            self._db.commit()
 
     def create_watch(self, watch: WatchTopic) -> WatchTopic:
         with self._lock:
@@ -779,6 +925,37 @@ class BiomedStorage:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(watch_id) REFERENCES biomed_watch_topics(watch_id) ON DELETE CASCADE,
                 FOREIGN KEY(retrieval_id) REFERENCES biomed_retrieval_manifests(retrieval_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS biomed_answer_audits(
+                audit_id TEXT PRIMARY KEY,
+                run_id TEXT,
+                retrieval_id TEXT,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                recommended_action TEXT NOT NULL,
+                audit_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_claim_audits(
+                claim_audit_id TEXT PRIMARY KEY,
+                audit_id TEXT NOT NULL,
+                run_id TEXT,
+                claim_text TEXT NOT NULL,
+                claim_type TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                support_score REAL NOT NULL,
+                cited_paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(audit_id) REFERENCES biomed_answer_audits(audit_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS biomed_conflict_audits(
+                conflict_audit_id TEXT PRIMARY KEY,
+                claim_hash TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                retrieval_id TEXT,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             """
         )

@@ -1,6 +1,6 @@
 /// <reference path="../../types/akashic-dashboard.d.ts" />
 
-type BiomedView = "ask" | "evidence" | "graph" | "watch" | "responsible";
+type BiomedView = "ask" | "evidence" | "graph" | "watch" | "audit" | "responsible";
 
 interface EvidenceRow {
   evidence_id: string;
@@ -83,9 +83,39 @@ interface WatchCheckResult {
   } | null;
 }
 
+interface ClaimAuditItem {
+  claim_id: string;
+  claim: string;
+  claim_type: string;
+  cited_paper_ids: string[];
+  evidence_ids: string[];
+  evidence_span?: string | null;
+  verdict: string;
+  support_score: number;
+  evidence_strength: string;
+  overclaim_reason?: string | null;
+  reason: string;
+  reviewer_notes: string[];
+}
+
+interface CitationAuditResult {
+  audit_id: string;
+  run_id?: string | null;
+  retrieval_id?: string | null;
+  claim_support_rate: number;
+  citation_precision: number;
+  unsupported_claim_rate: number;
+  overclaim_rate: number;
+  conflict_awareness: boolean;
+  uncertainty_calibrated: boolean;
+  recommended_action: string;
+  claim_audits: ClaimAuditItem[];
+  failed_claims: ClaimAuditItem[];
+}
+
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
   const value = dispatch?.filters["_view"];
-  if (value === "graph" || value === "watch" || value === "responsible" || value === "evidence") {
+  if (value === "graph" || value === "watch" || value === "audit" || value === "responsible" || value === "evidence") {
     return value;
   }
   return "ask";
@@ -177,12 +207,50 @@ function renderEvidenceDetail(item: EvidenceRow): string {
   `;
 }
 
+function renderAuditResult(result: CitationAuditResult): string {
+  const failed = result.failed_claims || [];
+  const rows = (result.claim_audits || []).map((item) => `
+    <div class="biomed-audit-row ${failed.some((failedItem) => failedItem.claim_id === item.claim_id) ? "is-failed" : ""}">
+      <div class="biomed-audit-row-head">
+        ${pill(item.verdict)}
+        ${pill(item.claim_type)}
+        <span>${Math.round(item.support_score * 100)}%</span>
+      </div>
+      <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
+      <div class="biomed-evidence-finding">${escapeHtml(item.reason)}</div>
+      <div class="biomed-watch-meta">
+        citations ${escapeHtml(item.cited_paper_ids.join(", ") || "-")} · evidence ${escapeHtml(item.evidence_ids.join(", ") || "-")}
+      </div>
+      ${item.evidence_span ? `<code class="biomed-query">${escapeHtml(item.evidence_span)}</code>` : ""}
+    </div>
+  `).join("");
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Audit</span><code>${escapeHtml(result.audit_id)}</code></div>
+        <div><span>Action</span><strong>${escapeHtml(result.recommended_action)}</strong></div>
+        <div><span>Claim Support</span><strong>${Math.round(result.claim_support_rate * 100)}%</strong></div>
+        <div><span>Citation Precision</span><strong>${Math.round(result.citation_precision * 100)}%</strong></div>
+        <div><span>Unsupported</span><strong>${Math.round(result.unsupported_claim_rate * 100)}%</strong></div>
+        <div><span>Overclaim</span><strong>${Math.round(result.overclaim_rate * 100)}%</strong></div>
+        <div><span>Conflict Aware</span><strong>${result.conflict_awareness ? "yes" : "no"}</strong></div>
+        <div><span>Uncertainty</span><strong>${result.uncertainty_calibrated ? "calibrated" : "mismatch"}</strong></div>
+      </div>
+    </div>
+    <div class="biomed-label">Claim Audit</div>
+    <div class="biomed-audit-table">
+      ${rows || '<div class="biomed-muted">No claims audited.</div>'}
+    </div>
+  `;
+}
+
 function renderTabs(view: BiomedView): string {
   const tabs: { id: BiomedView; label: string }[] = [
     { id: "ask", label: "Ask" },
     { id: "evidence", label: "Evidence" },
     { id: "graph", label: "Graph" },
     { id: "watch", label: "Watch" },
+    { id: "audit", label: "Audit" },
     { id: "responsible", label: "Responsible AI" },
   ];
   return `
@@ -231,6 +299,7 @@ function renderAsk(container: HTMLElement): void {
         <div class="biomed-answer-meta">
           <code>${escapeHtml(result.run_id)}</code>
           ${pill(result.uncertainty_level)}
+          <button data-biomed-audit-run="${escapeHtml(result.run_id)}">Run Audit</button>
         </div>
         <div class="biomed-label">Retrieval Provenance</div>
         ${renderManifest(result.retrieval_manifest)}
@@ -241,7 +310,25 @@ function renderAsk(container: HTMLElement): void {
         ${result.evidence_summary.map(renderEvidenceItem).join("") || '<div class="biomed-muted">No evidence extracted.</div>'}
         <div class="biomed-label">Limitations</div>
         ${renderList(result.limitations)}
+        <div id="biomed-inline-audit-result" class="biomed-result"></div>
       `;
+      resultNode.querySelector<HTMLButtonElement>("[data-biomed-audit-run]")?.addEventListener("click", async (event) => {
+        const button = event.currentTarget as HTMLButtonElement;
+        const runId = button.dataset.biomedAuditRun || "";
+        const auditTarget = resultNode.querySelector<HTMLElement>("#biomed-inline-audit-result");
+        if (!auditTarget || !runId) return;
+        button.disabled = true;
+        button.textContent = "Auditing...";
+        try {
+          const audit = await api<CitationAuditResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/audit`, { method: "POST" });
+          auditTarget.innerHTML = renderAuditResult(audit);
+        } catch (error) {
+          auditTarget.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+        } finally {
+          button.disabled = false;
+          button.textContent = "Run Audit";
+        }
+      });
     } catch (error) {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
@@ -408,6 +495,55 @@ function renderWatch(container: HTMLElement): void {
   void loadWatchEvents(container);
 }
 
+function renderAudit(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Citation & Evidence Audit</div>
+      <div class="biomed-form">
+        <div class="biomed-row">
+          <input id="biomed-audit-run-id" placeholder="answer run id" />
+          <button id="biomed-audit-run-btn">Run Audit</button>
+        </div>
+      </div>
+      <div id="biomed-audit-result" class="biomed-result"></div>
+      <div class="biomed-label">Recent Audits</div>
+      <div id="biomed-audit-list" class="biomed-result"></div>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-audit-run-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-audit-result");
+    const runId = container.querySelector<HTMLInputElement>("#biomed-audit-run-id")?.value || "";
+    if (!target || !runId) return;
+    target.textContent = "Running citation audit...";
+    try {
+      const audit = await api<CitationAuditResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/audit`, { method: "POST" });
+      target.innerHTML = renderAuditResult(audit);
+      await loadAuditList(container);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  void loadAuditList(container);
+}
+
+async function loadAuditList(container: HTMLElement): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-audit-list");
+  if (!target) return;
+  try {
+    const data = await api<{ items: { audit_id: string; run_id?: string | null; recommended_action: string; metrics?: Record<string, unknown>; created_at: string }[] }>("/api/biomed/audits");
+    target.innerHTML = data.items.map((item) => `
+      <div class="biomed-decision">
+        <div>${pill(item.recommended_action)} <code>${escapeHtml(item.audit_id)}</code></div>
+        <div class="biomed-watch-meta">
+          run ${escapeHtml(item.run_id || "-")} · ${escapeHtml(item.created_at || "")}
+        </div>
+      </div>
+    `).join("") || '<div class="biomed-muted">No audits yet.</div>';
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
 function csv(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
@@ -427,6 +563,7 @@ function renderResponsible(container: HTMLElement): void {
         <li>Clinical diagnosis, patient-specific treatment, and private medical-record interpretation are refused.</li>
         <li>Uncertainty is elevated when evidence is conflicting, observational, abstract-only, or missing citations.</li>
         <li>Retrieval manifests expose source, compiled query, result counts, warnings, and repeatability limits.</li>
+        <li>Citation presence is not enough; V1.3 audits claim-level support, overclaims, conflicts, and uncertainty calibration.</li>
       </ul>
     </div>
   `;
@@ -514,6 +651,8 @@ window.AkashicDashboard.registerPlugin({
       renderGraph(root);
     } else if (view === "watch") {
       renderWatch(root);
+    } else if (view === "audit") {
+      renderAudit(root);
     } else if (view === "responsible") {
       renderResponsible(root);
     } else if (view === "evidence") {

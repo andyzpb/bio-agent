@@ -9,6 +9,8 @@ from fastapi.responses import Response
 from plugins.biomed_evidence.literature_client import LiteratureClientError
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    CitationAuditRequest,
+    ConflictAuditRequest,
     EvidenceExtractionRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
@@ -135,6 +137,47 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "page_size": max(1, min(page_size, 200)),
         }
 
+    @app.post("/api/biomed/audit/citations")
+    def validate_citation_support(payload: CitationAuditRequest) -> dict[str, Any]:
+        result = service.audit_answer(payload)
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/answer-runs/{run_id}/audit")
+    def audit_answer_run(run_id: str) -> dict[str, Any]:
+        result = service.audit_answer_run(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="answer run not found")
+        return result.model_dump(mode="json")
+
+    @app.get("/api/biomed/audits")
+    def list_answer_audits(
+        run_id: str = "",
+        page: int = 1,
+        page_size: int = 25,
+    ) -> dict[str, Any]:
+        items, total = service.list_answer_audits(
+            run_id=run_id,
+            page=page,
+            page_size=page_size,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": max(1, page),
+            "page_size": max(1, min(page_size, 200)),
+        }
+
+    @app.get("/api/biomed/audits/{audit_id}")
+    def get_answer_audit(audit_id: str) -> dict[str, Any]:
+        result = service.get_citation_audit(audit_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="audit not found")
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/conflicts")
+    def find_conflicting_evidence(payload: ConflictAuditRequest) -> dict[str, Any]:
+        return service.find_conflicting_evidence(payload).model_dump(mode="json")
+
     @app.get("/api/biomed/graph")
     def get_evidence_graph(
         topic: str = "",
@@ -213,7 +256,12 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         result = service.get_answer_run(run_id)
         if result is None:
             raise HTTPException(status_code=404, detail="answer run not found")
-        return result.model_dump(mode="json")
+        payload = result.model_dump(mode="json")
+        latest_audit = service.get_latest_citation_audit_for_run(run_id)
+        payload["latest_citation_audit"] = (
+            latest_audit.model_dump(mode="json") if latest_audit is not None else None
+        )
+        return payload
 
     @app.get("/api/biomed/export")
     async def export_report(

@@ -56,6 +56,48 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert audit.status_code == 200
         assert audit.json()["run_id"] == payload["run_id"]
         assert audit.json()["retrieval_id"] == payload["retrieval_id"]
+        assert audit.json()["latest_citation_audit"] is None
+
+        created_audit = client.post(f"/api/biomed/answer-runs/{payload['run_id']}/audit")
+        assert created_audit.status_code == 200
+        audit_payload = created_audit.json()
+        assert audit_payload["run_id"] == payload["run_id"]
+        assert audit_payload["claim_support_rate"] >= 0.8
+        assert audit_payload["citation_precision"] >= 0.8
+        assert audit_payload["recommended_action"] in {
+            "pass",
+            "pass_with_limitations",
+            "revise",
+            "refuse_or_abstain",
+        }
+
+        audit_detail = client.get(f"/api/biomed/audits/{audit_payload['audit_id']}")
+        assert audit_detail.status_code == 200
+        assert audit_detail.json()["audit_id"] == audit_payload["audit_id"]
+
+        audit_list = client.get("/api/biomed/audits", params={"run_id": payload["run_id"]})
+        assert audit_list.status_code == 200
+        assert audit_list.json()["total"] == 1
+
+        audit = client.get(f"/api/biomed/audit/{payload['run_id']}")
+        assert audit.status_code == 200
+        assert audit.json()["latest_citation_audit"]["audit_id"] == audit_payload["audit_id"]
+
+        conflict = client.post(
+            "/api/biomed/conflicts",
+            json={
+                "claim": "Microglial activation is associated with Alzheimer's disease progression.",
+                "topic": "microglial activation Alzheimer's disease progression",
+                "source": "mock",
+            },
+        )
+        assert conflict.status_code == 200
+        assert conflict.json()["verdict"] in {
+            "no_conflict_found",
+            "mixed_evidence",
+            "contradicted",
+            "insufficient_search",
+        }
 
         report = client.get("/api/biomed/export", params={"run_id": payload["run_id"]})
         assert report.status_code == 200

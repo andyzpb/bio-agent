@@ -8,12 +8,12 @@ This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
 a research-only biomedical literature assistant built on top of the framework.
 The plugin currently supports deterministic mock retrieval, optional PubMed
 retrieval, evidence extraction, citation-grounded answers, retrieval
-provenance, Research Watch decision logs, dashboard views, evaluation, Docker,
-and CI-friendly checks.
+provenance, claim-level citation audit, Research Watch decision logs,
+dashboard views, evaluation, Docker, and CI-friendly checks.
 
-The next roadmap direction is **claim-level evidence trustworthiness**: moving
-from "answers with citations" toward a biomedical research agent that can audit
-whether each generated claim is actually supported by cited evidence.
+The current roadmap direction is **claim-level evidence trustworthiness**:
+moving from "answers with citations" toward a biomedical research agent that
+can audit whether each generated claim is actually supported by cited evidence.
 
 ## Status
 
@@ -29,19 +29,19 @@ Implemented today:
   returned paper IDs.
 - Research Watch topics with relevance scoring, retrieval snapshots, and
   push/skip decision logs.
+- V1.3 claim-level citation audit with atomic claims, support verdicts,
+  overclaim detection, conflict checks, uncertainty calibration, persisted
+  audit records, API routes, tools, dashboard audit view, and eval metrics.
 - Responsible-AI guardrails for research-only use.
 - Mock biomedical eval, Python tests, Node typecheck/build, Docker, and CI
   support.
 
 Planned next:
 
-- Claim-level citation audit.
-- Overclaim detection.
-- Conflict-aware evidence checks.
 - Audit/revise answer loop.
 - Project memory for research preferences.
 - Structured biomedical query planner.
-- Claim-level eval gates in CI.
+- Claim-level eval gates in CI and a larger golden dataset.
 
 ## Quickstart
 
@@ -217,6 +217,9 @@ The plugin currently registers these agent tools:
 - `delete_research_watch_topic`
 - `get_evidence_graph`
 - `export_evidence_report`
+- `validate_citation_support`
+- `audit_biomedical_answer`
+- `find_conflicting_evidence`
 
 Runtime biomedical data is stored under the active workspace:
 
@@ -294,20 +297,20 @@ Target audit metrics:
 
 V1.3 Citation & Evidence Audit Layer:
 
-- [ ] Add `AtomicClaim`, `ClaimAuditItem`, `CitationAuditResult`,
+- [x] Add `AtomicClaim`, `ClaimAuditItem`, `CitationAuditResult`,
   `ConflictAuditResult`, and `UncertaintyAudit` schemas.
-- [ ] Implement deterministic `extract_atomic_claims`.
-- [ ] Implement `validate_citation_support` with claim-to-citation/evidence
+- [x] Implement deterministic `extract_atomic_claims`.
+- [x] Implement `validate_citation_support` with claim-to-citation/evidence
   span alignment.
-- [ ] Implement overclaim detection for association-to-causation,
+- [x] Implement overclaim detection for association-to-causation,
   animal-to-human, in-vitro-to-clinical, single-study-to-consensus,
   abstract-only-to-established, and mechanism-to-treatment errors.
-- [ ] Implement conflict-aware checks using supporting, refuting, and
+- [x] Implement conflict-aware checks using supporting, refuting, and
   inconclusive evidence.
-- [ ] Persist answer audits and claim audits in SQLite.
-- [ ] Add audit API routes and plugin tools.
-- [ ] Add dashboard audit view with failed-claim table.
-- [ ] Extend mock eval with claim-level metrics and thresholds.
+- [x] Persist answer audits and claim audits in SQLite.
+- [x] Add audit API routes and plugin tools.
+- [x] Add dashboard audit view with failed-claim table.
+- [x] Extend mock eval with claim-level metrics.
 
 Audit/revise loop:
 

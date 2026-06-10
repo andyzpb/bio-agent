@@ -8,7 +8,11 @@ from agent.plugins import Plugin, tool
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     BiomedicalPaper,
+    Citation,
+    CitationAuditRequest,
+    ConflictAuditRequest,
     EvidenceExtractionRequest,
+    EvidenceItem,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     SearchBiomedicalLiteratureRequest,
@@ -147,6 +151,106 @@ class BiomedEvidencePlugin(Plugin):
                 project_context=project_context,
                 require_citations=require_citations,
                 source=source,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="validate_citation_support",
+        risk="read-only",
+        search_hint="audit biomedical answer claim citation evidence support",
+    )
+    async def validate_citation_support(
+        self,
+        event,
+        answer: str,
+        citations: list[dict] | None = None,
+        evidence_items: list[dict] | None = None,
+        run_id: str | None = None,
+        retrieval_id: str | None = None,
+        observed_uncertainty: Literal["low", "medium", "high"] | None = None,
+    ) -> str:
+        """Audit whether biomedical answer claims are supported by citations.
+
+        Args:
+            answer: Answer text to audit.
+            citations: Citation objects from answer_with_evidence.
+            evidence_items: EvidenceItem objects from answer_with_evidence.
+            run_id: Optional answer run id.
+            retrieval_id: Optional retrieval manifest id.
+            observed_uncertainty: Answer uncertainty label.
+        """
+        result = self._service.audit_answer(
+            CitationAuditRequest(
+                answer=answer,
+                citations=[
+                    Citation.model_validate(item)
+                    for item in (citations or [])
+                ],
+                evidence_items=[
+                    EvidenceItem.model_validate(item)
+                    for item in (evidence_items or [])
+                ],
+                run_id=run_id,
+                retrieval_id=retrieval_id,
+                observed_uncertainty=observed_uncertainty,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="audit_biomedical_answer",
+        risk="read-only",
+        search_hint="audit saved biomedical answer run claims citations",
+    )
+    async def audit_biomedical_answer(
+        self,
+        event,
+        run_id: str,
+    ) -> str:
+        """Audit a saved biomedical answer run by run id.
+
+        Args:
+            run_id: Saved answer run id.
+        """
+        result = self._service.audit_answer_run(run_id)
+        if result is None:
+            return _dump({"error": "answer_run_not_found", "run_id": run_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="find_conflicting_evidence",
+        risk="read-only",
+        search_hint="find supporting contradicting inconclusive biomedical evidence",
+    )
+    async def find_conflicting_evidence(
+        self,
+        event,
+        claim: str,
+        topic: str = "",
+        source: Literal["pubmed", "mock"] = "mock",
+        evidence_items: list[dict] | None = None,
+        retrieval_id: str | None = None,
+    ) -> str:
+        """Find conflict signals for a biomedical claim.
+
+        Args:
+            claim: Claim to inspect.
+            topic: Optional topic used to retrieve stored evidence.
+            source: Literature source.
+            evidence_items: Optional EvidenceItem objects to inspect directly.
+            retrieval_id: Optional retrieval manifest id.
+        """
+        result = self._service.find_conflicting_evidence(
+            ConflictAuditRequest(
+                claim=claim,
+                topic=topic,
+                source=source,
+                evidence_items=[
+                    EvidenceItem.model_validate(item)
+                    for item in (evidence_items or [])
+                ],
+                retrieval_id=retrieval_id,
             )
         )
         return _dump(result.model_dump(mode="json"))

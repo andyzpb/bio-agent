@@ -331,6 +331,9 @@ async def test_biomed_plugin_registers_tools(tmp_path: Path) -> None:
         await manager.load_all()
         assert tools.has_tool("search_biomedical_literature")
         assert tools.has_tool("answer_with_evidence")
+        assert tools.has_tool("validate_citation_support")
+        assert tools.has_tool("audit_biomedical_answer")
+        assert tools.has_tool("find_conflicting_evidence")
         raw = await tools.execute(
             "answer_with_evidence",
             {

@@ -14,10 +14,17 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - If no citation is available, the agent must say so and avoid strong claims.
 - Project memory is treated as user preference or project context, not biomedical fact.
 - Retrieval manifests expose source, compiled query, pagination, result counts, warnings, and returned paper IDs so reviewers can inspect how evidence was found.
+- Citation presence is not treated as sufficient. V1.3 adds claim-level audit
+  that separates supported, partially supported, overclaimed, contradicted,
+  insufficient, irrelevant, and uncited claims.
 
 ## Uncertainty Policy
 
-The system raises uncertainty when evidence is conflicting, observational, abstract-only, missing abstracts, heuristic-extracted, or based on small/animal cohorts.
+The system raises uncertainty when evidence is conflicting, observational,
+abstract-only, missing abstracts, heuristic-extracted, or based on small/animal
+cohorts. The citation audit also derives an uncertainty calibration signal from
+claim-support failures, retrieval warnings, conflicting evidence, and indirect
+animal/in-vitro evidence.
 
 ## Human Review
 

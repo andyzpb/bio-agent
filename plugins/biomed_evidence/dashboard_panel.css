@@ -13,9 +13,11 @@
 .biomed-tab,
 .biomed-row button,
 .biomed-watch-row button,
+.biomed-answer-meta button,
 #biomed-watch-create,
 #biomed-ask-btn,
-#biomed-graph-btn {
+#biomed-graph-btn,
+#biomed-audit-run-btn {
   border: 1px solid var(--border, #d0d7de);
   background: var(--panel-bg, #fff);
   color: var(--text, #24292f);
@@ -150,11 +152,36 @@
 .biomed-evidence-item,
 .biomed-watch-row,
 .biomed-decision,
+.biomed-audit-row,
 .biomed-policy {
   border: 1px solid var(--border, #d0d7de);
   border-radius: 8px;
   padding: 10px;
   background: var(--panel-bg, #fff);
+}
+
+.biomed-audit-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.biomed-audit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.biomed-audit-row.is-failed {
+  border-color: #fecaca;
+  background: color-mix(in srgb, var(--panel-bg, #fff) 90%, #ef4444 10%);
+}
+
+.biomed-audit-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
 }
 
 .biomed-provenance {

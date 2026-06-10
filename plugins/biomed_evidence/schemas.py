@@ -22,6 +22,46 @@ EntityType = Literal[
 ]
 WatchSchedule = Literal["daily", "weekly", "manual"]
 WatchDecisionValue = Literal["push", "skip", "defer"]
+ClaimType = Literal[
+    "background",
+    "association",
+    "mechanistic_hypothesis",
+    "causal",
+    "clinical_implication",
+    "treatment_recommendation",
+    "methodological",
+    "uncertainty",
+]
+CitationSupportVerdict = Literal[
+    "supported",
+    "partial_support",
+    "overclaimed",
+    "contradicted",
+    "insufficient_evidence",
+    "irrelevant_citation",
+    "not_cited",
+]
+EvidenceStrength = Literal[
+    "abstract_only",
+    "animal_or_in_vitro",
+    "observational",
+    "longitudinal",
+    "interventional",
+    "review_or_guideline",
+    "not_assessed",
+]
+AuditRecommendedAction = Literal[
+    "pass",
+    "pass_with_limitations",
+    "revise",
+    "refuse_or_abstain",
+]
+ConflictVerdict = Literal[
+    "no_conflict_found",
+    "mixed_evidence",
+    "contradicted",
+    "insufficient_search",
+]
 
 
 class BiomedicalPaper(BaseModel):
@@ -236,6 +276,102 @@ class AnswerWithEvidenceResult(BaseModel):
     not_medical_advice: bool = True
     disclaimer: str
     project_context_used: str | None = None
+
+
+class AtomicClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    text: str
+    claim_type: ClaimType
+    sentence_index: int | None = None
+    cited_paper_ids: list[str] = Field(default_factory=list)
+
+
+class ClaimAuditItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    claim: str
+    claim_type: ClaimType
+    cited_paper_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    evidence_span: str | None = None
+    verdict: CitationSupportVerdict
+    support_score: float = 0.0
+    evidence_strength: EvidenceStrength = "not_assessed"
+    overclaim_reason: str | None = None
+    reason: str
+    reviewer_notes: list[str] = Field(default_factory=list)
+
+
+class UncertaintyAudit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_uncertainty: ConfidenceLevel
+    observed_uncertainty: ConfidenceLevel | None = None
+    calibrated: bool
+    reasons: list[str] = Field(default_factory=list)
+    grade_like_factors: dict[str, str] = Field(default_factory=dict)
+
+
+class CitationAuditResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    audit_id: str
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    claims: list[AtomicClaim] = Field(default_factory=list)
+    claim_audits: list[ClaimAuditItem] = Field(default_factory=list)
+    uncertainty_audit: UncertaintyAudit
+    claim_support_rate: float
+    citation_precision: float
+    unsupported_claim_rate: float
+    overclaim_rate: float
+    conflict_awareness: bool
+    uncertainty_calibrated: bool
+    failed_claims: list[ClaimAuditItem] = Field(default_factory=list)
+    recommended_action: AuditRecommendedAction
+    created_at: str
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class CitationAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
+    citations: list[Citation] = Field(default_factory=list)
+    evidence_items: list[EvidenceItem] = Field(default_factory=list)
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    observed_uncertainty: ConfidenceLevel | None = None
+    retrieval_manifest: RetrievalManifest | None = None
+
+
+class ConflictAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str
+    topic: str = ""
+    source: Literal["pubmed", "mock"] = "mock"
+    evidence_items: list[EvidenceItem] = Field(default_factory=list)
+    retrieval_id: str | None = None
+
+
+class ConflictAuditResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conflict_audit_id: str
+    claim: str
+    topic: str
+    retrieval_id: str | None = None
+    supporting_papers: list[str] = Field(default_factory=list)
+    contradicting_papers: list[str] = Field(default_factory=list)
+    inconclusive_papers: list[str] = Field(default_factory=list)
+    conflict_axes: list[str] = Field(default_factory=list)
+    verdict: ConflictVerdict
+    created_at: str
 
 
 class WatchTopicCreateRequest(BaseModel):

@@ -50,6 +50,12 @@ async def _run(args: argparse.Namespace) -> dict:
     forbidden_checks: list[bool] = []
     manifest_checks: list[bool] = []
     repeatability_checks: list[bool] = []
+    claim_support_rates: list[float] = []
+    citation_precision_rates: list[float] = []
+    unsupported_claim_rates: list[float] = []
+    overclaim_rates: list[float] = []
+    conflict_awareness_checks: list[bool] = []
+    uncertainty_calibration_checks: list[bool] = []
     try:
         for case in cases:
             result = await service.answer_with_evidence(
@@ -61,6 +67,16 @@ async def _run(args: argparse.Namespace) -> dict:
             )
             if not case.get("expected_refusal"):
                 manifest_checks.append(_manifest_valid(result.retrieval_manifest))
+                audit = service.audit_answer_run(result.run_id)
+                if audit is not None:
+                    claim_support_rates.append(audit.claim_support_rate)
+                    citation_precision_rates.append(audit.citation_precision)
+                    unsupported_claim_rates.append(audit.unsupported_claim_rate)
+                    overclaim_rates.append(audit.overclaim_rate)
+                    conflict_awareness_checks.append(audit.conflict_awareness)
+                    uncertainty_calibration_checks.append(audit.uncertainty_calibrated)
+            else:
+                audit = None
             text = result.answer.lower()
             if case.get("must_include_citations"):
                 citation_checks.append(bool(result.citations))
@@ -82,6 +98,8 @@ async def _run(args: argparse.Namespace) -> dict:
                     "citations": len(result.citations),
                     "uncertainty": result.uncertainty_level,
                     "refused": "cannot help diagnose" in text or "clinical" in text,
+                    "audit_id": audit.audit_id if audit is not None else None,
+                    "recommended_action": audit.recommended_action if audit is not None else None,
                 }
             )
 
@@ -133,6 +151,12 @@ async def _run(args: argparse.Namespace) -> dict:
             "retrieval_manifest_validity": rate(manifest_checks),
             "retrieval_repeatability": rate(repeatability_checks),
             "retrieval_count_stability": rate(count_stability_checks),
+            "claim_support_rate": _average(claim_support_rates),
+            "citation_precision": _average(citation_precision_rates),
+            "unsupported_claim_rate": _average(unsupported_claim_rates),
+            "overclaim_rate": _average(overclaim_rates),
+            "conflict_awareness_rate": rate(conflict_awareness_checks),
+            "uncertainty_calibration_rate": rate(uncertainty_calibration_checks),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -162,6 +186,12 @@ def _manifest_valid(value: object) -> bool:
     returned = getattr(value, "returned_paper_ids", None)
     compiled = getattr(value, "compiled_query", None)
     return bool(manifest and isinstance(returned, list) and compiled is not None)
+
+
+def _average(values: list[float]) -> float:
+    if not values:
+        return 1.0
+    return round(sum(values) / len(values), 4)
 
 
 def main() -> None:

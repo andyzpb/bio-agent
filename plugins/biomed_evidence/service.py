@@ -11,6 +11,10 @@ from typing import Any, cast
 
 import httpx
 
+from plugins.biomed_evidence.citation_auditor import (
+    find_conflicting_evidence as audit_conflicts,
+    validate_citation_support,
+)
 from plugins.biomed_evidence.evidence_extractor import EvidenceExtractor
 from plugins.biomed_evidence.guardrails import (
     RESEARCH_USE_DISCLAIMER,
@@ -27,7 +31,11 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     BiomedicalPaper,
     Citation,
+    CitationAuditRequest,
+    CitationAuditResult,
     ConfidenceLevel,
+    ConflictAuditRequest,
+    ConflictAuditResult,
     EvidenceExtractionRequest,
     EvidenceExtractionResult,
     EvidenceGraph,
@@ -585,6 +593,70 @@ class BiomedEvidenceService:
     def get_retrieval_manifest(self, retrieval_id: str) -> RetrievalManifest | None:
         return self.storage.get_retrieval_manifest(retrieval_id)
 
+    def audit_answer(self, request: CitationAuditRequest) -> CitationAuditResult:
+        audit = validate_citation_support(
+            answer=request.answer,
+            citations=request.citations,
+            evidence_items=request.evidence_items,
+            run_id=request.run_id,
+            retrieval_id=request.retrieval_id,
+            observed_uncertainty=request.observed_uncertainty,
+            retrieval_manifest=request.retrieval_manifest,
+        )
+        self.storage.save_citation_audit(audit)
+        return audit
+
+    def audit_answer_run(self, run_id: str) -> CitationAuditResult | None:
+        result = self.storage.get_answer_run(run_id)
+        if result is None:
+            return None
+        return self.audit_answer(
+            CitationAuditRequest(
+                answer=result.answer,
+                citations=result.citations,
+                evidence_items=result.evidence_summary,
+                run_id=result.run_id,
+                retrieval_id=result.retrieval_id,
+                observed_uncertainty=result.uncertainty_level,
+                retrieval_manifest=result.retrieval_manifest,
+            )
+        )
+
+    def get_citation_audit(self, audit_id: str) -> CitationAuditResult | None:
+        return self.storage.get_citation_audit(audit_id)
+
+    def get_latest_citation_audit_for_run(self, run_id: str) -> CitationAuditResult | None:
+        return self.storage.get_latest_citation_audit_for_run(run_id)
+
+    def list_answer_audits(
+        self,
+        *,
+        run_id: str = "",
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[dict[str, object]], int]:
+        return self.storage.list_citation_audits(
+            run_id=run_id,
+            page=page,
+            page_size=page_size,
+        )
+
+    def find_conflicting_evidence(
+        self,
+        request: ConflictAuditRequest,
+    ) -> ConflictAuditResult:
+        evidence = request.evidence_items or self._stored_evidence_for_topic(
+            request.topic or request.claim
+        )
+        result = audit_conflicts(
+            claim=request.claim,
+            topic=request.topic or request.claim,
+            evidence_items=evidence,
+            retrieval_id=request.retrieval_id,
+        )
+        self.storage.save_conflict_audit(result)
+        return result
+
     async def export_report(self, request: ExportEvidenceReportRequest) -> str:
         result: AnswerWithEvidenceResult | None = None
         if request.run_id:
@@ -603,6 +675,33 @@ class BiomedEvidenceService:
         if source == "pubmed":
             return self.pubmed_client
         return self.mock_client
+
+    def _stored_evidence_for_topic(self, topic: str) -> list[EvidenceItem]:
+        rows, _ = self.storage.list_evidence(q=topic, page=1, page_size=200)
+        items: list[EvidenceItem] = []
+        for row in rows:
+            try:
+                items.append(
+                    EvidenceItem.model_validate(
+                        {
+                            "evidence_id": row["evidence_id"],
+                            "paper_id": row["paper_id"],
+                            "claim": row["claim"],
+                            "finding": row["finding"],
+                            "evidence_direction": row["evidence_direction"],
+                            "entities": row.get("entities", []),
+                            "methods": row.get("methods", []),
+                            "datasets_or_cohorts": row.get("datasets_or_cohorts", []),
+                            "limitations": row.get("limitations", []),
+                            "confidence": row["confidence"],
+                            "evidence_span": row.get("evidence_span"),
+                            "requires_expert_review": row.get("requires_expert_review", True),
+                        }
+                    )
+                )
+            except Exception:
+                continue
+        return items
 
 
 def _compile_query(
