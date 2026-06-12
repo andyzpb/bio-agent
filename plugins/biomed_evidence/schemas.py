@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -101,6 +101,8 @@ TraceStepName = Literal[
     "validate_plan",
     "retrieve",
     "extract",
+    "coverage_gap_analysis",
+    "build_packet",
     "draft",
     "audit",
     "advisory_verify",
@@ -208,6 +210,216 @@ LogicVerdict = Literal[
     "not_assessed",
 ]
 LogicFactFormat = Literal["text", "json"]
+ReleaseToolErrorCode = Literal[
+    "clinical_boundary",
+    "source_policy_blocked",
+    "invalid_input",
+    "unknown_run_id",
+    "unknown_retrieval_id",
+    "unknown_paper_id",
+    "missing_retrieval_manifest",
+    "empty_evidence",
+    "llm_schema_invalid",
+    "external_source_unavailable",
+    "rate_limited",
+    "timeout",
+    "budget_exceeded",
+    "export_path_blocked",
+    "packet_unavailable",
+    "provenance_unavailable",
+]
+ReleaseToolRiskLevel = Literal[
+    "read_only",
+    "writes_storage",
+    "external_network",
+    "exports_files",
+    "llm_cost",
+    "clinical_sensitive",
+]
+ReleaseToolSourcePolicy = Literal["mock_only", "live_opt_in", "no_source"]
+ReleaseToolSideEffect = Literal[
+    "read_storage",
+    "write_storage",
+    "write_files",
+    "external_network",
+    "llm_call",
+]
+EvidencePacketSelectionStrategy = Literal["all_valid", "submodular_greedy"]
+EvidencePacketAvailability = Literal[
+    "persisted",
+    "reconstructed",
+    "stale",
+    "unavailable",
+]
+BanditAdvisoryAction = Literal[
+    "stop",
+    "broaden_query",
+    "narrow_query",
+    "search_support",
+    "search_refute",
+    "search_mechanism",
+    "search_limitation",
+    "switch_to_pubmed_if_allowed",
+    "manual_review",
+]
+ObsidianExportType = Literal["evidence_packet", "project", "watch"]
+ProvenanceEntityType = Literal[
+    "paper",
+    "evidence_item",
+    "retrieval_manifest",
+    "evidence_packet",
+    "answer",
+    "citation_audit",
+    "logic_audit",
+    "revision",
+    "obsidian_note",
+]
+ProvenanceActivityType = Literal[
+    "classify",
+    "plan",
+    "search",
+    "fetch",
+    "extract",
+    "gap_analyze",
+    "packet_build",
+    "synthesize",
+    "audit",
+    "revise",
+    "export",
+]
+ProvenanceAgentType = Literal[
+    "deterministic_service",
+    "llm_provider_model",
+    "reviewer",
+    "plugin_tool",
+]
+ProvenanceRelationType = Literal[
+    "used",
+    "generated",
+    "wasDerivedFrom",
+    "wasAssociatedWith",
+]
+WorkflowState = Literal[
+    "classified",
+    "planned",
+    "searched",
+    "extracted",
+    "gap_analyzed",
+    "followup_searched",
+    "packet_built",
+    "synthesized",
+    "audited",
+    "revised",
+    "refused",
+    "failed",
+]
+class ReleaseToolError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: ReleaseToolErrorCode
+    message: str
+    recoverable: bool = True
+    next_allowed_actions: list[str] = Field(default_factory=list)
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReleaseToolMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    risk_level: ReleaseToolRiskLevel = "read_only"
+    source_policy: ReleaseToolSourcePolicy = "no_source"
+    side_effects: list[ReleaseToolSideEffect] = Field(default_factory=list)
+    requires_confirmation: bool = False
+    max_runtime_seconds: int = 30
+    output_schema_version: str = "release-tool-envelope-v1"
+
+
+class ReleaseToolEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    result: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[ReleaseToolError] = Field(default_factory=list)
+    error_code: ReleaseToolErrorCode | None = None
+    message: str | None = None
+    recoverable: bool | None = None
+    next_allowed_actions: list[str] = Field(default_factory=list)
+    trace: dict[str, Any] = Field(default_factory=dict)
+    ids: dict[str, str] = Field(default_factory=dict)
+    metadata: ReleaseToolMetadata | None = None
+
+
+class StepTransitionRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    from_state: WorkflowState
+    to_state: WorkflowState
+    tool_or_route: str
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    packet_id: str | None = None
+    source: str | None = None
+    planner_mode: PlannerMode | None = None
+    extractor_mode: ExtractionMode | None = None
+    llm_flags: dict[str, bool] = Field(default_factory=dict)
+    coverage_status_summary: dict[str, int] = Field(default_factory=dict)
+    step_index: int = 0
+    elapsed_time_bucket: str = "not_measured"
+    stop_reason: str | None = None
+    success_category: str = "completed"
+
+
+class StepTelemetrySummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    transition_records: list[StepTransitionRecord] = Field(default_factory=list)
+    transition_matrix: dict[str, dict[str, int]] = Field(default_factory=dict)
+    mean_tool_step_count: float = 0.0
+    p95_tool_step_count: float = 0.0
+    expected_remaining_steps: float = 0.0
+    unusual_path_warnings: list[str] = Field(default_factory=list)
+    advisory_only: bool = True
+
+
+class EvidenceSelectionItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    paper_id: str
+    selected: bool
+    reason: str
+    score: float = 0.0
+    coverage_contribution: dict[str, Any] = Field(default_factory=dict)
+    token_estimate: int = 0
+
+
+class EvidencePacketSelectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: EvidencePacketSelectionStrategy = "submodular_greedy"
+    max_items: int = 12
+    selected: list[EvidenceSelectionItem] = Field(default_factory=list)
+    dropped: list[EvidenceSelectionItem] = Field(default_factory=list)
+    selected_evidence_ids: list[str] = Field(default_factory=list)
+    dropped_evidence_ids: list[str] = Field(default_factory=list)
+    coverage_contribution: dict[str, Any] = Field(default_factory=dict)
+    token_estimate: int = 0
+    duplicate_evidence_delta: int = 0
+    trace: dict[str, Any] = Field(default_factory=dict)
+
+
+class BanditAdvisoryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    advisory_only: bool = True
+    action: BanditAdvisoryAction = "stop"
+    reason: str
+    confidence: float = 0.0
+    expected_additional_steps: float = 0.0
+    based_on: dict[str, Any] = Field(default_factory=dict)
 
 
 class BiomedicalPaper(BaseModel):
@@ -1128,6 +1340,216 @@ class AuditedAnswerResult(BaseModel):
     revision: AnswerRevision
     trace: list[AgentTraceStep] = Field(default_factory=list)
     final_action: RevisionAction
+
+
+class MultiPassLiteratureSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    source: Literal["pubmed", "mock"] = "mock"
+    max_results: int = 10
+    max_queries: int = 6
+    max_followups: int = 0
+    max_tool_steps: int = 20
+    max_wall_clock_seconds: int = 180
+    project_id: str | None = None
+    project_context: str | None = None
+    include_rejected_papers: bool = False
+    use_llm_planner: bool = False
+    execute_support_refute: bool = True
+
+
+class MultiPassLiteratureSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    source: Literal["pubmed", "mock"] = "mock"
+    classification: BiomedicalQuestionClassification | None = None
+    query_plan: BiomedicalQueryPlan | None = None
+    validation: QueryPlanValidation | None = None
+    retrieval_manifest: RetrievalManifest | None = None
+    retrieval_bundle: RetrievalBundle | None = None
+    paper_ids: list[str] = Field(default_factory=list)
+    item_count: int = 0
+    memory_trace: dict[str, Any] = Field(default_factory=dict)
+    budget: dict[str, Any] = Field(default_factory=dict)
+    step_telemetry: StepTelemetrySummary | None = None
+
+
+class EvidenceBatchExtractionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    paper_ids: list[str] = Field(default_factory=list)
+    source: Literal["pubmed", "mock"] = "mock"
+    research_question: str | None = None
+    use_llm_extractor: bool = False
+    max_papers: int = 10
+    max_evidence_items: int = 50
+
+
+class EvidenceBatchExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    source: Literal["pubmed", "mock"] = "mock"
+    paper_ids: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    evidence_count: int = 0
+    extraction_mode_counts: dict[str, int] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    memory_trace: dict[str, Any] = Field(default_factory=dict)
+    budget: dict[str, Any] = Field(default_factory=dict)
+
+
+class CoverageGapAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    source: Literal["pubmed", "mock"] = "mock"
+    research_question: str | None = None
+    max_gap_queries: int = 2
+
+
+class CoverageGapAnalysisResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    retrieval_id: str | None = None
+    coverage_matrix: list[CoverageMatrixRow] = Field(default_factory=list)
+    gap_decisions: list[GapSearchDecision] = Field(default_factory=list)
+    bandit_advisory: BanditAdvisoryResult | None = None
+    stop_reason: str = "not_started"
+    memory_trace: dict[str, Any] = Field(default_factory=dict)
+    step_telemetry: StepTelemetrySummary | None = None
+
+
+class EvidencePacketBuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    max_evidence_items: int = 12
+    selection_strategy: EvidencePacketSelectionStrategy = "submodular_greedy"
+
+
+class EvidencePacketBuildResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    evidence_packet: EvidencePacketSummary
+    selection: EvidencePacketSelectionResult
+    availability: EvidencePacketAvailability = "persisted"
+    memory_trace: dict[str, Any] = Field(default_factory=dict)
+    step_telemetry: StepTelemetrySummary | None = None
+
+
+class EvidencePacketGetResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    evidence_packet: EvidencePacketSummary | None = None
+    availability: EvidencePacketAvailability = "unavailable"
+    stale: bool = False
+    source: Literal["pubmed", "mock"] | None = None
+    memory_trace: dict[str, Any] = Field(default_factory=dict)
+    step_telemetry: StepTelemetrySummary | None = None
+
+
+class ObsidianExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    project_id: str | None = None
+    watch_id: str | None = None
+    export_dir: str | None = None
+    enabled: bool = False
+    max_files: int = 50
+
+
+class ObsidianNoteRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    export_id: str
+    export_type: ObsidianExportType
+    entity_id: str
+    path: str
+    filename: str
+    frontmatter: dict[str, Any] = Field(default_factory=dict)
+    links: list[str] = Field(default_factory=list)
+    sha256: str
+    generated_at: str
+    source_of_truth: str = "biomed_sqlite"
+    imported_as_evidence: bool = False
+
+
+class ObsidianExportResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    export_id: str
+    export_type: ObsidianExportType
+    export_dir: str
+    notes: list[ObsidianNoteRecord] = Field(default_factory=list)
+    note_count: int = 0
+    idempotent_key: str
+    source_of_truth: str = "biomed_sqlite"
+    imported_as_evidence: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ProvenanceNodeEntity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: ProvenanceEntityType
+    stable_id: str
+    label: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProvenanceActivity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: ProvenanceActivityType
+    label: str
+    started_at: str | None = None
+    ended_at: str | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProvenanceAgent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: ProvenanceAgentType
+    label: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProvenanceRelation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    target: str
+    type: ProvenanceRelationType
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProvenanceGraphResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    graph_id: str
+    run_id: str
+    schema_version: str = "biomed-provenance-v1"
+    entities: list[ProvenanceNodeEntity] = Field(default_factory=list)
+    activities: list[ProvenanceActivity] = Field(default_factory=list)
+    agents: list[ProvenanceAgent] = Field(default_factory=list)
+    relations: list[ProvenanceRelation] = Field(default_factory=list)
+    redactions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class CitationAuditRequest(BaseModel):

@@ -27,6 +27,54 @@
     "type": "number",
     "default": 100
   },
+  "max_tool_steps": {
+    "type": "number",
+    "default": 20
+  },
+  "max_retrieval_queries": {
+    "type": "number",
+    "default": 6
+  },
+  "max_followup_queries": {
+    "type": "number",
+    "default": 2
+  },
+  "max_llm_calls": {
+    "type": "number",
+    "default": 6
+  },
+  "max_wall_clock_seconds": {
+    "type": "number",
+    "default": 180
+  },
+  "max_evidence_items": {
+    "type": "number",
+    "default": 50
+  },
+  "max_obsidian_export_files": {
+    "type": "number",
+    "default": 50
+  },
+  "obsidian_export_dir": {
+    "type": "string",
+    "default": ""
+  },
+  "enable_obsidian_export": {
+    "type": "boolean",
+    "default": false
+  },
+  "enable_provenance_export": {
+    "type": "boolean",
+    "default": false
+  },
+  "enable_step_telemetry": {
+    "type": "boolean",
+    "default": true
+  },
+  "enable_bandit_advisory": {
+    "type": "boolean",
+    "default": false
+  },
   "default_require_abstract": {
     "type": "boolean",
     "default": true

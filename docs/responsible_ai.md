@@ -14,14 +14,49 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - If no citation is available, the agent must say so and avoid strong claims.
 - Project memory is treated as user preference or project context, not biomedical fact.
 - Retrieval manifests expose source, compiled query, pagination, result counts, warnings, and returned paper IDs so reviewers can inspect how evidence was found.
-- Citation presence is not treated as sufficient. V1.3 adds claim-level audit
-  that separates supported, partially supported, overclaimed, contradicted,
-  insufficient, irrelevant, and uncited claims.
-- V1.4 routes draft answers through deterministic audit/revise/refuse logic and
-  persists trace steps so reviewers can inspect how the final answer changed.
+- Citation presence is not treated as sufficient. Claim-level audit separates
+  supported, partially supported, overclaimed, contradicted, insufficient,
+  irrelevant, and uncited claims.
+- Release 1.0 routes toolized retrieval, extraction, packet construction,
+  synthesis, audit, revision, export, and provenance through structured
+  envelopes and persisted traces.
 - Optional LLM revision can only be used as a framework-injected reviser over
   supplied evidence and citations. The deterministic citation audit remains the
   verifier of record.
+- Optional claim-logic parsing can assist frame extraction, but deterministic
+  logic-audit rules remain the entailment verifier of record.
+
+## Tool And Memory Boundary
+
+- Clinical or patient-specific prompts are refused before memory, retrieval,
+  LLM calls, export, or provenance graph construction.
+- Project memory can influence planner preferences, include/exclude terms,
+  saved-paper priority, rejected-paper filtering, and review queues.
+- Project memory, Watch topics, Obsidian notes, reviewer comments, and model
+  drafts cannot satisfy citation support and cannot become evidence items.
+- Release tool errors are structured and fail fast for `clinical_boundary`,
+  `source_policy_blocked`, `budget_exceeded`, `export_path_blocked`,
+  `unknown_run_id`, and related policy failures.
+
+## Export And Provenance Boundary
+
+- Obsidian export is one-way and disabled by default.
+- Exported Markdown notes include `source_of_truth=biomed_sqlite` and
+  `imported_as_evidence=false`.
+- Provenance graphs link stable local IDs for answer runs, papers, evidence,
+  manifests, packets, audits, revisions, activities, agents, and tools.
+- Provenance output redacts raw prompts, raw provider responses, API keys, and
+  secrets.
+
+## Advisory Math Boundary
+
+- Submodular-style packet selection is deterministic and cannot drop protected
+  conflict or limitation evidence for optimization convenience.
+- Contextual-bandit-style retrieval advice is advisory-only. It suggests
+  whether to stop, broaden, or run a bounded support/refute/mechanism/limitation
+  query, but it cannot override caps or policy.
+- Step telemetry and Markov-style transition summaries are descriptive only and
+  cannot assert biomedical truth.
 
 ## Uncertainty Policy
 

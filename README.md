@@ -6,8 +6,8 @@ showcases a portfolio-grade **Biomedical Evidence** plugin built on that
 framework: a research-only agent for finding biomedical literature, extracting
 evidence, auditing generated claims, and making every answer traceable.
 
-The current biomedical implementation is **V2.6 Multi-Pass Gap-Directed
-Literature Retrieval**.
+The current biomedical implementation is **Release 1.0: Toolized Biomedical
+Evidence Workflow**.
 
 ## Why This Project Exists
 
@@ -46,6 +46,9 @@ prognosis, and patient-specific advice before retrieval or LLM stages run.
   projects, watch snapshots, and review decisions.
 - Provides a dashboard for Ask, Evidence, Graph, Audit, Trace, Projects,
   Research Watch, and Responsible AI views.
+- Exposes Release 1.0 tool envelopes for multi-pass retrieval, batch
+  extraction, coverage-gap analysis, packet building, Obsidian export, and
+  provenance graph export.
 
 ## Core Workflow
 
@@ -160,6 +163,48 @@ scoring, and push/skip decision logs. Saved project memory and Watch notes do
 not become biomedical evidence unless they point back to retrieved papers and
 evidence spans.
 
+### Release 1.0 Tool Chain
+
+Release 1.0 turns the internal answer pipeline into independently callable,
+auditable tools:
+
+- `run_multi_pass_literature_search`
+- `extract_evidence_batch`
+- `analyze_coverage_gaps`
+- `build_evidence_packet`
+- `get_evidence_packet`
+- `get_answer_trace`
+- `export_evidence_packet_to_obsidian`
+- `export_project_to_obsidian`
+- `export_research_watch_to_obsidian`
+- `export_provenance_graph`
+
+All Release 1.0 tools return a structured envelope with `ok`, `result`,
+`warnings`, `errors`, `error_code`, `trace`, `ids`, and tool metadata. Policy
+failures such as `clinical_boundary`, `source_policy_blocked`,
+`budget_exceeded`, `export_path_blocked`, and `unknown_run_id` are returned as
+schema-valid tool errors rather than unstructured strings.
+
+The tool chain keeps memory and reviewer notes on the workflow side of the
+boundary. They can influence planner preferences, include/exclude terms,
+saved-paper priority, and review queues; they cannot satisfy citation support
+or become evidence.
+
+### Mathematical Hardening
+
+Release 1.0 adds deterministic math-oriented review aids without handing them
+runtime authority:
+
+- submodular-style evidence packet selection that prioritizes coverage,
+  provenance diversity, conflict evidence, and limitation evidence;
+- contextual-bandit-style retrieval advisory that suggests stop/broaden/search
+  actions but never overrides clinical guardrails, source policy, or caps;
+- Markov-style step telemetry over workflow states, used only to summarize
+  observed execution paths;
+- PROV/OpenLineage-style provenance graphs that connect answer, paper,
+  evidence, retrieval manifest, packet, audit, logic audit, revision, tools,
+  activities, and agents while redacting prompts and provider raw responses.
+
 ## Dashboard
 
 Start the dashboard:
@@ -180,7 +225,8 @@ Main views:
 - **Audit**: claim-level citation audit, logic verdicts, conflicts, and
   revision pressure.
 - **Trace**: classify, plan, retrieve, extract, gap, packet, audit, revise,
-  and finalize metadata.
+  and finalize metadata, plus memory effects, budget snapshots, step
+  telemetry, packet selection, Obsidian export, and provenance graph results.
 - **Projects**: paper decisions, claims, review queue, and evidence briefs.
 - **Watch**: topic monitoring, snapshots, relevance scores, and decisions.
 - **Responsible AI**: research-only boundary and clinical refusal behavior.
@@ -218,6 +264,13 @@ Core evidence tools:
 - `validate_citation_support`
 - `audit_biomedical_answer`
 - `find_conflicting_evidence`
+- `run_multi_pass_literature_search`
+- `extract_evidence_batch`
+- `analyze_coverage_gaps`
+- `build_evidence_packet`
+- `get_evidence_packet`
+- `get_answer_trace`
+- `export_provenance_graph`
 
 Project and watch tools:
 
@@ -239,6 +292,9 @@ Project and watch tools:
 - `delete_research_watch_topic`
 - `get_evidence_graph`
 - `export_evidence_report`
+- `export_evidence_packet_to_obsidian`
+- `export_project_to_obsidian`
+- `export_research_watch_to_obsidian`
 
 ## API Surface
 
@@ -257,6 +313,15 @@ Common routes:
 - `POST /api/biomed/answer/audited`
 - `POST /api/biomed/answer-runs/{run_id}/audit`
 - `GET /api/biomed/answer-runs/{run_id}/trace`
+- `GET /api/biomed/answer-runs/{run_id}/evidence-packet`
+- `GET /api/biomed/answer-runs/{run_id}/provenance`
+- `POST /api/biomed/retrieval/multi-pass`
+- `POST /api/biomed/evidence/extract-batch`
+- `POST /api/biomed/evidence/coverage-gaps`
+- `POST /api/biomed/evidence/packet`
+- `POST /api/biomed/export/obsidian/evidence-packet`
+- `POST /api/biomed/export/obsidian/project`
+- `POST /api/biomed/export/obsidian/watch`
 - `GET /api/biomed/audits`
 - `POST /api/biomed/conflicts`
 - `GET /api/biomed/graph`
@@ -472,22 +537,21 @@ are excluded from Git.
 
 ## Roadmap
 
-Near-term:
+Release 1.0 completed:
 
-- V2.7 toolized multi-pass evidence workflow:
-  `run_multi_pass_literature_search`, `extract_evidence_batch`,
-  `analyze_coverage_gaps`, `build_evidence_packet`, `get_answer_trace`, and
-  `get_evidence_packet`.
-- Markov-style step-budget telemetry over tool-chain states to estimate when
-  to continue retrieval and when to stop.
-- Obsidian-compatible Markdown export for reviewer memory over papers, claims,
-  evidence packets, gaps, answer runs, projects, and Watch digests.
-
-Next mathematical hardening:
-
-- Submodular evidence-packet selection.
-- Contextual-bandit retrieval budget allocation.
+- toolized multi-pass evidence workflow;
+- Release tool contracts and structured errors;
+- memory bridge, budget fail-fast, and step telemetry;
+- one-way Obsidian Markdown export for reviewer notes;
+- deterministic packet selection and advisory retrieval policy;
 - PROV/OpenLineage-compatible provenance export.
+
+Next hardening:
+
+- dedicated dashboard controls for saved tool-chain templates;
+- live PubMed release smoke automation;
+- full-text/PDF ingestion behind the same provenance and audit gates;
+- stronger provenance visualization for export notes and human review events.
 
 Longer-term research tracks:
 

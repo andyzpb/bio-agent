@@ -324,9 +324,111 @@ interface TracePayload {
   run_id: string;
   answer_run: AnswerResult;
   trace: AgentTraceStep[];
+  step_telemetry?: StepTelemetrySummary | null;
+  memory?: Record<string, unknown>;
   revision?: AnswerRevision | null;
   latest_citation_audit?: CitationAuditResult | null;
   latest_advisory_verifier?: AdvisoryVerifierResult | null;
+}
+
+interface StepTelemetrySummary {
+  run_id?: string | null;
+  transition_records: {
+    from_state: string;
+    to_state: string;
+    tool_or_route: string;
+    step_index: number;
+    stop_reason?: string | null;
+    success_category: string;
+  }[];
+  transition_matrix: Record<string, Record<string, number>>;
+  mean_tool_step_count: number;
+  p95_tool_step_count: number;
+  expected_remaining_steps: number;
+  unusual_path_warnings: string[];
+  advisory_only: boolean;
+}
+
+interface ReleaseToolEnvelope<T = Record<string, unknown>> {
+  ok: boolean;
+  result: T;
+  warnings: string[];
+  error_code?: string | null;
+  message?: string | null;
+  trace: Record<string, unknown>;
+  ids: Record<string, string>;
+  metadata?: {
+    tool_name: string;
+    risk_level: string;
+    source_policy: string;
+    side_effects: string[];
+    requires_confirmation: boolean;
+  } | null;
+}
+
+interface EvidenceSelectionItem {
+  evidence_id: string;
+  paper_id: string;
+  selected: boolean;
+  reason: string;
+  score: number;
+  coverage_contribution: Record<string, unknown>;
+  token_estimate: number;
+}
+
+interface EvidencePacketSelectionResult {
+  strategy: string;
+  max_items: number;
+  selected: EvidenceSelectionItem[];
+  dropped: EvidenceSelectionItem[];
+  selected_evidence_ids: string[];
+  dropped_evidence_ids: string[];
+  coverage_contribution: Record<string, unknown>;
+  token_estimate: number;
+  duplicate_evidence_delta: number;
+  trace: Record<string, unknown>;
+}
+
+interface EvidencePacketBuildResult {
+  run_id: string;
+  evidence_packet: EvidencePacketSummary;
+  selection: EvidencePacketSelectionResult;
+  availability: string;
+  memory_trace: Record<string, unknown>;
+  step_telemetry?: StepTelemetrySummary | null;
+}
+
+interface ObsidianExportResult {
+  export_id: string;
+  export_type: string;
+  export_dir: string;
+  notes: {
+    export_id: string;
+    export_type: string;
+    entity_id: string;
+    path: string;
+    filename: string;
+    links: string[];
+    sha256: string;
+    imported_as_evidence: boolean;
+  }[];
+  note_count: number;
+  idempotent_key: string;
+  source_of_truth: string;
+  imported_as_evidence: boolean;
+  warnings: string[];
+}
+
+interface ProvenanceGraphResult {
+  graph_id: string;
+  run_id: string;
+  schema_version: string;
+  entities: { id: string; type: string; stable_id: string; label: string; attributes: Record<string, unknown> }[];
+  activities: { id: string; type: string; label: string; attributes: Record<string, unknown> }[];
+  agents: { id: string; type: string; label: string; attributes: Record<string, unknown> }[];
+  relations: { source: string; target: string; type: string; attributes: Record<string, unknown> }[];
+  redactions: string[];
+  warnings: string[];
 }
 
 interface BiomedProject {
@@ -517,6 +619,144 @@ function renderEvidencePacket(packet: EvidencePacketSummary | null | undefined):
       </div>
       ${packet.source_warnings.length ? `<div class="biomed-label">Source Warnings</div>${renderList(packet.source_warnings)}` : ""}
     </div>
+  `;
+}
+
+function renderPacketSelection(selection: EvidencePacketSelectionResult | null | undefined): string {
+  if (!selection) return '<div class="biomed-muted">No packet selection trace recorded.</div>';
+  const itemRow = (item: EvidenceSelectionItem) => `
+    <div class="biomed-audit-row ${item.selected ? "" : "is-dropped"}">
+      <div class="biomed-audit-row-head">
+        ${pill(item.selected ? "selected" : "dropped")}
+        ${pill(selection.strategy)}
+        <span>score ${Math.round(item.score * 100) / 100}</span>
+        <span>${item.token_estimate} tokens</span>
+        <code>${escapeHtml(item.paper_id)}</code>
+      </div>
+      <div class="biomed-evidence-claim"><code>${escapeHtml(item.evidence_id)}</code></div>
+      <div class="biomed-evidence-finding">${escapeHtml(item.reason)}</div>
+      <pre class="biomed-json">${escapeHtml(JSON.stringify(item.coverage_contribution, null, 2))}</pre>
+    </div>
+  `;
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Strategy</span><strong>${escapeHtml(selection.strategy)}</strong></div>
+        <div><span>Selected</span><strong>${selection.selected.length}</strong></div>
+        <div><span>Dropped</span><strong>${selection.dropped.length}</strong></div>
+        <div><span>Tokens</span><strong>${selection.token_estimate}</strong></div>
+        <div><span>Duplicate Delta</span><strong>${selection.duplicate_evidence_delta}</strong></div>
+        <div><span>Protected</span><strong>${String(selection.coverage_contribution.protected_evidence_retained ?? "-")}</strong></div>
+      </div>
+      <div class="biomed-label">Coverage Contribution</div>
+      <pre class="biomed-json">${escapeHtml(JSON.stringify(selection.coverage_contribution, null, 2))}</pre>
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Selected Evidence</div>
+          <div class="biomed-audit-table">${selection.selected.map(itemRow).join("") || '<div class="biomed-muted">None selected.</div>'}</div>
+        </div>
+        <div>
+          <div class="biomed-label">Dropped Evidence</div>
+          <div class="biomed-audit-table">${selection.dropped.map(itemRow).join("") || '<div class="biomed-muted">None dropped.</div>'}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPacketBuildResult(envelope: ReleaseToolEnvelope<EvidencePacketBuildResult>): string {
+  if (!envelope.ok) return renderReleaseError(envelope);
+  return `
+    <div class="biomed-label">Evidence Packet</div>
+    ${renderEvidencePacket(envelope.result.evidence_packet)}
+    <div class="biomed-label">Selected / Dropped Evidence</div>
+    ${renderPacketSelection(envelope.result.selection)}
+    ${envelope.result.step_telemetry ? `<div class="biomed-label">Packet Telemetry</div>${renderStepTelemetry(envelope.result.step_telemetry)}` : ""}
+  `;
+}
+
+function renderStepTelemetry(telemetry: StepTelemetrySummary | null | undefined): string {
+  if (!telemetry) return '<div class="biomed-muted">No step telemetry recorded.</div>';
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Advisory</span><strong>${telemetry.advisory_only ? "yes" : "no"}</strong></div>
+        <div><span>Mean Steps</span><strong>${telemetry.mean_tool_step_count}</strong></div>
+        <div><span>P95 Steps</span><strong>${telemetry.p95_tool_step_count}</strong></div>
+        <div><span>Remaining</span><strong>${telemetry.expected_remaining_steps}</strong></div>
+        <div><span>Transitions</span><strong>${telemetry.transition_records.length}</strong></div>
+        <div><span>Warnings</span><strong>${telemetry.unusual_path_warnings.length}</strong></div>
+      </div>
+      ${telemetry.unusual_path_warnings.length ? `<div class="biomed-label">Telemetry Warnings</div>${renderList(telemetry.unusual_path_warnings)}` : ""}
+      <div class="biomed-label">Transition Matrix</div>
+      <pre class="biomed-json">${escapeHtml(JSON.stringify(telemetry.transition_matrix, null, 2))}</pre>
+    </div>
+  `;
+}
+
+function renderObsidianExportResult(envelope: ReleaseToolEnvelope<ObsidianExportResult>): string {
+  if (!envelope.ok) return renderReleaseError(envelope);
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Export</span><code>${escapeHtml(envelope.result.export_id)}</code></div>
+        <div><span>Type</span><strong>${escapeHtml(envelope.result.export_type)}</strong></div>
+        <div><span>Notes</span><strong>${envelope.result.note_count}</strong></div>
+        <div><span>Source</span><strong>${escapeHtml(envelope.result.source_of_truth)}</strong></div>
+        <div><span>Imported Evidence</span><strong>${envelope.result.imported_as_evidence ? "yes" : "no"}</strong></div>
+        <div><span>Directory</span><code>${escapeHtml(envelope.result.export_dir)}</code></div>
+      </div>
+      <div class="biomed-label">Notes</div>
+      ${renderList(envelope.result.notes.map((note) => `${note.filename} | ${note.path} | ${note.sha256.slice(0, 12)}`))}
+    </div>
+  `;
+}
+
+function renderProvenanceResult(envelope: ReleaseToolEnvelope<ProvenanceGraphResult>): string {
+  if (!envelope.ok) return renderReleaseError(envelope);
+  const graph = envelope.result;
+  const counts = (items: { type: string }[]) => items.reduce<Record<string, number>>((acc, item) => {
+    acc[item.type] = (acc[item.type] || 0) + 1;
+    return acc;
+  }, {});
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Graph</span><code>${escapeHtml(graph.graph_id)}</code></div>
+        <div><span>Schema</span><strong>${escapeHtml(graph.schema_version)}</strong></div>
+        <div><span>Entities</span><strong>${graph.entities.length}</strong></div>
+        <div><span>Activities</span><strong>${graph.activities.length}</strong></div>
+        <div><span>Agents</span><strong>${graph.agents.length}</strong></div>
+        <div><span>Relations</span><strong>${graph.relations.length}</strong></div>
+      </div>
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Entity Types</div>
+          <pre class="biomed-json">${escapeHtml(JSON.stringify(counts(graph.entities), null, 2))}</pre>
+        </div>
+        <div>
+          <div class="biomed-label">Activity Types</div>
+          <pre class="biomed-json">${escapeHtml(JSON.stringify(counts(graph.activities), null, 2))}</pre>
+        </div>
+      </div>
+      <div class="biomed-label">Redactions</div>
+      ${renderList(graph.redactions)}
+      ${graph.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(graph.warnings)}` : ""}
+      <details class="biomed-logic-frames">
+        <summary>Raw Provenance JSON</summary>
+        <pre class="biomed-json">${escapeHtml(JSON.stringify(graph, null, 2))}</pre>
+      </details>
+    </div>
+  `;
+}
+
+function renderReleaseError(envelope: ReleaseToolEnvelope<unknown>): string {
+  return `
+    <div class="biomed-error">
+      ${escapeHtml(envelope.error_code || "release_tool_error")}: ${escapeHtml(envelope.message || "The tool call did not complete.")}
+    </div>
+    ${envelope.warnings?.length ? renderList(envelope.warnings) : ""}
+    ${envelope.trace && Object.keys(envelope.trace).length ? `<pre class="biomed-json">${escapeHtml(JSON.stringify(envelope.trace, null, 2))}</pre>` : ""}
   `;
 }
 
@@ -724,6 +964,10 @@ function renderTraceResult(payload: TracePayload): string {
   const revision = payload.revision;
   const audit = payload.latest_citation_audit;
   const advisory = payload.latest_advisory_verifier;
+  const budgetSnapshots = payload.trace
+    .map((step) => step.metadata?.budget)
+    .filter((item) => item && typeof item === "object");
+  const memory = payload.memory || payload.answer_run.project_context_trace || {};
   return `
     <div class="biomed-provenance">
       <div class="biomed-provenance-grid">
@@ -735,6 +979,18 @@ function renderTraceResult(payload: TracePayload): string {
         <div><span>Trace</span><strong>${payload.trace.length}</strong></div>
       </div>
     </div>
+    <div class="biomed-two-col">
+      <div>
+        <div class="biomed-label">Memory Effects</div>
+        <pre class="biomed-json">${escapeHtml(JSON.stringify(memory, null, 2))}</pre>
+      </div>
+      <div>
+        <div class="biomed-label">Budget Snapshots</div>
+        <pre class="biomed-json">${escapeHtml(JSON.stringify(budgetSnapshots, null, 2))}</pre>
+      </div>
+    </div>
+    <div class="biomed-label">Step Telemetry</div>
+    ${renderStepTelemetry(payload.step_telemetry)}
     <div class="biomed-label">Advisory Verifier</div>
     ${renderAdvisoryVerifier(advisory)}
     ${
@@ -813,6 +1069,8 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
       revision: result.revision,
       latest_citation_audit: result.audit,
       latest_advisory_verifier: result.advisory_verifier,
+      step_telemetry: undefined,
+      memory: result.answer_result.project_context_trace || {},
     })}
   `;
 }
@@ -1455,9 +1713,17 @@ function renderTrace(container: HTMLElement): void {
         <div class="biomed-row">
           <input id="biomed-trace-run-id" placeholder="answer run id" />
           <button id="biomed-trace-load-btn">Load Trace</button>
+          <button id="biomed-packet-build-btn">Build Packet</button>
+          <button id="biomed-provenance-load-btn">Provenance</button>
+        </div>
+        <div class="biomed-row">
+          <input id="biomed-obsidian-dir" placeholder="workspace-relative Obsidian export dir" value="obsidian-export" />
+          <label class="biomed-check"><input id="biomed-obsidian-enabled" type="checkbox" /> enable one-way export</label>
+          <button id="biomed-obsidian-export-btn">Export Packet</button>
         </div>
       </div>
       <div id="biomed-trace-result" class="biomed-result"></div>
+      <div id="biomed-release-tool-result" class="biomed-result"></div>
     </div>
   `;
   container.querySelector<HTMLButtonElement>("#biomed-trace-load-btn")?.addEventListener("click", async () => {
@@ -1468,6 +1734,52 @@ function renderTrace(container: HTMLElement): void {
     try {
       const trace = await api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`);
       target.innerHTML = renderTraceResult(trace);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-packet-build-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
+    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
+    if (!target || !runId) return;
+    target.textContent = "Building evidence packet...";
+    try {
+      const envelope = await api<ReleaseToolEnvelope<EvidencePacketBuildResult>>("/api/biomed/evidence/packet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: runId, max_evidence_items: 12, selection_strategy: "submodular_greedy" }),
+      });
+      target.innerHTML = renderPacketBuildResult(envelope);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-provenance-load-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
+    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
+    if (!target || !runId) return;
+    target.textContent = "Loading provenance graph...";
+    try {
+      const envelope = await api<ReleaseToolEnvelope<ProvenanceGraphResult>>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/provenance`);
+      target.innerHTML = renderProvenanceResult(envelope);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-obsidian-export-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
+    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
+    const exportDir = container.querySelector<HTMLInputElement>("#biomed-obsidian-dir")?.value || "";
+    const enabled = Boolean(container.querySelector<HTMLInputElement>("#biomed-obsidian-enabled")?.checked);
+    if (!target || !runId) return;
+    target.textContent = "Exporting one-way Obsidian note...";
+    try {
+      const envelope = await api<ReleaseToolEnvelope<ObsidianExportResult>>("/api/biomed/export/obsidian/evidence-packet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: runId, export_dir: exportDir, enabled }),
+      });
+      target.innerHTML = renderObsidianExportResult(envelope);
     } catch (error) {
       target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
@@ -1493,8 +1805,11 @@ function renderResponsible(container: HTMLElement): void {
         <li>Clinical diagnosis, patient-specific treatment, and private medical-record interpretation are refused.</li>
         <li>Uncertainty is elevated when evidence is conflicting, observational, abstract-only, or missing citations.</li>
         <li>Retrieval manifests expose source, compiled query, result counts, warnings, and repeatability limits.</li>
-        <li>Citation presence is not enough; V1.3 audits claim-level support, overclaims, conflicts, and uncertainty calibration.</li>
-        <li>V1.4 routes draft answers through audit, deterministic revision, and persisted trace before final presentation.</li>
+        <li>Release 1.0 tool outputs use structured envelopes, fail fast on policy errors, and preserve partial traces.</li>
+        <li>Toolized retrieval, extraction, packet building, audit, revision, export, and provenance stay inspectable through trace.</li>
+        <li>Obsidian export is one-way reviewer output; exported notes are never imported as biomedical evidence.</li>
+        <li>Packet selection and retrieval advisories are deterministic or advisory-only and cannot override clinical/source policy.</li>
+        <li>Provenance graphs redact prompts, provider raw responses, API keys, and secrets.</li>
       </ul>
     </div>
   `;

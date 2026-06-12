@@ -59,6 +59,40 @@ python -m eval.biomed_evidence.run_eval \
 - `project_brief_audit_pass_rate`: project evidence briefs include audit-linked claims rather than memory-only claims.
 - `project_trace_completeness`: project-aware runs expose original and filtered paper IDs in trace metadata.
 - `clinical_boundary_before_memory_rate`: clinical requests refuse before project memory is loaded.
+- `tool_schema_validity`: Release 1.0 tool contracts exist and declare the release envelope schema.
+- `tool_output_schema_validity`: Release 1.0 tool calls return schema-valid envelopes.
+- `tool_chain_parity_rate`: toolized packet building remains consistent with answer-run evidence.
+- `clinical_boundary_before_tool_chain_rate`: clinical prompts are blocked before tool-chain retrieval.
+- `live_source_policy_before_tool_chain_rate`: live PubMed policy can block live retrieval before execution.
+- `memory_trace_completeness`: memory trace reports use, sources, effects, and `memory_as_evidence=false`.
+- `memory_source_ref_validity`: memory source references point to stable biomedical project IDs.
+- `tool_transition_trace_rate`: step telemetry exposes transition matrix and advisory-only status.
+- `mean_tool_step_count`: average observed tool/trace step count.
+- `p95_tool_step_count`: release smoke p95 step count approximation for local runs.
+- `budget_compliance_rate`: over-budget tool requests fail with structured `budget_exceeded`.
+- `structured_error_validity`: structured tool errors include code, recoverability, and next actions.
+- `obsidian_frontmatter_validity`: exported Obsidian notes include required YAML frontmatter.
+- `obsidian_duplicate_note_rate`: deterministic re-export duplicate path rate.
+- `obsidian_export_not_imported_as_evidence_rate`: exported notes remain one-way reviewer artifacts.
+- `submodular_packet_coverage_rate`: packet selection retains protected conflict/limitation evidence.
+- `submodular_duplicate_reduction_rate`: packet selection does not increase duplicate evidence.
+- `bandit_advisory_schema_validity`: retrieval advisory is schema-valid and advisory-only.
+- `provenance_graph_validity`: provenance graph links answer, evidence, manifests, audit, revision, and tools.
+- `prompt_injection_boundary_success_rate`: prompt-injection-like clinical requests still hit the clinical boundary.
+
+## Release 1.0 Gate
+
+The Release 1.0 mock gate is:
+
+```bash
+.venv/bin/python -m eval.biomed_evidence.run_eval \
+  --output /tmp/biomed_eval_release_1_0.json
+```
+
+Expected release-specific checks should be `1.0` except
+`obsidian_duplicate_note_rate`, which should be `0.0`. The mock gate does not
+exercise live PubMed or real LLM network calls; those remain opt-in smoke
+tests.
 
 ## Optional Live PubMed Eval
 

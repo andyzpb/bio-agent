@@ -19,13 +19,18 @@ from plugins.biomed_evidence.schemas import (
     Citation,
     CitationAuditRequest,
     ConflictAuditRequest,
+    CoverageGapAnalysisRequest,
+    EvidenceBatchExtractionRequest,
     EvidenceExtractionRequest,
     EvidenceItem,
+    EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
+    MultiPassLiteratureSearchRequest,
+    ObsidianExportRequest,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
@@ -33,8 +38,21 @@ from plugins.biomed_evidence.schemas import (
     WatchTopicUpdateRequest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
+from plugins.biomed_evidence.tool_contracts import (
+    list_release_tool_contracts,
+    release_source_policy_error,
+)
 
 _PROMPT_CTX_SLOT = "prompt:ctx"
+
+_RELEASE_TOOL_NAMES = frozenset(
+    item.tool_name for item in list_release_tool_contracts()
+)
+_RELEASE_SOURCE_TOOL_NAMES = frozenset(
+    item.tool_name
+    for item in list_release_tool_contracts()
+    if item.source_policy != "no_source"
+)
 
 _BIOMED_TOOL_NAMES = frozenset(
     {
@@ -68,7 +86,7 @@ _BIOMED_TOOL_NAMES = frozenset(
         "audit_biomedical_answer",
         "find_conflicting_evidence",
     }
-)
+) | _RELEASE_TOOL_NAMES
 
 _TOOLS_WITH_SOURCE = frozenset(
     {
@@ -84,11 +102,12 @@ _TOOLS_WITH_SOURCE = frozenset(
         "reject_project_paper",
         "find_conflicting_evidence",
     }
-)
+) | _RELEASE_SOURCE_TOOL_NAMES
 
 _TOOLS_WITH_PROJECT_ID = frozenset(
     {
         "search_literature",
+        "run_multi_pass_literature_search",
         "answer_with_evidence",
         "answer_with_audit",
         "update_biomed_project",
@@ -101,12 +120,14 @@ _TOOLS_WITH_PROJECT_ID = frozenset(
         "list_project_evidence",
         "list_project_review_queue",
         "generate_project_evidence_brief",
+        "export_project_to_obsidian",
     }
 )
 
 _TOOLS_WITH_OPTIONAL_ACTIVE_PROJECT = frozenset(
     {
         "search_literature",
+        "run_multi_pass_literature_search",
         "answer_with_evidence",
         "answer_with_audit",
         "list_project_evidence",
@@ -137,6 +158,11 @@ _TOOL_LLM_FLAGS: dict[str, tuple[str, ...]] = {
         "use_llm_claim_logic",
         "export_logic_facts",
     ),
+    "run_multi_pass_literature_search": (
+        "use_llm_planner",
+        "execute_support_refute",
+    ),
+    "extract_evidence_batch": ("use_llm_extractor",),
 }
 
 _BIOMED_INTENT_TERMS = (
@@ -192,7 +218,8 @@ class BiomedEvidencePlugin(Plugin):
             return HookOutcome(
                 decision="deny",
                 reason=(
-                    "biomed_evidence guardrail: clinical_or_patient_specific_boundary. "
+                    "biomed_evidence guardrail: clinical_boundary "
+                    "(clinical_or_patient_specific_boundary). "
                     "Reframe the request as a non-clinical biomedical research question."
                 ),
                 extra_message=(
@@ -999,6 +1026,248 @@ class BiomedEvidencePlugin(Plugin):
         return _dump(result.model_dump(mode="json"))
 
     @tool(
+        name="run_multi_pass_literature_search",
+        risk="read-only",
+        search_hint="toolized biomedical planner retrieval bundle no answer",
+    )
+    async def run_multi_pass_literature_search(
+        self,
+        event,
+        question: str,
+        source: Literal["pubmed", "mock"] = "mock",
+        max_results: int = 10,
+        max_queries: int = 6,
+        max_followups: int = 0,
+        max_tool_steps: int = 20,
+        max_wall_clock_seconds: int = 180,
+        project_id: str | None = None,
+        project_context: str | None = None,
+        include_rejected_papers: bool = False,
+        use_llm_planner: bool = False,
+        execute_support_refute: bool = True,
+    ) -> str:
+        """Run planner plus controlled literature retrieval without answering."""
+        result = await self._service.run_multi_pass_literature_search(
+            MultiPassLiteratureSearchRequest(
+                question=question,
+                source=source,
+                max_results=max_results,
+                max_queries=max_queries,
+                max_followups=max_followups,
+                max_tool_steps=max_tool_steps,
+                max_wall_clock_seconds=max_wall_clock_seconds,
+                project_id=project_id,
+                project_context=project_context,
+                include_rejected_papers=include_rejected_papers,
+                use_llm_planner=use_llm_planner,
+                execute_support_refute=execute_support_refute,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="extract_evidence_batch",
+        risk="read-only",
+        search_hint="toolized batch evidence extraction from run retrieval papers",
+    )
+    async def extract_evidence_batch(
+        self,
+        event,
+        run_id: str | None = None,
+        retrieval_id: str | None = None,
+        paper_ids: list[str] | None = None,
+        source: Literal["pubmed", "mock"] = "mock",
+        research_question: str | None = None,
+        use_llm_extractor: bool = False,
+        max_papers: int = 10,
+        max_evidence_items: int = 50,
+    ) -> str:
+        """Extract evidence from a run, retrieval manifest, or explicit paper ids."""
+        result = await self._service.extract_evidence_batch(
+            EvidenceBatchExtractionRequest(
+                run_id=run_id,
+                retrieval_id=retrieval_id,
+                paper_ids=paper_ids or [],
+                source=source,
+                research_question=research_question,
+                use_llm_extractor=use_llm_extractor,
+                max_papers=max_papers,
+                max_evidence_items=max_evidence_items,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="analyze_coverage_gaps",
+        risk="read-only",
+        search_hint="toolized coverage gap analysis advisory only",
+    )
+    async def analyze_coverage_gaps(
+        self,
+        event,
+        run_id: str | None = None,
+        retrieval_id: str | None = None,
+        source: Literal["pubmed", "mock"] = "mock",
+        research_question: str | None = None,
+        max_gap_queries: int = 2,
+    ) -> str:
+        """Analyze evidence coverage gaps without fetching or inventing evidence."""
+        result = self._service.analyze_coverage_gaps(
+            CoverageGapAnalysisRequest(
+                run_id=run_id,
+                retrieval_id=retrieval_id,
+                source=source,
+                research_question=research_question,
+                max_gap_queries=max_gap_queries,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="build_evidence_packet",
+        risk="read-only",
+        search_hint="toolized evidence packet builder selection trace",
+    )
+    async def build_evidence_packet(
+        self,
+        event,
+        run_id: str,
+        max_evidence_items: int = 12,
+        selection_strategy: Literal["all_valid", "submodular_greedy"] = "submodular_greedy",
+    ) -> str:
+        """Build or refresh a single downstream evidence packet for a run."""
+        result = self._service.build_evidence_packet(
+            EvidencePacketBuildRequest(
+                run_id=run_id,
+                max_evidence_items=max_evidence_items,
+                selection_strategy=selection_strategy,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="get_evidence_packet",
+        risk="read-only",
+        search_hint="get persisted evidence packet no retrieval",
+    )
+    async def get_evidence_packet(self, event, run_id: str) -> str:
+        """Return a persisted evidence packet without running retrieval."""
+        result = self._service.get_evidence_packet(run_id)
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="get_answer_trace",
+        risk="read-only",
+        search_hint="get answer trace telemetry memory audit revision",
+    )
+    async def get_answer_trace(self, event, run_id: str) -> str:
+        """Return persisted audited-answer trace and advisory telemetry."""
+        result = self._service.get_answer_trace(run_id)
+        if result is None:
+            return _dump({"ok": False, "error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(result)
+
+    @tool(
+        name="export_provenance_graph",
+        risk="read-only",
+        search_hint="export answer run provenance graph prov openlineage compatible",
+    )
+    async def export_provenance_graph(self, event, run_id: str) -> str:
+        """Return a redacted provenance graph for an answer run."""
+        result = self._service.export_provenance_graph(run_id)
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="export_evidence_packet_to_obsidian",
+        risk="read-write",
+        search_hint="export evidence packet reviewer note obsidian one way",
+    )
+    async def export_evidence_packet_to_obsidian(
+        self,
+        event,
+        run_id: str,
+        export_dir: str | None = None,
+        enabled: bool | None = None,
+        max_files: int | None = None,
+    ) -> str:
+        """Export a persisted evidence packet as one-way Obsidian Markdown."""
+        result = self._service.export_evidence_packet_to_obsidian(
+            ObsidianExportRequest(
+                run_id=run_id,
+                export_dir=export_dir or _config_str(self, "obsidian_export_dir", ""),
+                enabled=(
+                    enabled
+                    if enabled is not None
+                    else _config_bool(self, "enable_obsidian_export", False)
+                ),
+                max_files=max_files
+                if max_files is not None
+                else _config_int(self, "max_obsidian_export_files", 50),
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="export_project_to_obsidian",
+        risk="read-write",
+        search_hint="export biomedical project reviewer memory obsidian one way",
+    )
+    async def export_project_to_obsidian(
+        self,
+        event,
+        project_id: str,
+        export_dir: str | None = None,
+        enabled: bool | None = None,
+        max_files: int | None = None,
+    ) -> str:
+        """Export a biomedical project as one-way Obsidian Markdown."""
+        result = self._service.export_project_to_obsidian(
+            ObsidianExportRequest(
+                project_id=project_id,
+                export_dir=export_dir or _config_str(self, "obsidian_export_dir", ""),
+                enabled=(
+                    enabled
+                    if enabled is not None
+                    else _config_bool(self, "enable_obsidian_export", False)
+                ),
+                max_files=max_files
+                if max_files is not None
+                else _config_int(self, "max_obsidian_export_files", 50),
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="export_research_watch_to_obsidian",
+        risk="read-write",
+        search_hint="export research watch reviewer note obsidian one way",
+    )
+    async def export_research_watch_to_obsidian(
+        self,
+        event,
+        watch_id: str,
+        export_dir: str | None = None,
+        enabled: bool | None = None,
+        max_files: int | None = None,
+    ) -> str:
+        """Export a research watch topic as one-way Obsidian Markdown."""
+        result = self._service.export_research_watch_to_obsidian(
+            ObsidianExportRequest(
+                watch_id=watch_id,
+                export_dir=export_dir or _config_str(self, "obsidian_export_dir", ""),
+                enabled=(
+                    enabled
+                    if enabled is not None
+                    else _config_bool(self, "enable_obsidian_export", False)
+                ),
+                max_files=max_files
+                if max_files is not None
+                else _config_int(self, "max_obsidian_export_files", 50),
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
         name="validate_citation_support",
         risk="read-only",
         search_hint="audit biomedical answer claim citation evidence support",
@@ -1327,14 +1596,19 @@ class BiomedEvidencePlugin(Plugin):
             messages.append(f"applied default biomedical source: {source}")
         if source not in {"mock", "pubmed"}:
             return f"biomed_evidence guardrail: unsupported_source ({source})"
-        if source == "pubmed" and not _config_bool(
-            self,
-            "allow_live_pubmed_tools",
-            False,
-        ):
+        policy_error = release_source_policy_error(
+            tool_name=tool_name,
+            source=source,
+            allow_live_pubmed_tools=_config_bool(
+                self,
+                "allow_live_pubmed_tools",
+                False,
+            ),
+        )
+        if policy_error is not None:
             return (
-                "biomed_evidence guardrail: live PubMed tool calls are disabled "
-                "by plugin config; use source=mock or enable allow_live_pubmed_tools."
+                "biomed_evidence guardrail: "
+                f"{policy_error.error_code}: {policy_error.message}"
             )
         return ""
 
@@ -1355,6 +1629,30 @@ class BiomedEvidencePlugin(Plugin):
             args,
             "page_size",
             _config_int(self, "max_page_size", 100),
+            messages,
+        )
+        _cap_int_arg(
+            args,
+            "max_queries",
+            _config_int(self, "max_retrieval_queries", 6),
+            messages,
+        )
+        _cap_int_arg(
+            args,
+            "max_followups",
+            _config_int(self, "max_followup_queries", 2),
+            messages,
+        )
+        _cap_int_arg(
+            args,
+            "max_evidence_items",
+            _config_int(self, "max_evidence_items", 50),
+            messages,
+        )
+        _cap_int_arg(
+            args,
+            "max_tool_steps",
+            _config_int(self, "max_tool_steps", 20),
             messages,
         )
 

@@ -60,13 +60,57 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     }'
 ```
 
+## Release 1.0 Tool Chain Smoke
+
+After creating an audited answer run, inspect the toolized workflow surfaces:
+
+```bash
+RUN_ID="<answer run id>"
+
+curl -s "http://127.0.0.1:2236/api/biomed/answer-runs/$RUN_ID/trace" \
+  | jq '{run_id, steps:[.trace[] | {step,status}], step_telemetry, memory}'
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/evidence/packet" \
+  -H "Content-Type: application/json" \
+  -d "{\"run_id\":\"$RUN_ID\",\"max_evidence_items\":12,\"selection_strategy\":\"submodular_greedy\"}" \
+  | jq '{ok, packet:.result.evidence_packet.packet_id, selected:.result.selection.selected_evidence_ids, dropped:.result.selection.dropped_evidence_ids}'
+
+curl -s "http://127.0.0.1:2236/api/biomed/answer-runs/$RUN_ID/provenance" \
+  | jq '{ok, graph:.result.graph_id, entities:(.result.entities|length), activities:(.result.activities|length), redactions:.result.redactions}'
+```
+
+Obsidian export is disabled by default. For a local one-way export, pass an
+explicit workspace-relative directory and `enabled=true`:
+
+```bash
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/export/obsidian/evidence-packet" \
+  -H "Content-Type: application/json" \
+  -d "{\"run_id\":\"$RUN_ID\",\"export_dir\":\"obsidian-export\",\"enabled\":true}" \
+  | jq '{ok, export_id:.result.export_id, notes:.result.notes, imported_as_evidence:.result.imported_as_evidence}'
+```
+
+The export is deterministic and one-way; Markdown notes are reviewer artifacts
+and are not imported as biomedical evidence.
+
 ## Docker
 
 ```bash
-docker compose up --build
+docker compose up -d --build --force-recreate
 ```
 
 The compose file mounts `.akashic-workspace` as the runtime workspace and exposes the dashboard on port `2236`.
+
+Release gates before merging:
+
+```bash
+.venv/bin/pyright --level error
+.venv/bin/pyright --project pyrightconfig.tests.json --level error
+.venv/bin/pytest -q tests/
+.venv/bin/python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_release_1_0.json
+npm run typecheck
+npm run build
+docker compose up -d --build --force-recreate
+```
 
 ## Troubleshooting
 

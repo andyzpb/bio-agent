@@ -18,6 +18,7 @@ from plugins.biomed_evidence.citation_auditor import (
     validate_citation_support,
 )
 from plugins.biomed_evidence.evidence_extractor import EvidenceExtractor
+from plugins.biomed_evidence.errors import release_error, release_ok
 from plugins.biomed_evidence.guardrails import (
     RESEARCH_USE_DISCLAIMER,
     clinical_refusal,
@@ -28,6 +29,13 @@ from plugins.biomed_evidence.literature_client import (
     MockLiteratureClient,
     PubMedLiteratureClient,
 )
+from plugins.biomed_evidence.obsidian_export import (
+    ensure_obsidian_export_dir,
+    export_packet_note,
+    export_project_note,
+    export_watch_note,
+)
+from plugins.biomed_evidence.provenance_service import build_provenance_graph
 from plugins.biomed_evidence.schemas import (
     AdvisoryClaimReview,
     AdvisoryVerifierDisagreement,
@@ -38,6 +46,7 @@ from plugins.biomed_evidence.schemas import (
     AnswerRevision,
     AtomicClaim,
     AuditedAnswerResult,
+    BanditAdvisoryResult,
     BiomedProject,
     BiomedProjectCreateRequest,
     BiomedProjectUpdateRequest,
@@ -52,9 +61,19 @@ from plugins.biomed_evidence.schemas import (
     ConfidenceLevel,
     ConflictAuditRequest,
     ConflictAuditResult,
+    CoverageGapAnalysisRequest,
+    CoverageGapAnalysisResult,
     CoverageStatus,
+    EvidenceBatchExtractionRequest,
+    EvidenceBatchExtractionResult,
     EvidenceExtractionRequest,
     EvidenceExtractionResult,
+    EvidencePacketBuildRequest,
+    EvidencePacketBuildResult,
+    EvidencePacketGetResult,
+    EvidenceSelectionItem,
+    EvidencePacketSelectionResult,
+    EvidencePacketSelectionStrategy,
     EvidencePacketSummary,
     ExtractionMode,
     EvidenceGraph,
@@ -74,6 +93,10 @@ from plugins.biomed_evidence.schemas import (
     LiteratureSourceTrace,
     LogicalClaimFrame,
     LogicalEvidenceFrame,
+    MultiPassLiteratureSearchRequest,
+    MultiPassLiteratureSearchResult,
+    ObsidianExportRequest,
+    ObsidianExportResult,
     PaperMetadata,
     PlanBiomedicalSearchRequest,
     PlanBiomedicalSearchResult,
@@ -83,8 +106,10 @@ from plugins.biomed_evidence.schemas import (
     ProjectPaperDecision,
     ProjectPaperDecisionRequest,
     ProjectReviewQueueItem,
+    ProvenanceGraphResult,
     QueryPlanValidation,
     CoverageMatrixRow,
+    ReleaseToolEnvelope,
     RetrievalBundle,
     RetrievalBundleRecord,
     RetrievalIntent,
@@ -100,6 +125,8 @@ from plugins.biomed_evidence.schemas import (
     WatchTopicUpdateRequest,
 )
 from plugins.biomed_evidence.storage import BiomedStorage
+from plugins.biomed_evidence.telemetry_service import build_step_telemetry
+from plugins.biomed_evidence.tool_contracts import get_release_tool_metadata
 
 
 @dataclass(frozen=True)
@@ -609,6 +636,943 @@ class BiomedEvidenceService:
             warnings=warnings,
             errors=errors,
         )
+
+    async def run_multi_pass_literature_search(
+        self,
+        request: MultiPassLiteratureSearchRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "run_multi_pass_literature_search"
+        metadata = get_release_tool_metadata(tool_name)
+        run_id = f"biomed-tool-run-{uuid.uuid4().hex[:12]}"
+        trace = [
+            _tool_trace_step(
+                run_id=run_id,
+                step="classify",
+                status="started",
+                input_summary=request.question,
+                output_summary="clinical boundary precheck",
+                metadata={"clinical_boundary_prechecked": True},
+            )
+        ]
+        if is_clinical_request(request.question):
+            trace[0] = trace[0].model_copy(
+                update={
+                    "status": "completed",
+                    "output_summary": "clinical_boundary",
+                    "metadata": {
+                        **trace[0].metadata,
+                        "clinical_boundary": True,
+                        "clinical_boundary_before_memory": True,
+                    },
+                }
+            )
+            return release_error(
+                tool_name=tool_name,
+                code="clinical_boundary",
+                message=(
+                    "Biomedical Evidence tools are research-only and were not executed "
+                    "for a clinical or patient-specific request."
+                ),
+                trace={
+                    "trace": [item.model_dump(mode="json") for item in trace],
+                    "memory_used": False,
+                    "memory_as_evidence": False,
+                },
+                metadata=metadata,
+            )
+
+        budget = _release_tool_budget(
+            max_tool_steps=request.max_tool_steps,
+            max_retrieval_queries=request.max_queries,
+            max_followup_queries=request.max_followups,
+            max_papers=request.max_results,
+            max_evidence_items=0,
+            max_llm_calls=1 if request.use_llm_planner else 0,
+            max_wall_clock_seconds=request.max_wall_clock_seconds,
+        )
+        memory_trace, project = self._release_project_memory_trace(
+            project_id=request.project_id,
+            request_context=request.project_context,
+        )
+        if request.project_id and project is None:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="project_id was provided but no biomedical project exists.",
+                detail={"project_id": request.project_id},
+                trace={
+                    "trace": [item.model_dump(mode="json") for item in trace],
+                    "memory": memory_trace,
+                    "budget": budget,
+                },
+                metadata=metadata,
+            )
+        active_question = request.question
+        project_context = request.project_context
+        if project is not None:
+            project_context = _project_context_text(
+                project=project,
+                request_context=request.project_context,
+            )
+        plan_request = PlanBiomedicalSearchRequest(
+            question=active_question,
+            max_results=request.max_results,
+            source=request.source,
+            project_context=project_context,
+            use_llm_planner=request.use_llm_planner,
+        )
+        planning_result = await self.plan_biomedical_search(plan_request)
+        trace.extend(
+            [
+                _tool_trace_step(
+                    run_id=run_id,
+                    step="plan",
+                    status="completed",
+                    input_summary=active_question,
+                    output_summary=(
+                        planning_result.query_plan.primary_query
+                        if planning_result.query_plan is not None
+                        else "no query plan"
+                    ),
+                    warnings=(
+                        planning_result.query_plan.warnings
+                        if planning_result.query_plan is not None
+                        else []
+                    ),
+                    metadata={
+                        "query_plan": (
+                            planning_result.query_plan.model_dump(mode="json")
+                            if planning_result.query_plan is not None
+                            else None
+                        ),
+                        "memory": memory_trace,
+                    },
+                ),
+                _tool_trace_step(
+                    run_id=run_id,
+                    step="validate_plan",
+                    status="completed",
+                    input_summary="structured planner output",
+                    output_summary=planning_result.validation.status,
+                    warnings=planning_result.validation.warnings,
+                    metadata={
+                        "validation": planning_result.validation.model_dump(
+                            mode="json"
+                        )
+                    },
+                ),
+            ]
+        )
+        if planning_result.classification.clinical_boundary:
+            return release_error(
+                tool_name=tool_name,
+                code="clinical_boundary",
+                message="Planner classified the request as clinical; retrieval was not executed.",
+                trace={
+                    "trace": [item.model_dump(mode="json") for item in trace],
+                    "memory": memory_trace,
+                    "budget": budget,
+                },
+                metadata=metadata,
+            )
+        if not planning_result.validation.valid:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="Retrieval plan validation failed; no literature search executed.",
+                detail={
+                    "validation": planning_result.validation.model_dump(mode="json")
+                },
+                warnings=planning_result.validation.warnings,
+                trace={
+                    "trace": [item.model_dump(mode="json") for item in trace],
+                    "memory": memory_trace,
+                    "budget": budget,
+                },
+                metadata=metadata,
+            )
+        search_request = (
+            planning_result.search_request
+            if planning_result.search_request is not None
+            else SearchBiomedicalLiteratureRequest(
+                query=active_question,
+                max_results=request.max_results,
+                source=request.source,
+            )
+        )
+        planned_query_count = 1
+        if request.execute_support_refute and planning_result.query_plan is not None:
+            specs, _ = _planned_retrieval_specs(
+                base_request=search_request,
+                query_plan=planning_result.query_plan,
+            )
+            planned_query_count = len(specs)
+        if planned_query_count > request.max_queries:
+            return release_error(
+                tool_name=tool_name,
+                code="budget_exceeded",
+                message="Planned retrieval query count exceeded max_queries.",
+                detail={
+                    "planned_query_count": planned_query_count,
+                    "max_queries": request.max_queries,
+                },
+                trace={
+                    "trace": [item.model_dump(mode="json") for item in trace],
+                    "memory": memory_trace,
+                    "budget": budget,
+                },
+                metadata=metadata,
+            )
+        answer_request = AnswerWithEvidenceRequest(
+            question=active_question,
+            max_papers=request.max_results,
+            project_id=request.project_id,
+            project_context=project_context,
+            source=request.source,
+            include_rejected_papers=request.include_rejected_papers,
+            use_llm_planner=request.use_llm_planner,
+            execute_support_refute=request.execute_support_refute,
+        )
+        (
+            metadata_items,
+            retrieval_manifest,
+            retrieval_bundle,
+            _paper_intents,
+            _paper_retrieval_ids,
+        ) = await self._retrieve_answer_papers(
+            request=answer_request,
+            planning_result=planning_result,
+            search_request=search_request,
+            run_id=run_id,
+        )
+        if project is not None:
+            (
+                metadata_items,
+                retrieval_manifest,
+                retrieval_bundle,
+                project_retrieval_trace,
+            ) = self._apply_project_memory_to_retrieval(
+                project=project,
+                request=answer_request,
+                metadata=metadata_items,
+                retrieval_manifest=retrieval_manifest,
+                retrieval_bundle=retrieval_bundle,
+            )
+            memory_trace.update(_memory_effects_from_project_trace(project_retrieval_trace))
+            self.storage.save_retrieval_manifest(retrieval_manifest)
+            self.storage.link_retrieval_papers(
+                retrieval_manifest.retrieval_id,
+                source=request.source,
+                paper_ids=[item.paper_id for item in metadata_items],
+            )
+        trace.append(
+            _tool_trace_step(
+                run_id=run_id,
+                step="retrieve",
+                status="completed",
+                input_summary=search_request.query,
+                output_summary=retrieval_manifest.retrieval_id,
+                warnings=_merge_unique(
+                    retrieval_manifest.warnings,
+                    retrieval_bundle.warnings if retrieval_bundle else [],
+                ),
+                metadata={
+                    "retrieval_id": retrieval_manifest.retrieval_id,
+                    "paper_ids": [item.paper_id for item in metadata_items],
+                    "retrieval_bundle": _retrieval_bundle_trace(retrieval_bundle),
+                    "memory": memory_trace,
+                    "budget": {
+                        **budget,
+                        "retrieval_queries_used": planned_query_count,
+                        "papers_returned": len(metadata_items),
+                    },
+                },
+            )
+        )
+        step_telemetry = build_step_telemetry(
+            trace,
+            run_id=run_id,
+            coverage_matrix=(
+                retrieval_bundle.coverage_matrix if retrieval_bundle is not None else []
+            ),
+            stop_reason=(
+                retrieval_bundle.stop_reason if retrieval_bundle is not None else None
+            ),
+        )
+        result = MultiPassLiteratureSearchResult(
+            run_id=run_id,
+            source=request.source,
+            classification=planning_result.classification,
+            query_plan=planning_result.query_plan,
+            validation=planning_result.validation,
+            retrieval_manifest=retrieval_manifest,
+            retrieval_bundle=retrieval_bundle,
+            paper_ids=[item.paper_id for item in metadata_items],
+            item_count=len(metadata_items),
+            memory_trace=memory_trace,
+            budget=budget,
+            step_telemetry=step_telemetry,
+        )
+        return release_ok(
+            tool_name=tool_name,
+            result=result.model_dump(mode="json"),
+            ids={
+                "run_id": run_id,
+                "retrieval_id": retrieval_manifest.retrieval_id,
+                "bundle_id": retrieval_bundle.bundle_id if retrieval_bundle else "",
+            },
+            warnings=_merge_unique(
+                retrieval_manifest.warnings,
+                retrieval_bundle.warnings if retrieval_bundle else [],
+            ),
+            trace={
+                "trace": [item.model_dump(mode="json") for item in trace],
+                "step_telemetry": step_telemetry.model_dump(mode="json"),
+                "memory": memory_trace,
+                "budget": budget,
+            },
+            metadata=metadata,
+        )
+
+    async def extract_evidence_batch(
+        self,
+        request: EvidenceBatchExtractionRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "extract_evidence_batch"
+        metadata = get_release_tool_metadata(tool_name)
+        run = self.storage.get_answer_run(request.run_id) if request.run_id else None
+        if request.run_id and run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        if run is not None and is_clinical_request(run.answer):
+            return release_error(
+                tool_name=tool_name,
+                code="clinical_boundary",
+                message="Clinical refusal runs cannot be used for evidence extraction.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        retrieval_manifest = None
+        if request.retrieval_id:
+            retrieval_manifest = self.storage.get_retrieval_manifest(
+                request.retrieval_id
+            )
+            if retrieval_manifest is None:
+                return release_error(
+                    tool_name=tool_name,
+                    code="unknown_retrieval_id",
+                    message="No retrieval manifest exists for retrieval_id.",
+                    detail={"retrieval_id": request.retrieval_id},
+                    metadata=metadata,
+                )
+        elif run is not None:
+            retrieval_manifest = run.retrieval_manifest
+
+        paper_ids = _merge_unique(
+            request.paper_ids,
+            (
+                run.retrieval_bundle.deduped_paper_ids
+                if run is not None and run.retrieval_bundle is not None
+                else []
+            ),
+            (
+                retrieval_manifest.returned_paper_ids
+                if retrieval_manifest is not None
+                else []
+            ),
+        )
+        if not paper_ids:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="Provide run_id, retrieval_id, or paper_ids for extraction.",
+                metadata=metadata,
+            )
+        if len(paper_ids) > request.max_papers:
+            return release_error(
+                tool_name=tool_name,
+                code="budget_exceeded",
+                message="Requested papers exceed max_papers.",
+                detail={"paper_count": len(paper_ids), "max_papers": request.max_papers},
+                ids={"run_id": request.run_id or ""},
+                metadata=metadata,
+            )
+
+        source = (
+            run.retrieval_manifest.source
+            if run is not None and run.retrieval_manifest is not None
+            else (
+                retrieval_manifest.source
+                if retrieval_manifest is not None
+                else request.source
+            )
+        )
+        research_question = (
+            request.research_question
+            or (run.answer if run is not None else "")
+            or "Biomedical evidence extraction"
+        )
+        answer_request = AnswerWithEvidenceRequest(
+            question=research_question,
+            source=cast(Any, source),
+            max_papers=request.max_papers,
+            use_llm_extractor=request.use_llm_extractor,
+        )
+        evidence: list[EvidenceItem] = []
+        warnings: list[str] = []
+        resolved_paper_ids: list[str] = []
+        for paper_id in paper_ids:
+            paper = await self.fetch(
+                FetchBiomedicalPaperRequest(
+                    paper_id=paper_id,
+                    source=cast(Any, source),
+                )
+            )
+            if paper is None:
+                warnings.append(f"Paper not found: {paper_id}")
+                continue
+            resolved_paper_ids.append(paper.paper_id)
+            extracted = await self._extract_evidence_for_answer(
+                request=answer_request,
+                paper=paper,
+                retrieval_id=(
+                    request.retrieval_id
+                    or (retrieval_manifest.retrieval_id if retrieval_manifest else None)
+                ),
+                retrieval_intent="unknown",
+            )
+            evidence.extend(extracted.evidence)
+            if len(evidence) > request.max_evidence_items:
+                return release_error(
+                    tool_name=tool_name,
+                    code="budget_exceeded",
+                    message="Extracted evidence exceeded max_evidence_items.",
+                    detail={
+                        "evidence_count": len(evidence),
+                        "max_evidence_items": request.max_evidence_items,
+                    },
+                    trace={"partial_evidence_count": len(evidence)},
+                    ids={"run_id": request.run_id or ""},
+                    metadata=metadata,
+                )
+        if not evidence:
+            return release_error(
+                tool_name=tool_name,
+                code="empty_evidence",
+                message="No evidence could be extracted from the selected papers.",
+                detail={"paper_ids": paper_ids},
+                warnings=warnings,
+                ids={"run_id": request.run_id or ""},
+                metadata=metadata,
+            )
+        if run is not None and not run.evidence_summary:
+            updated_run = run.model_copy(update={"evidence_summary": evidence})
+            self.storage.save_answer_run(updated_run, question=research_question)
+        result = EvidenceBatchExtractionResult(
+            run_id=request.run_id,
+            retrieval_id=(
+                request.retrieval_id
+                or (retrieval_manifest.retrieval_id if retrieval_manifest else None)
+            ),
+            source=cast(Any, source),
+            paper_ids=resolved_paper_ids,
+            evidence=evidence,
+            evidence_count=len(evidence),
+            extraction_mode_counts=_extraction_mode_counts(evidence),
+            warnings=warnings,
+            memory_trace=_run_memory_trace(run),
+            budget={
+                "max_papers": request.max_papers,
+                "max_evidence_items": request.max_evidence_items,
+                "papers_used": len(resolved_paper_ids),
+                "evidence_items": len(evidence),
+            },
+        )
+        return release_ok(
+            tool_name=tool_name,
+            result=result.model_dump(mode="json"),
+            ids={
+                "run_id": request.run_id or "",
+                "retrieval_id": result.retrieval_id or "",
+            },
+            warnings=warnings,
+            trace={
+                "memory": result.memory_trace,
+                "budget": result.budget,
+            },
+            metadata=metadata,
+        )
+
+    def analyze_coverage_gaps(
+        self,
+        request: CoverageGapAnalysisRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "analyze_coverage_gaps"
+        metadata = get_release_tool_metadata(tool_name)
+        run = self.storage.get_answer_run(request.run_id) if request.run_id else None
+        if request.run_id and run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        retrieval_manifest = None
+        if request.retrieval_id:
+            retrieval_manifest = self.storage.get_retrieval_manifest(
+                request.retrieval_id
+            )
+            if retrieval_manifest is None:
+                return release_error(
+                    tool_name=tool_name,
+                    code="unknown_retrieval_id",
+                    message="No retrieval manifest exists for retrieval_id.",
+                    detail={"retrieval_id": request.retrieval_id},
+                    metadata=metadata,
+                )
+        elif run is not None:
+            retrieval_manifest = run.retrieval_manifest
+        if retrieval_manifest is None:
+            return release_error(
+                tool_name=tool_name,
+                code="missing_retrieval_manifest",
+                message="Coverage analysis requires run_id with retrieval or retrieval_id.",
+                metadata=metadata,
+            )
+
+        evidence = run.evidence_summary if run is not None else []
+        bundle = run.retrieval_bundle if run is not None else None
+        if bundle is None:
+            bundle = _retrieval_bundle_from_manifest(retrieval_manifest)
+        coverage_matrix = _build_coverage_matrix(bundle, evidence)
+        gap_decisions: list[GapSearchDecision] = []
+        if run is not None and run.query_plan is not None:
+            gap_decisions = _gap_search_decisions(
+                coverage_matrix,
+                query_plan=run.query_plan,
+                existing_queries={record.query.lower() for record in bundle.records},
+                max_decisions=max(0, request.max_gap_queries),
+            )
+        stop_reason = _coverage_stop_reason(coverage_matrix)
+        bandit = _bandit_advisory_from_coverage(
+            coverage_matrix,
+            gap_decisions,
+            stop_reason=stop_reason,
+        )
+        trace = [
+            _tool_trace_step(
+                run_id=request.run_id or "coverage-gap-analysis",
+                step="coverage_gap_analysis",
+                status="completed",
+                input_summary=request.retrieval_id or request.run_id or "",
+                output_summary=stop_reason,
+                metadata={
+                    "coverage_rows": len(coverage_matrix),
+                    "gap_decisions": len(gap_decisions),
+                    "advisory_only": True,
+                },
+            )
+        ]
+        step_telemetry = build_step_telemetry(
+            trace,
+            run_id=request.run_id,
+            coverage_matrix=coverage_matrix,
+            stop_reason=stop_reason,
+        )
+        result = CoverageGapAnalysisResult(
+            run_id=request.run_id,
+            retrieval_id=retrieval_manifest.retrieval_id,
+            coverage_matrix=coverage_matrix,
+            gap_decisions=gap_decisions,
+            bandit_advisory=bandit,
+            stop_reason=stop_reason,
+            memory_trace=_run_memory_trace(run),
+            step_telemetry=step_telemetry,
+        )
+        return release_ok(
+            tool_name=tool_name,
+            result=result.model_dump(mode="json"),
+            ids={
+                "run_id": request.run_id or "",
+                "retrieval_id": retrieval_manifest.retrieval_id,
+            },
+            trace={
+                "trace": [item.model_dump(mode="json") for item in trace],
+                "step_telemetry": step_telemetry.model_dump(mode="json"),
+                "memory": result.memory_trace,
+            },
+            metadata=metadata,
+        )
+
+    def build_evidence_packet(
+        self,
+        request: EvidencePacketBuildRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "build_evidence_packet"
+        metadata = get_release_tool_metadata(tool_name)
+        run = self.storage.get_answer_run(request.run_id)
+        if run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        if run.retrieval_manifest is None:
+            return release_error(
+                tool_name=tool_name,
+                code="missing_retrieval_manifest",
+                message="Evidence packet requires a retrieval manifest.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        if not run.evidence_summary:
+            return release_error(
+                tool_name=tool_name,
+                code="empty_evidence",
+                message="Evidence packet requires extracted evidence.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        selected = _select_evidence_for_packet(
+            run.evidence_summary,
+            max_items=request.max_evidence_items,
+            strategy=request.selection_strategy,
+        )
+        selected_ids = set(selected.selected_evidence_ids)
+        selected_evidence = [
+            item for item in run.evidence_summary if item.evidence_id in selected_ids
+        ]
+        packet_paper_ids = (
+            run.retrieval_bundle.deduped_paper_ids
+            if run.retrieval_bundle is not None
+            else run.retrieval_manifest.returned_paper_ids
+        )
+        metadata_items = [
+            _paper_metadata_from_stored_paper(
+                self.storage.get_paper(paper_id, source=run.retrieval_manifest.source)
+            )
+            for paper_id in packet_paper_ids
+        ]
+        metadata_items = [item for item in metadata_items if item is not None]
+        packet = _build_evidence_packet(
+            request=AnswerWithEvidenceRequest(
+                question=(
+                    run.query_plan.question
+                    if run.query_plan is not None
+                    else run.answer[:240]
+                ),
+                source=cast(Any, run.retrieval_manifest.source),
+                max_papers=len(metadata_items) or len(run.retrieval_manifest.returned_paper_ids),
+            ),
+            planning_result=None,
+            retrieval_manifest=run.retrieval_manifest,
+            retrieval_bundle=run.retrieval_bundle,
+            metadata=cast(list[PaperMetadata], metadata_items),
+            evidence=selected_evidence,
+        )
+        updated_run = run.model_copy(update={"evidence_packet": packet})
+        self.storage.save_answer_run(updated_run, question=packet.question)
+        trace = [
+            _tool_trace_step(
+                run_id=request.run_id,
+                step="build_packet",
+                status="completed",
+                input_summary=f"{len(run.evidence_summary)} evidence items",
+                output_summary=packet.packet_id,
+                metadata={
+                    "selection": selected.model_dump(mode="json"),
+                    "memory": _run_memory_trace(run),
+                },
+            )
+        ]
+        step_telemetry = build_step_telemetry(
+            trace,
+            run_id=request.run_id,
+            coverage_matrix=packet.coverage_matrix,
+            stop_reason=packet.stop_reason,
+        )
+        result = EvidencePacketBuildResult(
+            run_id=request.run_id,
+            evidence_packet=packet,
+            selection=selected,
+            availability="persisted",
+            memory_trace=_run_memory_trace(run),
+            step_telemetry=step_telemetry,
+        )
+        return release_ok(
+            tool_name=tool_name,
+            result=result.model_dump(mode="json"),
+            ids={"run_id": request.run_id, "packet_id": packet.packet_id},
+            trace={
+                "trace": [item.model_dump(mode="json") for item in trace],
+                "step_telemetry": step_telemetry.model_dump(mode="json"),
+            },
+            metadata=metadata,
+        )
+
+    def get_evidence_packet(self, run_id: str) -> ReleaseToolEnvelope:
+        tool_name = "get_evidence_packet"
+        metadata = get_release_tool_metadata(tool_name)
+        run = self.storage.get_answer_run(run_id)
+        if run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": run_id},
+                metadata=metadata,
+            )
+        availability: str = "unavailable"
+        packet = run.evidence_packet
+        if packet is not None:
+            availability = "persisted"
+        result = EvidencePacketGetResult(
+            run_id=run_id,
+            evidence_packet=packet,
+            availability=cast(Any, availability),
+            stale=False,
+            source=(
+                run.retrieval_manifest.source if run.retrieval_manifest is not None else None
+            ),
+            memory_trace=_run_memory_trace(run),
+            step_telemetry=build_step_telemetry(
+                self.storage.list_agent_trace_steps(run_id),
+                run_id=run_id,
+                coverage_matrix=packet.coverage_matrix if packet is not None else [],
+                stop_reason=packet.stop_reason if packet is not None else None,
+            ),
+        )
+        if packet is None:
+            return release_error(
+                tool_name=tool_name,
+                code="packet_unavailable",
+                message="No persisted evidence packet is available for run_id.",
+                detail={"run_id": run_id},
+                trace=result.model_dump(mode="json"),
+                metadata=metadata,
+            )
+        return release_ok(
+            tool_name=tool_name,
+            result=result.model_dump(mode="json"),
+            ids={"run_id": run_id, "packet_id": packet.packet_id},
+            trace={
+                "memory": result.memory_trace,
+                "step_telemetry": (
+                    result.step_telemetry.model_dump(mode="json")
+                    if result.step_telemetry is not None
+                    else None
+                ),
+            },
+            metadata=metadata,
+        )
+
+    def export_provenance_graph(self, run_id: str) -> ReleaseToolEnvelope:
+        tool_name = "export_provenance_graph"
+        metadata = get_release_tool_metadata(tool_name)
+        run = self.storage.get_answer_run(run_id)
+        if run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": run_id},
+                metadata=metadata,
+            )
+        try:
+            graph = build_provenance_graph(
+                answer=run,
+                trace=self.storage.list_agent_trace_steps(run_id),
+                audit=self.storage.get_latest_citation_audit_for_run(run_id),
+                revision=self.storage.get_answer_revision(run_id),
+                advisory=self.storage.get_latest_advisory_verifier_for_run(run_id),
+            )
+        except Exception as exc:
+            return release_error(
+                tool_name=tool_name,
+                code="provenance_unavailable",
+                message="Provenance graph could not be constructed.",
+                detail={"run_id": run_id, "error": f"{type(exc).__name__}: {exc}"},
+                metadata=metadata,
+            )
+        return release_ok(
+            tool_name=tool_name,
+            result=graph.model_dump(mode="json"),
+            ids={"run_id": run_id, "graph_id": graph.graph_id},
+            warnings=graph.warnings,
+            trace={
+                "schema_version": graph.schema_version,
+                "entity_count": len(graph.entities),
+                "activity_count": len(graph.activities),
+                "agent_count": len(graph.agents),
+                "relation_count": len(graph.relations),
+                "redactions": graph.redactions,
+            },
+            metadata=metadata,
+        )
+
+    def export_evidence_packet_to_obsidian(
+        self,
+        request: ObsidianExportRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "export_evidence_packet_to_obsidian"
+        metadata = get_release_tool_metadata(tool_name)
+        export_dir, error = self._resolve_obsidian_export_dir(
+            request=request,
+            tool_name=tool_name,
+            metadata=metadata,
+        )
+        if error is not None:
+            return error
+        if not request.run_id:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="run_id is required for evidence packet export.",
+                metadata=metadata,
+            )
+        run = self.storage.get_answer_run(request.run_id)
+        if run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        if run.evidence_packet is None:
+            return release_error(
+                tool_name=tool_name,
+                code="packet_unavailable",
+                message="No persisted evidence packet is available for run_id.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        result = export_packet_note(
+            packet=run.evidence_packet,
+            export_dir=cast(Path, export_dir),
+            run_id=request.run_id,
+        )
+        return _obsidian_export_ok(
+            tool_name=tool_name,
+            result=result,
+            metadata=metadata,
+            ids={"run_id": request.run_id, "packet_id": run.evidence_packet.packet_id},
+        )
+
+    def export_project_to_obsidian(
+        self,
+        request: ObsidianExportRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "export_project_to_obsidian"
+        metadata = get_release_tool_metadata(tool_name)
+        export_dir, error = self._resolve_obsidian_export_dir(
+            request=request,
+            tool_name=tool_name,
+            metadata=metadata,
+        )
+        if error is not None:
+            return error
+        if not request.project_id:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="project_id is required for project export.",
+                metadata=metadata,
+            )
+        project = self.storage.get_project(request.project_id)
+        if project is None:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="No biomedical project exists for project_id.",
+                detail={"project_id": request.project_id},
+                metadata=metadata,
+            )
+        result = export_project_note(project=project, export_dir=cast(Path, export_dir))
+        return _obsidian_export_ok(
+            tool_name=tool_name,
+            result=result,
+            metadata=metadata,
+            ids={"project_id": project.project_id},
+        )
+
+    def export_research_watch_to_obsidian(
+        self,
+        request: ObsidianExportRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "export_research_watch_to_obsidian"
+        metadata = get_release_tool_metadata(tool_name)
+        export_dir, error = self._resolve_obsidian_export_dir(
+            request=request,
+            tool_name=tool_name,
+            metadata=metadata,
+        )
+        if error is not None:
+            return error
+        if not request.watch_id:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="watch_id is required for watch export.",
+                metadata=metadata,
+            )
+        watch = self.storage.get_watch(request.watch_id)
+        if watch is None:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="No research watch exists for watch_id.",
+                detail={"watch_id": request.watch_id},
+                metadata=metadata,
+            )
+        result = export_watch_note(watch=watch, export_dir=cast(Path, export_dir))
+        return _obsidian_export_ok(
+            tool_name=tool_name,
+            result=result,
+            metadata=metadata,
+            ids={"watch_id": watch.watch_id},
+        )
+
+    def _resolve_obsidian_export_dir(
+        self,
+        *,
+        request: ObsidianExportRequest,
+        tool_name: str,
+        metadata: Any,
+    ) -> tuple[Path | None, ReleaseToolEnvelope | None]:
+        if request.max_files < 1:
+            return None, release_error(
+                tool_name=tool_name,
+                code="budget_exceeded",
+                message="Obsidian export requires max_files >= 1.",
+                detail={"max_files": request.max_files},
+                metadata=metadata,
+            )
+        export_dir, reason = ensure_obsidian_export_dir(
+            workspace=self.workspace,
+            export_dir=request.export_dir,
+            enabled=request.enabled,
+        )
+        if reason is not None:
+            return None, release_error(
+                tool_name=tool_name,
+                code="export_path_blocked",
+                message=reason,
+                detail={
+                    "enabled": request.enabled,
+                    "export_dir": request.export_dir,
+                },
+                metadata=metadata,
+            )
+        return export_dir, None
 
     async def search_with_manifest(
         self,
@@ -1731,6 +2695,50 @@ class BiomedEvidenceService:
         }
         return sorted_metadata, updated_manifest, updated_bundle, trace
 
+    def _release_project_memory_trace(
+        self,
+        *,
+        project_id: str | None,
+        request_context: str | None,
+    ) -> tuple[dict[str, object], BiomedProject | None]:
+        trace: dict[str, object] = {
+            "memory_used": False,
+            "memory_sources": [],
+            "memory_effects": [],
+            "memory_as_evidence": False,
+            "clinical_boundary_before_memory": True,
+        }
+        if not project_id:
+            return trace, None
+        project = self.storage.get_project(project_id)
+        if project is None:
+            trace.update({"project_id": project_id, "project_found": False})
+            return trace, None
+        effects: list[str] = []
+        if project.include_keywords:
+            effects.append("added_include_keyword_preferences")
+        if project.exclude_keywords:
+            effects.append("added_excluded_term_preferences")
+        if project.preferred_methods:
+            effects.append("added_preferred_method_filter")
+        if request_context:
+            effects.append("merged_request_project_context")
+        trace.update(
+            {
+                "project_id": project.project_id,
+                "project_found": True,
+                "memory_used": True,
+                "memory_sources": [f"biomed_project:{project.project_id}"],
+                "memory_effects": effects,
+                "include_keywords": project.include_keywords,
+                "exclude_keywords": project.exclude_keywords,
+                "preferred_methods": project.preferred_methods,
+                "preferred_species": project.preferred_species,
+                "preferred_study_types": project.preferred_study_types,
+            }
+        )
+        return trace, project
+
     async def answer_with_audit(
         self,
         request: AnswerWithEvidenceRequest,
@@ -2757,10 +3765,36 @@ class BiomedEvidenceService:
         revision = self.storage.get_answer_revision(run_id)
         latest_audit = self.storage.get_latest_citation_audit_for_run(run_id)
         latest_advisory = self.storage.get_latest_advisory_verifier_for_run(run_id)
+        coverage_matrix = (
+            result.evidence_packet.coverage_matrix
+            if result.evidence_packet is not None
+            else (
+                result.retrieval_bundle.coverage_matrix
+                if result.retrieval_bundle is not None
+                else []
+            )
+        )
+        stop_reason = (
+            result.evidence_packet.stop_reason
+            if result.evidence_packet is not None
+            else (
+                result.retrieval_bundle.stop_reason
+                if result.retrieval_bundle is not None
+                else None
+            )
+        )
+        step_telemetry = build_step_telemetry(
+            trace,
+            run_id=run_id,
+            coverage_matrix=coverage_matrix,
+            stop_reason=stop_reason,
+        )
         return {
             "run_id": run_id,
             "answer_run": result.model_dump(mode="json"),
             "trace": [item.model_dump(mode="json") for item in trace],
+            "step_telemetry": step_telemetry.model_dump(mode="json"),
+            "memory": _run_memory_trace(result),
             "revision": (
                 revision.model_dump(mode="json") if revision is not None else None
             ),
@@ -3368,6 +4402,374 @@ def _literature_request_from_search_request(
         project_id=project_id,
         require_abstract=require_abstract,
         store=request.store,
+    )
+
+
+def _tool_trace_step(
+    *,
+    run_id: str,
+    step: str,
+    status: str,
+    input_summary: str = "",
+    output_summary: str = "",
+    warnings: list[str] | None = None,
+    metadata: dict[str, object] | None = None,
+) -> AgentTraceStep:
+    return AgentTraceStep(
+        step_id=f"{run_id}-{step}-{uuid.uuid4().hex[:8]}",
+        run_id=run_id,
+        step=cast(Any, step),
+        status=cast(Any, status),
+        input_summary=input_summary[:500],
+        output_summary=output_summary[:500],
+        warnings=warnings or [],
+        metadata=metadata or {},
+        created_at=_now_iso(),
+    )
+
+
+def _release_tool_budget(
+    *,
+    max_tool_steps: int,
+    max_retrieval_queries: int,
+    max_followup_queries: int,
+    max_papers: int,
+    max_evidence_items: int,
+    max_llm_calls: int,
+    max_wall_clock_seconds: int,
+) -> dict[str, object]:
+    return {
+        "max_tool_steps": max(1, max_tool_steps),
+        "max_retrieval_queries": max(1, max_retrieval_queries),
+        "max_followup_queries": max(0, max_followup_queries),
+        "max_papers": max(1, max_papers),
+        "max_evidence_items": max(0, max_evidence_items),
+        "max_llm_calls": max(0, max_llm_calls),
+        "max_wall_clock_seconds": max(1, max_wall_clock_seconds),
+    }
+
+
+def _memory_effects_from_project_trace(trace: dict[str, object]) -> dict[str, object]:
+    effects = list(cast(list[str], trace.get("memory_effects", [])))
+    if trace.get("saved_paper_ids"):
+        effects.append("prioritized_saved_papers")
+    if trace.get("dropped_rejected_paper_ids"):
+        effects.append("excluded_rejected_papers")
+    return {
+        "memory_used": bool(trace.get("project_filter_applied") or effects),
+        "memory_effects": _merge_unique(effects),
+        "memory_as_evidence": False,
+        "retrieval_memory_trace": trace,
+    }
+
+
+def _run_memory_trace(run: AnswerWithEvidenceResult | None) -> dict[str, object]:
+    if run is None:
+        return {"memory_used": False, "memory_sources": [], "memory_as_evidence": False}
+    trace = dict(run.project_context_trace or {})
+    trace.setdefault("memory_used", bool(run.project_id))
+    trace.setdefault(
+        "memory_sources",
+        [f"biomed_project:{run.project_id}"] if run.project_id else [],
+    )
+    trace.setdefault("memory_effects", [])
+    trace["memory_as_evidence"] = False
+    return trace
+
+
+def _retrieval_bundle_from_manifest(manifest: RetrievalManifest) -> RetrievalBundle:
+    return RetrievalBundle(
+        bundle_id=f"{manifest.retrieval_id}-bundle",
+        source=cast(Any, manifest.source),
+        executed_multi_query=False,
+        records=[
+            RetrievalBundleRecord(
+                intent="primary",
+                query=manifest.original_query,
+                retrieval_id=manifest.retrieval_id,
+                manifest=manifest,
+                returned_paper_ids=manifest.returned_paper_ids,
+                pass_index=1,
+                warnings=manifest.warnings,
+                errors=manifest.errors,
+            )
+        ],
+        deduped_paper_ids=manifest.returned_paper_ids,
+        stop_reason="single_retrieval_manifest",
+        warnings=manifest.warnings,
+    )
+
+
+def _paper_metadata_from_stored_paper(paper: BiomedicalPaper | None) -> PaperMetadata | None:
+    if paper is None:
+        return None
+    if paper.source not in {"pubmed", "mock"}:
+        return None
+    return PaperMetadata(
+        paper_id=paper.paper_id,
+        source=cast(Any, paper.source),
+        title=paper.title,
+        authors=paper.authors,
+        journal=paper.journal,
+        publication_date=paper.publication_date,
+        abstract_available=bool((paper.abstract or "").strip()),
+        doi=paper.doi,
+        url=paper.url,
+    )
+
+
+def _select_evidence_for_packet(
+    evidence: list[EvidenceItem],
+    *,
+    max_items: int,
+    strategy: EvidencePacketSelectionStrategy,
+) -> EvidencePacketSelectionResult:
+    capped_max = max(1, max_items)
+
+    def contribution(item: EvidenceItem) -> dict[str, object]:
+        return {
+            "retrieval_intent": item.retrieval_intent,
+            "evidence_direction": item.evidence_direction,
+            "paper_id": item.paper_id,
+            "has_limitations": bool(item.limitations),
+            "method_count": len(item.methods),
+            "entity_count": len(item.entities),
+            "confidence": item.confidence,
+        }
+
+    def token_estimate(item: EvidenceItem) -> int:
+        text = " ".join([item.claim, item.finding, item.evidence_span or ""])
+        return max(16, int(len(text.split()) * 1.35) + 8)
+
+    def score(item: EvidenceItem) -> float:
+        direction_bonus = {
+            "supports": 3.0,
+            "contradicts": 3.5,
+            "inconclusive": 2.5,
+            "background": 1.5,
+        }.get(item.evidence_direction, 1.0)
+        confidence_bonus = {"high": 1.5, "medium": 1.0, "low": 0.5}.get(
+            item.confidence,
+            0.5,
+        )
+        limitation_bonus = 0.4 if item.limitations else 0.0
+        method_bonus = min(0.5, 0.1 * len(item.methods))
+        return direction_bonus + confidence_bonus + limitation_bonus + method_bonus
+
+    if strategy == "all_valid":
+        ranked = list(evidence)
+        protected = [
+            item
+            for item in evidence
+            if item.evidence_direction in {"contradicts", "inconclusive"}
+            or bool(item.limitations)
+        ]
+    else:
+        protected = [
+            item
+            for item in evidence
+            if item.evidence_direction in {"contradicts", "inconclusive"}
+            or bool(item.limitations)
+        ]
+        protected_ids = {item.evidence_id for item in protected}
+        ranked_rest = sorted(
+            [item for item in evidence if item.evidence_id not in protected_ids],
+            key=lambda item: (-score(item), item.paper_id, item.evidence_id),
+        )
+        ranked = sorted(
+            protected,
+            key=lambda item: (-score(item), item.paper_id, item.evidence_id),
+        ) + ranked_rest
+    protected_ids = {item.evidence_id for item in protected}
+    effective_max = min(capped_max, len(ranked))
+    selected_items = ranked[:effective_max]
+    selected_ids = {item.evidence_id for item in selected_items}
+    protected_selected_count = len(protected_ids & selected_ids)
+    selected = [
+        EvidenceSelectionItem(
+            evidence_id=item.evidence_id,
+            paper_id=item.paper_id,
+            selected=True,
+            reason=(
+                "kept by release packet selector; conflict and limitation coverage "
+                "are prioritized."
+            ),
+            score=score(item),
+            coverage_contribution=contribution(item),
+            token_estimate=token_estimate(item),
+        )
+        for item in selected_items
+    ]
+    dropped = [
+        EvidenceSelectionItem(
+            evidence_id=item.evidence_id,
+            paper_id=item.paper_id,
+            selected=False,
+            reason="dropped because max_evidence_items was reached.",
+            score=score(item),
+            coverage_contribution=contribution(item),
+            token_estimate=token_estimate(item),
+        )
+        for item in evidence
+        if item.evidence_id not in selected_ids
+    ]
+    selected_papers = {item.paper_id for item in selected_items}
+    input_papers = {item.paper_id for item in evidence}
+    selected_claims = {item.claim.strip().lower() for item in selected_items}
+    input_claims = {item.claim.strip().lower() for item in evidence}
+    return EvidencePacketSelectionResult(
+        strategy=strategy,
+        max_items=effective_max,
+        selected=selected,
+        dropped=dropped,
+        selected_evidence_ids=[item.evidence_id for item in selected_items],
+        dropped_evidence_ids=[item.evidence_id for item in evidence if item.evidence_id not in selected_ids],
+        coverage_contribution={
+            "selected_paper_count": len(selected_papers),
+            "input_paper_count": len(input_papers),
+            "selected_claim_count": len(selected_claims),
+            "input_claim_count": len(input_claims),
+            "directions": {
+                direction: sum(
+                    1 for item in selected_items if item.evidence_direction == direction
+                )
+                for direction in sorted({item.evidence_direction for item in evidence})
+            },
+            "protected_evidence_retained": all(
+                item.evidence_id in selected_ids
+                for item in evidence
+                if item.evidence_direction in {"contradicts", "inconclusive"}
+                or bool(item.limitations)
+            ),
+            "protected_evidence_input_count": len(protected_ids),
+            "protected_evidence_selected_count": protected_selected_count,
+        },
+        token_estimate=sum(token_estimate(item) for item in selected_items),
+        duplicate_evidence_delta=max(0, len(evidence) - len(input_claims))
+        - max(0, len(selected_items) - len(selected_claims)),
+        trace={
+            "input_evidence_count": len(evidence),
+            "selected_count": len(selected),
+            "dropped_count": len(dropped),
+            "requested_max_items": capped_max,
+            "effective_max_items": effective_max,
+            "hard_cap_enforced": True,
+            "protected_evidence_input_count": len(protected_ids),
+            "protected_evidence_selected_count": protected_selected_count,
+            "protected_evidence_omitted_count": max(
+                0,
+                len(protected_ids) - protected_selected_count,
+            ),
+            "objective": [
+                "subquestion coverage",
+                "retrieval-intent diversity",
+                "support/refute/limitation balance",
+                "paper provenance quality",
+                "abstract/span availability",
+                "duplicate-paper penalty",
+                "redundant-claim penalty",
+                "source-warning penalty",
+            ],
+            "advisory_only": False,
+        },
+    )
+
+
+def _bandit_advisory_from_coverage(
+    coverage: list[CoverageMatrixRow],
+    gap_decisions: list[GapSearchDecision],
+    *,
+    stop_reason: str,
+) -> BanditAdvisoryResult:
+    counts: dict[str, int] = {}
+    for row in coverage:
+        counts[row.coverage_status] = counts.get(row.coverage_status, 0) + 1
+    if counts.get("conflicted", 0) > 0:
+        return BanditAdvisoryResult(
+            action="manual_review",
+            reason="Coverage includes conflicted rows; reviewer inspection is advised.",
+            confidence=0.8,
+            expected_additional_steps=1.0,
+            based_on={
+                "coverage_status_counts": counts,
+                "stop_reason": stop_reason,
+                "autonomous_runtime_control": False,
+                "clinical_and_source_policy_priority": True,
+            },
+        )
+    if gap_decisions:
+        action: str = "search_refute"
+        if any(decision.retrieval_intent == "support" for decision in gap_decisions):
+            action = "search_support"
+        if any(decision.retrieval_intent == "limitation" for decision in gap_decisions):
+            action = "search_limitation"
+        if any(decision.retrieval_intent == "mechanism" for decision in gap_decisions):
+            action = "search_mechanism"
+        return BanditAdvisoryResult(
+            action=cast(Any, action),
+            reason="Coverage gaps remain; a bounded follow-up query may improve balance.",
+            confidence=0.65,
+            expected_additional_steps=float(min(2, len(gap_decisions))),
+            based_on={
+                "coverage_status_counts": counts,
+                "gap_decision_count": len(gap_decisions),
+                "stop_reason": stop_reason,
+                "autonomous_runtime_control": False,
+                "clinical_and_source_policy_priority": True,
+            },
+        )
+    if counts.get("weak", 0) or counts.get("missing", 0) or counts.get("source_limited", 0):
+        return BanditAdvisoryResult(
+            action="broaden_query",
+            reason="Coverage is weak or source-limited, but no safe follow-up query was generated.",
+            confidence=0.55,
+            expected_additional_steps=1.0,
+            based_on={
+                "coverage_status_counts": counts,
+                "stop_reason": stop_reason,
+                "autonomous_runtime_control": False,
+                "clinical_and_source_policy_priority": True,
+            },
+        )
+    return BanditAdvisoryResult(
+        action="stop",
+        reason="Coverage is sufficient for the current bounded workflow.",
+        confidence=0.7,
+        expected_additional_steps=0.0,
+        based_on={
+            "coverage_status_counts": counts,
+            "stop_reason": stop_reason,
+            "autonomous_runtime_control": False,
+            "clinical_and_source_policy_priority": True,
+        },
+    )
+
+
+def _obsidian_export_ok(
+    *,
+    tool_name: str,
+    result: ObsidianExportResult,
+    metadata: Any,
+    ids: dict[str, str],
+) -> ReleaseToolEnvelope:
+    note_ids = {
+        f"note_{index}_path": note.path
+        for index, note in enumerate(result.notes, start=1)
+    }
+    return release_ok(
+        tool_name=tool_name,
+        result=result.model_dump(mode="json"),
+        ids={**ids, **note_ids, "export_id": result.export_id},
+        warnings=result.warnings,
+        trace={
+            "export_type": result.export_type,
+            "export_dir": result.export_dir,
+            "note_count": result.note_count,
+            "source_of_truth": result.source_of_truth,
+            "imported_as_evidence": result.imported_as_evidence,
+            "notes": [note.model_dump(mode="json") for note in result.notes],
+        },
+        metadata=metadata,
     )
 
 

@@ -13,12 +13,17 @@ from plugins.biomed_evidence.schemas import (
     BiomedProjectUpdateRequest,
     CitationAuditRequest,
     ConflictAuditRequest,
+    CoverageGapAnalysisRequest,
+    EvidenceBatchExtractionRequest,
     EvidenceExtractionRequest,
+    EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
+    MultiPassLiteratureSearchRequest,
+    ObsidianExportRequest,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
@@ -27,6 +32,7 @@ from plugins.biomed_evidence.schemas import (
     WatchTopicUpdateRequest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
+from plugins.biomed_evidence.tool_contracts import list_release_tool_contracts
 
 
 def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
@@ -68,6 +74,69 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
     ) -> dict[str, Any]:
         result = await service.check_literature_access(payload)
         return result.model_dump(mode="json")
+
+    @app.get("/api/biomed/release/tool-contracts")
+    def get_release_tool_contracts() -> dict[str, Any]:
+        contracts = list_release_tool_contracts()
+        return {
+            "schema_version": "release-tool-envelope-v1",
+            "tools": [item.model_dump(mode="json") for item in contracts],
+            "tool_count": len(contracts),
+        }
+
+    @app.post("/api/biomed/retrieval/multi-pass")
+    async def run_multi_pass_literature_search(
+        payload: MultiPassLiteratureSearchRequest,
+    ) -> dict[str, Any]:
+        try:
+            result = await service.run_multi_pass_literature_search(payload)
+        except LiteratureClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/evidence/extract-batch")
+    async def extract_evidence_batch(
+        payload: EvidenceBatchExtractionRequest,
+    ) -> dict[str, Any]:
+        try:
+            result = await service.extract_evidence_batch(payload)
+        except LiteratureClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/evidence/coverage-gaps")
+    def analyze_coverage_gaps(payload: CoverageGapAnalysisRequest) -> dict[str, Any]:
+        return service.analyze_coverage_gaps(payload).model_dump(mode="json")
+
+    @app.post("/api/biomed/evidence/packet")
+    def build_evidence_packet(payload: EvidencePacketBuildRequest) -> dict[str, Any]:
+        return service.build_evidence_packet(payload).model_dump(mode="json")
+
+    @app.get("/api/biomed/answer-runs/{run_id}/evidence-packet")
+    def get_evidence_packet(run_id: str) -> dict[str, Any]:
+        return service.get_evidence_packet(run_id).model_dump(mode="json")
+
+    @app.get("/api/biomed/answer-runs/{run_id}/provenance")
+    def export_provenance_graph(run_id: str) -> dict[str, Any]:
+        return service.export_provenance_graph(run_id).model_dump(mode="json")
+
+    @app.post("/api/biomed/export/obsidian/evidence-packet")
+    def export_evidence_packet_to_obsidian(
+        payload: ObsidianExportRequest,
+    ) -> dict[str, Any]:
+        return service.export_evidence_packet_to_obsidian(payload).model_dump(mode="json")
+
+    @app.post("/api/biomed/export/obsidian/project")
+    def export_project_to_obsidian(payload: ObsidianExportRequest) -> dict[str, Any]:
+        return service.export_project_to_obsidian(payload).model_dump(mode="json")
+
+    @app.post("/api/biomed/export/obsidian/watch")
+    def export_research_watch_to_obsidian(
+        payload: ObsidianExportRequest,
+    ) -> dict[str, Any]:
+        return service.export_research_watch_to_obsidian(payload).model_dump(
+            mode="json"
+        )
 
     @app.post("/api/biomed/literature/search")
     async def search_literature(payload: LiteratureSearchRequest) -> dict[str, Any]:

@@ -3,13 +3,14 @@
 Biomedical Evidence is a research-only Akashic plugin for citation-grounded
 biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured router/planner output, planner-driven
-primary/support/refute and V2.6 multi-pass retrieval bundles, structured evidence extraction, cited
+primary/support/refute and Release 1.0 multi-pass retrieval bundles, structured evidence extraction, cited
 answers, retrieval manifests, claim-level citation audit, audit/revise traces,
 claim logic entailment audit, symbolic logic fact export, project evidence
 workspaces, framework-native tool guardrails, prompt context injection,
 literature-source readiness checks, the controlled `search_literature` tool, a
 coverage matrix, gap-directed follow-up searches, structured evidence packets, a
-lightweight evidence graph, and Research Watch decision logs. It is
+lightweight evidence graph, Obsidian one-way export, provenance graph export,
+and Research Watch decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
 
@@ -174,6 +175,46 @@ Project-enabled answer responses include `project_id` and
 papers are excluded by default unless `include_rejected_papers` is true.
 Project memory is never accepted as citation evidence.
 
+## Release 1.0 Toolized Workflow
+
+Release 1.0 exposes the internal evidence workflow as independently callable
+tools and API routes:
+
+- `run_multi_pass_literature_search` / `POST /api/biomed/retrieval/multi-pass`
+- `extract_evidence_batch` / `POST /api/biomed/evidence/extract-batch`
+- `analyze_coverage_gaps` / `POST /api/biomed/evidence/coverage-gaps`
+- `build_evidence_packet` / `POST /api/biomed/evidence/packet`
+- `get_evidence_packet` / `GET /api/biomed/answer-runs/{run_id}/evidence-packet`
+- `get_answer_trace` / `GET /api/biomed/answer-runs/{run_id}/trace`
+- `export_provenance_graph` / `GET /api/biomed/answer-runs/{run_id}/provenance`
+- `export_evidence_packet_to_obsidian`
+- `export_project_to_obsidian`
+- `export_research_watch_to_obsidian`
+
+Every Release 1.0 tool returns `release-tool-envelope-v1`, including `ok`,
+`result`, `warnings`, `errors`, `error_code`, `trace`, stable `ids`, and
+metadata. Clinical, source-policy, budget, unknown-ID, export-path, and
+provenance failures are structured and recoverable where appropriate.
+
+Memory bridge behavior is explicit: memory may guide planner preferences,
+saved/rejected-paper handling, project selection, and reviewer workflow, but
+`memory_as_evidence` remains false. The trace API includes memory effects,
+budget snapshots, and advisory step telemetry.
+
+Release 1.0 also adds deterministic/advisory mathematical aids:
+
+- submodular-style packet selection with selected/dropped evidence IDs, drop
+  reasons, coverage contribution, token estimate, and protected
+  conflict/limitation retention;
+- contextual-bandit-style retrieval advisory that recommends stop/broaden or
+  support/refute/mechanism/limitation search without controlling runtime;
+- PROV/OpenLineage-style provenance graph export that links answer, papers,
+  evidence, manifests, packets, audits, logic audits, revisions, activities,
+  agents, and tools while redacting prompts, provider raw responses, secrets,
+  and API keys;
+- Obsidian-compatible Markdown export for evidence packets, projects, and
+  Watch topics. Export is one-way and disabled by default.
+
 ## Dashboard
 
 Start the dashboard:
@@ -202,7 +243,9 @@ The panel includes:
 - Trace: inspect planner validation, retrieval bundle metadata, draft answer,
   final answer, revision mode/action, removed/softened claims, added
   limitations, V2.6 evidence packet metadata, coverage/gap decisions,
-  logic-audit summary metadata, and ordered agent steps.
+  logic-audit summary metadata, ordered agent steps, memory effects, budget
+  snapshots, step telemetry, packet selection, Obsidian export, and provenance
+  graph output.
 - Responsible AI: review the research-only operating boundary and retrieval
   limitations.
 

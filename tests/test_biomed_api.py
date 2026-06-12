@@ -228,6 +228,8 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
                 "use_llm_planner": True,
                 "execute_support_refute": True,
                 "use_llm_verifier": True,
+                "use_llm_claim_logic": True,
+                "export_logic_facts": True,
             },
         )
         assert audited.status_code == 200
@@ -252,6 +254,8 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert trace_payload["run_id"] == audited_run_id
         assert trace_payload["revision"]["revision_id"] == audited_payload["revision"]["revision_id"]
         assert trace_payload["latest_advisory_verifier"]["verifier_mode"] == "fallback"
+        assert trace_payload["step_telemetry"]["advisory_only"] is True
+        assert trace_payload["memory"]["memory_as_evidence"] is False
         assert {step["step"] for step in trace_payload["trace"]} == {
             "classify",
             "plan",
@@ -269,6 +273,246 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert retrieve_step["metadata"]["retrieval_bundle"]["executed_multi_query"] is True
         assert retrieve_step["metadata"]["retrieval_bundle"]["coverage_matrix"]
         assert retrieve_step["metadata"]["evidence_packet"]["coverage_matrix"]
+
+        multi_pass = client.post(
+            "/api/biomed/retrieval/multi-pass",
+            json={
+                "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+                "max_results": 5,
+                "max_queries": 6,
+                "use_llm_planner": False,
+                "execute_support_refute": True,
+            },
+        )
+        assert multi_pass.status_code == 200
+        multi_payload = multi_pass.json()
+        assert multi_payload["ok"] is True
+        assert multi_payload["result"]["item_count"] >= 1
+        assert multi_payload["result"]["retrieval_bundle"]["executed_multi_query"] is True
+        assert multi_payload["result"]["memory_trace"]["memory_as_evidence"] is False
+        assert multi_payload["trace"]["step_telemetry"]["advisory_only"] is True
+        multi_retrieval_id = multi_payload["ids"]["retrieval_id"]
+
+        budget_blocked = client.post(
+            "/api/biomed/retrieval/multi-pass",
+            json={
+                "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+                "max_results": 5,
+                "max_queries": 1,
+                "execute_support_refute": True,
+            },
+        )
+        assert budget_blocked.status_code == 200
+        assert budget_blocked.json()["error_code"] == "budget_exceeded"
+
+        clinical_blocked = client.post(
+            "/api/biomed/retrieval/multi-pass",
+            json={
+                "question": "What dose should my mother take for Alzheimer disease?",
+                "source": "mock",
+            },
+        )
+        assert clinical_blocked.status_code == 200
+        clinical_payload = clinical_blocked.json()
+        assert clinical_payload["ok"] is False
+        assert clinical_payload["error_code"] == "clinical_boundary"
+        assert clinical_payload["trace"]["memory_used"] is False
+
+        batch = client.post(
+            "/api/biomed/evidence/extract-batch",
+            json={
+                "retrieval_id": multi_retrieval_id,
+                "source": "mock",
+                "research_question": "microglial activation and Alzheimer's progression",
+                "max_papers": 10,
+                "max_evidence_items": 50,
+            },
+        )
+        assert batch.status_code == 200
+        batch_payload = batch.json()
+        assert batch_payload["ok"] is True
+        assert batch_payload["result"]["evidence_count"] >= 1
+        assert batch_payload["result"]["extraction_mode_counts"]
+
+        coverage = client.post(
+            "/api/biomed/evidence/coverage-gaps",
+            json={"run_id": audited_run_id, "max_gap_queries": 2},
+        )
+        assert coverage.status_code == 200
+        coverage_payload = coverage.json()
+        assert coverage_payload["ok"] is True
+        assert coverage_payload["result"]["coverage_matrix"]
+        assert coverage_payload["result"]["bandit_advisory"]["advisory_only"] is True
+        assert coverage_payload["result"]["bandit_advisory"]["action"] in {
+            "stop",
+            "broaden_query",
+            "narrow_query",
+            "search_support",
+            "search_refute",
+            "search_mechanism",
+            "search_limitation",
+            "switch_to_pubmed_if_allowed",
+            "manual_review",
+        }
+        assert (
+            coverage_payload["result"]["bandit_advisory"]["based_on"][
+                "autonomous_runtime_control"
+            ]
+            is False
+        )
+        assert coverage_payload["trace"]["step_telemetry"]["advisory_only"] is True
+
+        packet = client.post(
+            "/api/biomed/evidence/packet",
+            json={
+                "run_id": audited_run_id,
+                "max_evidence_items": 2,
+                "selection_strategy": "submodular_greedy",
+            },
+        )
+        assert packet.status_code == 200
+        packet_payload = packet.json()
+        assert packet_payload["ok"] is True
+        assert packet_payload["result"]["evidence_packet"]["packet_id"]
+        assert packet_payload["result"]["selection"]["token_estimate"] > 0
+        selection = packet_payload["result"]["selection"]
+        assert len(selection["selected_evidence_ids"]) <= 2
+        assert selection["trace"]["hard_cap_enforced"] is True
+        assert selection["trace"]["effective_max_items"] <= 2
+        assert (
+            selection["coverage_contribution"]["protected_evidence_selected_count"]
+            <= selection["coverage_contribution"]["protected_evidence_input_count"]
+        )
+        assert packet_payload["result"]["selection"]["selected"][0]["token_estimate"] > 0
+        assert packet_payload["result"]["selection"]["selected"][0][
+            "coverage_contribution"
+        ]
+        assert packet_payload["result"]["memory_trace"]["memory_as_evidence"] is False
+
+        persisted_packet = client.get(
+            f"/api/biomed/answer-runs/{audited_run_id}/evidence-packet"
+        )
+        assert persisted_packet.status_code == 200
+        persisted_payload = persisted_packet.json()
+        assert persisted_payload["ok"] is True
+        assert persisted_payload["result"]["availability"] == "persisted"
+        assert (
+            persisted_payload["result"]["evidence_packet"]["packet_id"]
+            == packet_payload["result"]["evidence_packet"]["packet_id"]
+        )
+
+        export_disabled = client.post(
+            "/api/biomed/export/obsidian/evidence-packet",
+            json={
+                "run_id": audited_run_id,
+                "export_dir": str(tmp_path / "obsidian"),
+                "enabled": False,
+            },
+        )
+        assert export_disabled.status_code == 200
+        assert export_disabled.json()["error_code"] == "export_path_blocked"
+
+        export_enabled = client.post(
+            "/api/biomed/export/obsidian/evidence-packet",
+            json={
+                "run_id": audited_run_id,
+                "export_dir": str(tmp_path / "obsidian"),
+                "enabled": True,
+            },
+        )
+        assert export_enabled.status_code == 200
+        export_payload = export_enabled.json()
+        assert export_payload["ok"] is True
+        assert export_payload["result"]["imported_as_evidence"] is False
+        assert export_payload["result"]["note_count"] == 1
+        note = export_payload["result"]["notes"][0]
+        note_path = Path(note["path"])
+        assert note_path.exists()
+        note_text = note_path.read_text(encoding="utf-8")
+        assert "type: \"evidence_packet\"" in note_text
+        assert "source_of_truth: \"biomed_sqlite\"" in note_text
+        assert "imported_as_evidence: false" in note_text
+        assert "[[answer-run:" in note_text
+        assert "[[evidence-packet:" in note_text
+        assert "[[paper:" in note_text
+
+        export_again = client.post(
+            "/api/biomed/export/obsidian/evidence-packet",
+            json={
+                "run_id": audited_run_id,
+                "export_dir": str(tmp_path / "obsidian"),
+                "enabled": True,
+            },
+        )
+        assert export_again.status_code == 200
+        assert (
+            export_again.json()["result"]["notes"][0]["path"]
+            == export_payload["result"]["notes"][0]["path"]
+        )
+        assert (
+            export_again.json()["result"]["notes"][0]["sha256"]
+            == export_payload["result"]["notes"][0]["sha256"]
+        )
+
+        project_export = client.post(
+            "/api/biomed/export/obsidian/project",
+            json={
+                "project_id": project_id,
+                "export_dir": str(tmp_path / "obsidian"),
+                "enabled": True,
+            },
+        )
+        assert project_export.status_code == 200
+        assert project_export.json()["ok"] is True
+        assert "[[project:" in Path(
+            project_export.json()["result"]["notes"][0]["path"]
+        ).read_text(encoding="utf-8")
+
+        provenance = client.get(
+            f"/api/biomed/answer-runs/{audited_run_id}/provenance"
+        )
+        assert provenance.status_code == 200
+        provenance_payload = provenance.json()
+        assert provenance_payload["ok"] is True
+        graph = provenance_payload["result"]
+        assert graph["schema_version"] == "biomed-provenance-v1"
+        entity_types = {item["type"] for item in graph["entities"]}
+        assert {
+            "answer",
+            "retrieval_manifest",
+            "paper",
+            "evidence_item",
+            "evidence_packet",
+            "citation_audit",
+            "logic_audit",
+            "revision",
+        }.issubset(entity_types)
+        activity_types = {item["type"] for item in graph["activities"]}
+        assert {"classify", "plan", "search", "extract", "audit", "revise"}.issubset(
+            activity_types
+        )
+        agent_types = {item["type"] for item in graph["agents"]}
+        assert {"deterministic_service", "plugin_tool"}.issubset(agent_types)
+        relation_types = {item["type"] for item in graph["relations"]}
+        assert {"used", "generated", "wasDerivedFrom", "wasAssociatedWith"}.issubset(
+            relation_types
+        )
+        assert graph["redactions"]
+        attribute_payloads = [
+            item.get("attributes", {})
+            for group_name in ("entities", "activities", "agents", "relations")
+            for item in graph[group_name]
+        ]
+        assert all("llm_raw_response" not in attrs for attrs in attribute_payloads)
+        assert all("api_key" not in attrs for attrs in attribute_payloads)
+
+        missing_provenance = client.get(
+            "/api/biomed/answer-runs/unknown-run/provenance"
+        )
+        assert missing_provenance.status_code == 200
+        assert missing_provenance.json()["error_code"] == "unknown_run_id"
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
@@ -304,6 +548,20 @@ def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
         )
         assert patched.status_code == 200
         assert patched.json()["enabled"] is False
+
+        watch_export = client.post(
+            "/api/biomed/export/obsidian/watch",
+            json={
+                "watch_id": watch_id,
+                "export_dir": str(tmp_path / "obsidian"),
+                "enabled": True,
+            },
+        )
+        assert watch_export.status_code == 200
+        assert watch_export.json()["ok"] is True
+        watch_note = Path(watch_export.json()["result"]["notes"][0]["path"])
+        assert watch_note.exists()
+        assert "[[watch:" in watch_note.read_text(encoding="utf-8")
 
         deleted = client.delete(f"/api/biomed/watch/{watch_id}")
         assert deleted.status_code == 200

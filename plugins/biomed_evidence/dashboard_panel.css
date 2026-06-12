@@ -334,6 +334,12 @@
   background: color-mix(in srgb, var(--panel-bg, #fff) 90%, #ef4444 10%);
 }
 
+.biomed-audit-row.is-dropped {
+  opacity: 0.78;
+  border-left: 3px solid var(--text-soft, #6c6a64);
+  padding-left: 8px;
+}
+
 .biomed-audit-row-head {
   display: flex;
   flex-wrap: wrap;
