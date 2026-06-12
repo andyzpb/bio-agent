@@ -46,6 +46,30 @@ Implemented now:
 Project memory is context only. It can influence planning preferences and
 post-retrieval filtering, but it is never treated as biomedical evidence.
 
+## Roadmap Highlight: V2.1 Claim Logic Entailment
+
+The next planned hardening step is a **schema-constrained biomedical claim
+logic parser**. Instead of asking an LLM to judge whether a citation supports a
+claim, V2.1 will use the LLM only as a semantic parser:
+
+```text
+claim / evidence text
+  -> LLM-assisted logical frame parsing
+  -> Pydantic schema validation
+  -> deterministic biomedical entailment rules
+  -> audit verdict, triggered rules, mismatch trace, and revision pressure
+```
+
+This should catch semantic overclaims that lexical citation checks often miss:
+association stated as causation, animal or in-vitro evidence generalized to
+human claims, mechanistic findings turned into treatment claims, weak evidence
+written as definitive, and citations that mention the right entities but do not
+actually entail the generated claim.
+
+The key trust boundary is that the LLM helps formalize language, while
+deterministic code remains the source of record for support, overclaim, scope,
+population, modality, and clinical-boundary verdicts.
+
 ## Version Summary
 
 - V1.0: Biomedical Evidence plugin, service/storage/API/dashboard/eval, mock
@@ -73,6 +97,21 @@ post-retrieval filtering, but it is never treated as biomedical evidence.
 ## What Remains
 
 Near-term V2.1:
+
+- LLM-assisted claim logic parser for generated atomic claims and aligned
+  evidence spans.
+- Schema-validated logical claim/evidence frames with parser mode, model, prompt
+  hash, source spans, and fallback warnings.
+- Deterministic biomedical entailment rules for association-to-causation,
+  animal/in-vitro-to-human, mechanism-to-treatment, weak-to-definitive,
+  diagnostic, prognostic, population, scope, and modality overclaims.
+- `ClaimAuditItem` / audit JSON integration so logic verdicts, triggered rules,
+  mismatches, and reasons appear in audit, trace, and dashboard output.
+- Golden tests and metrics for logic parser validity, expected rule recall,
+  expected verdict accuracy, fallback rate, clinical-boundary preservation, and
+  project-memory isolation.
+
+After V2.1:
 
 - Richer project reviewer workflows: accept/reject review queue items, claim
   status transitions, reviewer notes, and decision provenance.
@@ -199,6 +238,7 @@ User question
   -> evidence extraction with spans and retrieval-intent labels
   -> citation-grounded draft answer
   -> deterministic claim-level audit
+  -> optional claim logic parser + deterministic entailment audit
   -> optional advisory verifier
   -> deterministic or LLM-backed revision
   -> final answer + citations + trace + project review queue update
