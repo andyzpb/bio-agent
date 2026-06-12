@@ -549,10 +549,26 @@ Release 1.0 completed:
 
 Next hardening:
 
+- Release 1.1 live PubMed smoke automation with replayable artifact bundles;
 - dedicated dashboard controls for saved tool-chain templates;
-- live PubMed release smoke automation;
 - full-text/PDF ingestion behind the same provenance and audit gates;
 - stronger provenance visualization for export notes and human review events.
+
+Run the Release 1.1 smoke against a running dashboard:
+
+```bash
+.venv/bin/python -m eval.biomed_evidence.run_release_smoke \
+  --source pubmed \
+  --ollama-model gpt-oss:120b-cloud \
+  --output-dir /tmp/biomed_release_smoke
+```
+
+The smoke captures redacted JSON artifacts plus `report.md` for Ollama
+connectivity, dashboard plugin readiness, live PubMed readiness/search,
+audited answer, trace, evidence packet, provenance graph, retrieval manifest,
+and clinical guardrail regression. Exit codes distinguish code regressions,
+external PubMed instability, Ollama unavailability, policy/guardrail failures,
+and dashboard unavailability.
 
 Longer-term research tracks:
 

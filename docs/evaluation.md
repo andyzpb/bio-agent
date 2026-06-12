@@ -94,6 +94,38 @@ Expected release-specific checks should be `1.0` except
 exercise live PubMed or real LLM network calls; those remain opt-in smoke
 tests.
 
+## Release 1.1 Live Smoke
+
+Release 1.1 adds a repeatable dashboard-level smoke runner for the live PubMed
+and Ollama path:
+
+```bash
+.venv/bin/python -m eval.biomed_evidence.run_release_smoke \
+  --source pubmed \
+  --ollama-model gpt-oss:120b-cloud \
+  --output-dir /tmp/biomed_release_smoke
+```
+
+The runner assumes the dashboard is already running, usually through Docker
+when `config.toml` points to `http://host.docker.internal:11434/v1`. It writes
+redacted artifacts for:
+
+- Ollama model/chat connectivity;
+- dashboard plugin and release tool-contract readiness;
+- live PubMed readiness and controlled `search_literature`;
+- PubMed + Ollama `answer/audited`;
+- persisted trace, evidence packet, retrieval manifest, and provenance graph;
+- clinical guardrail regression.
+
+Exit codes are intentionally distinct:
+
+- `0`: smoke passed.
+- `1`: code/schema regression.
+- `2`: external PubMed/source instability.
+- `3`: Ollama or LLM path unavailable.
+- `4`: policy or clinical guardrail failure.
+- `5`: dashboard unavailable.
+
 ## Optional Live PubMed Eval
 
 Real PubMed evaluation is opt-in and is not used by default CI:
