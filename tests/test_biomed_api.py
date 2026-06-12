@@ -239,6 +239,11 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert audited_payload["final_action"] in {"pass", "revise", "refuse", "abstain"}
         assert audited_payload["answer_result"]["retrieval_bundle"]["executed_multi_query"] is True
         assert len(audited_payload["answer_result"]["retrieval_bundle"]["records"]) >= 3
+        assert audited_payload["answer_result"]["evidence_packet"]["coverage_matrix"]
+        assert audited_payload["answer_result"]["evidence_packet"]["stop_reason"] in {
+            "coverage_sufficient",
+            "gap_followup_complete",
+        }
         assert len(audited_payload["trace"]) == 11
 
         trace = client.get(f"/api/biomed/answer-runs/{audited_run_id}/trace")
@@ -262,6 +267,8 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         }
         retrieve_step = next(step for step in trace_payload["trace"] if step["step"] == "retrieve")
         assert retrieve_step["metadata"]["retrieval_bundle"]["executed_multi_query"] is True
+        assert retrieve_step["metadata"]["retrieval_bundle"]["coverage_matrix"]
+        assert retrieve_step["metadata"]["evidence_packet"]["coverage_matrix"]
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:

@@ -30,7 +30,7 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/check" \
 The response reports `ok`, `ready`, item count, abstract coverage, NCBI
 identity flags, retrieval manifest, warnings, and errors.
 
-Run the controlled V2.5 literature search tool path before answer generation:
+Run the controlled literature search tool path before answer generation:
 
 ```bash
 curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/search" \
@@ -42,6 +42,23 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/search" \
 `check_literature_access` is a readiness smoke. `search_literature` is the
 agent-facing retrieval path that returns normalized paper records, manifest,
 coverage, source trace, warnings, and errors; it does not synthesize answers.
+
+Run the V2.6 multi-pass audited answer path to verify planner subquestions,
+coverage matrix, optional gap follow-up, and evidence packet assembly:
+
+```bash
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What recent evidence links microglial activation to Alzheimer disease progression?","source":"mock","max_papers":5,"use_llm_planner":true,"execute_support_refute":true}' \
+  | jq '{
+      run_id:.answer_result.run_id,
+      retrieval_records:(.answer_result.retrieval_bundle.records | length),
+      coverage_rows:(.answer_result.evidence_packet.coverage_matrix | length),
+      gaps:(.answer_result.evidence_packet.coverage_gaps | length),
+      stop:.answer_result.evidence_packet.stop_reason,
+      trace_steps:(.trace | length)
+    }'
+```
 
 ## Docker
 

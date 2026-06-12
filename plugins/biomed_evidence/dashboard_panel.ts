@@ -38,11 +38,62 @@ interface RetrievalManifest {
 interface RetrievalBundleRecord {
   intent: string;
   query: string;
+  query_id?: string | null;
+  subquestion_id?: string | null;
+  reason?: string | null;
+  pass_index?: number;
   retrieval_id?: string | null;
   returned_paper_ids: string[];
+  added_paper_ids?: string[];
+  coverage?: {
+    item_count: number;
+    abstract_count: number;
+    abstract_coverage: number;
+    stored_paper_count: number;
+    skipped_no_abstract_count: number;
+  } | null;
   warnings: string[];
   errors: string[];
   skipped_reason?: string | null;
+}
+
+interface RetrievalSubquestion {
+  subquestion_id: string;
+  question: string;
+  query: string;
+  retrieval_intent: string;
+  reason: string;
+  max_results: number;
+}
+
+interface CoverageMatrixRow {
+  subquestion_id: string;
+  subquestion: string;
+  retrieval_intent: string;
+  pass_index: number;
+  query: string;
+  retrieval_ids: string[];
+  paper_ids: string[];
+  papers_found: number;
+  evidence_count: number;
+  citations: number;
+  conflicts: number;
+  limitations: number;
+  coverage_status: string;
+  gap_reason?: string | null;
+}
+
+interface GapSearchDecision {
+  gap_id: string;
+  subquestion_id: string;
+  retrieval_intent: string;
+  followup_query: string;
+  reason: string;
+  executed: boolean;
+  retrieval_id?: string | null;
+  returned_paper_ids: string[];
+  added_paper_ids: string[];
+  stop_reason?: string | null;
 }
 
 interface RetrievalBundle {
@@ -52,7 +103,31 @@ interface RetrievalBundle {
   records: RetrievalBundleRecord[];
   deduped_paper_ids: string[];
   duplicate_paper_ids: string[];
+  subquestions?: RetrievalSubquestion[];
+  coverage_matrix?: CoverageMatrixRow[];
+  gap_decisions?: GapSearchDecision[];
+  stop_reason?: string | null;
   warnings: string[];
+}
+
+interface EvidencePacketSummary {
+  packet_id: string;
+  question: string;
+  planner_mode: string;
+  source: string;
+  subquestions: RetrievalSubquestion[];
+  retrieval_manifest_ids: string[];
+  paper_ids: string[];
+  evidence_ids: string[];
+  supported_claims: string[];
+  conflicting_claims: string[];
+  limitations: string[];
+  coverage_matrix: CoverageMatrixRow[];
+  coverage_gaps: CoverageMatrixRow[];
+  gap_decisions: GapSearchDecision[];
+  source_warnings: string[];
+  stop_reason: string;
+  created_at: string;
 }
 
 interface AnswerResult {
@@ -62,6 +137,7 @@ interface AnswerResult {
   retrieval_id?: string | null;
   retrieval_manifest?: RetrievalManifest | null;
   retrieval_bundle?: RetrievalBundle | null;
+  evidence_packet?: EvidencePacketSummary | null;
   answer: string;
   citations: { paper_id: string; title: string; doi?: string | null; url?: string | null; cited_claim: string }[];
   evidence_summary: EvidenceRow[];
@@ -351,6 +427,8 @@ function renderEvidenceItem(item: EvidenceRow): string {
 
 function renderRetrievalBundle(bundle: RetrievalBundle | null | undefined): string {
   if (!bundle) return '<div class="biomed-muted">No retrieval bundle recorded.</div>';
+  const coverageRows = bundle.coverage_matrix || [];
+  const gapDecisions = bundle.gap_decisions || [];
   return `
     <div class="biomed-provenance">
       <div class="biomed-provenance-grid">
@@ -358,21 +436,86 @@ function renderRetrievalBundle(bundle: RetrievalBundle | null | undefined): stri
         <div><span>Source</span><strong>${escapeHtml(bundle.source)}</strong></div>
         <div><span>Mode</span><strong>${bundle.executed_multi_query ? "multi-query" : "single-query"}</strong></div>
         <div><span>Papers</span><strong>${bundle.deduped_paper_ids.length}</strong></div>
+        <div><span>Stop</span><strong>${escapeHtml(bundle.stop_reason || "-")}</strong></div>
+        <div><span>Gaps</span><strong>${coverageRows.filter((row) => row.coverage_status !== "covered").length}</strong></div>
       </div>
       ${bundle.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(bundle.warnings)}` : ""}
+      ${coverageRows.length ? `
+        <div class="biomed-label">Coverage Matrix</div>
+        <div class="biomed-audit-table">
+          ${coverageRows.map((row) => `
+            <div class="biomed-audit-row">
+              <div class="biomed-audit-row-head">
+                ${pill(row.retrieval_intent)}
+                ${pill(row.coverage_status)}
+                ${pill(`pass ${row.pass_index}`)}
+                <span>${row.evidence_count}/${row.papers_found} evidence</span>
+              </div>
+              <div class="biomed-evidence-claim">${escapeHtml(row.subquestion)}</div>
+              ${row.gap_reason ? `<div class="biomed-evidence-finding">${escapeHtml(row.gap_reason)}</div>` : ""}
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
+      ${gapDecisions.length ? `
+        <div class="biomed-label">Gap Follow-up</div>
+        ${gapDecisions.map((gap) => `
+          <div class="biomed-evidence-item">
+            <div class="biomed-evidence-head">
+              ${pill(gap.retrieval_intent)}
+              ${pill(gap.executed ? "executed" : "skipped")}
+              ${gap.retrieval_id ? `<code>${escapeHtml(gap.retrieval_id)}</code>` : ""}
+            </div>
+            <code class="biomed-query">${escapeHtml(gap.followup_query)}</code>
+            <div class="biomed-evidence-finding">${escapeHtml(gap.reason)}</div>
+            ${gap.stop_reason ? `<div class="biomed-muted">${escapeHtml(gap.stop_reason)}</div>` : ""}
+          </div>
+        `).join("")}
+      ` : ""}
       <div class="biomed-label">Retrieval Records</div>
       ${bundle.records.map((record) => `
         <div class="biomed-evidence-item">
           <div class="biomed-evidence-head">
             ${pill(record.intent)}
+            ${record.pass_index ? pill(`pass ${record.pass_index}`) : ""}
+            ${record.coverage ? pill(`${record.coverage.item_count} items`) : ""}
             ${record.retrieval_id ? `<code>${escapeHtml(record.retrieval_id)}</code>` : ""}
           </div>
           <code class="biomed-query">${escapeHtml(record.query)}</code>
+          ${record.reason ? `<div class="biomed-evidence-finding">${escapeHtml(record.reason)}</div>` : ""}
           ${record.returned_paper_ids.length ? renderList(record.returned_paper_ids) : '<div class="biomed-muted">No papers returned.</div>'}
+          ${record.added_paper_ids?.length ? `<div class="biomed-label">Added Papers</div>${renderList(record.added_paper_ids)}` : ""}
           ${record.skipped_reason ? `<div class="biomed-muted">${escapeHtml(record.skipped_reason)}</div>` : ""}
         </div>
       `).join("")}
       ${bundle.duplicate_paper_ids.length ? `<div class="biomed-label">Duplicates</div>${renderList(bundle.duplicate_paper_ids)}` : ""}
+    </div>
+  `;
+}
+
+function renderEvidencePacket(packet: EvidencePacketSummary | null | undefined): string {
+  if (!packet) return '<div class="biomed-muted">No evidence packet recorded.</div>';
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Packet</span><code>${escapeHtml(packet.packet_id)}</code></div>
+        <div><span>Planner</span><strong>${escapeHtml(packet.planner_mode)}</strong></div>
+        <div><span>Source</span><strong>${escapeHtml(packet.source)}</strong></div>
+        <div><span>Papers</span><strong>${packet.paper_ids.length}</strong></div>
+        <div><span>Evidence</span><strong>${packet.evidence_ids.length}</strong></div>
+        <div><span>Stop</span><strong>${escapeHtml(packet.stop_reason)}</strong></div>
+      </div>
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Supported Claims</div>
+          ${renderList(packet.supported_claims.slice(0, 5))}
+        </div>
+        <div>
+          <div class="biomed-label">Gaps / Conflicts</div>
+          ${renderList(packet.coverage_gaps.slice(0, 5).map((row) => `${row.retrieval_intent}: ${row.coverage_status}${row.gap_reason ? ` - ${row.gap_reason}` : ""}`))}
+        </div>
+      </div>
+      ${packet.source_warnings.length ? `<div class="biomed-label">Source Warnings</div>${renderList(packet.source_warnings)}` : ""}
     </div>
   `;
 }
@@ -654,6 +797,8 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
     ${renderManifest(result.answer_result.retrieval_manifest)}
     <div class="biomed-label">Retrieval Bundle</div>
     ${renderRetrievalBundle(result.answer_result.retrieval_bundle)}
+    <div class="biomed-label">Evidence Packet</div>
+    ${renderEvidencePacket(result.answer_result.evidence_packet)}
     <div class="biomed-label">Final Answer</div>
     <div class="biomed-answer">${renderMarkdown(result.final_answer)}</div>
     <div class="biomed-label">Audit</div>
@@ -1009,6 +1154,8 @@ function renderAsk(container: HTMLElement): void {
         ${renderManifest(result.retrieval_manifest)}
         <div class="biomed-label">Retrieval Bundle</div>
         ${renderRetrievalBundle(result.retrieval_bundle)}
+        <div class="biomed-label">Evidence Packet</div>
+        ${renderEvidencePacket(result.evidence_packet)}
         ${result.project_context_trace ? `<div class="biomed-label">Project Trace</div><pre class="biomed-json">${escapeHtml(JSON.stringify(result.project_context_trace, null, 2))}</pre>` : ""}
         <div class="biomed-answer">${renderMarkdown(result.answer)}</div>
         <div class="biomed-label">Citations</div>

@@ -286,6 +286,13 @@ async def test_answer_with_planner_executes_support_refute_bundle(
     assert result.retrieval_bundle.executed_multi_query is True
     intents = {record.intent for record in result.retrieval_bundle.records}
     assert {"primary", "support", "refute"} <= intents
+    assert {"background", "mechanism", "limitation"} <= intents
+    assert result.retrieval_bundle.subquestions
+    assert result.retrieval_bundle.coverage_matrix
+    assert result.retrieval_bundle.stop_reason in {
+        "coverage_sufficient",
+        "gap_followup_complete",
+    }
     assert result.retrieval_manifest is not None
     assert (
         result.retrieval_bundle.records[0].retrieval_id
@@ -296,10 +303,15 @@ async def test_answer_with_planner_executes_support_refute_bundle(
     )
     assert result.retrieval_bundle.duplicate_paper_ids
     assert result.evidence_summary
-    assert {item.retrieval_intent for item in result.evidence_summary} <= {
-        "primary",
-        "support",
-        "refute",
+    assert {item.retrieval_intent for item in result.evidence_summary}
+    assert result.evidence_packet is not None
+    assert result.evidence_packet.coverage_matrix
+    assert result.evidence_packet.retrieval_manifest_ids
+    assert set(result.evidence_packet.evidence_ids) == {
+        item.evidence_id for item in result.evidence_summary
+    }
+    assert set(result.evidence_packet.paper_ids) == {
+        item.paper_id for item in result.evidence_summary
     }
 
 

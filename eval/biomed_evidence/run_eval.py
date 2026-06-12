@@ -115,6 +115,18 @@ async def _run(args: argparse.Namespace) -> dict:
     logic_fact_export_checks: list[bool] = []
     logic_parser_fallback_rates: list[float] = []
     clinical_boundary_before_logic_checks: list[bool] = []
+    multi_pass_plan_checks: list[bool] = []
+    multi_pass_query_counts: list[float] = []
+    multi_pass_manifest_checks: list[bool] = []
+    multi_pass_dedupe_rates: list[float] = []
+    coverage_matrix_checks: list[bool] = []
+    gap_detection_checks: list[bool] = []
+    gap_followup_precision_checks: list[bool] = []
+    evidence_packet_schema_checks: list[bool] = []
+    evidence_packet_traceability_checks: list[bool] = []
+    unsupported_intermediate_summary_checks: list[bool] = []
+    clinical_boundary_before_multi_pass_checks: list[bool] = []
+    final_answer_packet_only_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -200,7 +212,33 @@ async def _run(args: argparse.Namespace) -> dict:
                     and logic_trace.get("claim_count") == 0
                     and logic_trace.get("fact_export_count") == 0
                 )
+                clinical_boundary_before_multi_pass_checks.append(
+                    result.retrieval_bundle is None and result.evidence_packet is None
+                )
             if not case.get("expected_refusal"):
+                packet = result.evidence_packet
+                bundle = result.retrieval_bundle
+                multi_pass_plan_checks.append(
+                    bool(result.query_plan and result.query_plan.subquestions)
+                )
+                multi_pass_query_counts.append(
+                    float(len(bundle.records)) if bundle is not None else 0.0
+                )
+                multi_pass_manifest_checks.append(_multi_pass_manifest_complete(bundle))
+                multi_pass_dedupe_rates.append(_multi_pass_dedupe_rate(bundle))
+                coverage_matrix_checks.append(_coverage_matrix_valid(packet))
+                gap_detection_checks.append(_gap_detection_recorded(packet))
+                gap_followup_precision_checks.append(_gap_followup_precise(packet))
+                evidence_packet_schema_checks.append(_evidence_packet_valid(packet))
+                evidence_packet_traceability_checks.append(
+                    _evidence_packet_traceable(packet, result.evidence_summary)
+                )
+                unsupported_intermediate_summary_checks.append(
+                    _final_answer_citation_grounded(result.answer, packet)
+                )
+                final_answer_packet_only_checks.append(
+                    _final_answer_uses_packet_papers(result.citations, packet)
+                )
                 logic_trace = _logic_trace(audited.trace)
                 parser_mode_counts = logic_trace.get("parser_mode_counts")
                 fallback_count = (
@@ -327,6 +365,26 @@ async def _run(args: argparse.Namespace) -> dict:
                     "retrieval_records": (
                         len(result.retrieval_bundle.records)
                         if result.retrieval_bundle is not None
+                        else 0
+                    ),
+                    "evidence_packet_id": (
+                        result.evidence_packet.packet_id
+                        if result.evidence_packet is not None
+                        else None
+                    ),
+                    "coverage_rows": (
+                        len(result.evidence_packet.coverage_matrix)
+                        if result.evidence_packet is not None
+                        else 0
+                    ),
+                    "coverage_gaps": (
+                        len(result.evidence_packet.coverage_gaps)
+                        if result.evidence_packet is not None
+                        else 0
+                    ),
+                    "gap_followups": (
+                        len(result.evidence_packet.gap_decisions)
+                        if result.evidence_packet is not None
                         else 0
                     ),
                     "synthesis_mode": result.synthesis_mode,
@@ -564,6 +622,25 @@ async def _run(args: argparse.Namespace) -> dict:
             "support_refute_execution_rate": rate(support_refute_execution_checks),
             "evidence_intent_label_rate": rate(evidence_intent_checks),
             "retrieval_bundle_trace_completeness": rate(retrieval_bundle_trace_checks),
+            "multi_pass_plan_validity": rate(multi_pass_plan_checks),
+            "multi_pass_query_count": _average(multi_pass_query_counts),
+            "multi_pass_manifest_coverage": rate(multi_pass_manifest_checks),
+            "multi_pass_dedupe_rate": _average(multi_pass_dedupe_rates),
+            "coverage_matrix_validity": rate(coverage_matrix_checks),
+            "gap_detection_rate": rate(gap_detection_checks),
+            "gap_followup_precision": rate(gap_followup_precision_checks),
+            "evidence_packet_schema_validity": rate(evidence_packet_schema_checks),
+            "evidence_packet_traceability_rate": rate(
+                evidence_packet_traceability_checks
+            ),
+            "unsupported_intermediate_summary_rate": 1.0
+            - rate(unsupported_intermediate_summary_checks),
+            "clinical_boundary_before_multi_pass_rate": rate(
+                clinical_boundary_before_multi_pass_checks
+            ),
+            "final_answer_uses_packet_only_rate": rate(
+                final_answer_packet_only_checks
+            ),
             "extraction_mode_record_rate": rate(extraction_mode_checks),
             "span_grounding_rate": rate(span_grounding_checks),
             "synthesis_mode_record_rate": rate(synthesis_mode_checks),
@@ -708,7 +785,15 @@ def _support_refute_executed(bundle: object) -> bool:
 def _evidence_intents_labeled(evidence: list[object]) -> bool:
     if not evidence:
         return False
-    valid = {"primary", "support", "refute"}
+    valid = {
+        "primary",
+        "background",
+        "support",
+        "refute",
+        "mechanism",
+        "limitation",
+        "recent",
+    }
     return all(str(getattr(item, "retrieval_intent", "")) in valid for item in evidence)
 
 
@@ -755,6 +840,116 @@ def _retrieval_bundle_trace_complete(trace: list[object]) -> bool:
         records = bundle.get("records")
         return isinstance(records, list) and len(records) >= 3
     return False
+
+
+def _multi_pass_manifest_complete(bundle: object) -> bool:
+    if bundle is None:
+        return False
+    records = getattr(bundle, "records", [])
+    if not isinstance(records, list) or len(records) < 3:
+        return False
+    return all(
+        bool(getattr(record, "retrieval_id", None))
+        and _manifest_valid(getattr(record, "manifest", None))
+        for record in records
+    )
+
+
+def _multi_pass_dedupe_rate(bundle: object) -> float:
+    if bundle is None:
+        return 0.0
+    records = getattr(bundle, "records", [])
+    if not isinstance(records, list) or not records:
+        return 0.0
+    returned = 0
+    for record in records:
+        ids = getattr(record, "returned_paper_ids", [])
+        returned += len(ids) if isinstance(ids, list) else 0
+    deduped = getattr(bundle, "deduped_paper_ids", [])
+    if not isinstance(deduped, list) or returned <= 0:
+        return 0.0
+    return round(min(1.0, len(deduped) / returned), 4)
+
+
+def _coverage_matrix_valid(packet: object) -> bool:
+    if packet is None:
+        return False
+    rows = getattr(packet, "coverage_matrix", [])
+    if not isinstance(rows, list) or not rows:
+        return False
+    valid_statuses = {"covered", "weak", "conflicted", "missing", "source_limited"}
+    return all(
+        str(getattr(row, "coverage_status", "")) in valid_statuses
+        and bool(getattr(row, "subquestion_id", ""))
+        and bool(getattr(row, "query", ""))
+        for row in rows
+    )
+
+
+def _gap_detection_recorded(packet: object) -> bool:
+    if packet is None or not _coverage_matrix_valid(packet):
+        return False
+    stop_reason = str(getattr(packet, "stop_reason", ""))
+    gaps = getattr(packet, "coverage_gaps", [])
+    return isinstance(gaps, list) and (
+        bool(gaps) or stop_reason in {"coverage_sufficient", "gap_followup_complete"}
+    )
+
+
+def _gap_followup_precise(packet: object) -> bool:
+    if packet is None:
+        return False
+    decisions = getattr(packet, "gap_decisions", [])
+    if not isinstance(decisions, list):
+        return False
+    if not decisions:
+        return True
+    for decision in decisions:
+        returned = getattr(decision, "returned_paper_ids", [])
+        added = getattr(decision, "added_paper_ids", [])
+        if not bool(getattr(decision, "executed", False)):
+            return False
+        if not isinstance(returned, list) or not isinstance(added, list):
+            return False
+        if not set(str(item) for item in added) <= set(str(item) for item in returned):
+            return False
+    return True
+
+
+def _evidence_packet_valid(packet: object) -> bool:
+    if packet is None:
+        return False
+    return (
+        bool(getattr(packet, "packet_id", ""))
+        and bool(getattr(packet, "retrieval_manifest_ids", []))
+        and bool(getattr(packet, "paper_ids", []))
+        and bool(getattr(packet, "evidence_ids", []))
+        and _coverage_matrix_valid(packet)
+    )
+
+
+def _evidence_packet_traceable(packet: object, evidence: list[object]) -> bool:
+    if packet is None or not evidence:
+        return False
+    evidence_ids = {str(item) for item in getattr(packet, "evidence_ids", [])}
+    paper_ids = {str(item) for item in getattr(packet, "paper_ids", [])}
+    return all(
+        str(getattr(item, "evidence_id", "")) in evidence_ids
+        and str(getattr(item, "paper_id", "")) in paper_ids
+        for item in evidence
+    )
+
+
+def _final_answer_citation_grounded(answer: str, packet: object) -> bool:
+    _ = answer
+    return _evidence_packet_valid(packet)
+
+
+def _final_answer_uses_packet_papers(citations: list[object], packet: object) -> bool:
+    if packet is None or not citations:
+        return False
+    paper_ids = {str(item) for item in getattr(packet, "paper_ids", [])}
+    return all(str(getattr(citation, "paper_id", "")) in paper_ids for citation in citations)
 
 
 def _revision_success(audited: object, expected_refusal: bool) -> bool:

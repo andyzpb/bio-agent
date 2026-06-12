@@ -114,7 +114,23 @@ RevisionMode = Literal["deterministic", "llm", "fallback"]
 PlannerMode = Literal["deterministic", "llm", "fallback"]
 ExtractionMode = Literal["deterministic", "llm", "fallback"]
 SynthesisMode = Literal["deterministic", "llm", "fallback"]
-RetrievalIntent = Literal["primary", "support", "refute", "unknown"]
+RetrievalIntent = Literal[
+    "primary",
+    "background",
+    "support",
+    "refute",
+    "mechanism",
+    "limitation",
+    "recent",
+    "unknown",
+]
+CoverageStatus = Literal[
+    "covered",
+    "weak",
+    "conflicted",
+    "missing",
+    "source_limited",
+]
 QuestionIntent = Literal[
     "research_question",
     "clinical_or_patient_specific",
@@ -581,6 +597,73 @@ class LiteratureSearchResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class RetrievalSubquestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subquestion_id: str
+    question: str
+    query: str
+    retrieval_intent: RetrievalIntent
+    reason: str
+    max_results: int = 5
+
+
+class CoverageMatrixRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subquestion_id: str
+    subquestion: str
+    retrieval_intent: RetrievalIntent
+    pass_index: int = 1
+    query: str
+    retrieval_ids: list[str] = Field(default_factory=list)
+    paper_ids: list[str] = Field(default_factory=list)
+    papers_found: int = 0
+    evidence_count: int = 0
+    citations: int = 0
+    conflicts: int = 0
+    limitations: int = 0
+    coverage_status: CoverageStatus
+    gap_reason: str | None = None
+
+
+class GapSearchDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gap_id: str
+    subquestion_id: str
+    retrieval_intent: RetrievalIntent
+    followup_query: str
+    reason: str
+    executed: bool = False
+    retrieval_id: str | None = None
+    returned_paper_ids: list[str] = Field(default_factory=list)
+    added_paper_ids: list[str] = Field(default_factory=list)
+    stop_reason: str | None = None
+
+
+class EvidencePacketSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    packet_id: str
+    question: str
+    planner_mode: PlannerMode = "deterministic"
+    source: Literal["pubmed", "mock"] = "mock"
+    subquestions: list[RetrievalSubquestion] = Field(default_factory=list)
+    retrieval_manifest_ids: list[str] = Field(default_factory=list)
+    paper_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    supported_claims: list[str] = Field(default_factory=list)
+    conflicting_claims: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    coverage_matrix: list[CoverageMatrixRow] = Field(default_factory=list)
+    coverage_gaps: list[CoverageMatrixRow] = Field(default_factory=list)
+    gap_decisions: list[GapSearchDecision] = Field(default_factory=list)
+    source_warnings: list[str] = Field(default_factory=list)
+    stop_reason: str = "not_started"
+    created_at: str
+
+
 class LiteratureAccessCheckResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -607,9 +690,15 @@ class RetrievalBundleRecord(BaseModel):
 
     intent: RetrievalIntent
     query: str
+    query_id: str | None = None
+    subquestion_id: str | None = None
+    reason: str | None = None
+    pass_index: int = 1
     retrieval_id: str | None = None
     manifest: RetrievalManifest | None = None
     returned_paper_ids: list[str] = Field(default_factory=list)
+    added_paper_ids: list[str] = Field(default_factory=list)
+    coverage: LiteratureSearchCoverage | None = None
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     skipped_reason: str | None = None
@@ -624,6 +713,10 @@ class RetrievalBundle(BaseModel):
     records: list[RetrievalBundleRecord] = Field(default_factory=list)
     deduped_paper_ids: list[str] = Field(default_factory=list)
     duplicate_paper_ids: list[str] = Field(default_factory=list)
+    subquestions: list[RetrievalSubquestion] = Field(default_factory=list)
+    coverage_matrix: list[CoverageMatrixRow] = Field(default_factory=list)
+    gap_decisions: list[GapSearchDecision] = Field(default_factory=list)
+    stop_reason: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -695,6 +788,7 @@ class BiomedicalQueryPlan(BaseModel):
     species_terms: list[str] = Field(default_factory=list)
     support_queries: list[str] = Field(default_factory=list)
     refute_queries: list[str] = Field(default_factory=list)
+    subquestions: list[RetrievalSubquestion] = Field(default_factory=list)
     max_results: int = 10
     rationale: str = ""
     warnings: list[str] = Field(default_factory=list)
@@ -776,6 +870,7 @@ class AnswerWithEvidenceResult(BaseModel):
     question_classification: BiomedicalQuestionClassification | None = None
     query_plan: BiomedicalQueryPlan | None = None
     query_plan_validation: QueryPlanValidation | None = None
+    evidence_packet: EvidencePacketSummary | None = None
     synthesis_mode: SynthesisMode = "deterministic"
     synthesis_model: str | None = None
     synthesis_prompt_hash: str | None = None

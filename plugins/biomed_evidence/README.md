@@ -3,11 +3,12 @@
 Biomedical Evidence is a research-only Akashic plugin for citation-grounded
 biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured router/planner output, planner-driven
-primary/support/refute retrieval bundles, structured evidence extraction, cited
+primary/support/refute and V2.6 multi-pass retrieval bundles, structured evidence extraction, cited
 answers, retrieval manifests, claim-level citation audit, audit/revise traces,
 claim logic entailment audit, symbolic logic fact export, project evidence
 workspaces, framework-native tool guardrails, prompt context injection,
 literature-source readiness checks, the controlled `search_literature` tool, a
+coverage matrix, gap-directed follow-up searches, structured evidence packets, a
 lightweight evidence graph, and Research Watch decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
@@ -115,6 +116,26 @@ Literature access checks return `ok`, `ready`, source liveness, item count,
 abstract coverage, stored-paper count, NCBI identity flags, retrieval manifest,
 items, warnings, and errors.
 
+## V2.6 Multi-Pass Gap-Directed Retrieval
+
+V2.6 builds on `search_literature` with a bounded multi-pass retrieval loop:
+
+```text
+router / guardrail
+  -> planner subquestions
+  -> search_literature per query
+  -> retrieval bundle + coverage matrix
+  -> optional gap-directed follow-up
+  -> structured evidence packet
+  -> synthesis / audit / revision
+```
+
+Answer responses can include `evidence_packet` with planner mode, retrieval
+manifest IDs, paper IDs, evidence IDs, supported/conflicting claims,
+limitations, coverage matrix rows, gap decisions, source warnings, and a stop
+reason. The final answer path uses this curated packet and evidence items, not
+raw search noise or unsupported intermediate summaries.
+
 ## V2.5 Controlled Literature Search Tool
 
 V2.5 promotes literature retrieval into the agent's core controlled tool
@@ -137,9 +158,11 @@ generate answers, browse arbitrary websites, or bypass the framework
 next structured adapter after the PubMed path is stable.
 
 Planner-enabled answer responses can also include a `retrieval_bundle` with
-primary/support/refute retrieval records, per-query manifest IDs, deduped paper
-IDs, duplicate IDs, and bundle warnings. Extracted evidence carries
-`retrieval_intent` as `primary`, `support`, `refute`, or `unknown`.
+per-query retrieval records, subquestions, retrieval intents, pass numbers,
+per-query manifest IDs, coverage rows, gap decisions, deduped paper IDs,
+duplicate IDs, and bundle warnings. Extracted evidence carries
+`retrieval_intent` as `primary`, `background`, `support`, `refute`,
+`mechanism`, `limitation`, `recent`, or `unknown`.
 
 Audit responses can include `ClaimAuditItem.logic_audit` with parsed logical
 claim/evidence frames, deterministic entailment verdicts, triggered rules,
@@ -178,7 +201,8 @@ The panel includes:
   fact exports, and recommended action.
 - Trace: inspect planner validation, retrieval bundle metadata, draft answer,
   final answer, revision mode/action, removed/softened claims, added
-  limitations, logic-audit summary metadata, and ordered agent steps.
+  limitations, V2.6 evidence packet metadata, coverage/gap decisions,
+  logic-audit summary metadata, and ordered agent steps.
 - Responsible AI: review the research-only operating boundary and retrieval
   limitations.
 
@@ -233,7 +257,7 @@ npm run build
 docker build -t bio-agent-biomed:latest .
 ```
 
-Literature search, retrieval-bundle, and V2.5 claim-logic API smoke:
+Literature search, V2.6 retrieval-bundle/evidence-packet, and claim-logic API smoke:
 
 ```bash
 curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/check" \

@@ -22,11 +22,23 @@ python -m eval.biomed_evidence.run_eval \
 - `literature_access_item_count`: papers returned by the readiness check.
 - `literature_access_abstract_coverage`: fraction of readiness-check papers with stored abstracts.
 - `literature_access_live`: whether the readiness check used a live source.
-- `literature_search_manifest_validity`: V2.5 controlled search returned a valid retrieval manifest.
+- `literature_search_manifest_validity`: controlled search returned a valid retrieval manifest.
 - `literature_search_item_count`: normalized paper records returned by `search_literature`.
 - `literature_search_stored_paper_count`: returned papers persisted for downstream workflows.
 - `literature_search_abstract_coverage`: fraction of controlled-search records with abstracts.
 - `literature_search_warning_count`: explicit warnings surfaced by controlled search.
+- `multi_pass_plan_validity`: planner produced V2.6 retrieval subquestions.
+- `multi_pass_query_count`: average executed retrieval records in the bounded multi-pass bundle.
+- `multi_pass_manifest_coverage`: every executed retrieval record has a manifest.
+- `multi_pass_dedupe_rate`: unique paper ratio across multi-query results.
+- `coverage_matrix_validity`: V2.6 coverage rows have valid status, query, and subquestion IDs.
+- `gap_detection_rate`: coverage gaps or sufficient-coverage stop reasons are recorded.
+- `gap_followup_precision`: executed gap follow-ups have traceable returned/added paper IDs.
+- `evidence_packet_schema_validity`: structured evidence packet is present and schema-consistent.
+- `evidence_packet_traceability_rate`: evidence packet IDs match extracted evidence items.
+- `unsupported_intermediate_summary_rate`: answer runs that bypassed the evidence packet path.
+- `clinical_boundary_before_multi_pass_rate`: clinical requests refuse before multi-pass retrieval.
+- `final_answer_uses_packet_only_rate`: final citations are drawn from packet paper IDs.
 - `claim_support_rate`: audited atomic claims marked supported or partially supported.
 - `citation_precision`: citations that support at least one audited claim.
 - `unsupported_claim_rate`: audited claims that are uncited, irrelevant, or insufficiently supported.

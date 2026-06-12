@@ -52,13 +52,16 @@ from plugins.biomed_evidence.schemas import (
     ConfidenceLevel,
     ConflictAuditRequest,
     ConflictAuditResult,
+    CoverageStatus,
     EvidenceExtractionRequest,
     EvidenceExtractionResult,
+    EvidencePacketSummary,
     ExtractionMode,
     EvidenceGraph,
     EvidenceItem,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    GapSearchDecision,
     GenerateProjectEvidenceBriefRequest,
     GraphEdge,
     GraphNode,
@@ -81,10 +84,12 @@ from plugins.biomed_evidence.schemas import (
     ProjectPaperDecisionRequest,
     ProjectReviewQueueItem,
     QueryPlanValidation,
+    CoverageMatrixRow,
     RetrievalBundle,
     RetrievalBundleRecord,
     RetrievalIntent,
     RetrievalManifest,
+    RetrievalSubquestion,
     SearchBiomedicalLiteratureRequest,
     SearchBiomedicalLiteratureResult,
     WatchCheckResult,
@@ -1161,6 +1166,34 @@ class BiomedEvidenceService:
             )
             evidence.extend(extracted.evidence)
 
+        if retrieval_bundle is not None:
+            (
+                metadata,
+                retrieval_bundle,
+                paper_intents,
+                paper_retrieval_ids,
+                papers,
+                evidence,
+            ) = await self._apply_gap_directed_retrieval(
+                request=active_request,
+                planning_result=planning_result,
+                metadata=metadata,
+                retrieval_bundle=retrieval_bundle,
+                paper_intents=paper_intents,
+                paper_retrieval_ids=paper_retrieval_ids,
+                papers=papers,
+                evidence=evidence,
+                project=project,
+            )
+        evidence_packet = _build_evidence_packet(
+            request=active_request,
+            planning_result=planning_result,
+            retrieval_manifest=retrieval_manifest,
+            retrieval_bundle=retrieval_bundle,
+            metadata=metadata,
+            evidence=evidence,
+        )
+
         citations = [
             Citation(
                 paper_id=item.paper_id,
@@ -1225,6 +1258,7 @@ class BiomedEvidenceService:
                     papers=papers,
                     retrieval_manifest=retrieval_manifest,
                     retrieval_bundle=retrieval_bundle,
+                    evidence_packet=evidence_packet,
                     uncertainty=uncertainty,
                     run_id=run_id,
                 )
@@ -1257,6 +1291,7 @@ class BiomedEvidenceService:
             query_plan_validation=(
                 planning_result.validation if planning_result is not None else None
             ),
+            evidence_packet=evidence_packet,
             synthesis_mode=cast(Any, synthesis_outcome.mode),
             synthesis_model=synthesis_outcome.model,
             synthesis_prompt_hash=synthesis_outcome.prompt_hash,
@@ -1312,24 +1347,41 @@ class BiomedEvidenceService:
         paper_intents: dict[str, RetrievalIntent] = {}
         paper_retrieval_ids: dict[str, str] = {}
         primary_manifest: RetrievalManifest | None = None
-        for intent, retrieval_request in specs:
-            search_result = await self.search_with_manifest(retrieval_request)
-            manifest = search_result.retrieval_manifest
+        for subquestion, retrieval_request in specs:
+            intent = subquestion.retrieval_intent
+            literature_result = await self.search_literature(
+                _literature_request_from_search_request(
+                    retrieval_request,
+                    retrieval_intent=intent,
+                    project_id=request.project_id,
+                    require_abstract=True,
+                )
+            )
+            search_items = [
+                _paper_metadata_from_literature_record(item)
+                for item in literature_result.items
+            ]
+            manifest = literature_result.retrieval_manifest
             if primary_manifest is None:
                 primary_manifest = manifest
-            returned_ids = [item.paper_id for item in search_result.items]
+            returned_ids = [item.paper_id for item in search_items]
             records.append(
                 RetrievalBundleRecord(
                     intent=intent,
                     query=retrieval_request.query,
+                    query_id=subquestion.subquestion_id,
+                    subquestion_id=subquestion.subquestion_id,
+                    reason=subquestion.reason,
+                    pass_index=1,
                     retrieval_id=manifest.retrieval_id,
                     manifest=manifest,
                     returned_paper_ids=returned_ids,
-                    warnings=manifest.warnings,
-                    errors=manifest.errors,
+                    coverage=literature_result.coverage,
+                    warnings=literature_result.warnings,
+                    errors=literature_result.errors,
                 )
             )
-            for item in search_result.items:
+            for item in search_items:
                 if item.paper_id in seen_paper_ids:
                     duplicate_paper_ids.append(item.paper_id)
                     continue
@@ -1355,6 +1407,8 @@ class BiomedEvidenceService:
             records=records,
             deduped_paper_ids=[item.paper_id for item in unique_items],
             duplicate_paper_ids=duplicate_paper_ids,
+            subquestions=[subquestion for subquestion, _ in specs],
+            stop_reason="first_pass_complete",
             warnings=bundle_warnings,
         )
         return (
@@ -1363,6 +1417,207 @@ class BiomedEvidenceService:
             bundle,
             paper_intents,
             paper_retrieval_ids,
+        )
+
+    async def _apply_gap_directed_retrieval(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        planning_result: PlanBiomedicalSearchResult | None,
+        metadata: list[PaperMetadata],
+        retrieval_bundle: RetrievalBundle,
+        paper_intents: dict[str, RetrievalIntent],
+        paper_retrieval_ids: dict[str, str],
+        papers: dict[str, BiomedicalPaper],
+        evidence: list[EvidenceItem],
+        project: BiomedProject | None,
+    ) -> tuple[
+        list[PaperMetadata],
+        RetrievalBundle,
+        dict[str, RetrievalIntent],
+        dict[str, str],
+        dict[str, BiomedicalPaper],
+        list[EvidenceItem],
+    ]:
+        coverage = _build_coverage_matrix(retrieval_bundle, evidence)
+        if (
+            not request.execute_support_refute
+            or planning_result is None
+            or planning_result.query_plan is None
+        ):
+            return (
+                metadata,
+                retrieval_bundle.model_copy(
+                    update={
+                        "coverage_matrix": coverage,
+                        "stop_reason": "multi_pass_not_requested",
+                    }
+                ),
+                paper_intents,
+                paper_retrieval_ids,
+                papers,
+                evidence,
+            )
+
+        decisions = _gap_search_decisions(
+            coverage,
+            query_plan=planning_result.query_plan,
+            existing_queries={record.query.lower() for record in retrieval_bundle.records},
+            max_decisions=2,
+        )
+        if not decisions:
+            return (
+                metadata,
+                retrieval_bundle.model_copy(
+                    update={
+                        "coverage_matrix": coverage,
+                        "gap_decisions": [],
+                        "stop_reason": _coverage_stop_reason(coverage),
+                    }
+                ),
+                paper_intents,
+                paper_retrieval_ids,
+                papers,
+                evidence,
+            )
+
+        records = list(retrieval_bundle.records)
+        duplicate_paper_ids = list(retrieval_bundle.duplicate_paper_ids)
+        seen_paper_ids = {item.paper_id for item in metadata}
+        rejected_ids: set[str] = set()
+        if project is not None and not request.include_rejected_papers:
+            project_decisions = self.storage.get_project_paper_decision_map(
+                project.project_id,
+                source=request.source,
+            )
+            rejected_ids = {
+                paper_id
+                for paper_id, decision in project_decisions.items()
+                if decision.decision == "rejected"
+            }
+
+        updated_decisions: list[GapSearchDecision] = []
+        warnings = list(retrieval_bundle.warnings)
+        for decision in decisions:
+            try:
+                literature_result = await self.search_literature(
+                    LiteratureSearchRequest(
+                        query=decision.followup_query,
+                        max_results=max(1, min(request.max_papers, 3)),
+                        date_from=planning_result.query_plan.date_from,
+                        date_to=planning_result.query_plan.date_to,
+                        source=request.source,
+                        mesh_terms=planning_result.query_plan.mesh_terms,
+                        publication_types=planning_result.query_plan.publication_types,
+                        study_types=planning_result.query_plan.study_types,
+                        species_terms=planning_result.query_plan.species_terms,
+                        exclude_terms=planning_result.query_plan.exclude_terms,
+                        retrieval_intent=decision.retrieval_intent,
+                        project_id=request.project_id,
+                        require_abstract=True,
+                        store=True,
+                    )
+                )
+            except LiteratureClientError as exc:
+                updated_decisions.append(
+                    decision.model_copy(
+                        update={
+                            "executed": False,
+                            "stop_reason": f"follow-up retrieval failed: {exc}",
+                        }
+                    )
+                )
+                warnings.append(f"Gap follow-up failed: {exc}")
+                continue
+
+            manifest = literature_result.retrieval_manifest
+            returned_ids = [item.paper_id for item in literature_result.items]
+            added_ids: list[str] = []
+            for record in literature_result.items:
+                item = _paper_metadata_from_literature_record(record)
+                if item.paper_id in rejected_ids:
+                    warnings.append(
+                        "Project memory excluded a rejected paper from gap follow-up."
+                    )
+                    continue
+                if item.paper_id in seen_paper_ids:
+                    duplicate_paper_ids.append(item.paper_id)
+                    continue
+                seen_paper_ids.add(item.paper_id)
+                metadata.append(item)
+                added_ids.append(item.paper_id)
+                paper_intents[item.paper_id] = decision.retrieval_intent
+                paper_retrieval_ids[item.paper_id] = manifest.retrieval_id
+                paper = await self.fetch(
+                    FetchBiomedicalPaperRequest(
+                        paper_id=item.paper_id,
+                        source=request.source,
+                    )
+                )
+                if paper is None:
+                    continue
+                papers[paper.paper_id] = paper
+                extracted = await self._extract_evidence_for_answer(
+                    request=request,
+                    paper=paper,
+                    retrieval_id=manifest.retrieval_id,
+                    retrieval_intent=decision.retrieval_intent,
+                )
+                evidence.extend(extracted.evidence)
+            records.append(
+                RetrievalBundleRecord(
+                    intent=decision.retrieval_intent,
+                    query=decision.followup_query,
+                    query_id=decision.gap_id,
+                    subquestion_id=decision.subquestion_id,
+                    reason=decision.reason,
+                    pass_index=2,
+                    retrieval_id=manifest.retrieval_id,
+                    manifest=manifest,
+                    returned_paper_ids=returned_ids,
+                    added_paper_ids=added_ids,
+                    coverage=literature_result.coverage,
+                    warnings=literature_result.warnings,
+                    errors=literature_result.errors,
+                )
+            )
+            updated_decisions.append(
+                decision.model_copy(
+                    update={
+                        "executed": True,
+                        "retrieval_id": manifest.retrieval_id,
+                        "returned_paper_ids": returned_ids,
+                        "added_paper_ids": added_ids,
+                        "stop_reason": (
+                            "added_new_papers"
+                            if added_ids
+                            else "no_new_unique_papers"
+                        ),
+                    }
+                )
+            )
+
+        updated_bundle = retrieval_bundle.model_copy(
+            update={
+                "records": records,
+                "deduped_paper_ids": [item.paper_id for item in metadata],
+                "duplicate_paper_ids": _merge_unique(duplicate_paper_ids),
+                "coverage_matrix": _build_coverage_matrix(
+                    retrieval_bundle.model_copy(update={"records": records}),
+                    evidence,
+                ),
+                "gap_decisions": updated_decisions,
+                "stop_reason": "gap_followup_complete",
+                "warnings": _merge_unique(warnings),
+            }
+        )
+        return (
+            metadata,
+            updated_bundle,
+            paper_intents,
+            paper_retrieval_ids,
+            papers,
+            evidence,
         )
 
     def _apply_project_memory_to_retrieval(
@@ -2001,6 +2256,7 @@ class BiomedEvidenceService:
         papers: dict[str, BiomedicalPaper],
         retrieval_manifest: RetrievalManifest,
         retrieval_bundle: RetrievalBundle | None,
+        evidence_packet: EvidencePacketSummary | None,
         uncertainty: ConfidenceLevel,
         run_id: str,
     ) -> _SynthesisOutcome:
@@ -2022,6 +2278,7 @@ class BiomedEvidenceService:
             papers=papers,
             retrieval_manifest=retrieval_manifest,
             retrieval_bundle=retrieval_bundle,
+            evidence_packet=evidence_packet,
             uncertainty=uncertainty,
         )
         prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
@@ -2821,6 +3078,22 @@ def _deterministic_query_plan(
     mesh_terms = _infer_mesh_terms(classification.normalized_question)
     include_terms = _infer_include_terms(classification.normalized_question)
     refute_seed = primary_query or classification.normalized_question
+    max_results = max(1, min(request.max_results, 50))
+    support_queries = [
+        f"{refute_seed} association evidence",
+        f"{refute_seed} mechanism evidence",
+    ]
+    refute_queries = [
+        f"{refute_seed} contradictory evidence",
+        f"{refute_seed} negative results limitations",
+    ]
+    subquestions = _deterministic_retrieval_subquestions(
+        question=request.question,
+        primary_query=primary_query or classification.normalized_question,
+        support_queries=support_queries,
+        refute_queries=refute_queries,
+        max_results=max(1, min(max_results, 5)),
+    )
     warnings = (
         [
             "Project context was treated as retrieval preference only, not biomedical evidence."
@@ -2846,18 +3119,96 @@ def _deterministic_query_plan(
         ],
         study_types=_infer_study_types(classification.normalized_question),
         species_terms=_infer_species_terms(classification.normalized_question),
-        support_queries=[
-            f"{refute_seed} association evidence",
-            f"{refute_seed} mechanism evidence",
-        ],
-        refute_queries=[
-            f"{refute_seed} contradictory evidence",
-            f"{refute_seed} negative results limitations",
-        ],
-        max_results=max(1, min(request.max_results, 50)),
+        support_queries=support_queries,
+        refute_queries=refute_queries,
+        subquestions=subquestions,
+        max_results=max_results,
         rationale="Deterministic query plan derived from biomedical terms in the question.",
         warnings=warnings,
     )
+
+
+def _deterministic_retrieval_subquestions(
+    *,
+    question: str,
+    primary_query: str,
+    support_queries: list[str],
+    refute_queries: list[str],
+    max_results: int,
+) -> list[RetrievalSubquestion]:
+    specs: list[tuple[RetrievalIntent, str, str, str]] = [
+        (
+            "background",
+            "What is the biomedical context for the relationship in the question?",
+            f"{primary_query} background",
+            "Establish core biomedical context before narrower support/refute searches.",
+        ),
+    ]
+    if "recent" in question.lower():
+        specs.append(
+            (
+                "recent",
+                "Which recent papers update this evidence base?",
+                f"{primary_query} recent evidence",
+                "The user asked for recent evidence, so run an explicit recency-oriented query.",
+            )
+        )
+    if support_queries:
+        specs.append(
+            (
+                "support",
+                "Which papers support the relationship in the question?",
+                support_queries[0],
+                "Find direct supporting evidence for the proposed relationship.",
+            )
+        )
+    if len(support_queries) > 1:
+        specs.append(
+            (
+                "mechanism",
+                "Which papers describe plausible mechanisms for the relationship?",
+                support_queries[1],
+                "Separate mechanistic evidence from general association evidence.",
+            )
+        )
+    if refute_queries:
+        specs.append(
+            (
+                "refute",
+                "Which papers report conflicting, negative, or null findings?",
+                refute_queries[0],
+                "Actively look for evidence that could weaken or contradict the answer.",
+            )
+        )
+    if len(refute_queries) > 1:
+        specs.append(
+            (
+                "limitation",
+                "Which papers clarify study-design or evidence limitations?",
+                refute_queries[1],
+                "Capture limitations so the final answer does not overstate evidence.",
+            )
+        )
+    result: list[RetrievalSubquestion] = []
+    seen_queries: set[str] = set()
+    for index, (intent, subquestion, query, reason) in enumerate(specs, start=1):
+        if len(result) >= 5:
+            break
+        clean_query = re.sub(r"\s+", " ", query).strip()
+        if not clean_query or clean_query.lower() in seen_queries:
+            continue
+        seen_queries.add(clean_query.lower())
+        result.append(
+            RetrievalSubquestion(
+                subquestion_id=_subquestion_id(question, intent, index),
+                question=subquestion,
+                query=clean_query[:300].rstrip(),
+                retrieval_intent=intent,
+                reason=reason,
+                max_results=max_results,
+            )
+        )
+    return result
 
 
 def _validate_query_plan(
@@ -2933,13 +3284,17 @@ def _planned_retrieval_specs(
     *,
     base_request: SearchBiomedicalLiteratureRequest,
     query_plan: BiomedicalQueryPlan,
-) -> tuple[list[tuple[RetrievalIntent, SearchBiomedicalLiteratureRequest]], list[str]]:
-    specs: list[tuple[RetrievalIntent, SearchBiomedicalLiteratureRequest]] = []
+) -> tuple[
+    list[tuple[RetrievalSubquestion, SearchBiomedicalLiteratureRequest]], list[str]
+]:
+    specs: list[tuple[RetrievalSubquestion, SearchBiomedicalLiteratureRequest]] = []
     warnings: list[str] = []
     seen_queries: set[str] = set()
-    max_results = max(1, min(base_request.max_results, query_plan.max_results, 20))
+    max_results = max(1, min(base_request.max_results, query_plan.max_results, 5))
 
-    def add(intent: RetrievalIntent, query: str) -> None:
+    def add(subquestion: RetrievalSubquestion) -> None:
+        intent = subquestion.retrieval_intent
+        query = subquestion.query
         compiled = re.sub(r"\s+", " ", query).strip()
         if not compiled:
             warnings.append(f"Skipped empty {intent} query.")
@@ -2952,27 +3307,327 @@ def _planned_retrieval_specs(
             warnings.append(f"Skipped duplicate {intent} query: {compiled[:120]}")
             return
         seen_queries.add(key)
+        sub_max_results = max(1, min(subquestion.max_results, max_results))
         specs.append(
             (
-                intent,
+                subquestion.model_copy(
+                    update={
+                        "query": compiled,
+                        "max_results": sub_max_results,
+                    }
+                ),
                 base_request.model_copy(
-                    update={"query": compiled, "max_results": max_results}
+                    update={"query": compiled, "max_results": sub_max_results}
                 ),
             )
         )
 
-    add("primary", base_request.query or query_plan.primary_query)
-    support_queries = _clean_list(query_plan.support_queries)
-    refute_queries = _clean_list(query_plan.refute_queries)
-    if len(support_queries) > 2:
-        warnings.append("Support queries were capped at 2 for V1.6 retrieval.")
-    if len(refute_queries) > 2:
-        warnings.append("Refute queries were capped at 2 for V1.6 retrieval.")
-    for query in support_queries[:2]:
-        add("support", query)
-    for query in refute_queries[:2]:
-        add("refute", query)
+    primary = RetrievalSubquestion(
+        subquestion_id=_subquestion_id(query_plan.question, "primary", 0),
+        question="Primary retrieval query for the user question.",
+        query=base_request.query or query_plan.primary_query,
+        retrieval_intent="primary",
+        reason="Preserve a primary retrieval record for backward-compatible provenance.",
+        max_results=max_results,
+    )
+    add(primary)
+
+    subquestions = query_plan.subquestions or _deterministic_retrieval_subquestions(
+        question=query_plan.question,
+        primary_query=base_request.query or query_plan.primary_query,
+        support_queries=_clean_list(query_plan.support_queries),
+        refute_queries=_clean_list(query_plan.refute_queries),
+        max_results=max_results,
+    )
+    if len(subquestions) > 5:
+        warnings.append("Retrieval subquestions were capped at 5 for V2.6.")
+    for subquestion in subquestions[:5]:
+        add(subquestion)
     return specs, warnings
+
+
+def _literature_request_from_search_request(
+    request: SearchBiomedicalLiteratureRequest,
+    *,
+    retrieval_intent: RetrievalIntent,
+    project_id: str | None,
+    require_abstract: bool,
+) -> LiteratureSearchRequest:
+    return LiteratureSearchRequest(
+        query=request.query,
+        max_results=request.max_results,
+        date_from=request.date_from,
+        date_to=request.date_to,
+        source=request.source,
+        publication_types=request.publication_types,
+        study_types=request.study_types,
+        mesh_terms=request.mesh_terms,
+        species_terms=request.species_terms,
+        exclude_terms=request.exclude_terms,
+        retrieval_intent=retrieval_intent,
+        project_id=project_id,
+        require_abstract=require_abstract,
+        store=request.store,
+    )
+
+
+def _paper_metadata_from_literature_record(record: LiteraturePaperRecord) -> PaperMetadata:
+    return PaperMetadata(
+        paper_id=record.paper_id,
+        source=record.source,
+        title=record.title,
+        authors=record.authors,
+        journal=record.journal,
+        publication_date=record.publication_date,
+        abstract_available=record.abstract_available,
+        doi=record.doi,
+        url=record.url,
+    )
+
+
+def _build_coverage_matrix(
+    bundle: RetrievalBundle,
+    evidence: list[EvidenceItem],
+) -> list[CoverageMatrixRow]:
+    evidence_by_paper: dict[str, list[EvidenceItem]] = {}
+    for item in evidence:
+        evidence_by_paper.setdefault(item.paper_id, []).append(item)
+    subquestions = {item.subquestion_id: item for item in bundle.subquestions}
+    rows: list[CoverageMatrixRow] = []
+    for index, record in enumerate(bundle.records, start=1):
+        paper_ids = _merge_unique(record.returned_paper_ids)
+        record_evidence = [
+            item
+            for paper_id in paper_ids
+            for item in evidence_by_paper.get(paper_id, [])
+        ]
+        conflicts = sum(
+            1 for item in record_evidence if item.evidence_direction == "contradicts"
+        )
+        limitations = sum(1 for item in record_evidence if item.limitations)
+        status, gap_reason = _coverage_status(
+            record=record,
+            papers_found=len(paper_ids),
+            evidence_count=len(record_evidence),
+            conflicts=conflicts,
+        )
+        subquestion = (
+            subquestions.get(record.subquestion_id or "")
+            if record.subquestion_id
+            else None
+        )
+        rows.append(
+            CoverageMatrixRow(
+                subquestion_id=record.subquestion_id
+                or record.query_id
+                or _subquestion_id(record.query, record.intent, index),
+                subquestion=(
+                    subquestion.question
+                    if subquestion is not None
+                    else record.reason or record.query
+                ),
+                retrieval_intent=record.intent,
+                pass_index=record.pass_index,
+                query=record.query,
+                retrieval_ids=([record.retrieval_id] if record.retrieval_id else []),
+                paper_ids=paper_ids,
+                papers_found=len(paper_ids),
+                evidence_count=len(record_evidence),
+                citations=len(record_evidence),
+                conflicts=conflicts,
+                limitations=limitations,
+                coverage_status=status,
+                gap_reason=gap_reason,
+            )
+        )
+    return rows
+
+
+def _coverage_status(
+    *,
+    record: RetrievalBundleRecord,
+    papers_found: int,
+    evidence_count: int,
+    conflicts: int,
+) -> tuple[CoverageStatus, str | None]:
+    if record.errors:
+        return "source_limited", "retrieval errors limited this subquestion."
+    if papers_found == 0:
+        return "source_limited", "no papers were returned for this subquestion."
+    if evidence_count == 0:
+        return "missing", "papers were returned but no usable evidence span was extracted."
+    if (
+        conflicts > 0
+        and record.intent in {"primary", "background", "support", "mechanism", "recent"}
+    ):
+        return "conflicted", "conflicting evidence was found and must stay visible."
+    if evidence_count < min(2, papers_found) and papers_found >= 2:
+        return "weak", "evidence coverage is sparse relative to returned papers."
+    return "covered", None
+
+
+def _gap_search_decisions(
+    coverage: list[CoverageMatrixRow],
+    *,
+    query_plan: BiomedicalQueryPlan,
+    existing_queries: set[str],
+    max_decisions: int,
+) -> list[GapSearchDecision]:
+    result: list[GapSearchDecision] = []
+    for row in coverage:
+        if row.pass_index != 1:
+            continue
+        if row.retrieval_intent == "primary":
+            continue
+        if row.coverage_status not in {"weak", "missing", "source_limited"}:
+            continue
+        followup_query = _followup_query_for_gap(row, query_plan)
+        if followup_query.lower() in existing_queries:
+            followup_query = f"{followup_query} additional evidence"
+        result.append(
+            GapSearchDecision(
+                gap_id=_gap_id(row.subquestion_id, row.coverage_status),
+                subquestion_id=row.subquestion_id,
+                retrieval_intent=row.retrieval_intent,
+                followup_query=followup_query[:300].rstrip(),
+                reason=row.gap_reason
+                or f"{row.retrieval_intent} coverage was {row.coverage_status}.",
+            )
+        )
+        if len(result) >= max(0, max_decisions):
+            break
+    return result
+
+
+def _followup_query_for_gap(
+    row: CoverageMatrixRow,
+    query_plan: BiomedicalQueryPlan,
+) -> str:
+    base = query_plan.primary_query or row.query
+    if row.retrieval_intent == "refute":
+        suffix = "conflicting evidence negative results null findings"
+    elif row.retrieval_intent == "mechanism":
+        suffix = "mechanism pathway biological process"
+    elif row.retrieval_intent == "limitation":
+        suffix = "limitations study design cohort model system"
+    elif row.retrieval_intent == "recent":
+        suffix = "recent evidence"
+    elif row.retrieval_intent == "background":
+        suffix = "background review"
+    else:
+        suffix = "supporting evidence"
+    return re.sub(r"\s+", " ", f"{base} {suffix}").strip()
+
+
+def _gap_id(subquestion_id: str, status: str) -> str:
+    digest = hashlib.sha256(f"{subquestion_id}:{status}".encode("utf-8")).hexdigest()[
+        :12
+    ]
+    return f"gap-{digest}"
+
+
+def _coverage_stop_reason(coverage: list[CoverageMatrixRow]) -> str:
+    if not coverage:
+        return "no_multi_pass_coverage"
+    actionable = [
+        row
+        for row in coverage
+        if row.retrieval_intent != "primary"
+        and row.coverage_status in {"weak", "missing", "source_limited"}
+    ]
+    if not actionable:
+        return "coverage_sufficient"
+    return "gaps_recorded_without_followup"
+
+
+def _build_evidence_packet(
+    *,
+    request: AnswerWithEvidenceRequest,
+    planning_result: PlanBiomedicalSearchResult | None,
+    retrieval_manifest: RetrievalManifest,
+    retrieval_bundle: RetrievalBundle | None,
+    metadata: list[PaperMetadata],
+    evidence: list[EvidenceItem],
+) -> EvidencePacketSummary:
+    bundle_manifest_ids = (
+        [
+            record.retrieval_id
+            for record in retrieval_bundle.records
+            if record.retrieval_id
+        ]
+        if retrieval_bundle is not None
+        else []
+    )
+    coverage_matrix = (
+        retrieval_bundle.coverage_matrix if retrieval_bundle is not None else []
+    )
+    coverage_gaps = [
+        row
+        for row in coverage_matrix
+        if row.coverage_status in {"weak", "missing", "source_limited", "conflicted"}
+    ]
+    source_warnings = _merge_unique(
+        retrieval_manifest.warnings,
+        retrieval_bundle.warnings if retrieval_bundle is not None else [],
+        *(
+            [record.warnings for record in retrieval_bundle.records]
+            if retrieval_bundle is not None
+            else []
+        ),
+    )
+    return EvidencePacketSummary(
+        packet_id=_evidence_packet_id(request.question, retrieval_manifest.retrieval_id),
+        question=request.question,
+        planner_mode=(
+            planning_result.query_plan.planner_mode
+            if planning_result is not None and planning_result.query_plan is not None
+            else "deterministic"
+        ),
+        source=request.source,
+        subquestions=(
+            retrieval_bundle.subquestions if retrieval_bundle is not None else []
+        ),
+        retrieval_manifest_ids=_merge_unique(
+            [retrieval_manifest.retrieval_id],
+            bundle_manifest_ids,
+        ),
+        paper_ids=[item.paper_id for item in metadata],
+        evidence_ids=[item.evidence_id for item in evidence],
+        supported_claims=_merge_unique(
+            [
+                item.claim
+                for item in evidence
+                if item.evidence_direction in {"supports", "background"}
+            ]
+        )[:12],
+        conflicting_claims=_merge_unique(
+            [
+                item.claim
+                for item in evidence
+                if item.evidence_direction in {"contradicts", "inconclusive"}
+            ]
+        )[:12],
+        limitations=_merge_unique(_collect_limitations(evidence))[:12],
+        coverage_matrix=coverage_matrix,
+        coverage_gaps=coverage_gaps,
+        gap_decisions=(
+            retrieval_bundle.gap_decisions if retrieval_bundle is not None else []
+        ),
+        source_warnings=source_warnings,
+        stop_reason=(
+            retrieval_bundle.stop_reason
+            if retrieval_bundle is not None and retrieval_bundle.stop_reason
+            else "single_pass"
+        ),
+        created_at=_now_iso(),
+    )
+
+
+def _evidence_packet_id(question: str, retrieval_id: str) -> str:
+    digest = hashlib.sha256(f"{question}:{retrieval_id}".encode("utf-8")).hexdigest()[
+        :16
+    ]
+    return f"packet-{digest}"
 
 
 def _llm_extraction_payload(
@@ -3298,6 +3953,7 @@ def _llm_synthesis_payload(
     papers: dict[str, BiomedicalPaper],
     retrieval_manifest: RetrievalManifest,
     retrieval_bundle: RetrievalBundle | None,
+    evidence_packet: EvidencePacketSummary | None,
     uncertainty: ConfidenceLevel,
 ) -> dict[str, object]:
     return {
@@ -3318,6 +3974,11 @@ def _llm_synthesis_payload(
             "compiled_query": retrieval_manifest.compiled_query,
             "bundle": _retrieval_bundle_trace(retrieval_bundle),
         },
+        "evidence_packet": (
+            evidence_packet.model_dump(mode="json")
+            if evidence_packet is not None
+            else None
+        ),
         "citations": [citation.model_dump(mode="json") for citation in citations],
         "evidence_items": [
             {
@@ -3457,7 +4118,8 @@ def _llm_planner_payload(
             "Do not answer the biomedical question.",
             "Do not override deterministic clinical guardrails.",
             "Use only these intents: research_question, clinical_or_patient_specific, needs_clarification, out_of_scope.",
-            "The query plan must include primary_query, mesh_terms, include_terms, exclude_terms, support_queries, refute_queries, max_results, and rationale.",
+            "The query plan must include primary_query, mesh_terms, include_terms, exclude_terms, support_queries, refute_queries, subquestions, max_results, and rationale.",
+            "Subquestions should use retrieval_intent values: background, support, refute, mechanism, limitation, recent.",
             "Keep queries concise and suitable for PubMed or deterministic mock retrieval.",
         ],
         "question": request.question,
@@ -3561,6 +4223,22 @@ def _query_plan_from_llm(
         " ",
         str(value.get("primary_query") or fallback.primary_query),
     ).strip()
+    max_results = max(
+        1, min(_safe_int(value.get("max_results"), fallback.max_results), 50)
+    )
+    support_queries = (
+        _coerce_string_list(value.get("support_queries")) or fallback.support_queries
+    )
+    refute_queries = (
+        _coerce_string_list(value.get("refute_queries")) or fallback.refute_queries
+    )
+    subquestions = _coerce_retrieval_subquestions(
+        value.get("subquestions"),
+        fallback=fallback,
+        support_queries=support_queries,
+        refute_queries=refute_queries,
+        max_results=max(1, min(max_results, 5)),
+    )
     return BiomedicalQueryPlan(
         plan_id=_plan_id(fallback.question, fallback.source, "llm", prompt_hash),
         question=fallback.question,
@@ -3579,18 +4257,86 @@ def _query_plan_from_llm(
         or fallback.study_types,
         species_terms=_coerce_string_list(value.get("species_terms"))
         or fallback.species_terms,
-        support_queries=_coerce_string_list(value.get("support_queries"))
-        or fallback.support_queries,
-        refute_queries=_coerce_string_list(value.get("refute_queries"))
-        or fallback.refute_queries,
-        max_results=max(
-            1, min(_safe_int(value.get("max_results"), fallback.max_results), 50)
-        ),
+        support_queries=support_queries,
+        refute_queries=refute_queries,
+        subquestions=subquestions,
+        max_results=max_results,
         rationale=str(value.get("rationale") or fallback.rationale),
         warnings=_coerce_string_list(value.get("warnings")),
         llm_model=model,
         llm_prompt_hash=prompt_hash,
         llm_raw_response=raw_response,
+    )
+
+
+def _coerce_retrieval_subquestions(
+    value: object,
+    *,
+    fallback: BiomedicalQueryPlan,
+    support_queries: list[str],
+    refute_queries: list[str],
+    max_results: int,
+) -> list[RetrievalSubquestion]:
+    allowed: set[str] = {
+        "primary",
+        "background",
+        "support",
+        "refute",
+        "mechanism",
+        "limitation",
+        "recent",
+    }
+    result: list[RetrievalSubquestion] = []
+    seen_queries: set[str] = set()
+    if isinstance(value, list):
+        for index, raw in enumerate(value, start=1):
+            if not isinstance(raw, dict):
+                continue
+            query = re.sub(r"\s+", " ", str(raw.get("query") or "")).strip()
+            if not query:
+                continue
+            intent = str(raw.get("retrieval_intent") or raw.get("intent") or "support")
+            if intent not in allowed:
+                intent = "support"
+            key = query.lower()
+            if key in seen_queries:
+                continue
+            seen_queries.add(key)
+            question = re.sub(
+                r"\s+",
+                " ",
+                str(raw.get("question") or raw.get("subquestion") or query),
+            ).strip()
+            reason = re.sub(
+                r"\s+",
+                " ",
+                str(raw.get("reason") or f"LLM planned {intent} retrieval."),
+            ).strip()
+            result.append(
+                RetrievalSubquestion(
+                    subquestion_id=str(
+                        raw.get("subquestion_id")
+                        or _subquestion_id(fallback.question, intent, index)
+                    ),
+                    question=question[:300].rstrip(),
+                    query=query[:300].rstrip(),
+                    retrieval_intent=cast(Any, intent),
+                    reason=reason[:300].rstrip(),
+                    max_results=max(1, min(_safe_int(raw.get("max_results"), max_results), 10)),
+                )
+            )
+            if len(result) >= 5:
+                break
+    if result:
+        return result
+    if fallback.subquestions:
+        return fallback.subquestions
+    return _deterministic_retrieval_subquestions(
+        question=fallback.question,
+        primary_query=fallback.primary_query,
+        support_queries=support_queries,
+        refute_queries=refute_queries,
+        max_results=max_results,
     )
 
 
@@ -3733,6 +4479,13 @@ def _plan_id(question: str, source: str, mode: str, nonce: str = "") -> str:
         f"{question.lower()}:{source}:{mode}:{nonce}".encode("utf-8")
     ).hexdigest()[:16]
     return f"plan-{digest}"
+
+
+def _subquestion_id(question: str, intent: str, index: int) -> str:
+    digest = hashlib.sha256(
+        f"{question.lower()}:{intent}:{index}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"subq-{digest}"
 
 
 def _safe_int(value: object, fallback: int) -> int:
@@ -4432,13 +5185,33 @@ def _retrieval_bundle_trace(bundle: RetrievalBundle | None) -> dict[str, object]
         "executed_multi_query": bundle.executed_multi_query,
         "deduped_paper_ids": bundle.deduped_paper_ids,
         "duplicate_paper_ids": bundle.duplicate_paper_ids,
+        "subquestions": [
+            item.model_dump(mode="json") for item in bundle.subquestions
+        ],
+        "coverage_matrix": [
+            item.model_dump(mode="json") for item in bundle.coverage_matrix
+        ],
+        "gap_decisions": [
+            item.model_dump(mode="json") for item in bundle.gap_decisions
+        ],
+        "stop_reason": bundle.stop_reason,
         "warnings": bundle.warnings,
         "records": [
             {
                 "intent": record.intent,
                 "query": record.query,
+                "query_id": record.query_id,
+                "subquestion_id": record.subquestion_id,
+                "reason": record.reason,
+                "pass_index": record.pass_index,
                 "retrieval_id": record.retrieval_id,
                 "returned_paper_ids": record.returned_paper_ids,
+                "added_paper_ids": record.added_paper_ids,
+                "coverage": (
+                    record.coverage.model_dump(mode="json")
+                    if record.coverage is not None
+                    else None
+                ),
                 "warnings": record.warnings,
                 "errors": record.errors,
                 "skipped_reason": record.skipped_reason,
@@ -4652,6 +5425,11 @@ def _build_trace_steps(
                 else []
             ),
             "retrieval_bundle": _retrieval_bundle_trace(result.retrieval_bundle),
+            "evidence_packet": (
+                result.evidence_packet.model_dump(mode="json")
+                if result.evidence_packet is not None
+                else None
+            ),
             "project_context_trace": result.project_context_trace,
         },
     )
@@ -4663,6 +5441,16 @@ def _build_trace_steps(
         metadata={
             "evidence_intent_counts": _evidence_intent_counts(result.evidence_summary),
             "extraction_mode_counts": _extraction_mode_counts(result.evidence_summary),
+            "evidence_packet_id": (
+                result.evidence_packet.packet_id
+                if result.evidence_packet is not None
+                else None
+            ),
+            "coverage_gap_count": (
+                len(result.evidence_packet.coverage_gaps)
+                if result.evidence_packet is not None
+                else 0
+            ),
         },
     )
     add(
