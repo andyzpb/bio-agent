@@ -44,6 +44,7 @@ from plugins.akasha.core import (
     graph_seed_keys_from_snapshot as _graph_seed_keys_from_snapshot,
     parse_turn_key as _parse_turn_key,
     bounded_add as _bounded_add,
+    reinforce_boost_from_payload as _reinforce_boost_from_payload,
 )
 from agent.config_models import Config
 from bus.events_lifecycle import TurnCommitted
@@ -161,7 +162,7 @@ class AkashaMemoryEngine:
             build_idf_table, idf_table_is_stale, load_idf_from_db, set_idf_table,
         )
         sessions_db = str(self._session_db_path)
-        conn = self._store._db
+        conn = self._store.db
         try:
             stale = idf_table_is_stale(sessions_db, conn)
         except Exception:
@@ -224,7 +225,26 @@ class AkashaMemoryEngine:
                     "required": ["query"],
                 },
                 search_hint="历史对话 原始消息 Akasha 右脑联想",
-            )
+            ),
+            tools=(
+                MemoryToolSpec(
+                    name="reinforce_memory",
+                    description=(
+                        "加强记忆。当用户纠正你刚才依据记忆给的答案/做法,或明确强调某事该被记牢时调用。"
+                        "把当前情境的记忆绑得更牢,影响未来召回(纯加强,不删除、不改写其它记忆)。"
+                        "例:用户说'查睡眠该用 snapshot 不是 sleep report'后,调用本工具加强这条理解。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "note": {"type": "string", "description": "为什么加强(简述纠正/强调的要点)"},
+                        },
+                        "required": [],
+                    },
+                    risk="write",
+                    search_hint="纠正 强调 记牢 加强记忆",
+                ),
+            ),
         )
 
     # 根据 MemoryQuery 执行 Akasha 检索。
@@ -254,8 +274,15 @@ class AkashaMemoryEngine:
                 }
             )
         query_vec = np.array(await self._embedder.embed(query_text), dtype=np.float32)
-        result = self._retrieve(query_text, query_vec, request, now_ts=now_ts)
-        if request.intent in {"context", "answer"}:
+        stateful = request.effect != "read_only"
+        result = self._retrieve(
+            query_text,
+            query_vec,
+            request,
+            now_ts=now_ts,
+            update_state=stateful,
+        )
+        if stateful and request.intent in {"context", "answer"}:
             self._remember_pending_activation(request, result.activation_items, now_ts=now_ts)
 
         # 4. context 注入按 Akasha 配置展示 topK；工具查询继续尊重调用方 limit。
@@ -287,7 +314,7 @@ class AkashaMemoryEngine:
         cards = [*dense_cards, *ripple_cards]
 
         # 5. 记录检索诊断日志（context/answer intent 才有意义）。
-        if request.intent in {"context", "answer"} and request.scope.session_key:
+        if stateful and request.intent in {"context", "answer"} and request.scope.session_key:
             self._write_query_log(
                 request=request,
                 result=result,
@@ -304,6 +331,7 @@ class AkashaMemoryEngine:
                 "engine": self.DESCRIPTOR.name,
                 "profile": self.DESCRIPTOR.profile.value,
                 "intent": request.intent,
+                "effect": request.effect,
                 "dense_count": len(dense_cards),
                 "ripple_count": len(ripple_cards),
                 "seed_count": result.trace.seed_count,
@@ -500,6 +528,7 @@ class AkashaMemoryEngine:
         request: MemoryQuery,
         *,
         now_ts: float,
+        update_state: bool,
     ) -> "_AkashaRetrieval":
         # 1. 准备内存图和当前查询所在的预测 seq。
         snapshot = self._graph_snapshot()
@@ -556,10 +585,11 @@ class AkashaMemoryEngine:
             if source_db is not None:
                 source_db.close()
 
-        # 3. 查询阶段只更新旧节点状态，当前 turn 的边等 after-turn 再补。
-        updates = _activation_updates(activation_items, snapshot.nodes, now_ts)
-        self._store.update_activation_batch(updates)
-        self._apply_activation_updates(updates)
+        # 3. 只读查询没有记忆动力学副作用。
+        if update_state:
+            updates = _activation_updates(activation_items, snapshot.nodes, now_ts)
+            self._store.update_activation_batch(updates)
+            self._apply_activation_updates(updates)
         return _AkashaRetrieval(
             dense_items=dense_items,
             ripple_items=ripple_items,
@@ -590,7 +620,7 @@ class AkashaMemoryEngine:
     # TurnCommitted 后把真实 user/assistant 写入 sidecar，并补本轮共激活边。
     async def _on_turn_committed(self, event: TurnCommitted) -> None:
         # 1. 跳过不应进入记忆的系统轮次。
-        if bool((event.extra or {}).get("skip_post_memory")):
+        if event.session_key.startswith("scheduler:") or bool((event.extra or {}).get("skip_post_memory")):
             return
         messages = _load_committed_turn_messages(self._session_db_path, event)
         if not messages:
@@ -610,17 +640,24 @@ class AkashaMemoryEngine:
             self._refresh_cached_message(message, embedding, current_key)
 
         # 3. 用真实 current_key 建边，并记录激活诊断。
+        #    reinforce 标记 = 本轮调用了 reinforce_memory 工具(记在 tool_chain)或 extra 回填；
+        #    与离线重建(build._load_reinforce_boosts)读同一来源，live 与重放一致。
+        gain_boost = _reinforce_boost_for_turn(
+            event.extra,
+            event.tool_chain_raw,
+        )
         pending = self._pending_by_session.pop(event.session_key, None)
         if current_key and pending is not None:
-            self._commit_pending_activation(current_key, pending)
+            self._commit_pending_activation(current_key, pending, gain_boost=gain_boost)
 
     # 把 pending activation 转成边和事件。
     def _commit_pending_activation(
         self,
         current_key: str,
         pending: PendingActivation,
+        gain_boost: float = 1.0,
     ) -> None:
-        edge_updates = _activation_edge_updates(current_key, pending.items, pending.ts)
+        edge_updates = _activation_edge_updates(current_key, pending.items, pending.ts, gain_boost)
         self._store.upsert_edges(edge_updates)
         self._apply_edge_updates(edge_updates)
 
@@ -981,6 +1018,13 @@ class _AkashaRetrieval:
     activation_items: list[AkashaCandidate]
     trace: ActivationTrace
     seq: int
+
+
+def _reinforce_boost_for_turn(
+    event_extra: dict[str, object] | None,
+    tool_chain: list[dict[str, object]],
+) -> float:
+    return _reinforce_boost_from_payload(event_extra, tool_chain)
 
 
 def _core_config(config: AkashaConfig) -> CoreConfig:
