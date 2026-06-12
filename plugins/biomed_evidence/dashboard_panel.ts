@@ -386,6 +386,10 @@ function renderManifest(manifest: RetrievalManifest | null | undefined): string 
   `;
 }
 
+function renderLoading(message: string): string {
+  return `<div class="biomed-loading">${escapeHtml(message)}</div>`;
+}
+
 async function hydrateRetrievalBlocks(container: HTMLElement): Promise<void> {
   const blocks = Array.from(container.querySelectorAll<HTMLElement>("[data-biomed-retrieval-id]"));
   await Promise.all(blocks.map(async (block) => {
@@ -873,27 +877,57 @@ function renderTabs(view: BiomedView): string {
 function renderAsk(container: HTMLElement): void {
   container.innerHTML += `
     <div class="biomed-section">
-      <div class="biomed-title">Ask Evidence Question</div>
+      <div class="biomed-section-head">
+        <div>
+          <div class="biomed-title">Ask Evidence Question</div>
+          <div class="biomed-subtitle">Research-only biomedical evidence workflow</div>
+        </div>
+        ${pill("V2.1")}
+      </div>
       <div class="biomed-form">
-        <textarea id="biomed-question" rows="4">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
-        <div class="biomed-row">
-          <select id="biomed-project-select">
-            <option value="">no project</option>
-          </select>
-          <select id="biomed-source">
-            <option value="mock">mock</option>
-            <option value="pubmed">pubmed</option>
-          </select>
-          <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
-          <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
-          <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
-          <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
-          <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
-          <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
-          <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
-          <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
-          <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
-          <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Export facts</label>
+        <label class="biomed-field">
+          <span class="biomed-label">Question</span>
+          <textarea id="biomed-question" rows="5">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
+        </label>
+        <div class="biomed-control-grid">
+          <label class="biomed-field">
+            <span class="biomed-label">Project</span>
+            <select id="biomed-project-select">
+              <option value="">no project</option>
+            </select>
+          </label>
+          <label class="biomed-field">
+            <span class="biomed-label">Source</span>
+            <select id="biomed-source">
+              <option value="mock">mock</option>
+              <option value="pubmed">pubmed</option>
+            </select>
+          </label>
+          <label class="biomed-field">
+            <span class="biomed-label">Papers</span>
+            <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
+          </label>
+        </div>
+        <div class="biomed-option-panel">
+          <div class="biomed-label">Retrieval</div>
+          <div class="biomed-toggle-grid">
+            <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
+            <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
+          </div>
+        </div>
+        <div class="biomed-option-panel">
+          <div class="biomed-label">LLM + Audit</div>
+          <div class="biomed-toggle-grid">
+            <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
+            <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
+            <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
+            <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
+            <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
+            <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
+            <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Export facts</label>
+          </div>
+        </div>
+        <div class="biomed-action-row">
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
         </div>
@@ -904,7 +938,9 @@ function renderAsk(container: HTMLElement): void {
   container.querySelector<HTMLButtonElement>("#biomed-ask-btn")?.addEventListener("click", async () => {
     const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
     if (!resultNode) return;
-    resultNode.textContent = "Running evidence search...";
+    const button = container.querySelector<HTMLButtonElement>("#biomed-ask-btn");
+    resultNode.innerHTML = renderLoading("Running evidence search...");
+    if (button) button.disabled = true;
     const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
     const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
@@ -971,12 +1007,16 @@ function renderAsk(container: HTMLElement): void {
       });
     } catch (error) {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    } finally {
+      if (button) button.disabled = false;
     }
   });
   container.querySelector<HTMLButtonElement>("#biomed-audited-btn")?.addEventListener("click", async () => {
     const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
     if (!resultNode) return;
-    resultNode.textContent = "Running evidence search, audit, and revision...";
+    const button = container.querySelector<HTMLButtonElement>("#biomed-audited-btn");
+    resultNode.innerHTML = renderLoading("Running evidence search, audit, and revision...");
+    if (button) button.disabled = true;
     const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
     const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
     const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
@@ -1013,6 +1053,8 @@ function renderAsk(container: HTMLElement): void {
       resultNode.innerHTML = renderAuditedAnswer(result);
     } catch (error) {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    } finally {
+      if (button) button.disabled = false;
     }
   });
   void loadProjectOptions(container);
