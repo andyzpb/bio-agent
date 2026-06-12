@@ -6,14 +6,13 @@ integrations, tool plugins, and a FastAPI dashboard.
 
 This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
 a research-only biomedical literature assistant built on top of the framework.
-The current implementation is **V2.0 Project Evidence Workspace + Review
-Memory**.
+The current implementation is **V2.1 Claim Logic Entailment + Fact Export**.
 
 The biomedical direction is claim-level evidence trustworthiness: every answer
 should be traceable from question, routing, retrieval plan, retrieved papers,
 evidence spans, citations, audit, revision, and final output.
 
-## Current V2.0 Snapshot
+## Current V2.1 Snapshot
 
 Implemented now:
 
@@ -29,10 +28,17 @@ Implemented now:
   evidence spans, and retrieval-intent provenance.
 - Optional LLM stages behind explicit flags:
   `use_llm_planner`, `use_llm_extractor`, `use_llm_synthesis`,
-  `use_llm_verifier`, and `use_llm_revision`.
+  `use_llm_verifier`, `use_llm_revision`, and `use_llm_claim_logic`.
 - Citation-grounded answers with deterministic claim-level audit, overclaim
   checks, conflict awareness, uncertainty calibration, audit/revise loop, and
   persisted trace.
+- V2.1 claim logic audit with schema-validated logical claim/evidence frames,
+  deterministic biomedical entailment rules, optional `logic_audit` attachment
+  to claim audits, and explicit fallback warnings when LLM claim parsing is
+  requested but unavailable.
+- V2.1 symbolic logic fact export for claim/evidence frames, alignments,
+  non-entailment rules, triggered rules, mismatch facts, warnings, and final
+  verdict facts. Fact export is deterministic and does not call an LLM.
 - Optional advisory verifier model. It records disagreement and review pressure,
   but deterministic audit remains the verifier of record.
 - V2.0 project evidence workspace:
@@ -46,16 +52,16 @@ Implemented now:
 Project memory is context only. It can influence planning preferences and
 post-retrieval filtering, but it is never treated as biomedical evidence.
 
-## Roadmap Highlight: V2.1 Claim Logic Entailment + Fact Export
+## Highlight: V2.1 Claim Logic Entailment + Fact Export
 
-The next planned hardening step is a **schema-constrained biomedical claim
+The latest hardening step adds a **schema-constrained biomedical claim
 logic parser**. Instead of asking an LLM to judge whether a citation supports a
-claim, V2.1 will use the LLM only as a semantic parser and then export the
+claim, V2.1 uses typed logical frames and then exports the
 deterministic reasoning trace as symbolic facts:
 
 ```text
 claim / evidence text
-  -> LLM-assisted logical frame parsing
+  -> logical frame parsing
   -> Pydantic schema validation
   -> deterministic biomedical entailment rules
   -> symbolic logic fact export
@@ -68,12 +74,12 @@ human claims, mechanistic findings turned into treatment claims, weak evidence
 written as definitive, and citations that mention the right entities but do not
 actually entail the generated claim.
 
-The key trust boundary is that the LLM helps formalize language, while
-deterministic code remains the source of record for support, overclaim, scope,
-population, modality, and clinical-boundary verdicts. The fact export layer is
-for inspectability, regression testing, and future Datalog/Prolog/Z3-style
-solver integration; it does not prove biomedical truth or override the audit
-verdict.
+The key trust boundary is that any LLM parser may only help formalize language,
+while deterministic code remains the source of record for support, overclaim,
+scope, population, modality, and clinical-boundary verdicts. The fact export
+layer is for inspectability, regression testing, and future
+Datalog/Prolog/Z3-style solver integration; it does not prove biomedical truth
+or override the audit verdict.
 
 ## Version Summary
 
@@ -98,29 +104,43 @@ verdict.
 - V2.0: Project evidence workspace, project memory as context, saved/rejected
   paper decisions, project claims, review queue, evidence briefs, dashboard
   Projects view, API/tools, and project-level eval metrics.
+- V2.1: Claim logic entailment audit with schema-validated logical frames,
+  deterministic semantic overclaim rules, audit/trace integration, and
+  symbolic logic fact export.
+- V2.2 planned: Provider-backed LLM claim/evidence logic parser hardening,
+  stricter clinical-boundary short-circuiting, Logic Facts dashboard polish, and
+  expanded claim-logic eval gates.
 
-## What Remains
+## Next Roadmap: V2.2
 
-Near-term V2.1:
+V2.2 should turn the current V2.1 claim-logic base into a stronger
+LLM-assisted semantic parser path while preserving the deterministic audit as
+the source of record.
 
-- LLM-assisted claim logic parser for generated atomic claims and aligned
-  evidence spans.
-- Schema-validated logical claim/evidence frames with parser mode, model, prompt
-  hash, source spans, and fallback warnings.
-- Deterministic biomedical entailment rules for association-to-causation,
-  animal/in-vitro-to-human, mechanism-to-treatment, weak-to-definitive,
-  diagnostic, prognostic, population, scope, and modality overclaims.
-- Symbolic logic fact export for parsed claim/evidence frames, alignments,
-  non-entailment rules, triggered rules, mismatches, warnings, and final
-  verdicts.
-- `ClaimAuditItem` / audit JSON integration so logic verdicts, triggered rules,
-  mismatches, and reasons appear in audit, trace, and dashboard output.
-- Golden tests and metrics for logic parser validity, expected rule recall,
-  expected verdict accuracy, fact export determinism, expected fact recall,
-  symbol normalization, fallback rate, clinical-boundary preservation, and
-  project-memory isolation.
+Planned V2.2 scope:
 
-After V2.1:
+- Add provider-backed LLM claim/evidence parsers for `use_llm_claim_logic`,
+  including JSON-only prompts, prompt hashes, model metadata, validation errors,
+  parser warnings, and explainable fallback reasons.
+- Keep final support, overclaim, scope, population, modality, and clinical
+  verdicts deterministic. The LLM may only formalize claim/evidence semantics.
+- Short-circuit clinical refusal paths before claim-logic parsing and fact
+  export, so clinical guardrails cannot create misleading `not_assessed` logic
+  artifacts.
+- Add a first-class dashboard Logic Facts panel for each audited claim,
+  including parsed frames, triggered rules, mismatch facts, exported symbolic
+  facts, parser mode/model, and fallback warnings.
+- Expand golden claim-logic evals for association-to-causation,
+  animal/in-vitro-to-human, mechanism-to-treatment, biomarker-to-diagnostic,
+  nonlongitudinal-to-prognostic, weak-to-definitive, and inconclusive evidence
+  cases.
+- Add CI-visible metrics for parser schema success, fallback rate, expected
+  verdict accuracy, expected rule recall, fact export determinism, expected fact
+  recall, symbol normalization errors, and clinical-boundary-before-logic rate.
+- Re-run local Ollama smoke with `gpt-oss:120b-cloud` across planner,
+  extractor, synthesis, verifier, revision, and claim-logic parser paths.
+
+Deferred after V2.2:
 
 - Richer project reviewer workflows: accept/reject review queue items, claim
   status transitions, reviewer notes, and decision provenance.
@@ -417,7 +437,9 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     "use_llm_synthesis": true,
     "use_llm_verifier": true,
     "use_llm_revision": true,
-    "execute_support_refute": true
+    "execute_support_refute": true,
+    "use_llm_claim_logic": true,
+    "export_logic_facts": true
   }' | jq '{
     planner_mode: .answer_result.query_plan.planner_mode,
     extraction_modes: ([.answer_result.evidence_summary[].extraction_mode] | unique),
@@ -428,13 +450,23 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     retrieval_records: (.answer_result.retrieval_bundle.records | length),
     citations: (.answer_result.citations | length),
     evidence: (.answer_result.evidence_summary | length),
+    logic_trace: ([.trace[] | select(.step=="audit") | .metadata.logic_audit][0]),
+    logic_verdicts: [.audit.claim_audits[] | .logic_audit.logic_verdict],
+    fact_exports: [.audit.claim_audits[] | .logic_audit.logic_fact_export.export_id],
     trace_steps: (.trace | length)
   }'
 ```
 
 With no configured LLM provider, optional LLM stages may report `fallback`.
-The request should still return citations, a retrieval bundle, and an 11-step
-trace.
+The request should still return citations, a retrieval bundle, logic-audit
+metadata when requested, and an 11-step trace.
+
+Recent V2.1 Ollama smoke was run with the local Ollama Pro
+OpenAI-compatible endpoint and `gpt-oss:120b-cloud`. Planner, synthesis,
+advisory verifier, and revision returned through the LLM path; claim-logic
+audit and symbolic fact export were present in audit JSON and trace metadata.
+The current claim/evidence logic parser may still report deterministic
+`fallback`, which is the main V2.2 hardening target.
 
 ## Docker
 

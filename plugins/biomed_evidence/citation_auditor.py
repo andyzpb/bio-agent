@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Iterable, cast
 
+from plugins.biomed_evidence.claim_logic import audit_claim_logic
 from plugins.biomed_evidence.schemas import (
     AtomicClaim,
     AuditRecommendedAction,
@@ -18,10 +19,11 @@ from plugins.biomed_evidence.schemas import (
     ConflictVerdict,
     EvidenceItem,
     EvidenceStrength,
+    LogicAuditResult,
+    LogicParserMode,
     RetrievalManifest,
     UncertaintyAudit,
 )
-
 
 _STOPWORDS = {
     "about",
@@ -71,11 +73,22 @@ def validate_citation_support(
     retrieval_id: str | None = None,
     observed_uncertainty: str | None = None,
     retrieval_manifest: RetrievalManifest | None = None,
+    use_llm_claim_logic: bool = False,
+    export_logic_facts: bool = False,
 ) -> CitationAuditResult:
     claims = extract_atomic_claims(answer)
     citation_ids = {citation.paper_id for citation in citations}
     claim_audits = [
-        _audit_claim(claim, evidence_items, citation_ids)
+        _audit_claim(
+            claim,
+            evidence_items,
+            citation_ids,
+            use_claim_logic=use_llm_claim_logic or export_logic_facts,
+            claim_logic_parser_mode=(
+                "fallback" if use_llm_claim_logic else "deterministic"
+            ),
+            export_logic_facts=export_logic_facts,
+        )
         for claim in claims
     ]
     uncertainty_audit = derive_uncertainty_audit(
@@ -84,11 +97,11 @@ def validate_citation_support(
         retrieval_manifest=retrieval_manifest,
         observed_uncertainty=observed_uncertainty,
     )
-    failed_claims = [
-        item for item in claim_audits if item.verdict in _FAILED_VERDICTS
-    ]
+    failed_claims = [item for item in claim_audits if item.verdict in _FAILED_VERDICTS]
     supported_claims = [
-        item for item in claim_audits if item.verdict in {"supported", "partial_support"}
+        item
+        for item in claim_audits
+        if item.verdict in {"supported", "partial_support"}
     ]
     unsupported_claims = [
         item
@@ -98,10 +111,16 @@ def validate_citation_support(
     overclaimed_claims = [
         item for item in claim_audits if item.verdict == "overclaimed"
     ]
-    cited_ids = set().union(*(set(item.cited_paper_ids) for item in claim_audits)) if claim_audits else set()
-    supported_citation_ids = set().union(
-        *(set(item.cited_paper_ids) for item in supported_claims)
-    ) if supported_claims else set()
+    cited_ids = (
+        set().union(*(set(item.cited_paper_ids) for item in claim_audits))
+        if claim_audits
+        else set()
+    )
+    supported_citation_ids = (
+        set().union(*(set(item.cited_paper_ids) for item in supported_claims))
+        if supported_claims
+        else set()
+    )
     conflict_awareness = _conflict_awareness(answer, evidence_items)
     recommended_action = _recommended_action(
         failed_claims=failed_claims,
@@ -117,7 +136,9 @@ def validate_citation_support(
         claim_audits=claim_audits,
         uncertainty_audit=uncertainty_audit,
         claim_support_rate=_rate(len(supported_claims), len(claim_audits)),
-        citation_precision=_rate(len(supported_citation_ids), len(citation_ids or cited_ids)),
+        citation_precision=_rate(
+            len(supported_citation_ids), len(citation_ids or cited_ids)
+        ),
         unsupported_claim_rate=_rate(len(unsupported_claims), len(claim_audits)),
         overclaim_rate=_rate(len(overclaimed_claims), len(claim_audits)),
         conflict_awareness=conflict_awareness,
@@ -171,30 +192,47 @@ def derive_uncertainty_audit(
         reasons.append("No atomic claims were available to audit.")
     if any(item.verdict in _FAILED_VERDICTS for item in claim_audits):
         expected = "high"
-        reasons.append("One or more claims were unsupported, overclaimed, contradicted, irrelevant, or not cited.")
-    if any(item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence_items):
+        reasons.append(
+            "One or more claims were unsupported, overclaimed, contradicted, irrelevant, or not cited."
+        )
+    if any(
+        item.evidence_direction in {"contradicts", "inconclusive"}
+        for item in evidence_items
+    ):
         expected = "high"
-        reasons.append("Retrieved evidence includes contradictory or inconclusive findings.")
-    if retrieval_manifest and (retrieval_manifest.warnings or retrieval_manifest.errors):
+        reasons.append(
+            "Retrieved evidence includes contradictory or inconclusive findings."
+        )
+    if retrieval_manifest and (
+        retrieval_manifest.warnings or retrieval_manifest.errors
+    ):
         expected = "high"
         reasons.append("Retrieval manifest contains warnings or errors.")
     if expected != "high" and any(item.confidence == "low" for item in evidence_items):
         expected = "medium"
         reasons.append("At least one evidence item has low confidence.")
-    if expected != "high" and any(_evidence_strength(item) == "animal_or_in_vitro" for item in evidence_items):
+    if expected != "high" and any(
+        _evidence_strength(item) == "animal_or_in_vitro" for item in evidence_items
+    ):
         expected = "medium"
         reasons.append("Evidence includes animal or in-vitro model limitations.")
-    if expected != "high" and any(_evidence_strength(item) == "abstract_only" for item in evidence_items):
+    if expected != "high" and any(
+        _evidence_strength(item) == "abstract_only" for item in evidence_items
+    ):
         expected = "medium"
         reasons.append("Evidence is abstract-level only.")
     if not reasons:
-        reasons.append("Audited claims were citation-supported with no explicit conflict detected.")
+        reasons.append(
+            "Audited claims were citation-supported with no explicit conflict detected."
+        )
     observed: ConfidenceLevel | None = (
         cast(ConfidenceLevel, observed_uncertainty)
         if observed_uncertainty in {"low", "medium", "high"}
         else None
     )
-    calibrated = observed is None or _uncertainty_rank(observed) >= _uncertainty_rank(expected)
+    calibrated = observed is None or _uncertainty_rank(observed) >= _uncertainty_rank(
+        expected
+    )
     return UncertaintyAudit(
         expected_uncertainty=expected,
         observed_uncertainty=observed,
@@ -202,8 +240,22 @@ def derive_uncertainty_audit(
         reasons=reasons,
         grade_like_factors={
             "risk_of_bias": "unclear",
-            "inconsistency": "serious" if any(item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence_items) else "not_serious",
-            "indirectness": "serious" if any(_evidence_strength(item) == "animal_or_in_vitro" for item in evidence_items) else "not_serious",
+            "inconsistency": (
+                "serious"
+                if any(
+                    item.evidence_direction in {"contradicts", "inconclusive"}
+                    for item in evidence_items
+                )
+                else "not_serious"
+            ),
+            "indirectness": (
+                "serious"
+                if any(
+                    _evidence_strength(item) == "animal_or_in_vitro"
+                    for item in evidence_items
+                )
+                else "not_serious"
+            ),
             "imprecision": "unclear",
             "publication_bias": "not_assessed",
         },
@@ -220,17 +272,20 @@ def find_conflicting_evidence(
     supporting = [
         item.paper_id
         for item in evidence_items
-        if item.evidence_direction in {"supports", "background"} and _overlap(claim, _evidence_text(item)) >= 0.08
+        if item.evidence_direction in {"supports", "background"}
+        and _overlap(claim, _evidence_text(item)) >= 0.08
     ]
     contradicting = [
         item.paper_id
         for item in evidence_items
-        if item.evidence_direction == "contradicts" and _overlap(claim, _evidence_text(item)) >= 0.04
+        if item.evidence_direction == "contradicts"
+        and _overlap(claim, _evidence_text(item)) >= 0.04
     ]
     inconclusive = [
         item.paper_id
         for item in evidence_items
-        if item.evidence_direction == "inconclusive" and _overlap(claim, _evidence_text(item)) >= 0.04
+        if item.evidence_direction == "inconclusive"
+        and _overlap(claim, _evidence_text(item)) >= 0.04
     ]
     axes = _conflict_axes(evidence_items)
     verdict: ConflictVerdict
@@ -260,8 +315,14 @@ def _audit_claim(
     claim: AtomicClaim,
     evidence_items: list[EvidenceItem],
     citation_ids: set[str],
+    *,
+    use_claim_logic: bool = False,
+    claim_logic_parser_mode: LogicParserMode = "deterministic",
+    export_logic_facts: bool = False,
 ) -> ClaimAuditItem:
-    cited_ids = claim.cited_paper_ids or _infer_cited_ids(claim.text, evidence_items, citation_ids)
+    cited_ids = claim.cited_paper_ids or _infer_cited_ids(
+        claim.text, evidence_items, citation_ids
+    )
     if not cited_ids:
         return _claim_audit(
             claim,
@@ -270,6 +331,9 @@ def _audit_claim(
             verdict="not_cited",
             support_score=0.0,
             reason="No citation or cited paper ID was aligned to this claim.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
     candidates = [item for item in evidence_items if item.paper_id in cited_ids]
     if not candidates:
@@ -280,6 +344,9 @@ def _audit_claim(
             verdict="irrelevant_citation",
             support_score=0.0,
             reason="The claim cites papers that have no extracted evidence item in this run.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
     ranked = sorted(
         ((item, _overlap(claim.text, _evidence_text(item))) for item in candidates),
@@ -297,8 +364,14 @@ def _audit_claim(
             support_score=round(score, 3),
             reason=overclaim_reason,
             overclaim_reason=overclaim_reason,
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
-    if best.evidence_direction == "contradicts" and not _claim_reports_limiting_evidence(claim.text):
+    if (
+        best.evidence_direction == "contradicts"
+        and not _claim_reports_limiting_evidence(claim.text)
+    ):
         return _claim_audit(
             claim,
             cited_paper_ids=cited_ids,
@@ -306,6 +379,9 @@ def _audit_claim(
             verdict="contradicted",
             support_score=round(score, 3),
             reason="The cited evidence is a contradicting finding, but the claim presents it as positive support.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
     if best.evidence_direction == "inconclusive":
         return _claim_audit(
@@ -315,6 +391,9 @@ def _audit_claim(
             verdict="partial_support",
             support_score=round(score, 3),
             reason="The citation aligns to evidence marked inconclusive, so support is partial.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
     if score >= 0.14:
         return _claim_audit(
@@ -324,6 +403,9 @@ def _audit_claim(
             verdict="supported",
             support_score=round(score, 3),
             reason="The cited evidence span overlaps with and supports the claim.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
     if score >= 0.06:
         return _claim_audit(
@@ -333,6 +415,9 @@ def _audit_claim(
             verdict="partial_support",
             support_score=round(score, 3),
             reason="The citation is directionally relevant but only partially overlaps the claim.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
         )
     return _claim_audit(
         claim,
@@ -341,6 +426,9 @@ def _audit_claim(
         verdict="insufficient_evidence",
         support_score=round(score, 3),
         reason="The citation exists, but extracted evidence does not substantively support the claim.",
+        use_claim_logic=use_claim_logic,
+        claim_logic_parser_mode=claim_logic_parser_mode,
+        export_logic_facts=export_logic_facts,
     )
 
 
@@ -353,9 +441,12 @@ def _claim_audit(
     support_score: float,
     reason: str,
     overclaim_reason: str | None = None,
+    use_claim_logic: bool = False,
+    claim_logic_parser_mode: LogicParserMode = "deterministic",
+    export_logic_facts: bool = False,
 ) -> ClaimAuditItem:
     best = evidence_items[0] if evidence_items else None
-    return ClaimAuditItem(
+    audit_item = ClaimAuditItem(
         claim_id=claim.claim_id,
         claim=claim.text,
         claim_type=claim.claim_type,
@@ -364,11 +455,75 @@ def _claim_audit(
         evidence_span=best.evidence_span if best is not None else None,
         verdict=verdict,
         support_score=support_score,
-        evidence_strength=_evidence_strength(best) if best is not None else "not_assessed",
+        evidence_strength=(
+            _evidence_strength(best) if best is not None else "not_assessed"
+        ),
         overclaim_reason=overclaim_reason,
         reason=reason,
         reviewer_notes=_reviewer_notes(evidence_items),
     )
+    if not use_claim_logic:
+        return audit_item
+    logic = audit_claim_logic(
+        claim,
+        evidence_items,
+        parser_mode=claim_logic_parser_mode,
+        export_facts=export_logic_facts,
+    )
+    return _merge_logic_audit(audit_item, logic)
+
+
+def _merge_logic_audit(
+    audit_item: ClaimAuditItem,
+    logic: LogicAuditResult,
+) -> ClaimAuditItem:
+    reviewer_notes = _merge_unique(
+        audit_item.reviewer_notes,
+        [f"Logic audit: {logic.logic_verdict}. {logic.reason}"],
+    )
+    updates: dict[str, object] = {
+        "logic_audit": logic,
+        "reviewer_notes": reviewer_notes,
+    }
+    if audit_item.verdict in {
+        "supported",
+        "partial_support",
+    } and logic.logic_verdict in {
+        "overclaimed",
+        "contradicted",
+        "scope_mismatch",
+        "modality_mismatch",
+        "insufficient_evidence",
+    }:
+        new_verdict: CitationSupportVerdict = (
+            "insufficient_evidence"
+            if logic.logic_verdict == "insufficient_evidence"
+            else "overclaimed"
+        )
+        updates.update(
+            {
+                "verdict": new_verdict,
+                "support_score": min(audit_item.support_score, logic.entailment_score),
+                "overclaim_reason": logic.reason,
+                "reason": (
+                    f"{audit_item.reason} Logic entailment audit flagged "
+                    f"{logic.logic_verdict}: {logic.reason}"
+                ),
+            }
+        )
+    return audit_item.model_copy(update=updates)
+
+
+def _merge_unique(*groups: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for item in group:
+            if item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+    return merged
 
 
 def _infer_cited_ids(
@@ -433,11 +588,7 @@ def _is_markdown_section_heading(line: str) -> bool:
 
 
 def _split_sentences(text: str) -> list[str]:
-    return [
-        item.strip()
-        for item in re.split(r"(?<=[.!?])\s+", text)
-        if item.strip()
-    ]
+    return [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
 
 
 def _clean_claim_text(text: str) -> str:
@@ -457,13 +608,22 @@ def _claim_type(text: str) -> ClaimType:
         return "treatment_recommendation"
     if re.search(r"\b(patient|clinical|diagnos|prognos)\b", lowered):
         return "clinical_implication"
-    if re.search(r"\b(caus|drive|drives|led to|leads to|resulted in|proves?)\b", lowered):
+    if re.search(
+        r"\b(caus|drive|drives|led to|leads to|resulted in|proves?)\b", lowered
+    ):
         return "causal"
-    if re.search(r"\b(mechanis|pathway|program|expression|activation|phagocytosis)\b", lowered):
+    if re.search(
+        r"\b(mechanis|pathway|program|expression|activation|phagocytosis)\b", lowered
+    ):
         return "mechanistic_hypothesis"
-    if re.search(r"\b(associated|association|correlat|linked|enriched|observed|found|suggest)\b", lowered):
+    if re.search(
+        r"\b(associated|association|correlat|linked|enriched|observed|found|suggest)\b",
+        lowered,
+    ):
         return "association"
-    if re.search(r"\b(method|cohort|sequencing|transcriptomics|immunostaining)\b", lowered):
+    if re.search(
+        r"\b(method|cohort|sequencing|transcriptomics|immunostaining)\b", lowered
+    ):
         return "methodological"
     if re.search(r"\b(uncertain|inconclusive|limited|limitation)\b", lowered):
         return "uncertainty"
@@ -505,18 +665,30 @@ def _overclaim_reason(claim_text: str, evidence: EvidenceItem) -> str | None:
     if re.search(r"\b(causes?|caused|causal|drives?|proves?|establishes?)\b", lowered):
         if _claim_reports_limiting_evidence(claim_text):
             return None
-        if re.search(r"\b(associated|association|correlated|cross-sectional|limits causal)\b", evidence_text):
+        if re.search(
+            r"\b(associated|association|correlated|cross-sectional|limits causal)\b",
+            evidence_text,
+        ):
             return "The claim upgrades association or cross-sectional evidence into causality."
-    if re.search(r"\b(human|patients?|clinical|alzheimer's disease progression)\b", lowered):
-        if re.search(r"\b(mouse|mice|animal|transgenic|in vitro|cell culture)\b", evidence_text):
+    if re.search(
+        r"\b(human|patients?|clinical|alzheimer's disease progression)\b", lowered
+    ):
+        if re.search(
+            r"\b(mouse|mice|animal|transgenic|in vitro|cell culture)\b", evidence_text
+        ):
             if _claim_reports_limiting_evidence(claim_text):
                 return None
             return "The claim generalizes animal or in-vitro evidence to human/clinical relevance."
     if re.search(r"\b(established|definitive|consensus|robust|proven)\b", lowered):
-        if re.search(r"\b(small|single|abstract|limited|requires validation|cohort)\b", evidence_text):
+        if re.search(
+            r"\b(small|single|abstract|limited|requires validation|cohort)\b",
+            evidence_text,
+        ):
             return "The claim presents limited or abstract-level evidence as established consensus."
     if re.search(r"\b(treat|treatment|therapy|prescribe|medication)\b", lowered):
-        if re.search(r"\b(mechanism|activation|pathway|expression|association)\b", evidence_text):
+        if re.search(
+            r"\b(mechanism|activation|pathway|expression|association)\b", evidence_text
+        ):
             return "The claim turns mechanistic or association evidence into treatment guidance."
     return None
 
@@ -569,11 +741,17 @@ def _reviewer_notes(evidence_items: list[EvidenceItem]) -> list[str]:
 
 
 def _conflict_awareness(answer: str, evidence_items: list[EvidenceItem]) -> bool:
-    has_conflict = any(item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence_items)
+    has_conflict = any(
+        item.evidence_direction in {"contradicts", "inconclusive"}
+        for item in evidence_items
+    )
     if not has_conflict:
         return True
     lowered = answer.lower()
-    return any(term in lowered for term in ("contradict", "limit", "inconclusive", "conflict", "uncertain"))
+    return any(
+        term in lowered
+        for term in ("contradict", "limit", "inconclusive", "conflict", "uncertain")
+    )
 
 
 def _recommended_action(
@@ -583,15 +761,24 @@ def _recommended_action(
     conflict_awareness: bool,
     evidence_items: list[EvidenceItem],
 ) -> AuditRecommendedAction:
-    if any(item.claim_type in {"clinical_implication", "treatment_recommendation"} for item in failed_claims):
+    if any(
+        item.claim_type in {"clinical_implication", "treatment_recommendation"}
+        for item in failed_claims
+    ):
         return "refuse_or_abstain"
     if any(item.verdict in {"overclaimed", "contradicted"} for item in failed_claims):
         return "revise"
-    if any(item.verdict in {"insufficient_evidence", "irrelevant_citation", "not_cited"} for item in failed_claims):
+    if any(
+        item.verdict in {"insufficient_evidence", "irrelevant_citation", "not_cited"}
+        for item in failed_claims
+    ):
         return "revise"
     if not uncertainty_audit.calibrated or not conflict_awareness:
         return "pass_with_limitations"
-    if any(item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence_items):
+    if any(
+        item.evidence_direction in {"contradicts", "inconclusive"}
+        for item in evidence_items
+    ):
         return "pass_with_limitations"
     return "pass"
 
@@ -639,7 +826,9 @@ def _claim_id(text: str, index: int) -> str:
     return f"claim-{digest}"
 
 
-def _audit_id(run_id: str | None, answer: str, evidence_items: list[EvidenceItem]) -> str:
+def _audit_id(
+    run_id: str | None, answer: str, evidence_items: list[EvidenceItem]
+) -> str:
     key = {
         "run_id": run_id or "",
         "answer": answer,

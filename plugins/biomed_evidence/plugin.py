@@ -511,9 +511,7 @@ class BiomedEvidencePlugin(Plugin):
                 "paper_decision_total": paper_total,
                 "claims": [item.model_dump(mode="json") for item in claims],
                 "claim_total": claim_total,
-                "review_queue": [
-                    item.model_dump(mode="json") for item in review_queue
-                ],
+                "review_queue": [item.model_dump(mode="json") for item in review_queue],
                 "review_queue_total": review_total,
                 "briefs": [item.model_dump(mode="json") for item in briefs],
                 "brief_total": brief_total,
@@ -647,6 +645,8 @@ class BiomedEvidencePlugin(Plugin):
         use_llm_extractor: bool = False,
         use_llm_synthesis: bool = False,
         use_llm_verifier: bool = False,
+        use_llm_claim_logic: bool = False,
+        export_logic_facts: bool = False,
     ) -> str:
         """Answer a biomedical research question, audit claims, revise, and return trace.
 
@@ -664,6 +664,8 @@ class BiomedEvidencePlugin(Plugin):
             use_llm_extractor: Request framework-governed span-grounded evidence extraction.
             use_llm_synthesis: Request framework-governed evidence-constrained synthesis.
             use_llm_verifier: Request framework-governed advisory verifier review.
+            use_llm_claim_logic: Request claim logic audit frames; falls back deterministically when no LLM parser is configured.
+            export_logic_facts: Export deterministic symbolic logic facts for audited claims.
         """
         result = await self._service.answer_with_audit(
             AnswerWithEvidenceRequest(
@@ -680,6 +682,8 @@ class BiomedEvidencePlugin(Plugin):
                 use_llm_extractor=use_llm_extractor,
                 use_llm_synthesis=use_llm_synthesis,
                 use_llm_verifier=use_llm_verifier,
+                use_llm_claim_logic=use_llm_claim_logic,
+                export_logic_facts=export_logic_facts,
             )
         )
         return _dump(result.model_dump(mode="json"))
@@ -698,6 +702,8 @@ class BiomedEvidencePlugin(Plugin):
         run_id: str | None = None,
         retrieval_id: str | None = None,
         observed_uncertainty: Literal["low", "medium", "high"] | None = None,
+        use_llm_claim_logic: bool = False,
+        export_logic_facts: bool = False,
     ) -> str:
         """Audit whether biomedical answer claims are supported by citations.
 
@@ -708,6 +714,8 @@ class BiomedEvidencePlugin(Plugin):
             run_id: Optional answer run id.
             retrieval_id: Optional retrieval manifest id.
             observed_uncertainty: Answer uncertainty label.
+            use_llm_claim_logic: Request claim logic audit frames; falls back deterministically when no LLM parser is configured.
+            export_logic_facts: Export deterministic symbolic logic facts for audited claims.
         """
         result = self._service.audit_answer(
             CitationAuditRequest(
@@ -719,6 +727,8 @@ class BiomedEvidencePlugin(Plugin):
                 run_id=run_id,
                 retrieval_id=retrieval_id,
                 observed_uncertainty=observed_uncertainty,
+                use_llm_claim_logic=use_llm_claim_logic,
+                export_logic_facts=export_logic_facts,
             )
         )
         return _dump(result.model_dump(mode="json"))

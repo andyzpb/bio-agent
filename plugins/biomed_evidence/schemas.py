@@ -123,6 +123,75 @@ QuestionIntent = Literal[
 ]
 AllowedNextStep = Literal["plan_retrieval", "clarify", "refuse", "abstain"]
 PlanValidationStatus = Literal["valid", "valid_with_warnings", "invalid"]
+LogicParserMode = Literal["llm", "deterministic", "fallback"]
+LogicPredicate = Literal[
+    "associated_with",
+    "correlates_with",
+    "causes_or_drives",
+    "increases",
+    "decreases",
+    "predicts",
+    "treats",
+    "diagnoses",
+    "is_marker_of",
+    "is_mechanistically_linked_to",
+    "is_required_for",
+    "is_sufficient_for",
+    "has_no_effect",
+    "contradicts",
+    "uncertain_or_inconclusive",
+    "background_relation",
+    "unspecified",
+]
+LogicPolarity = Literal["positive", "negative", "mixed", "uncertain", "unspecified"]
+LogicModality = Literal[
+    "possible",
+    "suggestive",
+    "moderate",
+    "strong",
+    "definitive",
+    "inconclusive",
+    "unspecified",
+]
+LogicPopulation = Literal["human", "animal", "in_vitro", "mixed", "unspecified"]
+LogicClaimStrength = Literal[
+    "background",
+    "association",
+    "mechanistic",
+    "causal",
+    "clinical",
+    "treatment",
+    "diagnostic",
+    "prognostic",
+    "uncertainty",
+    "unspecified",
+]
+LogicStudyDesign = Literal[
+    "randomized_trial",
+    "interventional",
+    "longitudinal",
+    "observational",
+    "cross_sectional",
+    "case_control",
+    "cohort",
+    "preclinical",
+    "in_vitro",
+    "review",
+    "meta_analysis",
+    "abstract_only",
+    "unspecified",
+]
+LogicVerdict = Literal[
+    "entailed",
+    "partially_entailed",
+    "overclaimed",
+    "contradicted",
+    "scope_mismatch",
+    "modality_mismatch",
+    "insufficient_evidence",
+    "not_assessed",
+]
+LogicFactFormat = Literal["text", "json"]
 
 
 class BiomedicalPaper(BaseModel):
@@ -567,6 +636,8 @@ class AnswerWithEvidenceRequest(BaseModel):
     use_llm_extractor: bool = False
     use_llm_synthesis: bool = False
     use_llm_verifier: bool = False
+    use_llm_claim_logic: bool = False
+    export_logic_facts: bool = False
 
 
 class AnswerWithEvidenceResult(BaseModel):
@@ -644,6 +715,100 @@ class AtomicClaim(BaseModel):
     cited_paper_ids: list[str] = Field(default_factory=list)
 
 
+class LogicalEntity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    entity_type: str = "unspecified"
+    normalized_id: str | None = None
+    source_span: str | None = None
+
+
+class LogicalClaimFrame(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    claim_text: str
+    subject: LogicalEntity
+    predicate: LogicPredicate = "unspecified"
+    object: LogicalEntity
+    polarity: LogicPolarity = "unspecified"
+    modality: LogicModality = "unspecified"
+    population: LogicPopulation = "unspecified"
+    claim_strength: LogicClaimStrength = "unspecified"
+    scope: list[str] = Field(default_factory=list)
+    qualifiers: list[str] = Field(default_factory=list)
+    hedging: bool = False
+    source_spans: list[str] = Field(default_factory=list)
+    parser_mode: LogicParserMode = "deterministic"
+    parser_model: str | None = None
+    parser_prompt_hash: str | None = None
+    parser_warnings: list[str] = Field(default_factory=list)
+
+
+class LogicalEvidenceFrame(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    paper_id: str
+    evidence_text: str
+    subject: LogicalEntity
+    predicate: LogicPredicate = "unspecified"
+    object: LogicalEntity
+    polarity: LogicPolarity = "unspecified"
+    modality: LogicModality = "unspecified"
+    population: LogicPopulation = "unspecified"
+    model_system: str | None = None
+    study_design: LogicStudyDesign = "unspecified"
+    evidence_strength: EvidenceStrength = "not_assessed"
+    limitations: list[str] = Field(default_factory=list)
+    source_spans: list[str] = Field(default_factory=list)
+    parser_mode: LogicParserMode = "deterministic"
+    parser_model: str | None = None
+    parser_prompt_hash: str | None = None
+    parser_warnings: list[str] = Field(default_factory=list)
+
+
+class LogicFact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    predicate: str
+    arguments: list[str]
+    quoted_arguments: list[bool] = Field(default_factory=list)
+
+
+class LogicFactExport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    export_id: str
+    claim_id: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    facts: list[LogicFact] = Field(default_factory=list)
+    text: str | None = None
+    format: LogicFactFormat = "text"
+    exporter_version: str = "logic-fact-export-v1"
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LogicAuditResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    claim_frame: LogicalClaimFrame | None = None
+    evidence_frames: list[LogicalEvidenceFrame] = Field(default_factory=list)
+    logic_verdict: LogicVerdict = "not_assessed"
+    entailment_score: float = 0.0
+    rules_triggered: list[str] = Field(default_factory=list)
+    predicate_mismatches: list[dict[str, object]] = Field(default_factory=list)
+    scope_mismatches: list[dict[str, object]] = Field(default_factory=list)
+    modality_mismatches: list[dict[str, object]] = Field(default_factory=list)
+    population_mismatches: list[dict[str, object]] = Field(default_factory=list)
+    reason: str
+    warnings: list[str] = Field(default_factory=list)
+    logic_fact_export: LogicFactExport | None = None
+
+
 class ClaimAuditItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -659,6 +824,7 @@ class ClaimAuditItem(BaseModel):
     overclaim_reason: str | None = None
     reason: str
     reviewer_notes: list[str] = Field(default_factory=list)
+    logic_audit: LogicAuditResult | None = None
 
 
 class UncertaintyAudit(BaseModel):
@@ -765,6 +931,8 @@ class CitationAuditRequest(BaseModel):
     retrieval_id: str | None = None
     observed_uncertainty: ConfidenceLevel | None = None
     retrieval_manifest: RetrievalManifest | None = None
+    use_llm_claim_logic: bool = False
+    export_logic_facts: bool = False
 
 
 class ConflictAuditRequest(BaseModel):

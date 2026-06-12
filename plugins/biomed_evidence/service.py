@@ -306,11 +306,21 @@ class BiomedEvidenceService:
         saved_decisions = [item for item in decisions if item.decision == "saved"]
         audited_claims = [item for item in claims if item.audit_ids]
         included_evidence_ids = sorted(
-            {evidence_id for claim in audited_claims for evidence_id in claim.evidence_ids}
+            {
+                evidence_id
+                for claim in audited_claims
+                for evidence_id in claim.evidence_ids
+            }
         )
-        audit_ids = sorted({audit_id for claim in audited_claims for audit_id in claim.audit_ids})
+        audit_ids = sorted(
+            {audit_id for claim in audited_claims for audit_id in claim.audit_ids}
+        )
         verifier_ids = sorted(
-            {verifier_id for claim in audited_claims for verifier_id in claim.verifier_ids}
+            {
+                verifier_id
+                for claim in audited_claims
+                for verifier_id in claim.verifier_ids
+            }
         )
         title = request.title or f"{project.name} evidence brief"
         if request.format == "json":
@@ -764,7 +774,10 @@ class BiomedEvidenceService:
             "clinical_boundary_prechecked": is_clinical_request(request.question),
         }
         active_request = request
-        if request.project_id and not project_context_trace["clinical_boundary_prechecked"]:
+        if (
+            request.project_id
+            and not project_context_trace["clinical_boundary_prechecked"]
+        ):
             project = self.storage.get_project(request.project_id)
             if project is None:
                 raise ValueError("project not found")
@@ -797,9 +810,9 @@ class BiomedEvidenceService:
                     use_llm_planner=active_request.use_llm_planner,
                 )
             )
-        clinical_boundary = bool(project_context_trace["clinical_boundary_prechecked"]) or bool(
-            planning_result and planning_result.classification.clinical_boundary
-        )
+        clinical_boundary = bool(
+            project_context_trace["clinical_boundary_prechecked"]
+        ) or bool(planning_result and planning_result.classification.clinical_boundary)
         if clinical_boundary:
             result = AnswerWithEvidenceResult(
                 run_id=run_id,
@@ -1152,7 +1165,9 @@ class BiomedEvidenceService:
             source=request.source,
         )
         original_ids = [item.paper_id for item in metadata]
-        original_position = {paper_id: index for index, paper_id in enumerate(original_ids)}
+        original_position = {
+            paper_id: index for index, paper_id in enumerate(original_ids)
+        }
         rejected_ids = [
             paper_id
             for paper_id in original_ids
@@ -1222,11 +1237,11 @@ class BiomedEvidenceService:
                     "deduped_paper_ids": returned_ids,
                     "warnings": _merge_unique(
                         retrieval_bundle.warnings,
-                        [
-                            "Project paper decisions were applied after retrieval."
-                        ]
-                        if decisions
-                        else [],
+                        (
+                            ["Project paper decisions were applied after retrieval."]
+                            if decisions
+                            else []
+                        ),
                     ),
                 }
             )
@@ -1260,6 +1275,8 @@ class BiomedEvidenceService:
                 retrieval_id=draft_result.retrieval_id,
                 observed_uncertainty=draft_result.uncertainty_level,
                 retrieval_manifest=draft_result.retrieval_manifest,
+                use_llm_claim_logic=request.use_llm_claim_logic,
+                export_logic_facts=request.export_logic_facts,
             )
         )
         advisory_verifier = await self._llm_advisory_verifier_or_fallback(
@@ -1555,6 +1572,8 @@ class BiomedEvidenceService:
                         ConfidenceLevel | None, parsed.get("uncertainty_level")
                     ),
                     retrieval_manifest=draft_result.retrieval_manifest,
+                    use_llm_claim_logic=request.use_llm_claim_logic,
+                    export_logic_facts=request.export_logic_facts,
                 )
             )
             repair_changed_claims: list[str] = []
@@ -1579,6 +1598,8 @@ class BiomedEvidenceService:
                             parsed.get("uncertainty_level"),
                         ),
                         retrieval_manifest=draft_result.retrieval_manifest,
+                        use_llm_claim_logic=request.use_llm_claim_logic,
+                        export_logic_facts=request.export_logic_facts,
                     )
                 )
                 if repaired_audit.recommended_action in {"revise", "refuse_or_abstain"}:
@@ -1700,6 +1721,8 @@ class BiomedEvidenceService:
                         parsed.get("uncertainty_level") or uncertainty,
                     ),
                     retrieval_manifest=retrieval_manifest,
+                    use_llm_claim_logic=request.use_llm_claim_logic,
+                    export_logic_facts=request.export_logic_facts,
                 )
             )
             if synthesis_audit.recommended_action in {"revise", "refuse_or_abstain"}:
@@ -2083,6 +2106,8 @@ class BiomedEvidenceService:
             retrieval_id=request.retrieval_id,
             observed_uncertainty=request.observed_uncertainty,
             retrieval_manifest=request.retrieval_manifest,
+            use_llm_claim_logic=request.use_llm_claim_logic,
+            export_logic_facts=request.export_logic_facts,
         )
         self.storage.save_citation_audit(audit)
         return audit
@@ -3435,7 +3460,9 @@ def _fallback_advisory_verifier(
         fallback_reason=fallback_reason
         or _llm_verifier_unavailable_reason(provider, model),
         deterministic_action=audit.recommended_action,
-        advisory_action=cast(Any, _advisory_action_from_audit(audit.recommended_action)),
+        advisory_action=cast(
+            Any, _advisory_action_from_audit(audit.recommended_action)
+        ),
         claim_reviews=[],
         disagreements=[],
         high_risk_disagreement_count=0,
@@ -3518,9 +3545,8 @@ def _advisory_disagreements(
     by_claim = {_norm_claim(item.claim): item for item in audit.claim_audits}
     disagreements: list[AdvisoryVerifierDisagreement] = []
     for review in reviews:
-        deterministic = (
-            by_id.get(review.claim_id or "")
-            or by_claim.get(_norm_claim(review.claim))
+        deterministic = by_id.get(review.claim_id or "") or by_claim.get(
+            _norm_claim(review.claim)
         )
         if not _is_advisory_disagreement(review, deterministic, audit):
             continue
@@ -3587,14 +3613,19 @@ def _is_high_risk_advisory_disagreement(
         return True
     if deterministic is None:
         return review.advisory_action in {"revise", "needs_expert_review"}
-    deterministic_passed = (
-        deterministic.verdict in {"supported", "partial_support"}
-        and audit.recommended_action in {"pass", "pass_with_limitations"}
+    deterministic_passed = deterministic.verdict in {
+        "supported",
+        "partial_support",
+    } and audit.recommended_action in {"pass", "pass_with_limitations"}
+    return (
+        deterministic_passed
+        and review.advisory_action
+        in {
+            "revise",
+            "needs_expert_review",
+        }
+        and review.risk_level in {"medium", "high"}
     )
-    return deterministic_passed and review.advisory_action in {
-        "revise",
-        "needs_expert_review",
-    } and review.risk_level in {"medium", "high"}
 
 
 def _aggregate_advisory_action(
@@ -3655,19 +3686,16 @@ def _advisory_revision_limitations(
     if advisory_verifier is None or not advisory_verifier.disagreements:
         return []
     return [
-        (
-            "Advisory verifier flagged high-risk disagreement: "
-            f"{item.reason}"
-        )
+        ("Advisory verifier flagged high-risk disagreement: " f"{item.reason}")
         for item in advisory_verifier.disagreements
         if item.high_risk
     ]
 
 
 def _advisory_verifier_id(run_id: str, audit_id: str) -> str:
-    digest = hashlib.sha256(f"{run_id}:{audit_id}:advisory".encode("utf-8")).hexdigest()[
-        :16
-    ]
+    digest = hashlib.sha256(
+        f"{run_id}:{audit_id}:advisory".encode("utf-8")
+    ).hexdigest()[:16]
     return f"adv-{digest}"
 
 
@@ -3901,7 +3929,11 @@ def _is_markdown_section_heading(line: str) -> bool:
     stripped = line.strip()
     if re.match(r"^#{1,6}\s+\S", stripped):
         return True
-    return stripped.startswith("**") and stripped.endswith("**") and stripped.count("**") == 2
+    return (
+        stripped.startswith("**")
+        and stripped.endswith("**")
+        and stripped.count("**") == 2
+    )
 
 
 def _build_trace_steps(
@@ -4073,6 +4105,7 @@ def _build_trace_steps(
             "unsupported_claim_rate": audit.unsupported_claim_rate,
             "overclaim_rate": audit.overclaim_rate,
             "recommended_action": audit.recommended_action,
+            "logic_audit": _logic_audit_trace(audit),
         },
     )
     add(
@@ -4149,6 +4182,33 @@ def _build_trace_steps(
         metadata={"final_answer_chars": len(revision.final_answer)},
     )
     return steps
+
+
+def _logic_audit_trace(audit: CitationAuditResult) -> dict[str, object]:
+    logic_results = [
+        item.logic_audit for item in audit.claim_audits if item.logic_audit is not None
+    ]
+    verdict_counts: dict[str, int] = {}
+    rules: dict[str, int] = {}
+    fact_exports = 0
+    fact_count = 0
+    for logic in logic_results:
+        verdict_counts[logic.logic_verdict] = (
+            verdict_counts.get(logic.logic_verdict, 0) + 1
+        )
+        if logic.logic_fact_export is not None:
+            fact_exports += 1
+            fact_count += len(logic.logic_fact_export.facts)
+        for rule in logic.rules_triggered:
+            rules[rule] = rules.get(rule, 0) + 1
+    return {
+        "enabled": bool(logic_results),
+        "claim_count": len(logic_results),
+        "verdict_counts": verdict_counts,
+        "rules_triggered": rules,
+        "fact_export_count": fact_exports,
+        "fact_count": fact_count,
+    }
 
 
 def _llm_revision_payload(

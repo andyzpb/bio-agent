@@ -5,8 +5,8 @@ biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured router/planner output, planner-driven
 primary/support/refute retrieval bundles, structured evidence extraction, cited
 answers, retrieval manifests, claim-level citation audit, audit/revise traces,
-project evidence workspaces, a lightweight evidence graph, and Research Watch
-decision logs. It is
+claim logic entailment audit, symbolic logic fact export, project evidence
+workspaces, a lightweight evidence graph, and Research Watch decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
 
@@ -28,8 +28,15 @@ biomed_evidence/biomed.db
 Optional LLM planner, extractor, synthesizer, verifier, and revision paths use
 the framework-configured provider. They are request-gated with
 `use_llm_planner`, `use_llm_extractor`, `use_llm_synthesis`,
-`use_llm_verifier`, and `use_llm_revision`; default demos, tests, and eval
-remain deterministic and keyless.
+`use_llm_verifier`, `use_llm_revision`, and `use_llm_claim_logic`; default
+demos, tests, and eval remain deterministic and keyless. Claim logic currently
+falls back to deterministic frame parsing when provider-backed claim parsing is
+unavailable.
+
+V2.1 claim logic can be enabled with `use_llm_claim_logic=true`; symbolic fact
+export can be added with `export_logic_facts=true`. The fact exporter is a
+deterministic transformation over validated logical frames and audit results. It
+does not call an LLM and does not override the deterministic audit verdict.
 
 ## Tools
 
@@ -75,6 +82,10 @@ primary/support/refute retrieval records, per-query manifest IDs, deduped paper
 IDs, duplicate IDs, and bundle warnings. Extracted evidence carries
 `retrieval_intent` as `primary`, `support`, `refute`, or `unknown`.
 
+Audit responses can include `ClaimAuditItem.logic_audit` with parsed logical
+claim/evidence frames, deterministic entailment verdicts, triggered rules,
+mismatch details, and optional symbolic logic facts.
+
 Project-enabled answer responses include `project_id` and
 `project_context_trace`. Saved papers are prioritized after retrieval; rejected
 papers are excluded by default unless `include_rejected_papers` is true.
@@ -103,10 +114,11 @@ The panel includes:
 - Watch: create, update, check, and review research-watch topics, snapshots,
   and push/skip decisions.
 - Audit: inspect atomic claims, citation-support verdicts, overclaims,
-  conflict awareness, uncertainty calibration, and recommended action.
+  conflict awareness, uncertainty calibration, claim-logic verdicts, symbolic
+  fact exports, and recommended action.
 - Trace: inspect planner validation, retrieval bundle metadata, draft answer,
   final answer, revision mode/action, removed/softened claims, added
-  limitations, and ordered agent steps.
+  limitations, logic-audit summary metadata, and ordered agent steps.
 - Responsible AI: review the research-only operating boundary and retrieval
   limitations.
 
@@ -159,7 +171,7 @@ npm run build
 docker build -t bio-agent-biomed:latest .
 ```
 
-Planner and V1.6 retrieval-bundle API smoke:
+Planner, retrieval-bundle, and V2.1 claim-logic API smoke:
 
 ```bash
 curl -s -X POST "http://127.0.0.1:2236/api/biomed/plan" \
@@ -178,13 +190,30 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     "source": "mock",
     "max_papers": 5,
     "use_llm_planner": true,
+    "use_llm_extractor": true,
+    "use_llm_synthesis": true,
+    "use_llm_verifier": true,
     "use_llm_revision": true,
-    "execute_support_refute": true
+    "execute_support_refute": true,
+    "use_llm_claim_logic": true,
+    "export_logic_facts": true
   }' | jq '{
     planner_mode: .answer_result.query_plan.planner_mode,
+    extraction_modes: ([.answer_result.evidence_summary[].extraction_mode] | unique),
+    synthesis_mode: .answer_result.synthesis_mode,
+    verifier_mode: .advisory_verifier.verifier_mode,
     revision_mode: .revision.revision_mode,
     multi_query: .answer_result.retrieval_bundle.executed_multi_query,
     retrieval_records: (.answer_result.retrieval_bundle.records | length),
+    logic_trace: ([.trace[] | select(.step=="audit") | .metadata.logic_audit][0]),
+    logic_verdicts: [.audit.claim_audits[] | .logic_audit.logic_verdict],
+    fact_exports: [.audit.claim_audits[] | .logic_audit.logic_fact_export.export_id],
     trace_steps: (.trace | length)
   }'
 ```
+
+For local Ollama Pro testing, configure the OpenAI-compatible base URL and run
+the same smoke with `gpt-oss:120b-cloud`. V2.1 is expected to expose
+`logic_audit` and symbolic fact exports even when the claim/evidence logic
+parser reports deterministic `fallback`; provider-backed logic parsing is the
+V2.2 hardening target.
