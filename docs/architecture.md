@@ -1,0 +1,304 @@
+# Biomedical Evidence Architecture
+
+This document explains the design behind the Biomedical Evidence plugin. The
+main README is intentionally short; this file keeps the deeper architecture,
+tool-chain, trust-boundary, and provenance details.
+
+## Design Goal
+
+The Biomedical Evidence Agent is a research support workflow for biomedical
+literature review. It is designed to answer questions only when each generated
+claim can be traced back to retrieved papers, evidence spans, and audit records.
+
+The central invariant is:
+
+```text
+Memory, reviewer notes, model output, and project context may guide workflow.
+Only retrieved papers, evidence spans, retrieval manifests, citation audit,
+logic audit, and evidence packets may support biomedical claims.
+```
+
+The system refuses diagnosis, treatment, dosing, prognosis, and
+patient-specific medical requests before retrieval, memory loading, LLM calls,
+or export steps run.
+
+## Core Workflow
+
+```text
+user research question
+  -> boundary classifier
+  -> structured planner
+  -> retrieval subquestions
+  -> controlled literature search
+  -> retrieval bundle
+  -> evidence extraction
+  -> coverage matrix
+  -> bounded gap-directed follow-up
+  -> evidence packet
+  -> evidence-constrained synthesis
+  -> citation audit
+  -> logic audit
+  -> advisory verifier
+  -> revision
+  -> final answer + citations + trace + eval record
+```
+
+The synthesis step receives a curated evidence packet. It does not consume raw
+search noise, duplicate abstracts, untraceable summaries, project memory, or
+reviewer notes as factual evidence.
+
+## Trust Layers
+
+| Layer | Role |
+| --- | --- |
+| Router and guardrail | Classify research vs clinical or clarification cases. |
+| Planner | Produce structured query plans and retrieval subquestions. |
+| Retrieval tool | Fetch papers from controlled sources and persist manifests. |
+| Extractor | Convert paper abstracts into structured evidence spans. |
+| Coverage and gap finder | Identify covered, weak, missing, conflicted, and source-limited areas. |
+| Evidence packet | Compact, traceable contract consumed by answer generation. |
+| Synthesizer | Draft a research answer from evidence only. |
+| Citation audit | Check atomic claims against citations and evidence spans. |
+| Logic audit | Detect semantic overclaims such as association-as-causation. |
+| Advisory verifier | Optional LLM/judge signal that cannot override deterministic audit. |
+| Reviser | Soften, limit, remove, abstain, or refuse unsupported claims. |
+| Trace | Preserve each decision, fallback, manifest, and audit output. |
+
+Optional LLM stages are explicit request flags:
+
+- `use_llm_planner`
+- `use_llm_extractor`
+- `use_llm_synthesis`
+- `use_llm_verifier`
+- `use_llm_revision`
+- `use_llm_claim_logic`
+
+If an LLM provider fails, emits invalid JSON, or violates schema expectations,
+the system records a fallback reason and falls back to deterministic behavior
+where possible.
+
+## Controlled Literature Search
+
+`search_literature` is the core evidence retrieval tool. It returns:
+
+- normalized paper records;
+- source, query, and request trace;
+- coverage metrics;
+- stored paper IDs;
+- warnings and errors;
+- a retrieval manifest.
+
+It does not synthesize answers and does not browse arbitrary websites.
+
+`check_literature_access` is the readiness path for verifying `mock` or
+`pubmed` connectivity before running the answer pipeline.
+
+Supported sources:
+
+- `mock`: deterministic, keyless default for demos, tests, and CI.
+- `pubmed`: opt-in live PubMed E-utilities path.
+
+Europe PMC remains the preferred next structured adapter after PubMed is stable.
+General web search snippets are intentionally excluded from biomedical evidence.
+
+## Multi-Pass Gap-Directed Retrieval
+
+The planner can create subquestions such as:
+
+- background;
+- support;
+- refute;
+- mechanism;
+- limitation;
+- recent evidence.
+
+Each query is executed through `search_literature`, deduped by stable paper ID,
+and tied back to a retrieval manifest. The system then builds a coverage
+matrix:
+
+```text
+subquestion | intent | papers | evidence | conflicts | limitations | status
+```
+
+Weak or missing coverage can trigger one controlled follow-up pass. The stop
+reason is persisted, so reviewers can see whether the loop stopped because
+coverage was sufficient, source limits were reached, policy blocked retrieval,
+or no useful follow-up remained.
+
+## Evidence Packet
+
+The evidence packet is the handoff contract between retrieval/extraction and
+answer generation. It contains:
+
+- planner mode and source;
+- retrieval manifest IDs;
+- selected paper IDs;
+- selected evidence IDs;
+- supported claims;
+- conflicting claims;
+- limitations;
+- coverage matrix rows;
+- coverage gaps;
+- stop reason;
+- packet selection metadata.
+
+The packet is intentionally smaller than the full retrieval bundle. It should
+be inspectable, stable, and suitable for replay, audit, dashboard display, and
+eval.
+
+## Citation And Logic Audit
+
+Generated answers are decomposed into atomic claims. Each claim is checked
+against cited papers and extracted evidence spans. The audit detects:
+
+- missing citations;
+- irrelevant citations;
+- insufficient evidence;
+- overclaiming;
+- contradiction;
+- conflict awareness gaps;
+- uncertainty mismatch;
+- clinical-safety violations.
+
+The claim-logic layer can optionally ask an LLM to parse claim/evidence text
+into typed logical frames. Deterministic Python rules remain the verifier of
+record. Symbolic fact export makes the reasoning trace inspectable and ready
+for future Datalog, Prolog, or solver experiments.
+
+## Project Workspace And Research Watch
+
+The biomedical plugin includes a project evidence workspace:
+
+- save, reject, or mark papers as needing review;
+- record project claims;
+- generate evidence briefs;
+- maintain a review queue;
+- use project context as planning context only.
+
+Research Watch tracks topics over time with retrieval snapshots, relevance
+scoring, and push/skip decision logs. Saved project memory and Watch notes do
+not become biomedical evidence unless they point back to retrieved papers and
+evidence spans.
+
+## Release Tool Chain
+
+Release 1.0 turns the internal answer pipeline into independently callable,
+auditable tools:
+
+- `run_multi_pass_literature_search`
+- `extract_evidence_batch`
+- `analyze_coverage_gaps`
+- `build_evidence_packet`
+- `get_evidence_packet`
+- `get_answer_trace`
+- `export_evidence_packet_to_obsidian`
+- `export_project_to_obsidian`
+- `export_research_watch_to_obsidian`
+- `export_provenance_graph`
+
+All Release 1.0 tools return a structured envelope with:
+
+- `ok`
+- `result`
+- `warnings`
+- `errors`
+- `error_code`
+- `trace`
+- `ids`
+- tool metadata
+
+Policy failures such as `clinical_boundary`, `source_policy_blocked`,
+`budget_exceeded`, `export_path_blocked`, and `unknown_run_id` are returned as
+schema-valid tool errors rather than unstructured strings.
+
+## Mathematical Hardening
+
+Release 1.0 adds deterministic or advisory math-oriented review aids without
+handing them runtime authority:
+
+- submodular-style evidence packet selection prioritizes coverage, provenance
+  diversity, conflict evidence, and limitation evidence;
+- contextual-bandit-style retrieval advisory suggests stop, broaden, support,
+  refute, mechanism, or limitation searches but never overrides clinical
+  guardrails, source policy, or caps;
+- Markov-style step telemetry summarizes observed execution paths and expected
+  remaining steps;
+- PROV/OpenLineage-style provenance graphs connect answer, paper, evidence,
+  retrieval manifest, packet, audit, logic audit, revision, tools, activities,
+  and agents while redacting prompts and provider raw responses.
+
+These tools are used for reviewer visibility, debugging, and future evaluation.
+They are not treated as biomedical evidence.
+
+## Dashboard Views
+
+The dashboard surfaces the workflow as an operational tool:
+
+- **Ask**: citation-grounded answers, optional LLM stages, packet summary, and
+  answer trace.
+- **Evidence**: extracted claims, entities, methods, limitations, confidence,
+  spans, and retrieval provenance.
+- **Graph**: paper, entity, and claim relationships.
+- **Audit**: claim-level citation audit, logic verdicts, conflicts, and
+  revision pressure.
+- **Trace**: classify, plan, retrieve, extract, gap, packet, audit, revise, and
+  finalize metadata, plus memory effects, budget snapshots, telemetry, packet
+  selection, Obsidian export, and provenance results.
+- **Projects**: paper decisions, claims, review queue, and evidence briefs.
+- **Watch**: topic monitoring, snapshots, relevance scores, and decisions.
+- **Responsible AI**: research-only boundary and clinical refusal behavior.
+
+## Data Boundaries
+
+Runtime storage lives under the active workspace:
+
+```text
+biomed_evidence/biomed.db
+```
+
+Default runtime data is usually under:
+
+```text
+~/.akashic/workspace/
+```
+
+Generated Obsidian Markdown export is one-way reviewer output. Exported notes
+are never imported back as biomedical evidence.
+
+Secrets and provider raw responses are redacted from provenance and release
+smoke artifacts.
+
+## Release Smoke
+
+Release 1.1 adds a repeatable dashboard-level smoke runner for the live PubMed
+and Ollama path:
+
+```bash
+.venv/bin/python -m eval.biomed_evidence.run_release_smoke \
+  --source pubmed \
+  --ollama-model gpt-oss:120b-cloud \
+  --output-dir /tmp/biomed_release_smoke
+```
+
+The runner captures artifacts for:
+
+- Ollama model/chat connectivity;
+- dashboard plugin and release tool-contract readiness;
+- live PubMed readiness and controlled `search_literature`;
+- PubMed + Ollama `answer/audited`;
+- persisted trace, evidence packet, retrieval manifest, and provenance graph;
+- clinical guardrail regression.
+
+Exit codes distinguish code regression, external source instability, LLM
+unavailability, policy/guardrail failure, and dashboard unavailability.
+
+## Non-Goals
+
+- Clinical diagnosis, treatment, dosing, prognosis, or patient-specific advice.
+- Treating project memory, Obsidian notes, saved papers, or reviewer comments
+  as biomedical facts.
+- Replacing deterministic audit with an advisory verifier.
+- Making live PubMed the default source in CI or demos.
+- Using general web search snippets as biomedical evidence.
+- Adding full-text/PDF ingestion before abstract-level provenance and audit
+  gates remain stable.
