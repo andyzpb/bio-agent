@@ -142,3 +142,30 @@ async def test_answer_with_audit_records_logic_audit_trace(tmp_path: Path) -> No
     assert logic_trace["enabled"] is True
     assert logic_trace["claim_count"] >= 1
     assert logic_trace["fact_export_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_clinical_answer_with_audit_skips_claim_logic(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What dose should my mother take for Alzheimer disease?",
+                source="mock",
+                use_llm_claim_logic=True,
+                export_logic_facts=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    audit_step = next(step for step in result.trace if step.step == "audit")
+    logic_trace = audit_step.metadata["logic_audit"]
+    assert isinstance(logic_trace, dict)
+    assert logic_trace["enabled"] is False
+    assert logic_trace["claim_count"] == 0
+    assert logic_trace["fact_export_count"] == 0
+    assert result.final_action == "refuse"
+    assert not result.answer_result.citations
+    assert not result.answer_result.evidence_summary
+    assert all(item.logic_audit is None for item in result.audit.claim_audits)

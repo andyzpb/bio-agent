@@ -1266,6 +1266,12 @@ class BiomedEvidenceService:
             draft_result.question_classification
             and draft_result.question_classification.clinical_boundary
         )
+        use_claim_logic_for_audit = (
+            request.use_llm_claim_logic and not clinical_boundary
+        )
+        export_logic_facts_for_audit = (
+            request.export_logic_facts and not clinical_boundary
+        )
         audit = self.audit_answer(
             CitationAuditRequest(
                 answer=draft_result.answer,
@@ -1275,8 +1281,8 @@ class BiomedEvidenceService:
                 retrieval_id=draft_result.retrieval_id,
                 observed_uncertainty=draft_result.uncertainty_level,
                 retrieval_manifest=draft_result.retrieval_manifest,
-                use_llm_claim_logic=request.use_llm_claim_logic,
-                export_logic_facts=request.export_logic_facts,
+                use_llm_claim_logic=use_claim_logic_for_audit,
+                export_logic_facts=export_logic_facts_for_audit,
             )
         )
         advisory_verifier = await self._llm_advisory_verifier_or_fallback(

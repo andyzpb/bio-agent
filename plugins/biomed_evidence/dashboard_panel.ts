@@ -111,6 +111,31 @@ interface WatchCheckResult {
   } | null;
 }
 
+interface LogicFactExport {
+  export_id: string;
+  evidence_ids: string[];
+  facts: { predicate: string; arguments: string[]; quoted_arguments?: boolean[] }[];
+  text?: string | null;
+  format: string;
+  exporter_version: string;
+  warnings: string[];
+}
+
+interface LogicAuditResult {
+  claim_id: string;
+  evidence_ids: string[];
+  logic_verdict: string;
+  entailment_score: number;
+  rules_triggered: string[];
+  predicate_mismatches: Record<string, unknown>[];
+  scope_mismatches: Record<string, unknown>[];
+  modality_mismatches: Record<string, unknown>[];
+  population_mismatches: Record<string, unknown>[];
+  reason: string;
+  warnings: string[];
+  logic_fact_export?: LogicFactExport | null;
+}
+
 interface ClaimAuditItem {
   claim_id: string;
   claim: string;
@@ -124,6 +149,7 @@ interface ClaimAuditItem {
   overclaim_reason?: string | null;
   reason: string;
   reviewer_notes: string[];
+  logic_audit?: LogicAuditResult | null;
 }
 
 interface CitationAuditResult {
@@ -403,6 +429,45 @@ function renderEvidenceDetail(item: EvidenceRow): string {
   `;
 }
 
+function renderLogicAudit(logic: LogicAuditResult | null | undefined): string {
+  if (!logic) return "";
+  const factExport = logic.logic_fact_export;
+  const mismatchLines = [
+    ...(logic.predicate_mismatches || []).map((item) => `predicate: ${JSON.stringify(item)}`),
+    ...(logic.scope_mismatches || []).map((item) => `scope: ${JSON.stringify(item)}`),
+    ...(logic.modality_mismatches || []).map((item) => `modality: ${JSON.stringify(item)}`),
+    ...(logic.population_mismatches || []).map((item) => `population: ${JSON.stringify(item)}`),
+  ];
+  return `
+    <div class="biomed-label">Logic Audit</div>
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Verdict</span><strong>${escapeHtml(logic.logic_verdict)}</strong></div>
+        <div><span>Score</span><strong>${Math.round(logic.entailment_score * 100)}%</strong></div>
+        <div><span>Evidence</span><strong>${escapeHtml(logic.evidence_ids.join(", ") || "-")}</strong></div>
+        <div><span>Facts</span><strong>${factExport ? factExport.facts.length : 0}</strong></div>
+      </div>
+      <div class="biomed-evidence-finding">${escapeHtml(logic.reason)}</div>
+      <div class="biomed-label">Triggered Rules</div>
+      ${renderList(logic.rules_triggered)}
+      ${mismatchLines.length ? `<div class="biomed-label">Mismatches</div>${renderList(mismatchLines)}` : ""}
+      ${logic.warnings.length ? `<div class="biomed-label">Logic Warnings</div>${renderList(logic.warnings)}` : ""}
+      ${
+        factExport
+          ? `
+            <div class="biomed-label">Logic Fact Export</div>
+            <div class="biomed-watch-meta">
+              <code>${escapeHtml(factExport.export_id)}</code> · ${escapeHtml(factExport.format)} · ${escapeHtml(factExport.exporter_version)}
+            </div>
+            ${factExport.warnings.length ? renderList(factExport.warnings) : ""}
+            ${factExport.text ? `<pre class="biomed-json">${escapeHtml(factExport.text)}</pre>` : ""}
+          `
+          : ""
+      }
+    </div>
+  `;
+}
+
 function renderAuditResult(result: CitationAuditResult): string {
   const failed = result.failed_claims || [];
   const rows = (result.claim_audits || []).map((item) => `
@@ -418,6 +483,7 @@ function renderAuditResult(result: CitationAuditResult): string {
         citations ${escapeHtml(item.cited_paper_ids.join(", ") || "-")} · evidence ${escapeHtml(item.evidence_ids.join(", ") || "-")}
       </div>
       ${item.evidence_span ? `<code class="biomed-query">${escapeHtml(item.evidence_span)}</code>` : ""}
+      ${renderLogicAudit(item.logic_audit)}
     </div>
   `).join("");
   return `
@@ -826,6 +892,8 @@ function renderAsk(container: HTMLElement): void {
           <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
           <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
           <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
+          <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
+          <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Export facts</label>
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
         </div>
@@ -920,6 +988,8 @@ function renderAsk(container: HTMLElement): void {
     const useSynthesis = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked);
     const useRevision = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked);
     const useVerifier = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-verifier")?.checked);
+    const useClaimLogic = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked);
+    const exportLogicFacts = Boolean(container.querySelector<HTMLInputElement>("#biomed-export-logic-facts")?.checked);
     try {
       const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
         method: "POST",
@@ -936,6 +1006,8 @@ function renderAsk(container: HTMLElement): void {
           use_llm_synthesis: useSynthesis,
           use_llm_verifier: useVerifier,
           use_llm_revision: useRevision,
+          use_llm_claim_logic: useClaimLogic,
+          export_logic_facts: exportLogicFacts,
         }),
       });
       resultNode.innerHTML = renderAuditedAnswer(result);
@@ -1316,7 +1388,10 @@ window.AkashicDashboard.registerPlugin({
     const view = viewFromDispatch(dispatch);
     container.innerHTML = renderTabs(view);
     container.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
-      button.addEventListener("click", () => dispatch.setFilter("_view", button.dataset.biomedView || "ask"));
+      button.addEventListener("click", () => {
+        dispatch.setFilter("_view", button.dataset.biomedView || "ask");
+        dispatch.activate();
+      });
     });
   },
 
