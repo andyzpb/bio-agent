@@ -1,6 +1,7 @@
 [project]
 name = "akashic-agent"
 version = "0.1.0"
+license = "Apache-2.0"
 requires-python = ">=3.12"
 
 [tool.black]
@@ -12,4 +13,3 @@ include = '\.pyi?$'
 dev = [
     "rich>=15.0.0",
 ]
-

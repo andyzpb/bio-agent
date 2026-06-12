@@ -510,6 +510,10 @@ Longer-term research tracks:
 - Adding full-text/PDF ingestion before abstract-level provenance and audit
   gates remain stable.
 
+## License
+
+Licensed under the [Apache License 2.0](./LICENSE).
+
 ## More Docs
 
 | Topic | File |
