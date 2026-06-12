@@ -110,11 +110,16 @@ from plugins.biomed_evidence.schemas import (
     QueryPlanValidation,
     CoverageMatrixRow,
     ReleaseToolEnvelope,
+    ReleaseToolSourcePolicy,
     RetrievalBundle,
     RetrievalBundleRecord,
     RetrievalIntent,
     RetrievalManifest,
     RetrievalSubquestion,
+    SavedToolChainTemplate,
+    SavedToolChainTemplateListResult,
+    SavedToolChainTemplateRunRequest,
+    SavedToolChainTemplateSaveRequest,
     SearchBiomedicalLiteratureRequest,
     SearchBiomedicalLiteratureResult,
     WatchCheckResult,
@@ -174,6 +179,211 @@ class BiomedEvidenceService:
     async def aclose(self) -> None:
         self.storage.close()
         await self.pubmed_client.close()
+
+    def list_workflow_templates(self) -> SavedToolChainTemplateListResult:
+        custom, _ = self.storage.list_workflow_templates(page=1, page_size=500)
+        items = [*default_workflow_templates(), *custom]
+        return SavedToolChainTemplateListResult(items=items, total=len(items))
+
+    def get_workflow_template(self, template_id: str) -> SavedToolChainTemplate | None:
+        defaults = {item.template_id: item for item in default_workflow_templates()}
+        if template_id in defaults:
+            return defaults[template_id]
+        return self.storage.get_workflow_template(template_id)
+
+    def save_workflow_template(
+        self,
+        request: SavedToolChainTemplateSaveRequest,
+    ) -> SavedToolChainTemplate:
+        template_id = _clean_template_id(request.template_id or request.name)
+        if template_id in {item.template_id for item in default_workflow_templates()}:
+            raise ValueError("built-in workflow templates are immutable")
+        now = _now_iso()
+        existing = self.storage.get_workflow_template(template_id)
+        template = SavedToolChainTemplate(
+            template_id=template_id,
+            name=request.name.strip() or "Untitled workflow template",
+            description=request.description,
+            workflow=request.workflow,
+            builtin=False,
+            source=request.source,
+            source_policy=_template_source_policy(request.source),
+            max_papers=max(1, min(int(request.max_papers), 50)),
+            max_queries=max(1, min(int(request.max_queries), 20)),
+            max_followups=max(0, min(int(request.max_followups), 10)),
+            max_tool_steps=max(1, min(int(request.max_tool_steps), 100)),
+            max_wall_clock_seconds=max(
+                1,
+                min(int(request.max_wall_clock_seconds), 900),
+            ),
+            include_rejected_papers=request.include_rejected_papers,
+            require_citations=request.require_citations,
+            execute_support_refute=request.execute_support_refute,
+            use_llm_planner=request.use_llm_planner,
+            use_llm_extractor=request.use_llm_extractor,
+            use_llm_synthesis=request.use_llm_synthesis,
+            use_llm_verifier=request.use_llm_verifier,
+            use_llm_revision=request.use_llm_revision,
+            use_llm_claim_logic=request.use_llm_claim_logic,
+            export_logic_facts=request.export_logic_facts,
+            build_evidence_packet=request.build_evidence_packet,
+            export_provenance=request.export_provenance,
+            clinical_guard_required=request.clinical_guard_required,
+            required_skills=_clean_list(request.required_skills),
+            stop_conditions=_clean_list(request.stop_conditions),
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+        )
+        self.storage.save_workflow_template(template)
+        return template
+
+    def delete_workflow_template(self, template_id: str) -> bool:
+        if template_id in {item.template_id for item in default_workflow_templates()}:
+            return False
+        return self.storage.delete_workflow_template(template_id)
+
+    async def run_workflow_template(
+        self,
+        template_id: str,
+        request: SavedToolChainTemplateRunRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "run_saved_tool_chain_template"
+        metadata = get_release_tool_metadata(tool_name)
+        template = self.get_workflow_template(template_id)
+        if template is None:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="workflow template not found",
+                detail={"template_id": template_id},
+                metadata=metadata,
+            )
+        question = request.question.strip()
+        if not question:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message="question is required to run a workflow template",
+                detail={"template_id": template_id},
+                metadata=metadata,
+            )
+        if template.clinical_guard_required and is_clinical_request(question):
+            return release_error(
+                tool_name=tool_name,
+                code="clinical_boundary",
+                message=(
+                    "Clinical or patient-specific request blocked before template "
+                    "retrieval, extraction, LLM, audit, or export steps."
+                ),
+                detail={
+                    "template_id": template_id,
+                    "clinical_guard_required": True,
+                    "memory_used": False,
+                    "retrieval_executed": False,
+                },
+                trace={"template_id": template_id, "step": "clinical_precheck"},
+                metadata=metadata,
+            )
+        source = request.source_override or template.source
+        if source == "pubmed" and not request.allow_live_pubmed:
+            return release_error(
+                tool_name=tool_name,
+                code="source_policy_blocked",
+                message=(
+                    "This template would use live PubMed; rerun with "
+                    "allow_live_pubmed=true to opt in."
+                ),
+                detail={
+                    "template_id": template_id,
+                    "source": source,
+                    "source_policy": "live_opt_in",
+                },
+                metadata=metadata,
+            )
+        active_template = template.model_copy(
+            update={
+                "source": source,
+                "source_policy": _template_source_policy(source),
+                "max_papers": max(
+                    1,
+                    min(
+                        int(request.max_papers_override)
+                        if request.max_papers_override is not None
+                        else template.max_papers,
+                        50,
+                    ),
+                ),
+            }
+        )
+        try:
+            audited = await self.answer_with_audit(
+                AnswerWithEvidenceRequest(
+                    question=question,
+                    max_papers=active_template.max_papers,
+                    project_id=request.project_id,
+                    project_context=request.project_context,
+                    require_citations=active_template.require_citations,
+                    source=active_template.source,
+                    include_rejected_papers=active_template.include_rejected_papers,
+                    use_llm_revision=active_template.use_llm_revision,
+                    use_llm_planner=active_template.use_llm_planner,
+                    execute_support_refute=active_template.execute_support_refute,
+                    use_llm_extractor=active_template.use_llm_extractor,
+                    use_llm_synthesis=active_template.use_llm_synthesis,
+                    use_llm_verifier=active_template.use_llm_verifier,
+                    use_llm_claim_logic=active_template.use_llm_claim_logic,
+                    export_logic_facts=active_template.export_logic_facts,
+                )
+            )
+        except LiteratureClientError as exc:
+            return release_error(
+                tool_name=tool_name,
+                code="external_source_unavailable",
+                message=str(exc),
+                detail={"template_id": template_id, "source": active_template.source},
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            return release_error(
+                tool_name=tool_name,
+                code="invalid_input",
+                message=str(exc),
+                detail={
+                    "template_id": template_id,
+                    "project_id": request.project_id,
+                },
+                metadata=metadata,
+            )
+        provenance: dict[str, Any] | None = None
+        if active_template.export_provenance:
+            provenance = self.export_provenance_graph(
+                audited.answer_result.run_id
+            ).model_dump(mode="json")
+        ids = {
+            "template_id": active_template.template_id,
+            "run_id": audited.answer_result.run_id,
+        }
+        if audited.answer_result.retrieval_id:
+            ids["retrieval_id"] = audited.answer_result.retrieval_id
+        if audited.answer_result.evidence_packet:
+            ids["packet_id"] = audited.answer_result.evidence_packet.packet_id
+        return release_ok(
+            tool_name=tool_name,
+            result={
+                "template": active_template.model_dump(mode="json"),
+                "audited_answer": audited.model_dump(mode="json"),
+                "provenance": provenance,
+            },
+            ids=ids,
+            trace={
+                "template_id": active_template.template_id,
+                "workflow": active_template.workflow,
+                "source": active_template.source,
+                "required_skills": active_template.required_skills,
+                "stop_conditions": active_template.stop_conditions,
+            },
+            metadata=metadata,
+        )
 
     def create_project(self, request: BiomedProjectCreateRequest) -> BiomedProject:
         now = _now_iso()
@@ -7208,6 +7418,143 @@ def _merge_unique(*groups: Iterable[str]) -> list[str]:
             seen.add(clean)
             result.append(clean)
     return result
+
+
+def _template_source_policy(source: str) -> ReleaseToolSourcePolicy:
+    return "live_opt_in" if source == "pubmed" else "mock_only"
+
+
+def _clean_template_id(value: str) -> str:
+    base = _slug(value)
+    if not base.startswith("biomed-template-"):
+        base = f"biomed-template-{base}"
+    return base
+
+
+def default_workflow_templates() -> list[SavedToolChainTemplate]:
+    now = "builtin"
+    return [
+        SavedToolChainTemplate(
+            template_id="biomed-template-mock-ci",
+            name="Mock CI Workflow",
+            description=(
+                "Deterministic mock-source workflow for regression checks and demos."
+            ),
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=5,
+            max_queries=4,
+            max_followups=0,
+            execute_support_refute=True,
+            use_llm_claim_logic=True,
+            export_logic_facts=True,
+            export_provenance=True,
+            required_skills=[
+                "biomed-evidence-review",
+                "biomed-clinical-boundary",
+            ],
+            stop_conditions=[
+                "clinical_boundary",
+                "budget_exceeded",
+                "empty_evidence",
+            ],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-pubmed-live-research",
+            name="PubMed Live Research Workflow",
+            description=(
+                "Opt-in live PubMed workflow with LLM planning, extraction, "
+                "synthesis, verifier, revision, and provenance."
+            ),
+            builtin=True,
+            source="pubmed",
+            source_policy="live_opt_in",
+            max_papers=3,
+            max_queries=6,
+            max_followups=1,
+            execute_support_refute=True,
+            use_llm_planner=True,
+            use_llm_extractor=True,
+            use_llm_synthesis=True,
+            use_llm_verifier=True,
+            use_llm_revision=True,
+            use_llm_claim_logic=True,
+            export_logic_facts=True,
+            export_provenance=True,
+            required_skills=[
+                "biomed-evidence-review",
+                "biomed-clinical-boundary",
+            ],
+            stop_conditions=[
+                "clinical_boundary",
+                "source_policy_blocked",
+                "external_source_unavailable",
+                "llm_schema_invalid",
+            ],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-clinical-guarded",
+            name="Conservative Clinical-Guarded Workflow",
+            description=(
+                "Small deterministic workflow that prioritizes clinical-boundary "
+                "refusal before any retrieval or LLM path."
+            ),
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=3,
+            max_queries=2,
+            max_followups=0,
+            execute_support_refute=False,
+            clinical_guard_required=True,
+            export_provenance=False,
+            required_skills=["biomed-clinical-boundary"],
+            stop_conditions=["clinical_boundary"],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-deep-audit",
+            name="Deep Audit Workflow",
+            description=(
+                "High-scrutiny mock-source workflow for citation audit, logic facts, "
+                "revision, packet inspection, and provenance export."
+            ),
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=10,
+            max_queries=6,
+            max_followups=2,
+            execute_support_refute=True,
+            use_llm_planner=True,
+            use_llm_extractor=True,
+            use_llm_synthesis=True,
+            use_llm_verifier=True,
+            use_llm_revision=True,
+            use_llm_claim_logic=True,
+            export_logic_facts=True,
+            export_provenance=True,
+            required_skills=[
+                "biomed-evidence-review",
+                "biomed-clinical-boundary",
+                "biomed-project-memory-watch",
+            ],
+            stop_conditions=[
+                "clinical_boundary",
+                "budget_exceeded",
+                "empty_evidence",
+                "provenance_unavailable",
+            ],
+            created_at=now,
+            updated_at=now,
+        ),
+    ]
 
 
 def _revision_id(run_id: str, audit_id: str | None) -> str:

@@ -79,6 +79,8 @@ def test_release_tool_contract_registry_and_source_policy() -> None:
     assert "search_literature" in contracts
     assert "run_multi_pass_literature_search" in contracts
     assert "export_evidence_packet_to_obsidian" in contracts
+    assert "run_saved_tool_chain_template" in contracts
+    assert "list_biomed_workflow_templates" in contracts
 
     search_contract = get_release_tool_metadata("search_literature")
     assert search_contract.risk_level == "external_network"

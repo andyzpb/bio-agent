@@ -244,6 +244,7 @@ ReleaseToolSideEffect = Literal[
     "external_network",
     "llm_call",
 ]
+SavedToolChainWorkflow = Literal["audited_answer"]
 EvidencePacketSelectionStrategy = Literal["all_valid", "submodular_greedy"]
 EvidencePacketAvailability = Literal[
     "persisted",
@@ -420,6 +421,88 @@ class BanditAdvisoryResult(BaseModel):
     confidence: float = 0.0
     expected_additional_steps: float = 0.0
     based_on: dict[str, Any] = Field(default_factory=dict)
+
+
+class SavedToolChainTemplate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    template_id: str
+    name: str
+    description: str | None = None
+    workflow: SavedToolChainWorkflow = "audited_answer"
+    builtin: bool = False
+    source: Literal["pubmed", "mock"] = "mock"
+    source_policy: ReleaseToolSourcePolicy = "live_opt_in"
+    max_papers: int = 5
+    max_queries: int = 6
+    max_followups: int = 0
+    max_tool_steps: int = 20
+    max_wall_clock_seconds: int = 180
+    include_rejected_papers: bool = False
+    require_citations: bool = True
+    execute_support_refute: bool = True
+    use_llm_planner: bool = False
+    use_llm_extractor: bool = False
+    use_llm_synthesis: bool = False
+    use_llm_verifier: bool = False
+    use_llm_revision: bool = False
+    use_llm_claim_logic: bool = False
+    export_logic_facts: bool = False
+    build_evidence_packet: bool = True
+    export_provenance: bool = True
+    clinical_guard_required: bool = True
+    required_skills: list[str] = Field(default_factory=list)
+    stop_conditions: list[str] = Field(default_factory=list)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SavedToolChainTemplateSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    template_id: str | None = None
+    name: str
+    description: str | None = None
+    workflow: SavedToolChainWorkflow = "audited_answer"
+    source: Literal["pubmed", "mock"] = "mock"
+    max_papers: int = 5
+    max_queries: int = 6
+    max_followups: int = 0
+    max_tool_steps: int = 20
+    max_wall_clock_seconds: int = 180
+    include_rejected_papers: bool = False
+    require_citations: bool = True
+    execute_support_refute: bool = True
+    use_llm_planner: bool = False
+    use_llm_extractor: bool = False
+    use_llm_synthesis: bool = False
+    use_llm_verifier: bool = False
+    use_llm_revision: bool = False
+    use_llm_claim_logic: bool = False
+    export_logic_facts: bool = False
+    build_evidence_packet: bool = True
+    export_provenance: bool = True
+    clinical_guard_required: bool = True
+    required_skills: list[str] = Field(default_factory=list)
+    stop_conditions: list[str] = Field(default_factory=list)
+
+
+class SavedToolChainTemplateListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[SavedToolChainTemplate] = Field(default_factory=list)
+    total: int = 0
+
+
+class SavedToolChainTemplateRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    project_id: str | None = None
+    project_context: str | None = None
+    source_override: Literal["pubmed", "mock"] | None = None
+    max_papers_override: int | None = None
+    allow_live_pubmed: bool = False
 
 
 class BiomedicalPaper(BaseModel):

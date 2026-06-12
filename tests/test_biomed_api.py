@@ -568,6 +568,83 @@ def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
         assert deleted.json()["deleted"] is True
 
 
+def test_biomed_workflow_templates_api(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        templates = client.get("/api/biomed/workflow/templates")
+        assert templates.status_code == 200
+        template_payload = templates.json()
+        template_ids = {item["template_id"] for item in template_payload["items"]}
+        assert "biomed-template-mock-ci" in template_ids
+        assert "biomed-template-pubmed-live-research" in template_ids
+        assert template_payload["total"] >= 4
+
+        pubmed_blocked = client.post(
+            "/api/biomed/workflow/templates/biomed-template-pubmed-live-research/run",
+            json={
+                "question": "What evidence links microglia to Alzheimer disease?",
+                "allow_live_pubmed": False,
+            },
+        )
+        assert pubmed_blocked.status_code == 200
+        assert pubmed_blocked.json()["ok"] is False
+        assert pubmed_blocked.json()["error_code"] == "source_policy_blocked"
+
+        clinical_blocked = client.post(
+            "/api/biomed/workflow/templates/biomed-template-mock-ci/run",
+            json={"question": "What dose should my mother take for Alzheimer disease?"},
+        )
+        assert clinical_blocked.status_code == 200
+        clinical_payload = clinical_blocked.json()
+        assert clinical_payload["ok"] is False
+        assert clinical_payload["error_code"] == "clinical_boundary"
+        assert clinical_payload["errors"][0]["detail"]["retrieval_executed"] is False
+
+        saved = client.post(
+            "/api/biomed/workflow/templates",
+            json={
+                "name": "Custom Mock Audit",
+                "source": "mock",
+                "max_papers": 4,
+                "execute_support_refute": True,
+                "use_llm_claim_logic": True,
+                "export_logic_facts": True,
+                "required_skills": [
+                    "biomed-evidence-review",
+                    "biomed-clinical-boundary",
+                ],
+            },
+        )
+        assert saved.status_code == 200
+        saved_payload = saved.json()
+        assert saved_payload["template_id"] == "biomed-template-custom-mock-audit"
+        assert saved_payload["builtin"] is False
+
+        run = client.post(
+            f"/api/biomed/workflow/templates/{saved_payload['template_id']}/run",
+            json={
+                "question": "What recent evidence links microglial activation to Alzheimer's disease progression?",
+            },
+        )
+        assert run.status_code == 200
+        run_payload = run.json()
+        assert run_payload["ok"] is True
+        assert run_payload["ids"]["run_id"]
+        assert run_payload["result"]["template"]["required_skills"] == [
+            "biomed-evidence-review",
+            "biomed-clinical-boundary",
+        ]
+        audited = run_payload["result"]["audited_answer"]
+        assert audited["answer_result"]["citations"]
+        assert audited["answer_result"]["evidence_packet"]["packet_id"]
+        assert run_payload["result"]["provenance"]["ok"] is True
+
+        deleted = client.delete(
+            f"/api/biomed/workflow/templates/{saved_payload['template_id']}"
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted"] is True
+
+
 def test_biomed_api_validation_error(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.post("/api/biomed/answer", json={"source": "mock"})

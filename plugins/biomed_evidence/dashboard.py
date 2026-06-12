@@ -27,6 +27,8 @@ from plugins.biomed_evidence.schemas import (
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
+    SavedToolChainTemplateRunRequest,
+    SavedToolChainTemplateSaveRequest,
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
@@ -83,6 +85,42 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "tools": [item.model_dump(mode="json") for item in contracts],
             "tool_count": len(contracts),
         }
+
+    @app.get("/api/biomed/workflow/templates")
+    def list_workflow_templates() -> dict[str, Any]:
+        return service.list_workflow_templates().model_dump(mode="json")
+
+    @app.get("/api/biomed/workflow/templates/{template_id}")
+    def get_workflow_template(template_id: str) -> dict[str, Any]:
+        template = service.get_workflow_template(template_id)
+        if template is None:
+            raise HTTPException(status_code=404, detail="workflow template not found")
+        return template.model_dump(mode="json")
+
+    @app.post("/api/biomed/workflow/templates")
+    def save_workflow_template(
+        payload: SavedToolChainTemplateSaveRequest,
+    ) -> dict[str, Any]:
+        try:
+            template = service.save_workflow_template(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return template.model_dump(mode="json")
+
+    @app.delete("/api/biomed/workflow/templates/{template_id}")
+    def delete_workflow_template(template_id: str) -> dict[str, Any]:
+        return {
+            "deleted": service.delete_workflow_template(template_id),
+            "template_id": template_id,
+        }
+
+    @app.post("/api/biomed/workflow/templates/{template_id}/run")
+    async def run_workflow_template(
+        template_id: str,
+        payload: SavedToolChainTemplateRunRequest,
+    ) -> dict[str, Any]:
+        result = await service.run_workflow_template(template_id, payload)
+        return result.model_dump(mode="json")
 
     @app.post("/api/biomed/retrieval/multi-pass")
     async def run_multi_pass_literature_search(

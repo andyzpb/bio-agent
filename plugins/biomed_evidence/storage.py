@@ -24,6 +24,7 @@ from plugins.biomed_evidence.schemas import (
     ProjectPaperDecision,
     ProjectReviewQueueItem,
     RetrievalManifest,
+    SavedToolChainTemplate,
     WatchDecisionDetail,
     WatchSnapshot,
     WatchTopic,
@@ -328,6 +329,85 @@ class BiomedStorage:
             page=page,
             page_size=page_size,
         )
+
+    def save_workflow_template(self, template: SavedToolChainTemplate) -> None:
+        now = _now_iso()
+        created_at = template.created_at or now
+        saved = template.model_copy(
+            update={"builtin": False, "created_at": created_at, "updated_at": now}
+        )
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_workflow_templates(
+                    template_id, name, template_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(template_id) DO UPDATE SET
+                    name=excluded.name,
+                    template_json=excluded.template_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    saved.template_id,
+                    saved.name,
+                    _json(saved.model_dump(mode="json")),
+                    saved.created_at,
+                    saved.updated_at,
+                ),
+            )
+            self._db.commit()
+
+    def get_workflow_template(self, template_id: str) -> SavedToolChainTemplate | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT template_json
+                FROM biomed_workflow_templates
+                WHERE template_id=?
+                """,
+                (template_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SavedToolChainTemplate.model_validate(
+            json.loads(str(row["template_json"]))
+        )
+
+    def list_workflow_templates(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[list[SavedToolChainTemplate], int]:
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    "SELECT COUNT(*) FROM biomed_workflow_templates"
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                """
+                SELECT template_json
+                FROM biomed_workflow_templates
+                ORDER BY updated_at DESC, name ASC
+                LIMIT ? OFFSET ?
+                """,
+                (_safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        items = [
+            SavedToolChainTemplate.model_validate(json.loads(str(row["template_json"])))
+            for row in rows
+        ]
+        return items, total
+
+    def delete_workflow_template(self, template_id: str) -> bool:
+        with self._lock:
+            cursor = self._db.execute(
+                "DELETE FROM biomed_workflow_templates WHERE template_id=?",
+                (template_id,),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
 
     def save_project(self, project: BiomedProject) -> None:
         with self._lock:
@@ -1592,6 +1672,13 @@ class BiomedStorage:
                 answer_json TEXT NOT NULL,
                 retrieval_id TEXT,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_workflow_templates(
+                template_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                template_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS biomed_retrieval_manifests(
                 retrieval_id TEXT PRIMARY KEY,

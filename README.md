@@ -8,8 +8,8 @@ showcases a **research-only biomedical evidence agent** built on that framework:
 it searches literature, extracts evidence, audits generated claims, and makes
 every answer inspectable.
 
-Current biomedical baseline: **Release 1.1: Toolized Biomedical Evidence
-Workflow with Live PubMed Smoke Automation**.
+Current biomedical baseline: **Release 1.2: Saved Biomedical Tool-Chain
+Templates with Workflow Skills**.
 
 ## Why It Matters
 
@@ -46,6 +46,9 @@ and patient-specific advice are refused before retrieval or LLM stages run.
 - **Replayable live smoke**: Release 1.1 adds a dashboard-level PubMed + Ollama
   smoke runner that captures redacted artifacts for trace, packet, manifest,
   provenance, and clinical guardrail regression.
+- **Saved workflows**: Release 1.2 adds built-in and custom biomedical
+  tool-chain templates plus workflow skills for evidence review, clinical
+  boundary enforcement, and project/watch memory.
 - **Math-oriented review aids**: submodular-style packet selection,
   contextual-bandit-style retrieval advisory, Markov-style step telemetry, and
   PROV/OpenLineage-compatible provenance graphs are used as advisory and
@@ -164,11 +167,13 @@ Completed baseline:
 - project workspace, Research Watch, and one-way Obsidian export;
 - deterministic packet selection, retrieval advisory, step telemetry, and
   provenance export;
-- Release 1.1 live PubMed/Ollama smoke artifact automation.
+- Release 1.1 live PubMed/Ollama smoke artifact automation;
+- Release 1.2 saved tool-chain templates and biomedical workflow skills.
 
 Next:
 
-- dashboard controls for saved tool-chain templates;
+- Codex-style biomedical workspace shell with fewer visible toggles and stronger
+  progressive disclosure;
 - full-text/PDF ingestion behind the same provenance and audit gates;
 - stronger provenance visualization and human review events;
 - formal argumentation, conformal uncertainty, causal claim typing, topic drift,

@@ -115,6 +115,7 @@ def _register_defaults() -> None:
         "list_project_evidence",
         "list_project_review_queue",
         "list_research_watch_topics",
+        "list_biomed_workflow_templates",
     ):
         register_release_tool_contract(
             tool_name=tool_name,
@@ -134,6 +135,8 @@ def _register_defaults() -> None:
         "watch_research_topic",
         "update_research_watch_topic",
         "delete_research_watch_topic",
+        "save_biomed_workflow_template",
+        "delete_biomed_workflow_template",
     ):
         register_release_tool_contract(
             tool_name=tool_name,
@@ -149,22 +152,30 @@ def _register_defaults() -> None:
         "get_answer_trace",
         "get_evidence_packet",
         "export_provenance_graph",
+        "run_saved_tool_chain_template",
     ):
         register_release_tool_contract(
             tool_name=tool_name,
             risk_level=(
                 "external_network"
-                if tool_name == "run_multi_pass_literature_search"
+                if tool_name
+                in {"run_multi_pass_literature_search", "run_saved_tool_chain_template"}
                 else "read_only"
             ),
             source_policy=(
                 "live_opt_in"
                 if tool_name
-                in {"run_multi_pass_literature_search", "extract_evidence_batch"}
+                in {
+                    "run_multi_pass_literature_search",
+                    "extract_evidence_batch",
+                    "run_saved_tool_chain_template",
+                }
                 else "no_source"
             ),
             side_effects=(
-                ["read_storage", "write_storage", "external_network"]
+                ["read_storage", "write_storage", "external_network", "llm_call"]
+                if tool_name == "run_saved_tool_chain_template"
+                else ["read_storage", "write_storage", "external_network"]
                 if tool_name == "run_multi_pass_literature_search"
                 else ["read_storage"]
             ),

@@ -26,6 +26,18 @@
   - 把长代码库任务委托给本机 Codex CLI 后台执行，并等待完成后回灌结果。
   - 文件：`skills/codex-delegate/SKILL.md`
 
+- `biomed-evidence-review`
+  - 使用受控文献检索、证据包、audit/revision、trace 和 provenance 执行 research-only biomedical evidence review。
+  - 文件：`skills/biomed-evidence-review/SKILL.md`
+
+- `biomed-clinical-boundary`
+  - 在任何检索、LLM、记忆、导出或 provenance 之前执行临床/患者特异性请求边界拦截。
+  - 文件：`skills/biomed-clinical-boundary/SKILL.md`
+
+- `biomed-project-memory-watch`
+  - 管理 biomedical project memory、Research Watch、reviewer decisions 和 Obsidian 单向导出，同时禁止把记忆当证据。
+  - 文件：`skills/biomed-project-memory-watch/SKILL.md`
+
 - `skill-creater`
   - 创建或改写技能 `SKILL.md`，用于新增技能与结构迁移。
   - 文件：`skills/skill-creater/SKILL.md`

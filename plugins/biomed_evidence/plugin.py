@@ -34,6 +34,8 @@ from plugins.biomed_evidence.schemas import (
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
+    SavedToolChainTemplateRunRequest,
+    SavedToolChainTemplateSaveRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
 )
@@ -102,7 +104,7 @@ _TOOLS_WITH_SOURCE = frozenset(
         "reject_project_paper",
         "find_conflicting_evidence",
     }
-) | _RELEASE_SOURCE_TOOL_NAMES
+) | (_RELEASE_SOURCE_TOOL_NAMES - {"run_saved_tool_chain_template"})
 
 _TOOLS_WITH_PROJECT_ID = frozenset(
     {
@@ -121,6 +123,7 @@ _TOOLS_WITH_PROJECT_ID = frozenset(
         "list_project_review_queue",
         "generate_project_evidence_brief",
         "export_project_to_obsidian",
+        "run_saved_tool_chain_template",
     }
 )
 
@@ -133,6 +136,7 @@ _TOOLS_WITH_OPTIONAL_ACTIVE_PROJECT = frozenset(
         "list_project_evidence",
         "list_project_review_queue",
         "generate_project_evidence_brief",
+        "run_saved_tool_chain_template",
     }
 )
 
@@ -907,6 +911,120 @@ class BiomedEvidencePlugin(Plugin):
         except ValueError:
             return _dump({"error": "project_not_found", "project_id": project_id})
         return _dump(brief.model_dump(mode="json"))
+
+    @tool(
+        name="list_biomed_workflow_templates",
+        risk="read-only",
+        search_hint="list saved biomedical workflow tool chain templates",
+    )
+    async def list_biomed_workflow_templates(self, event) -> str:
+        """List built-in and saved biomedical tool-chain workflow templates."""
+        result = self._service.list_workflow_templates()
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="save_biomed_workflow_template",
+        risk="read-write",
+        search_hint="save biomedical workflow tool chain template",
+    )
+    async def save_biomed_workflow_template(
+        self,
+        event,
+        name: str,
+        template_id: str | None = None,
+        description: str | None = None,
+        source: Literal["pubmed", "mock"] = "mock",
+        max_papers: int = 5,
+        execute_support_refute: bool = True,
+        use_llm_planner: bool = False,
+        use_llm_extractor: bool = False,
+        use_llm_synthesis: bool = False,
+        use_llm_verifier: bool = False,
+        use_llm_revision: bool = False,
+        use_llm_claim_logic: bool = False,
+        export_logic_facts: bool = False,
+        export_provenance: bool = True,
+    ) -> str:
+        """Save a reusable biomedical audited-answer workflow template."""
+        try:
+            result = self._service.save_workflow_template(
+                SavedToolChainTemplateSaveRequest(
+                    template_id=template_id,
+                    name=name,
+                    description=description,
+                    source=source,
+                    max_papers=max_papers,
+                    execute_support_refute=execute_support_refute,
+                    use_llm_planner=use_llm_planner,
+                    use_llm_extractor=use_llm_extractor,
+                    use_llm_synthesis=use_llm_synthesis,
+                    use_llm_verifier=use_llm_verifier,
+                    use_llm_revision=use_llm_revision,
+                    use_llm_claim_logic=use_llm_claim_logic,
+                    export_logic_facts=export_logic_facts,
+                    export_provenance=export_provenance,
+                    required_skills=[
+                        "biomed-evidence-review",
+                        "biomed-clinical-boundary",
+                    ],
+                    stop_conditions=[
+                        "clinical_boundary",
+                        "source_policy_blocked",
+                        "empty_evidence",
+                    ],
+                )
+            )
+        except ValueError as exc:
+            return _dump({"error": "invalid_template", "message": str(exc)})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="delete_biomed_workflow_template",
+        risk="read-write",
+        search_hint="delete custom biomedical workflow template",
+    )
+    async def delete_biomed_workflow_template(self, event, template_id: str) -> str:
+        """Delete a custom biomedical workflow template. Built-ins are immutable."""
+        return _dump(
+            {
+                "deleted": self._service.delete_workflow_template(template_id),
+                "template_id": template_id,
+            }
+        )
+
+    @tool(
+        name="run_saved_tool_chain_template",
+        risk="read-only",
+        search_hint="run saved biomedical tool chain template audited answer",
+    )
+    async def run_saved_tool_chain_template(
+        self,
+        event,
+        template_id: str,
+        question: str,
+        project_id: str | None = None,
+        project_context: str | None = None,
+        source_override: Literal["pubmed", "mock"] | None = None,
+        max_papers_override: int | None = None,
+        allow_live_pubmed: bool | None = None,
+    ) -> str:
+        """Run a saved biomedical workflow template with policy revalidation."""
+        result = await self._service.run_workflow_template(
+            template_id,
+            SavedToolChainTemplateRunRequest(
+                question=question,
+                project_id=project_id,
+                project_context=project_context,
+                source_override=source_override,
+                max_papers_override=max_papers_override,
+                allow_live_pubmed=(
+                    allow_live_pubmed
+                    if allow_live_pubmed is not None
+                    else _config_bool(self, "allow_live_pubmed_tools", False)
+                ),
+            ),
+        )
+        return _dump(result.model_dump(mode="json"))
 
     @tool(
         name="answer_with_evidence",

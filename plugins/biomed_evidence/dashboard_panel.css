@@ -158,6 +158,19 @@
   gap: 8px;
 }
 
+.biomed-advanced-options summary {
+  cursor: pointer;
+  color: var(--text, #141413);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.biomed-advanced-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: 12px;
+}
+
 .biomed-toggle-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -477,6 +490,7 @@
   }
 
   .biomed-control-grid,
+  .biomed-advanced-grid,
   .biomed-toggle-grid {
     grid-template-columns: 1fr;
   }

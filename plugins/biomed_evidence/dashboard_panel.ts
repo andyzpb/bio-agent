@@ -2,6 +2,8 @@
 
 type BiomedView = "ask" | "projects" | "evidence" | "graph" | "watch" | "audit" | "trace" | "responsible";
 
+let biomedWorkflowTemplates: SavedToolChainTemplate[] = [];
+
 interface EvidenceRow {
   evidence_id: string;
   paper_id: string;
@@ -364,6 +366,46 @@ interface ReleaseToolEnvelope<T = Record<string, unknown>> {
     side_effects: string[];
     requires_confirmation: boolean;
   } | null;
+}
+
+interface SavedToolChainTemplate {
+  template_id: string;
+  name: string;
+  description?: string | null;
+  builtin: boolean;
+  source: "mock" | "pubmed";
+  source_policy: string;
+  max_papers: number;
+  max_queries: number;
+  max_followups: number;
+  max_tool_steps: number;
+  max_wall_clock_seconds: number;
+  include_rejected_papers: boolean;
+  require_citations: boolean;
+  execute_support_refute: boolean;
+  use_llm_planner: boolean;
+  use_llm_extractor: boolean;
+  use_llm_synthesis: boolean;
+  use_llm_verifier: boolean;
+  use_llm_revision: boolean;
+  use_llm_claim_logic: boolean;
+  export_logic_facts: boolean;
+  build_evidence_packet: boolean;
+  export_provenance: boolean;
+  clinical_guard_required: boolean;
+  required_skills: string[];
+  stop_conditions: string[];
+}
+
+interface SavedToolChainTemplateListResult {
+  items: SavedToolChainTemplate[];
+  total: number;
+}
+
+interface SavedToolChainTemplateRunResult {
+  template: SavedToolChainTemplate;
+  audited_answer: AuditedAnswerResult;
+  provenance?: ReleaseToolEnvelope<ProvenanceGraphResult> | null;
 }
 
 interface EvidenceSelectionItem {
@@ -781,6 +823,113 @@ function renderManifest(manifest: RetrievalManifest | null | undefined): string 
 
 function renderLoading(message: string): string {
   return `<div class="biomed-loading">${escapeHtml(message)}</div>`;
+}
+
+function renderWorkflowTemplateSummary(template: SavedToolChainTemplate | undefined): string {
+  if (!template) return "Select a workflow template to apply saved retrieval, LLM, audit, and provenance settings.";
+  const flags = [
+    template.use_llm_planner ? "planner" : "",
+    template.use_llm_extractor ? "extractor" : "",
+    template.use_llm_synthesis ? "synthesis" : "",
+    template.use_llm_verifier ? "verifier" : "",
+    template.use_llm_revision ? "revision" : "",
+    template.use_llm_claim_logic ? "logic" : "",
+    template.export_logic_facts ? "facts" : "",
+  ].filter(Boolean);
+  return `${template.builtin ? "built-in" : "custom"} | ${template.source} | max ${template.max_papers} papers | ${flags.join(", ") || "deterministic"}`;
+}
+
+function selectedWorkflowTemplate(container: HTMLElement): SavedToolChainTemplate | undefined {
+  const templateId = container.querySelector<HTMLSelectElement>("#biomed-template-select")?.value || "";
+  return biomedWorkflowTemplates.find((item) => item.template_id === templateId);
+}
+
+function setChecked(container: HTMLElement, selector: string, checked: boolean): void {
+  const input = container.querySelector<HTMLInputElement>(selector);
+  if (input) input.checked = checked;
+}
+
+function applyWorkflowTemplate(container: HTMLElement, template: SavedToolChainTemplate): void {
+  const source = container.querySelector<HTMLSelectElement>("#biomed-source");
+  const maxPapers = container.querySelector<HTMLInputElement>("#biomed-max-papers");
+  const summary = container.querySelector<HTMLElement>("#biomed-template-summary");
+  if (source) source.value = template.source;
+  if (maxPapers) maxPapers.value = String(template.max_papers);
+  setChecked(container, "#biomed-include-rejected", template.include_rejected_papers);
+  setChecked(container, "#biomed-execute-support-refute", template.execute_support_refute);
+  setChecked(container, "#biomed-use-planner", template.use_llm_planner);
+  setChecked(container, "#biomed-use-extractor", template.use_llm_extractor);
+  setChecked(container, "#biomed-use-synthesis", template.use_llm_synthesis);
+  setChecked(container, "#biomed-use-verifier", template.use_llm_verifier);
+  setChecked(container, "#biomed-use-revision", template.use_llm_revision);
+  setChecked(container, "#biomed-use-claim-logic", template.use_llm_claim_logic);
+  setChecked(container, "#biomed-export-logic-facts", template.export_logic_facts);
+  if (summary) summary.textContent = renderWorkflowTemplateSummary(template);
+}
+
+function currentWorkflowTemplatePayload(container: HTMLElement): Record<string, unknown> {
+  const name = container.querySelector<HTMLInputElement>("#biomed-template-name")?.value || "";
+  const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
+  const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 5);
+  return {
+    name,
+    description: "Saved from the Biomedical Evidence dashboard.",
+    source,
+    max_papers: maxPapers,
+    include_rejected_papers: Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked),
+    execute_support_refute: Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked),
+    use_llm_planner: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked),
+    use_llm_extractor: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked),
+    use_llm_synthesis: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked),
+    use_llm_verifier: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-verifier")?.checked),
+    use_llm_revision: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked),
+    use_llm_claim_logic: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked),
+    export_logic_facts: Boolean(container.querySelector<HTMLInputElement>("#biomed-export-logic-facts")?.checked),
+    export_provenance: true,
+    clinical_guard_required: true,
+    required_skills: ["biomed-evidence-review", "biomed-clinical-boundary"],
+    stop_conditions: ["clinical_boundary", "source_policy_blocked", "empty_evidence"],
+  };
+}
+
+async function loadWorkflowTemplates(container: HTMLElement): Promise<void> {
+  const select = container.querySelector<HTMLSelectElement>("#biomed-template-select");
+  const summary = container.querySelector<HTMLElement>("#biomed-template-summary");
+  if (!select) return;
+  try {
+    const data = await api<SavedToolChainTemplateListResult>("/api/biomed/workflow/templates");
+    biomedWorkflowTemplates = data.items || [];
+    select.innerHTML = biomedWorkflowTemplates.map((template) => `
+      <option value="${escapeHtml(template.template_id)}">${escapeHtml(template.name)}</option>
+    `).join("");
+    const first = biomedWorkflowTemplates[0];
+    if (first) {
+      select.value = first.template_id;
+      applyWorkflowTemplate(container, first);
+      if (summary) summary.textContent = renderWorkflowTemplateSummary(first);
+    } else {
+      select.innerHTML = '<option value="">no templates</option>';
+      if (summary) summary.textContent = "No workflow templates available.";
+    }
+  } catch (error) {
+    select.innerHTML = '<option value="">template load failed</option>';
+    if (summary) summary.textContent = String(error);
+  }
+}
+
+function renderWorkflowTemplateRun(envelope: ReleaseToolEnvelope<SavedToolChainTemplateRunResult>): string {
+  if (!envelope.ok) return renderReleaseError(envelope);
+  const result = envelope.result;
+  return `
+    <div class="biomed-answer-meta">
+      ${pill("template")}
+      ${pill(result.template.name)}
+      ${pill(result.template.source)}
+      <code>${escapeHtml(envelope.ids.run_id || result.audited_answer.answer_result.run_id)}</code>
+    </div>
+    ${renderAuditedAnswer(result.audited_answer)}
+    ${result.provenance ? `<div class="biomed-label">Template Provenance</div>${renderProvenanceResult(result.provenance)}` : ""}
+  `;
 }
 
 async function hydrateRetrievalBlocks(container: HTMLElement): Promise<void> {
@@ -1323,6 +1472,28 @@ function renderAsk(container: HTMLElement): void {
           <span class="biomed-label">Question</span>
           <textarea id="biomed-question" rows="5">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
         </label>
+        <div class="biomed-option-panel">
+          <div class="biomed-label">Workflow Template</div>
+          <div class="biomed-control-grid">
+            <label class="biomed-field">
+              <span class="biomed-label">Template</span>
+              <select id="biomed-template-select">
+                <option value="">loading templates...</option>
+              </select>
+            </label>
+            <label class="biomed-field">
+              <span class="biomed-label">Save As</span>
+              <input id="biomed-template-name" placeholder="custom workflow name" />
+            </label>
+            <label class="biomed-check"><input id="biomed-allow-live-pubmed" type="checkbox" /> opt in to live PubMed</label>
+          </div>
+          <div class="biomed-action-row">
+            <button id="biomed-template-apply-btn">Apply Template</button>
+            <button id="biomed-template-run-btn">Run Template</button>
+            <button id="biomed-template-save-btn">Save Current</button>
+          </div>
+          <div id="biomed-template-summary" class="biomed-muted"></div>
+        </div>
         <div class="biomed-control-grid">
           <label class="biomed-field">
             <span class="biomed-label">Project</span>
@@ -1342,25 +1513,30 @@ function renderAsk(container: HTMLElement): void {
             <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
           </label>
         </div>
-        <div class="biomed-option-panel">
-          <div class="biomed-label">Retrieval</div>
-          <div class="biomed-toggle-grid">
-            <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
-            <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
+        <details class="biomed-option-panel biomed-advanced-options">
+          <summary>Advanced options</summary>
+          <div class="biomed-advanced-grid">
+            <div>
+              <div class="biomed-label">Retrieval</div>
+              <div class="biomed-toggle-grid">
+                <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
+                <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
+              </div>
+            </div>
+            <div>
+              <div class="biomed-label">LLM + Audit</div>
+              <div class="biomed-toggle-grid">
+                <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
+                <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
+                <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
+                <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
+                <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
+                <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
+                <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Export facts</label>
+              </div>
+            </div>
           </div>
-        </div>
-        <div class="biomed-option-panel">
-          <div class="biomed-label">LLM + Audit</div>
-          <div class="biomed-toggle-grid">
-            <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
-            <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
-            <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
-            <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
-            <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
-            <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
-            <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Export facts</label>
-          </div>
-        </div>
+        </details>
         <div class="biomed-action-row">
           <button id="biomed-ask-btn">Answer</button>
           <button id="biomed-audited-btn">Answer + Audit</button>
@@ -1369,6 +1545,74 @@ function renderAsk(container: HTMLElement): void {
       <div id="biomed-ask-result" class="biomed-result"></div>
     </div>
   `;
+  container.querySelector<HTMLSelectElement>("#biomed-template-select")?.addEventListener("change", () => {
+    const summary = container.querySelector<HTMLElement>("#biomed-template-summary");
+    if (summary) summary.textContent = renderWorkflowTemplateSummary(selectedWorkflowTemplate(container));
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-template-apply-btn")?.addEventListener("click", () => {
+    const template = selectedWorkflowTemplate(container);
+    if (!template) return;
+    applyWorkflowTemplate(container, template);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-template-run-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+    const button = container.querySelector<HTMLButtonElement>("#biomed-template-run-btn");
+    const template = selectedWorkflowTemplate(container);
+    if (!resultNode || !template) return;
+    resultNode.innerHTML = renderLoading("Running saved workflow template...");
+    if (button) button.disabled = true;
+    const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
+    const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
+    const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || template.source;
+    const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || template.max_papers);
+    const allowLivePubmed = Boolean(container.querySelector<HTMLInputElement>("#biomed-allow-live-pubmed")?.checked);
+    try {
+      const envelope = await api<ReleaseToolEnvelope<SavedToolChainTemplateRunResult>>(
+        `/api/biomed/workflow/templates/${encodeURIComponent(template.template_id)}/run`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question,
+            project_id: projectId || null,
+            source_override: source !== template.source ? source : null,
+            max_papers_override: maxPapers !== template.max_papers ? maxPapers : null,
+            allow_live_pubmed: allowLivePubmed,
+          }),
+        },
+      );
+      resultNode.innerHTML = renderWorkflowTemplateRun(envelope);
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-template-save-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+    const button = container.querySelector<HTMLButtonElement>("#biomed-template-save-btn");
+    const name = container.querySelector<HTMLInputElement>("#biomed-template-name")?.value.trim() || "";
+    if (!resultNode || !name) {
+      if (resultNode) resultNode.innerHTML = '<div class="biomed-error">Template name is required.</div>';
+      return;
+    }
+    if (button) button.disabled = true;
+    try {
+      const template = await api<SavedToolChainTemplate>("/api/biomed/workflow/templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(currentWorkflowTemplatePayload(container)),
+      });
+      await loadWorkflowTemplates(container);
+      const select = container.querySelector<HTMLSelectElement>("#biomed-template-select");
+      if (select) select.value = template.template_id;
+      resultNode.innerHTML = `<div class="biomed-muted">Saved workflow template: ${escapeHtml(template.name)}</div>`;
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
   container.querySelector<HTMLButtonElement>("#biomed-ask-btn")?.addEventListener("click", async () => {
     const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
     if (!resultNode) return;
@@ -1494,6 +1738,7 @@ function renderAsk(container: HTMLElement): void {
     }
   });
   void loadProjectOptions(container);
+  void loadWorkflowTemplates(container);
 }
 
 function renderGraph(container: HTMLElement): void {
