@@ -274,6 +274,42 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert retrieve_step["metadata"]["retrieval_bundle"]["coverage_matrix"]
         assert retrieve_step["metadata"]["evidence_packet"]["coverage_matrix"]
 
+        argument_graph = client.get(
+            f"/api/biomed/answer-runs/{audited_run_id}/argument-graph"
+        )
+        assert argument_graph.status_code == 200
+        argument_payload = argument_graph.json()
+        assert argument_payload["status"] == "ok"
+        assert argument_payload["advisory_only"] is True
+        assert argument_payload["nodes"]
+        assert argument_payload["edges"]
+        assert argument_payload["claim_summaries"]
+        assert any(
+            edge["edge_type"] in {"supports", "limits"}
+            for edge in argument_payload["edges"]
+        )
+
+        math_signals = client.get(
+            f"/api/biomed/answer-runs/{audited_run_id}/math-signals"
+        )
+        assert math_signals.status_code == 200
+        math_payload = math_signals.json()
+        assert math_payload["status"] == "ok"
+        assert math_payload["advisory_only"] is True
+        assert math_payload["answer_uncertainty_bucket"] in {"low", "medium", "high"}
+        assert math_payload["recommendation"] in {
+            "answer",
+            "soften",
+            "retrieve_more",
+            "expert_review",
+        }
+        assert math_payload["claim_uncertainty"]
+        assert math_payload["claim_uncertainty"][0]["reason_factors"]
+        assert math_payload["coverage_diversity"]["evidence_count"] >= 1
+        assert 0 <= math_payload["coverage_diversity"]["diversity_score"] <= 1
+        assert math_payload["step_telemetry"]["advisory_only"] is True
+        assert math_payload["argument_graph"]["nodes"]
+
         multi_pass = client.post(
             "/api/biomed/retrieval/multi-pass",
             json={
@@ -513,6 +549,31 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         )
         assert missing_provenance.status_code == 200
         assert missing_provenance.json()["error_code"] == "unknown_run_id"
+
+        clinical_audited = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What dose should my mother take for Alzheimer disease?",
+                "source": "mock",
+                "use_llm_claim_logic": True,
+                "export_logic_facts": True,
+            },
+        )
+        assert clinical_audited.status_code == 200
+        clinical_audited_payload = clinical_audited.json()
+        clinical_run_id = clinical_audited_payload["answer_result"]["run_id"]
+        assert clinical_audited_payload["final_action"] == "refuse"
+        assert clinical_audited_payload["answer_result"]["citations"] == []
+        assert clinical_audited_payload["answer_result"]["evidence_summary"] == []
+
+        clinical_math = client.get(
+            f"/api/biomed/answer-runs/{clinical_run_id}/math-signals"
+        )
+        assert clinical_math.status_code == 200
+        clinical_math_payload = clinical_math.json()
+        assert clinical_math_payload["status"] == "not_applicable"
+        assert clinical_math_payload["advisory_only"] is True
+        assert clinical_math_payload["argument_graph"]["status"] == "not_applicable"
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:

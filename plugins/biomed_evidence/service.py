@@ -29,6 +29,10 @@ from plugins.biomed_evidence.literature_client import (
     MockLiteratureClient,
     PubMedLiteratureClient,
 )
+from plugins.biomed_evidence.math_signals import (
+    build_argument_graph,
+    build_math_signals,
+)
 from plugins.biomed_evidence.obsidian_export import (
     ensure_obsidian_export_dir,
     export_packet_note,
@@ -44,6 +48,7 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     AnswerWithEvidenceResult,
     AnswerRevision,
+    ArgumentGraphResult,
     AtomicClaim,
     AuditedAnswerResult,
     BanditAdvisoryResult,
@@ -93,6 +98,7 @@ from plugins.biomed_evidence.schemas import (
     LiteratureSourceTrace,
     LogicalClaimFrame,
     LogicalEvidenceFrame,
+    MathSignalsResult,
     MultiPassLiteratureSearchRequest,
     MultiPassLiteratureSearchResult,
     ObsidianExportRequest,
@@ -4019,6 +4025,53 @@ class BiomedEvidenceService:
                 else None
             ),
         }
+
+    def get_answer_argument_graph(self, run_id: str) -> ArgumentGraphResult | None:
+        result = self.storage.get_answer_run(run_id)
+        if result is None:
+            return None
+        latest_audit = self.storage.get_latest_citation_audit_for_run(run_id)
+        return build_argument_graph(run=result, audit=latest_audit)
+
+    def get_answer_math_signals(self, run_id: str) -> MathSignalsResult | None:
+        result = self.storage.get_answer_run(run_id)
+        if result is None:
+            return None
+        trace = self.storage.list_agent_trace_steps(run_id)
+        latest_audit = self.storage.get_latest_citation_audit_for_run(run_id)
+        revision = self.storage.get_answer_revision(run_id)
+        coverage_matrix = (
+            result.evidence_packet.coverage_matrix
+            if result.evidence_packet is not None
+            else (
+                result.retrieval_bundle.coverage_matrix
+                if result.retrieval_bundle is not None
+                else []
+            )
+        )
+        stop_reason = (
+            result.evidence_packet.stop_reason
+            if result.evidence_packet is not None
+            else (
+                result.retrieval_bundle.stop_reason
+                if result.retrieval_bundle is not None
+                else None
+            )
+        )
+        step_telemetry = build_step_telemetry(
+            trace,
+            run_id=run_id,
+            coverage_matrix=coverage_matrix,
+            stop_reason=stop_reason,
+        )
+        argument_graph = build_argument_graph(run=result, audit=latest_audit)
+        return build_math_signals(
+            run=result,
+            audit=latest_audit,
+            revision=revision,
+            step_telemetry=step_telemetry,
+            argument_graph=argument_graph,
+        )
 
     def list_answer_audits(
         self,

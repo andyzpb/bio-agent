@@ -385,6 +385,111 @@ class StepTelemetrySummary(BaseModel):
     advisory_only: bool = True
 
 
+class ArgumentGraphNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    node_type: Literal["claim", "evidence", "paper", "limitation"]
+    label: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ArgumentGraphEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    edge_id: str
+    source: str
+    target: str
+    edge_type: Literal["supports", "attacks", "limits", "cites"]
+    weight: float = 1.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClaimArgumentSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    support_count: int = 0
+    attack_count: int = 0
+    limitation_count: int = 0
+    citation_count: int = 0
+    unresolved_conflict_count: int = 0
+    strongest_supporting_evidence_ids: list[str] = Field(default_factory=list)
+    strongest_attacking_evidence_ids: list[str] = Field(default_factory=list)
+    limitation_summary: list[str] = Field(default_factory=list)
+
+
+class ArgumentGraphResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    audit_id: str | None = None
+    retrieval_id: str | None = None
+    status: Literal["ok", "not_applicable"] = "ok"
+    advisory_only: bool = True
+    nodes: list[ArgumentGraphNode] = Field(default_factory=list)
+    edges: list[ArgumentGraphEdge] = Field(default_factory=list)
+    claim_summaries: list[ClaimArgumentSummary] = Field(default_factory=list)
+    unresolved_conflict_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    not_applicable_reason: str | None = None
+
+
+class ClaimUncertaintySignal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    claim: str
+    risk_bucket: ConfidenceLevel = "medium"
+    risk_score: float = 0.0
+    recommendation: Literal["answer", "soften", "retrieve_more", "expert_review"] = (
+        "expert_review"
+    )
+    reason_factors: list[str] = Field(default_factory=list)
+    support_score: float = 0.0
+    citation_verdict: CitationSupportVerdict | None = None
+    logic_verdict: LogicVerdict | None = None
+    evidence_strength: EvidenceStrength = "not_assessed"
+
+
+class CoverageDiversitySignal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    diversity_score: float = 0.0
+    paper_count: int = 0
+    evidence_count: int = 0
+    unique_method_count: int = 0
+    unique_model_or_population_count: int = 0
+    paper_concentration: dict[str, float] = Field(default_factory=dict)
+    retrieval_intent_coverage: dict[str, int] = Field(default_factory=dict)
+    limitation_count: int = 0
+    duplicate_pressure: int = 0
+    concentration_warnings: list[str] = Field(default_factory=list)
+    missing_intent_warnings: list[str] = Field(default_factory=list)
+    recommended_retrieval_direction: str | None = None
+
+
+class MathSignalsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    audit_id: str | None = None
+    retrieval_id: str | None = None
+    status: Literal["ok", "not_applicable"] = "ok"
+    advisory_only: bool = True
+    answer_uncertainty_bucket: ConfidenceLevel = "medium"
+    recommendation: Literal["answer", "soften", "retrieve_more", "expert_review"] = (
+        "expert_review"
+    )
+    claim_uncertainty: list[ClaimUncertaintySignal] = Field(default_factory=list)
+    coverage_diversity: CoverageDiversitySignal
+    step_telemetry: StepTelemetrySummary
+    argument_graph: ArgumentGraphResult
+    reason_factors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    not_applicable_reason: str | None = None
+
+
 class EvidenceSelectionItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

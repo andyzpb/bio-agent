@@ -65,3 +65,4 @@ lme_error_log_*.txt
 /locks/worker.receive.lock
 /locks/
 /start.sh
+docs/biomedical_evidence_graph_requirements.md

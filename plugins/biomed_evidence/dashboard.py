@@ -466,6 +466,20 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             raise HTTPException(status_code=404, detail="answer run not found")
         return result
 
+    @app.get("/api/biomed/answer-runs/{run_id}/argument-graph")
+    def get_answer_argument_graph(run_id: str) -> dict[str, Any]:
+        result = service.get_answer_argument_graph(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="answer run not found")
+        return result.model_dump(mode="json")
+
+    @app.get("/api/biomed/answer-runs/{run_id}/math-signals")
+    def get_answer_math_signals(run_id: str) -> dict[str, Any]:
+        result = service.get_answer_math_signals(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="answer run not found")
+        return result.model_dump(mode="json")
+
     @app.get("/api/biomed/audits")
     def list_answer_audits(
         run_id: str = "",

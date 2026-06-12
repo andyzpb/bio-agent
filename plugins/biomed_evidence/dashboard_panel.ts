@@ -4,6 +4,17 @@ type BiomedView = "ask" | "projects" | "evidence" | "graph" | "watch" | "audit" 
 
 let biomedWorkflowTemplates: SavedToolChainTemplate[] = [];
 
+const BIOMED_VIEW_ITEMS: { id: BiomedView; label: string; description: string }[] = [
+  { id: "ask", label: "Run", description: "workflow" },
+  { id: "projects", label: "Projects", description: "memory" },
+  { id: "evidence", label: "Evidence", description: "claims" },
+  { id: "graph", label: "Graph", description: "relations" },
+  { id: "watch", label: "Watch", description: "monitoring" },
+  { id: "audit", label: "Audit", description: "review" },
+  { id: "trace", label: "Trace", description: "provenance" },
+  { id: "responsible", label: "Boundary", description: "policy" },
+];
+
 interface EvidenceRow {
   evidence_id: string;
   paper_id: string;
@@ -351,6 +362,93 @@ interface StepTelemetrySummary {
   advisory_only: boolean;
 }
 
+interface ArgumentGraphNode {
+  node_id: string;
+  node_type: string;
+  label: string;
+  metadata: Record<string, unknown>;
+}
+
+interface ArgumentGraphEdge {
+  edge_id: string;
+  source: string;
+  target: string;
+  edge_type: string;
+  weight: number;
+  metadata: Record<string, unknown>;
+}
+
+interface ClaimArgumentSummary {
+  claim_id: string;
+  support_count: number;
+  attack_count: number;
+  limitation_count: number;
+  citation_count: number;
+  unresolved_conflict_count: number;
+  strongest_supporting_evidence_ids: string[];
+  strongest_attacking_evidence_ids: string[];
+  limitation_summary: string[];
+}
+
+interface ArgumentGraphResult {
+  run_id: string;
+  audit_id?: string | null;
+  retrieval_id?: string | null;
+  status: string;
+  advisory_only: boolean;
+  nodes: ArgumentGraphNode[];
+  edges: ArgumentGraphEdge[];
+  claim_summaries: ClaimArgumentSummary[];
+  unresolved_conflict_count: number;
+  warnings: string[];
+  not_applicable_reason?: string | null;
+}
+
+interface ClaimUncertaintySignal {
+  claim_id: string;
+  claim: string;
+  risk_bucket: string;
+  risk_score: number;
+  recommendation: string;
+  reason_factors: string[];
+  support_score: number;
+  citation_verdict?: string | null;
+  logic_verdict?: string | null;
+  evidence_strength: string;
+}
+
+interface CoverageDiversitySignal {
+  diversity_score: number;
+  paper_count: number;
+  evidence_count: number;
+  unique_method_count: number;
+  unique_model_or_population_count: number;
+  paper_concentration: Record<string, number>;
+  retrieval_intent_coverage: Record<string, number>;
+  limitation_count: number;
+  duplicate_pressure: number;
+  concentration_warnings: string[];
+  missing_intent_warnings: string[];
+  recommended_retrieval_direction?: string | null;
+}
+
+interface MathSignalsResult {
+  run_id: string;
+  audit_id?: string | null;
+  retrieval_id?: string | null;
+  status: string;
+  advisory_only: boolean;
+  answer_uncertainty_bucket: string;
+  recommendation: string;
+  claim_uncertainty: ClaimUncertaintySignal[];
+  coverage_diversity: CoverageDiversitySignal;
+  step_telemetry: StepTelemetrySummary;
+  argument_graph: ArgumentGraphResult;
+  reason_factors: string[];
+  warnings: string[];
+  not_applicable_reason?: string | null;
+}
+
 interface ReleaseToolEnvelope<T = Record<string, unknown>> {
   ok: boolean;
   result: T;
@@ -406,6 +504,21 @@ interface SavedToolChainTemplateRunResult {
   template: SavedToolChainTemplate;
   audited_answer: AuditedAnswerResult;
   provenance?: ReleaseToolEnvelope<ProvenanceGraphResult> | null;
+}
+
+interface AnswerRunListItem {
+  run_id: string;
+  question: string;
+  retrieval_id?: string | null;
+  created_at: string;
+}
+
+interface WorkspaceRunContext {
+  answer: AnswerResult;
+  audited?: AuditedAnswerResult | null;
+  trace?: TracePayload | null;
+  provenance?: ReleaseToolEnvelope<ProvenanceGraphResult> | null;
+  raw?: unknown;
 }
 
 interface EvidenceSelectionItem {
@@ -732,6 +845,118 @@ function renderStepTelemetry(telemetry: StepTelemetrySummary | null | undefined)
       ${telemetry.unusual_path_warnings.length ? `<div class="biomed-label">Telemetry Warnings</div>${renderList(telemetry.unusual_path_warnings)}` : ""}
       <div class="biomed-label">Transition Matrix</div>
       <pre class="biomed-json">${escapeHtml(JSON.stringify(telemetry.transition_matrix, null, 2))}</pre>
+    </div>
+  `;
+}
+
+function renderArgumentGraph(result: ArgumentGraphResult | null | undefined): string {
+  if (!result) return '<div class="biomed-muted">No argument graph loaded.</div>';
+  if (result.status === "not_applicable") {
+    return `<div class="biomed-muted">${escapeHtml(result.not_applicable_reason || "Argument graph is not applicable for this run.")}</div>`;
+  }
+  const edgeCounts = result.edges.reduce<Record<string, number>>((acc, edge) => {
+    acc[edge.edge_type] = (acc[edge.edge_type] || 0) + 1;
+    return acc;
+  }, {});
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Status</span><strong>${escapeHtml(result.status)}</strong></div>
+        <div><span>Nodes</span><strong>${result.nodes.length}</strong></div>
+        <div><span>Edges</span><strong>${result.edges.length}</strong></div>
+        <div><span>Conflicts</span><strong>${result.unresolved_conflict_count}</strong></div>
+        <div><span>Audit</span><code>${escapeHtml(result.audit_id || "-")}</code></div>
+        <div><span>Advisory</span><strong>${result.advisory_only ? "yes" : "no"}</strong></div>
+      </div>
+      <div class="biomed-label">Edge Mix</div>
+      <pre class="biomed-json">${escapeHtml(JSON.stringify(edgeCounts, null, 2))}</pre>
+      <div class="biomed-label">Claim Argument Summary</div>
+      <div class="biomed-audit-table">
+        ${result.claim_summaries.map((item) => `
+          <div class="biomed-audit-row ${item.unresolved_conflict_count ? "is-failed" : ""}">
+            <div class="biomed-audit-row-head">
+              ${pill(`support ${item.support_count}`)}
+              ${pill(`attack ${item.attack_count}`)}
+              ${pill(`limits ${item.limitation_count}`)}
+              ${pill(`cites ${item.citation_count}`)}
+            </div>
+            <code>${escapeHtml(item.claim_id)}</code>
+            ${item.strongest_supporting_evidence_ids.length ? `<div class="biomed-label">Support</div>${renderList(item.strongest_supporting_evidence_ids)}` : ""}
+            ${item.strongest_attacking_evidence_ids.length ? `<div class="biomed-label">Attack</div>${renderList(item.strongest_attacking_evidence_ids)}` : ""}
+            ${item.limitation_summary.length ? `<div class="biomed-label">Limitations</div>${renderList(item.limitation_summary)}` : ""}
+          </div>
+        `).join("") || '<div class="biomed-muted">No claim summaries.</div>'}
+      </div>
+      ${result.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(result.warnings)}` : ""}
+      <details class="biomed-logic-frames">
+        <summary>Raw Argument Graph JSON</summary>
+        <pre class="biomed-json">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
+      </details>
+    </div>
+  `;
+}
+
+function renderMathSignals(result: MathSignalsResult | null | undefined): string {
+  if (!result) return '<div class="biomed-muted">No math signals loaded.</div>';
+  if (result.status === "not_applicable") {
+    return `
+      <div class="biomed-provenance">
+        <div class="biomed-provenance-grid">
+          <div><span>Status</span><strong>not applicable</strong></div>
+          <div><span>Advisory</span><strong>${result.advisory_only ? "yes" : "no"}</strong></div>
+        </div>
+        <div class="biomed-muted">${escapeHtml(result.not_applicable_reason || "Math review signals are not applicable for this run.")}</div>
+      </div>
+    `;
+  }
+  const coverage = result.coverage_diversity;
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Risk</span><strong>${escapeHtml(result.answer_uncertainty_bucket)}</strong></div>
+        <div><span>Recommendation</span><strong>${escapeHtml(result.recommendation)}</strong></div>
+        <div><span>Diversity</span><strong>${Math.round(coverage.diversity_score * 100)}%</strong></div>
+        <div><span>Papers</span><strong>${coverage.paper_count}</strong></div>
+        <div><span>Evidence</span><strong>${coverage.evidence_count}</strong></div>
+        <div><span>Methods</span><strong>${coverage.unique_method_count}</strong></div>
+        <div><span>Model/Population</span><strong>${coverage.unique_model_or_population_count}</strong></div>
+        <div><span>Duplicate Pressure</span><strong>${coverage.duplicate_pressure}</strong></div>
+      </div>
+      <div class="biomed-label">Reason Factors</div>
+      ${renderList(result.reason_factors)}
+      <div class="biomed-label">Claim Uncertainty</div>
+      <div class="biomed-audit-table">
+        ${result.claim_uncertainty.map((item) => `
+          <div class="biomed-audit-row ${item.risk_bucket === "high" ? "is-failed" : ""}">
+            <div class="biomed-audit-row-head">
+              ${pill(item.risk_bucket)}
+              ${pill(item.recommendation)}
+              ${item.citation_verdict ? pill(item.citation_verdict) : ""}
+              ${item.logic_verdict ? pill(item.logic_verdict) : ""}
+              <span>${Math.round(item.risk_score * 100)}%</span>
+            </div>
+            <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
+            <div class="biomed-watch-meta">support ${Math.round(item.support_score * 100)}% · strength ${escapeHtml(item.evidence_strength)}</div>
+            ${renderList(item.reason_factors)}
+          </div>
+        `).join("") || '<div class="biomed-muted">No audited claims available.</div>'}
+      </div>
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Paper Concentration</div>
+          <pre class="biomed-json">${escapeHtml(JSON.stringify(coverage.paper_concentration, null, 2))}</pre>
+        </div>
+        <div>
+          <div class="biomed-label">Retrieval Intent Coverage</div>
+          <pre class="biomed-json">${escapeHtml(JSON.stringify(coverage.retrieval_intent_coverage, null, 2))}</pre>
+        </div>
+      </div>
+      ${coverage.recommended_retrieval_direction ? `<div class="biomed-label">Recommended Retrieval Direction</div><div>${pill(coverage.recommended_retrieval_direction)}</div>` : ""}
+      ${coverage.concentration_warnings.length ? `<div class="biomed-label">Concentration Warnings</div>${renderList(coverage.concentration_warnings)}` : ""}
+      ${coverage.missing_intent_warnings.length ? `<div class="biomed-label">Missing Intent Warnings</div>${renderList(coverage.missing_intent_warnings)}` : ""}
+      ${result.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(result.warnings)}` : ""}
+      <div class="biomed-label">Step Telemetry</div>
+      ${renderStepTelemetry(result.step_telemetry)}
     </div>
   `;
 }
@@ -1224,6 +1449,250 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
   `;
 }
 
+function currentAuditFromContext(context: WorkspaceRunContext): CitationAuditResult | null {
+  return (
+    context.audited?.audit ||
+    context.trace?.latest_citation_audit ||
+    null
+  );
+}
+
+function currentRevisionFromContext(context: WorkspaceRunContext): AnswerRevision | null {
+  return (
+    context.audited?.revision ||
+    context.trace?.revision ||
+    null
+  );
+}
+
+function currentFinalAnswer(context: WorkspaceRunContext): string {
+  return (
+    context.audited?.final_answer ||
+    context.trace?.revision?.final_answer ||
+    context.answer.answer ||
+    ""
+  );
+}
+
+function renderWorkspaceRunSummary(context: WorkspaceRunContext): string {
+  const answer = context.answer;
+  const revision = currentRevisionFromContext(context);
+  const audit = currentAuditFromContext(context);
+  const finalAction = context.audited?.final_action || revision?.revision_action || "answer";
+  return `
+    <section class="biomed-run-hero">
+      <div class="biomed-run-kicker">
+        ${pill(finalAction)}
+        ${pill(answer.uncertainty_level)}
+        ${answer.synthesis_mode ? pill(answer.synthesis_mode) : ""}
+        ${answer.retrieval_manifest?.source ? pill(answer.retrieval_manifest.source) : ""}
+      </div>
+      <div class="biomed-run-title">${escapeHtml(answer.run_id)}</div>
+      <div class="biomed-run-stats">
+        <span>${answer.citations.length} citations</span>
+        <span>${answer.evidence_summary.length} evidence items</span>
+        <span>${answer.retrieval_bundle?.records.length || 0} retrieval passes</span>
+        <span>${audit ? audit.recommended_action : "audit pending"}</span>
+      </div>
+    </section>
+    <section class="biomed-output-band">
+      <div class="biomed-label">Final Answer</div>
+      <div class="biomed-answer biomed-answer-large">${renderMarkdown(currentFinalAnswer(context))}</div>
+    </section>
+    <section class="biomed-output-band">
+      <div class="biomed-label">Evidence At A Glance</div>
+      <div class="biomed-mini-grid">
+        <div><span>Packet</span><strong>${escapeHtml(answer.evidence_packet?.packet_id || "-")}</strong></div>
+        <div><span>Retrieval</span><strong>${escapeHtml(answer.retrieval_id || "-")}</strong></div>
+        <div><span>Conflicts</span><strong>${answer.conflicting_evidence.length}</strong></div>
+        <div><span>Limitations</span><strong>${answer.limitations.length}</strong></div>
+      </div>
+      ${answer.limitations.length ? renderList(answer.limitations.slice(0, 5)) : '<div class="biomed-muted">No explicit limitations recorded.</div>'}
+    </section>
+  `;
+}
+
+function renderInspectorTabs(active: string): string {
+  const tabs = [
+    ["overview", "Overview"],
+    ["trace", "Trace"],
+    ["evidence", "Evidence"],
+    ["audit", "Audit"],
+    ["logic", "Logic"],
+    ["argument", "Argument"],
+    ["math", "Math"],
+    ["provenance", "Provenance"],
+    ["raw", "Raw"],
+  ];
+  return `
+    <div class="biomed-inspector-tabs">
+      ${tabs.map(([id, label]) => `
+        <button class="biomed-inspector-tab ${id === active ? "is-active" : ""}" data-biomed-inspector="${id}">
+          ${escapeHtml(label)}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderLogicFactsPanel(audit: CitationAuditResult | null): string {
+  if (!audit) return '<div class="biomed-muted">No citation audit with logic facts is loaded.</div>';
+  const logicItems = audit.claim_audits.filter((item) => item.logic_audit);
+  if (!logicItems.length) return '<div class="biomed-muted">No logic audit artifacts were attached to this run.</div>';
+  return logicItems.map((item) => `
+    <div class="biomed-audit-row">
+      <div class="biomed-audit-row-head">
+        ${pill(item.logic_audit?.logic_verdict || "not_assessed")}
+        ${pill(item.verdict)}
+        <code>${escapeHtml(item.claim_id)}</code>
+      </div>
+      <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
+      ${renderLogicAudit(item.logic_audit)}
+    </div>
+  `).join("");
+}
+
+async function loadWorkspaceTrace(runId: string): Promise<TracePayload> {
+  return api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`);
+}
+
+async function loadWorkspaceRun(runId: string): Promise<WorkspaceRunContext> {
+  const trace = await loadWorkspaceTrace(runId);
+  return {
+    answer: trace.answer_run,
+    trace,
+    raw: trace,
+  };
+}
+
+async function loadRecentRuns(container: HTMLElement): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-recent-runs");
+  if (!target) return;
+  target.innerHTML = '<div class="biomed-muted">Loading recent runs...</div>';
+  try {
+    const data = await api<{ items: AnswerRunListItem[] }>("/api/biomed/answer-runs?page_size=8");
+    target.innerHTML = data.items.map((item) => `
+      <button class="biomed-run-link" data-biomed-run-id="${escapeHtml(item.run_id)}">
+        <span>${escapeHtml(item.question || item.run_id)}</span>
+        <code>${escapeHtml(item.created_at || item.run_id)}</code>
+      </button>
+    `).join("") || '<div class="biomed-muted">No runs yet.</div>';
+    target.querySelectorAll<HTMLButtonElement>("[data-biomed-run-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const runId = button.dataset.biomedRunId || "";
+        const center = container.querySelector<HTMLElement>("#biomed-ask-result");
+        if (center) center.innerHTML = renderLoading("Loading saved run...");
+        try {
+          const context = await loadWorkspaceRun(runId);
+          hydrateWorkspaceRun(container, context);
+        } catch (error) {
+          if (center) center.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+        }
+      });
+    });
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+function renderInspectorOverview(context: WorkspaceRunContext): string {
+  const answer = context.answer;
+  const audit = currentAuditFromContext(context);
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Run Snapshot</div>
+      <div class="biomed-mini-grid">
+        <div><span>Run</span><strong>${escapeHtml(answer.run_id)}</strong></div>
+        <div><span>Source</span><strong>${escapeHtml(answer.retrieval_manifest?.source || "-")}</strong></div>
+        <div><span>Citations</span><strong>${answer.citations.length}</strong></div>
+        <div><span>Evidence</span><strong>${answer.evidence_summary.length}</strong></div>
+        <div><span>Audit</span><strong>${escapeHtml(audit?.recommended_action || "pending")}</strong></div>
+        <div><span>Packet</span><strong>${escapeHtml(answer.evidence_packet?.stop_reason || "-")}</strong></div>
+      </div>
+      <div class="biomed-label">Retrieval Manifest</div>
+      ${renderManifest(answer.retrieval_manifest)}
+      <div class="biomed-label">Citations</div>
+      ${renderList(answer.citations.map((citation) => `${citation.title} | ${citation.paper_id}`))}
+    </div>
+  `;
+}
+
+async function loadInspectorTab(
+  container: HTMLElement,
+  context: WorkspaceRunContext,
+  tab: string,
+): Promise<void> {
+  const content = container.querySelector<HTMLElement>("#biomed-inspector-content");
+  const runId = context.answer.run_id;
+  if (!content) return;
+  container.querySelectorAll<HTMLButtonElement>("[data-biomed-inspector]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.biomedInspector === tab);
+  });
+  content.innerHTML = renderLoading(`Loading ${tab}...`);
+  try {
+    if (tab === "overview") {
+      content.innerHTML = renderInspectorOverview(context);
+    } else if (tab === "trace") {
+      const trace = context.trace || await loadWorkspaceTrace(runId);
+      context.trace = trace;
+      content.innerHTML = renderTraceResult(trace);
+    } else if (tab === "evidence") {
+      content.innerHTML = `
+        ${renderEvidencePacket(context.answer.evidence_packet)}
+        <div class="biomed-label">Evidence Items</div>
+        ${context.answer.evidence_summary.map(renderEvidenceItem).join("") || '<div class="biomed-muted">No evidence extracted.</div>'}
+      `;
+    } else if (tab === "audit") {
+      const audit = currentAuditFromContext(context);
+      content.innerHTML = audit ? renderAuditResult(audit) : '<div class="biomed-muted">No audit loaded for this run.</div>';
+    } else if (tab === "logic") {
+      content.innerHTML = renderLogicFactsPanel(currentAuditFromContext(context));
+    } else if (tab === "argument") {
+      const graph = await api<ArgumentGraphResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/argument-graph`);
+      content.innerHTML = renderArgumentGraph(graph);
+    } else if (tab === "math") {
+      const signals = await api<MathSignalsResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/math-signals`);
+      content.innerHTML = renderMathSignals(signals);
+    } else if (tab === "provenance") {
+      const provenance = context.provenance || await api<ReleaseToolEnvelope<ProvenanceGraphResult>>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/provenance`);
+      context.provenance = provenance;
+      content.innerHTML = renderProvenanceResult(provenance);
+    } else {
+      content.innerHTML = `<pre class="biomed-json biomed-json-tall">${escapeHtml(JSON.stringify(context.raw || context, null, 2))}</pre>`;
+    }
+  } catch (error) {
+    content.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+function hydrateWorkspaceRun(container: HTMLElement, context: WorkspaceRunContext): void {
+  const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+  const inspector = container.querySelector<HTMLElement>("#biomed-inspector");
+  if (resultNode) {
+    resultNode.innerHTML = renderWorkspaceRunSummary(context);
+  }
+  if (inspector) {
+    inspector.innerHTML = `
+      <div class="biomed-inspector-head">
+        <div>
+          <div class="biomed-label">Inspector</div>
+          <div class="biomed-inspector-title">${escapeHtml(context.answer.run_id)}</div>
+        </div>
+        ${pill(context.answer.uncertainty_level)}
+      </div>
+      ${renderInspectorTabs("overview")}
+      <div id="biomed-inspector-content" class="biomed-inspector-content"></div>
+    `;
+    inspector.querySelectorAll<HTMLButtonElement>("[data-biomed-inspector]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void loadInspectorTab(container, context, button.dataset.biomedInspector || "overview");
+      });
+    });
+    void loadInspectorTab(container, context, "overview");
+  }
+  void loadRecentRuns(container);
+}
+
 async function loadProjectOptions(container: HTMLElement): Promise<void> {
   const select = container.querySelector<HTMLSelectElement>("#biomed-project-select");
   if (!select) return;
@@ -1436,19 +1905,9 @@ function renderProjects(container: HTMLElement): void {
 }
 
 function renderTabs(view: BiomedView): string {
-  const tabs: { id: BiomedView; label: string }[] = [
-    { id: "ask", label: "Ask" },
-    { id: "projects", label: "Projects" },
-    { id: "evidence", label: "Evidence" },
-    { id: "graph", label: "Graph" },
-    { id: "watch", label: "Watch" },
-    { id: "audit", label: "Audit" },
-    { id: "trace", label: "Trace" },
-    { id: "responsible", label: "Responsible AI" },
-  ];
   return `
     <div class="biomed-tabs">
-      ${tabs.map((tab) => `
+      ${BIOMED_VIEW_ITEMS.map((tab) => `
         <button class="biomed-tab ${tab.id === view ? "is-active" : ""}" data-biomed-view="${tab.id}">
           ${escapeHtml(tab.label)}
         </button>
@@ -1457,116 +1916,332 @@ function renderTabs(view: BiomedView): string {
   `;
 }
 
-function renderAsk(container: HTMLElement): void {
-  container.innerHTML += `
-    <div class="biomed-section">
-      <div class="biomed-section-head">
+function renderBiomedWorkbenchPage(
+  root: HTMLElement,
+  title: string,
+  subtitle: string,
+  renderBody: (body: HTMLElement) => void,
+): void {
+  root.innerHTML = `
+    <div class="biomed-workbench-page">
+      <header class="biomed-workbench-page-head">
         <div>
-          <div class="biomed-title">Ask Evidence Question</div>
-          <div class="biomed-subtitle">Research-only biomedical evidence workflow</div>
+          <div class="biomed-label">Biomedical Evidence Agent</div>
+          <h2>${escapeHtml(title)}</h2>
+          <p>${escapeHtml(subtitle)}</p>
         </div>
-        ${pill("V2.2")}
-      </div>
-      <div class="biomed-form">
-        <label class="biomed-field">
-          <span class="biomed-label">Question</span>
-          <textarea id="biomed-question" rows="5">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
-        </label>
-        <div class="biomed-option-panel">
-          <div class="biomed-label">Workflow Template</div>
-          <div class="biomed-control-grid">
-            <label class="biomed-field">
-              <span class="biomed-label">Template</span>
-              <select id="biomed-template-select">
-                <option value="">loading templates...</option>
-              </select>
-            </label>
-            <label class="biomed-field">
-              <span class="biomed-label">Save As</span>
-              <input id="biomed-template-name" placeholder="custom workflow name" />
-            </label>
-            <label class="biomed-check"><input id="biomed-allow-live-pubmed" type="checkbox" /> opt in to live PubMed</label>
-          </div>
-          <div class="biomed-action-row">
-            <button id="biomed-template-apply-btn">Apply Template</button>
-            <button id="biomed-template-run-btn">Run Template</button>
-            <button id="biomed-template-save-btn">Save Current</button>
-          </div>
-          <div id="biomed-template-summary" class="biomed-muted"></div>
-        </div>
-        <div class="biomed-control-grid">
-          <label class="biomed-field">
-            <span class="biomed-label">Project</span>
-            <select id="biomed-project-select">
-              <option value="">no project</option>
-            </select>
-          </label>
-          <label class="biomed-field">
-            <span class="biomed-label">Source</span>
-            <select id="biomed-source">
-              <option value="mock">mock</option>
-              <option value="pubmed">pubmed</option>
-            </select>
-          </label>
-          <label class="biomed-field">
-            <span class="biomed-label">Papers</span>
-            <input id="biomed-max-papers" type="number" min="1" max="20" value="10" />
-          </label>
-        </div>
-        <details class="biomed-option-panel biomed-advanced-options">
-          <summary>Advanced options</summary>
-          <div class="biomed-advanced-grid">
-            <div>
-              <div class="biomed-label">Retrieval</div>
-              <div class="biomed-toggle-grid">
-                <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
-                <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
-              </div>
-            </div>
-            <div>
-              <div class="biomed-label">LLM + Audit</div>
-              <div class="biomed-toggle-grid">
-                <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> LLM planner</label>
-                <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> LLM extractor</label>
-                <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> LLM synthesis</label>
-                <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> LLM verifier</label>
-                <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> LLM revision</label>
-                <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
-                <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Export facts</label>
-              </div>
-            </div>
-          </div>
-        </details>
-        <div class="biomed-action-row">
-          <button id="biomed-ask-btn">Answer</button>
-          <button id="biomed-audited-btn">Answer + Audit</button>
-        </div>
-      </div>
-      <div id="biomed-ask-result" class="biomed-result"></div>
+      </header>
+      <section class="biomed-workbench-page-body"></section>
     </div>
   `;
+  const body = root.querySelector<HTMLElement>(".biomed-workbench-page-body");
+  if (body) renderBody(body);
+}
+
+function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
+  root.innerHTML = "";
+  if (view === "ask") {
+    renderAskWorkspace(root);
+    return;
+  }
+  if (view === "graph") {
+    renderBiomedWorkbenchPage(root, "Evidence graph", "Inspect paper, entity, and claim relationships for a topic.", renderGraph);
+  } else if (view === "projects") {
+    renderBiomedWorkbenchPage(root, "Projects", "Keep research context, saved papers, claims, and reviewer queues organized.", renderProjects);
+  } else if (view === "watch") {
+    renderBiomedWorkbenchPage(root, "Research watch", "Track topics and record source-backed relevance decisions.", renderWatch);
+  } else if (view === "audit") {
+    renderBiomedWorkbenchPage(root, "Citation and evidence audit", "Re-run claim-level checks against saved answer runs.", renderAudit);
+  } else if (view === "trace") {
+    renderBiomedWorkbenchPage(root, "Trace and exports", "Inspect tool-chain steps, provenance, packets, and one-way Obsidian exports.", renderTrace);
+  } else if (view === "responsible") {
+    renderBiomedWorkbenchPage(root, "Responsible AI boundary", "Review the research-only safety contract enforced before tool execution.", renderResponsible);
+  } else {
+    renderBiomedWorkbenchPage(root, "Evidence browser", "Browse retrieved evidence items from the current biomedical store.", renderEvidenceBrowser);
+  }
+}
+
+function renderEvidenceBrowser(container: HTMLElement): void {
+  container.innerHTML = `
+    <div class="biomed-evidence-browser">
+      <section class="biomed-evidence-toolbar">
+        <label>
+          <span>Search</span>
+          <input id="biomed-evidence-q" type="text" value="microglia" placeholder="claim, paper, entity, finding" />
+        </label>
+        <label>
+          <span>Direction</span>
+          <select id="biomed-evidence-direction">
+            <option value="">all</option>
+            <option value="supports">supports</option>
+            <option value="contradicts">contradicts</option>
+            <option value="inconclusive">inconclusive</option>
+            <option value="background">background</option>
+          </select>
+        </label>
+        <label>
+          <span>Entity</span>
+          <input id="biomed-evidence-entity" type="text" placeholder="Microglia" />
+        </label>
+        <button id="biomed-evidence-load-btn" type="button">Load Evidence</button>
+      </section>
+      <section id="biomed-evidence-browser-summary" class="biomed-evidence-summary"></section>
+      <section id="biomed-evidence-browser-results" class="biomed-evidence-grid"></section>
+    </div>
+  `;
+  container.querySelector<HTMLButtonElement>("#biomed-evidence-load-btn")?.addEventListener("click", () => {
+    void loadEvidenceBrowser(container);
+  });
+  container.querySelectorAll<HTMLInputElement | HTMLSelectElement>("#biomed-evidence-q, #biomed-evidence-direction, #biomed-evidence-entity").forEach((node) => {
+    node.addEventListener("keydown", (event) => {
+      if (event instanceof KeyboardEvent && event.key === "Enter") void loadEvidenceBrowser(container);
+    });
+    node.addEventListener("change", () => {
+      if (node instanceof HTMLSelectElement) void loadEvidenceBrowser(container);
+    });
+  });
+  void loadEvidenceBrowser(container);
+}
+
+async function loadEvidenceBrowser(container: HTMLElement): Promise<void> {
+  const summary = container.querySelector<HTMLElement>("#biomed-evidence-browser-summary");
+  const results = container.querySelector<HTMLElement>("#biomed-evidence-browser-results");
+  if (!summary || !results) return;
+  const params = new URLSearchParams();
+  params.set("page", "1");
+  params.set("page_size", "25");
+  const query = container.querySelector<HTMLInputElement>("#biomed-evidence-q")?.value.trim() || "";
+  const direction = container.querySelector<HTMLSelectElement>("#biomed-evidence-direction")?.value || "";
+  const entity = container.querySelector<HTMLInputElement>("#biomed-evidence-entity")?.value.trim() || "";
+  if (query) params.set("q", query);
+  if (direction) params.set("direction", direction);
+  if (entity) params.set("entity", entity);
+  summary.innerHTML = renderLoading("Loading evidence...");
+  results.innerHTML = "";
+  try {
+    const data = await api<{ items: EvidenceRow[]; total: number }>(`/api/biomed/evidence?${params.toString()}`);
+    const items = data.items || [];
+    const retrievalIds = new Set(items.map((item) => item.retrieval_id).filter(Boolean));
+    const directions = items.reduce<Record<string, number>>((acc, item) => {
+      const key = item.evidence_direction || "unknown";
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    summary.innerHTML = `
+      <div class="biomed-mini-grid">
+        <div><span>Total Matches</span><strong>${data.total || 0}</strong></div>
+        <div><span>Shown</span><strong>${items.length}</strong></div>
+        <div><span>Retrievals</span><strong>${retrievalIds.size}</strong></div>
+        <div><span>Directions</span><strong>${escapeHtml(Object.entries(directions).map(([key, count]) => `${key} ${count}`).join(" · ") || "-")}</strong></div>
+      </div>
+    `;
+    results.innerHTML = items.map(renderEvidenceBrowserCard).join("") || `
+      <div class="biomed-empty-state">
+        <div class="biomed-empty-title">No evidence matched.</div>
+        <div class="biomed-empty-copy">Try a broader query or run a workflow to populate the evidence store.</div>
+      </div>
+    `;
+  } catch (error) {
+    summary.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+function renderEvidenceBrowserCard(item: EvidenceRow): string {
+  const entities = (item.entities || []).slice(0, 4).map((entity) => `${entity.name} (${entity.entity_type})`);
+  return `
+    <article class="biomed-evidence-card">
+      <div class="biomed-evidence-head">
+        ${pill(item.evidence_direction)}
+        ${pill(item.confidence)}
+        ${item.retrieval_intent ? pill(item.retrieval_intent) : ""}
+        ${item.extraction_mode ? pill(item.extraction_mode) : ""}
+      </div>
+      <div class="biomed-evidence-card-title">${escapeHtml(item.claim)}</div>
+      <div class="biomed-evidence-card-finding">${escapeHtml(item.finding)}</div>
+      <div class="biomed-evidence-card-meta">
+        <code>${escapeHtml(item.paper_id)}</code>
+        ${item.retrieval_id ? `<code>${escapeHtml(item.retrieval_id)}</code>` : ""}
+      </div>
+      <div class="biomed-evidence-card-detail">
+        <div>
+          <span>Entities</span>
+          ${renderList(entities)}
+        </div>
+        <div>
+          <span>Methods</span>
+          ${renderList((item.methods || []).slice(0, 4))}
+        </div>
+      </div>
+      ${item.limitations?.length ? `
+        <div class="biomed-evidence-card-limit">
+          <span>Limitations</span>
+          ${renderList(item.limitations.slice(0, 3))}
+        </div>
+      ` : ""}
+    </article>
+  `;
+}
+
+function renderAskWorkspace(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-workspace">
+      <aside class="biomed-agent-rail">
+        <div class="biomed-agent-brand">
+          <div class="biomed-agent-mark">BE</div>
+          <div>
+            <div class="biomed-agent-title">Biomedical Evidence Agent</div>
+            <div class="biomed-agent-subtitle">Research-only workflow runner</div>
+          </div>
+        </div>
+        <div class="biomed-rail-section">
+          <div class="biomed-label">Workflow</div>
+          <select id="biomed-template-select" class="biomed-rail-select">
+            <option value="">loading templates...</option>
+          </select>
+          <div id="biomed-template-summary" class="biomed-template-summary"></div>
+          <div class="biomed-rail-actions">
+            <button id="biomed-template-apply-btn">Apply</button>
+            <button id="biomed-template-save-btn">Save</button>
+          </div>
+          <input id="biomed-template-name" class="biomed-rail-input" placeholder="custom template name" />
+        </div>
+        <div class="biomed-rail-section">
+          <div class="biomed-label">Source Status</div>
+          <div class="biomed-source-strip">
+            <span>Mock</span>
+            <strong>default</strong>
+          </div>
+          <label class="biomed-live-toggle">
+            <input id="biomed-allow-live-pubmed" type="checkbox" />
+            <span>Allow live PubMed</span>
+          </label>
+        </div>
+        <div class="biomed-rail-section biomed-recent-section">
+          <div class="biomed-label">Recent Runs</div>
+          <div id="biomed-recent-runs" class="biomed-recent-runs"></div>
+        </div>
+      </aside>
+      <main class="biomed-agent-main">
+        <section class="biomed-composer">
+          <div class="biomed-composer-head">
+            <div>
+              <div class="biomed-label">Task</div>
+              <div class="biomed-composer-title">Evidence-backed biomedical research answer</div>
+            </div>
+            <div class="biomed-safety-chip">research-only</div>
+          </div>
+          <textarea id="biomed-question" rows="5">What recent evidence links microglial activation to Alzheimer's disease progression?</textarea>
+          <div class="biomed-command-row">
+            <label>
+              <span>Project</span>
+              <select id="biomed-project-select">
+                <option value="">no project</option>
+              </select>
+            </label>
+            <label>
+              <span>Source</span>
+              <select id="biomed-source">
+                <option value="mock">mock</option>
+                <option value="pubmed">pubmed</option>
+              </select>
+            </label>
+            <label>
+              <span>Papers</span>
+              <input id="biomed-max-papers" type="number" min="1" max="20" value="5" />
+            </label>
+          </div>
+          <details class="biomed-advanced-drawer">
+            <summary>Advanced workflow controls</summary>
+            <div class="biomed-advanced-grid">
+              <div>
+                <div class="biomed-label">Retrieval</div>
+                <div class="biomed-toggle-grid">
+                  <label class="biomed-check"><input id="biomed-include-rejected" type="checkbox" /> Include rejected</label>
+                  <label class="biomed-check"><input id="biomed-execute-support-refute" type="checkbox" /> Support/refute retrieval</label>
+                </div>
+              </div>
+              <div>
+                <div class="biomed-label">LLM + Audit</div>
+                <div class="biomed-toggle-grid">
+                  <label class="biomed-check"><input id="biomed-use-planner" type="checkbox" /> Planner</label>
+                  <label class="biomed-check"><input id="biomed-use-extractor" type="checkbox" /> Extractor</label>
+                  <label class="biomed-check"><input id="biomed-use-synthesis" type="checkbox" /> Synthesis</label>
+                  <label class="biomed-check"><input id="biomed-use-verifier" type="checkbox" /> Verifier</label>
+                  <label class="biomed-check"><input id="biomed-use-revision" type="checkbox" /> Revision</label>
+                  <label class="biomed-check"><input id="biomed-use-claim-logic" type="checkbox" /> Claim logic</label>
+                  <label class="biomed-check"><input id="biomed-export-logic-facts" type="checkbox" /> Logic facts</label>
+                </div>
+              </div>
+            </div>
+          </details>
+          <div class="biomed-primary-actions">
+            <button id="biomed-template-run-btn" class="biomed-primary-button">Run Workflow</button>
+            <button id="biomed-audited-btn">Direct Audit Run</button>
+            <button id="biomed-ask-btn">Draft Only</button>
+          </div>
+        </section>
+        <div id="biomed-ask-result" class="biomed-agent-output">
+          <div class="biomed-empty-state">
+            <div class="biomed-empty-title">Start with a workflow template.</div>
+            <div class="biomed-empty-copy">The run will produce a citation-backed answer, evidence packet, audit trail, argument graph, math review signals, and provenance inspector.</div>
+          </div>
+        </div>
+      </main>
+      <aside id="biomed-inspector" class="biomed-agent-inspector">
+        <div class="biomed-inspector-empty">
+          <div class="biomed-label">Inspector</div>
+          <div class="biomed-inspector-title">No active run</div>
+          <div class="biomed-muted">Run a workflow or open a recent run to inspect trace, evidence, audit, logic facts, argument graph, math signals, and provenance.</div>
+        </div>
+      </aside>
+    </div>
+  `;
+
   container.querySelector<HTMLSelectElement>("#biomed-template-select")?.addEventListener("change", () => {
+    const template = selectedWorkflowTemplate(container);
     const summary = container.querySelector<HTMLElement>("#biomed-template-summary");
-    if (summary) summary.textContent = renderWorkflowTemplateSummary(selectedWorkflowTemplate(container));
+    if (summary) summary.textContent = renderWorkflowTemplateSummary(template);
+    if (template) applyWorkflowTemplate(container, template);
   });
   container.querySelector<HTMLButtonElement>("#biomed-template-apply-btn")?.addEventListener("click", () => {
     const template = selectedWorkflowTemplate(container);
-    if (!template) return;
-    applyWorkflowTemplate(container, template);
+    if (template) applyWorkflowTemplate(container, template);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-template-save-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+    const name = container.querySelector<HTMLInputElement>("#biomed-template-name")?.value.trim() || "";
+    if (!resultNode || !name) {
+      if (resultNode) resultNode.innerHTML = '<div class="biomed-error">Template name is required.</div>';
+      return;
+    }
+    resultNode.innerHTML = renderLoading("Saving workflow template...");
+    try {
+      const template = await api<SavedToolChainTemplate>("/api/biomed/workflow/templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(currentWorkflowTemplatePayload(container)),
+      });
+      await loadWorkflowTemplates(container);
+      const select = container.querySelector<HTMLSelectElement>("#biomed-template-select");
+      if (select) select.value = template.template_id;
+      resultNode.innerHTML = `<div class="biomed-empty-state"><div class="biomed-empty-title">Saved template</div><div class="biomed-empty-copy">${escapeHtml(template.name)}</div></div>`;
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
   });
   container.querySelector<HTMLButtonElement>("#biomed-template-run-btn")?.addEventListener("click", async () => {
     const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
     const button = container.querySelector<HTMLButtonElement>("#biomed-template-run-btn");
     const template = selectedWorkflowTemplate(container);
     if (!resultNode || !template) return;
-    resultNode.innerHTML = renderLoading("Running saved workflow template...");
+    resultNode.innerHTML = renderLoading("Running workflow template...");
     if (button) button.disabled = true;
-    const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
-    const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
-    const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || template.source;
-    const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || template.max_papers);
-    const allowLivePubmed = Boolean(container.querySelector<HTMLInputElement>("#biomed-allow-live-pubmed")?.checked);
     try {
+      const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
+      const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
+      const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || template.source;
+      const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || template.max_papers);
+      const allowLivePubmed = Boolean(container.querySelector<HTMLInputElement>("#biomed-allow-live-pubmed")?.checked);
       const envelope = await api<ReleaseToolEnvelope<SavedToolChainTemplateRunResult>>(
         `/api/biomed/workflow/templates/${encodeURIComponent(template.template_id)}/run`,
         {
@@ -1581,109 +2256,15 @@ function renderAsk(container: HTMLElement): void {
           }),
         },
       );
-      resultNode.innerHTML = renderWorkflowTemplateRun(envelope);
-    } catch (error) {
-      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
-    } finally {
-      if (button) button.disabled = false;
-    }
-  });
-  container.querySelector<HTMLButtonElement>("#biomed-template-save-btn")?.addEventListener("click", async () => {
-    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
-    const button = container.querySelector<HTMLButtonElement>("#biomed-template-save-btn");
-    const name = container.querySelector<HTMLInputElement>("#biomed-template-name")?.value.trim() || "";
-    if (!resultNode || !name) {
-      if (resultNode) resultNode.innerHTML = '<div class="biomed-error">Template name is required.</div>';
-      return;
-    }
-    if (button) button.disabled = true;
-    try {
-      const template = await api<SavedToolChainTemplate>("/api/biomed/workflow/templates", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(currentWorkflowTemplatePayload(container)),
-      });
-      await loadWorkflowTemplates(container);
-      const select = container.querySelector<HTMLSelectElement>("#biomed-template-select");
-      if (select) select.value = template.template_id;
-      resultNode.innerHTML = `<div class="biomed-muted">Saved workflow template: ${escapeHtml(template.name)}</div>`;
-    } catch (error) {
-      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
-    } finally {
-      if (button) button.disabled = false;
-    }
-  });
-  container.querySelector<HTMLButtonElement>("#biomed-ask-btn")?.addEventListener("click", async () => {
-    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
-    if (!resultNode) return;
-    const button = container.querySelector<HTMLButtonElement>("#biomed-ask-btn");
-    resultNode.innerHTML = renderLoading("Running evidence search...");
-    if (button) button.disabled = true;
-    const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
-    const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
-    const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
-    const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
-    const includeRejected = Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked);
-    const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
-    const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
-    const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
-    const useSynthesis = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked);
-    try {
-      const result = await api<AnswerResult>("/api/biomed/answer", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question,
-          project_id: projectId || null,
-          source,
-          max_papers: maxPapers,
-          include_rejected_papers: includeRejected,
-          use_llm_planner: usePlanner,
-          execute_support_refute: executeSupportRefute,
-          use_llm_extractor: useExtractor,
-          use_llm_synthesis: useSynthesis,
-        }),
-      });
-      resultNode.innerHTML = `
-        <div class="biomed-answer-meta">
-          <code>${escapeHtml(result.run_id)}</code>
-          ${pill(result.uncertainty_level)}
-          ${result.project_id ? pill("project") : ""}
-          ${result.synthesis_mode ? pill(result.synthesis_mode) : ""}
-          <button data-biomed-audit-run="${escapeHtml(result.run_id)}">Run Audit</button>
-        </div>
-        <div class="biomed-label">Retrieval Provenance</div>
-        ${renderManifest(result.retrieval_manifest)}
-        <div class="biomed-label">Retrieval Bundle</div>
-        ${renderRetrievalBundle(result.retrieval_bundle)}
-        <div class="biomed-label">Evidence Packet</div>
-        ${renderEvidencePacket(result.evidence_packet)}
-        ${result.project_context_trace ? `<div class="biomed-label">Project Trace</div><pre class="biomed-json">${escapeHtml(JSON.stringify(result.project_context_trace, null, 2))}</pre>` : ""}
-        <div class="biomed-answer">${renderMarkdown(result.answer)}</div>
-        <div class="biomed-label">Citations</div>
-        ${renderList(result.citations.map((citation) => `${citation.title} | ${citation.paper_id}${citation.doi ? ` | doi:${citation.doi}` : ""}`))}
-        <div class="biomed-label">Evidence</div>
-        ${result.evidence_summary.map(renderEvidenceItem).join("") || '<div class="biomed-muted">No evidence extracted.</div>'}
-        <div class="biomed-label">Limitations</div>
-        ${renderList(result.limitations)}
-        <div id="biomed-inline-audit-result" class="biomed-result"></div>
-      `;
-      resultNode.querySelector<HTMLButtonElement>("[data-biomed-audit-run]")?.addEventListener("click", async (event) => {
-        const button = event.currentTarget as HTMLButtonElement;
-        const runId = button.dataset.biomedAuditRun || "";
-        const auditTarget = resultNode.querySelector<HTMLElement>("#biomed-inline-audit-result");
-        if (!auditTarget || !runId) return;
-        button.disabled = true;
-        button.textContent = "Auditing...";
-        try {
-          const audit = await api<CitationAuditResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/audit`, { method: "POST" });
-          auditTarget.innerHTML = renderAuditResult(audit);
-        } catch (error) {
-          auditTarget.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
-        } finally {
-          button.disabled = false;
-          button.textContent = "Run Audit";
-        }
+      if (!envelope.ok) {
+        resultNode.innerHTML = renderReleaseError(envelope);
+        return;
+      }
+      hydrateWorkspaceRun(container, {
+        answer: envelope.result.audited_answer.answer_result,
+        audited: envelope.result.audited_answer,
+        provenance: envelope.result.provenance || null,
+        raw: envelope,
       });
     } catch (error) {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
@@ -1693,44 +2274,43 @@ function renderAsk(container: HTMLElement): void {
   });
   container.querySelector<HTMLButtonElement>("#biomed-audited-btn")?.addEventListener("click", async () => {
     const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
-    if (!resultNode) return;
     const button = container.querySelector<HTMLButtonElement>("#biomed-audited-btn");
-    resultNode.innerHTML = renderLoading("Running evidence search, audit, and revision...");
+    if (!resultNode) return;
+    resultNode.innerHTML = renderLoading("Running audited answer chain...");
     if (button) button.disabled = true;
-    const question = container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "";
-    const projectId = container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || "";
-    const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
-    const maxPapers = Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 10);
-    const includeRejected = Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked);
-    const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
-    const executeSupportRefute = Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked);
-    const useExtractor = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked);
-    const useSynthesis = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked);
-    const useRevision = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked);
-    const useVerifier = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-verifier")?.checked);
-    const useClaimLogic = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked);
-    const exportLogicFacts = Boolean(container.querySelector<HTMLInputElement>("#biomed-export-logic-facts")?.checked);
     try {
       const result = await api<AuditedAnswerResult>("/api/biomed/answer/audited", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question,
-          project_id: projectId || null,
-          source,
-          max_papers: maxPapers,
-          include_rejected_papers: includeRejected,
-          use_llm_planner: usePlanner,
-          execute_support_refute: executeSupportRefute,
-          use_llm_extractor: useExtractor,
-          use_llm_synthesis: useSynthesis,
-          use_llm_verifier: useVerifier,
-          use_llm_revision: useRevision,
-          use_llm_claim_logic: useClaimLogic,
-          export_logic_facts: exportLogicFacts,
-        }),
+        body: JSON.stringify(workspaceAnswerPayload(container, true)),
       });
-      resultNode.innerHTML = renderAuditedAnswer(result);
+      hydrateWorkspaceRun(container, {
+        answer: result.answer_result,
+        audited: result,
+        raw: result,
+      });
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-ask-btn")?.addEventListener("click", async () => {
+    const resultNode = container.querySelector<HTMLElement>("#biomed-ask-result");
+    const button = container.querySelector<HTMLButtonElement>("#biomed-ask-btn");
+    if (!resultNode) return;
+    resultNode.innerHTML = renderLoading("Drafting citation-backed answer...");
+    if (button) button.disabled = true;
+    try {
+      const result = await api<AnswerResult>("/api/biomed/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(workspaceAnswerPayload(container, false)),
+      });
+      hydrateWorkspaceRun(container, {
+        answer: result,
+        raw: result,
+      });
     } catch (error) {
       resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     } finally {
@@ -1739,6 +2319,25 @@ function renderAsk(container: HTMLElement): void {
   });
   void loadProjectOptions(container);
   void loadWorkflowTemplates(container);
+  void loadRecentRuns(container);
+}
+
+function workspaceAnswerPayload(container: HTMLElement, audited: boolean): Record<string, unknown> {
+  return {
+    question: container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "",
+    project_id: container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || null,
+    source: container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock",
+    max_papers: Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 5),
+    include_rejected_papers: Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked),
+    use_llm_planner: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked),
+    execute_support_refute: Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked),
+    use_llm_extractor: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked),
+    use_llm_synthesis: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked),
+    use_llm_verifier: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-verifier")?.checked),
+    use_llm_revision: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked),
+    use_llm_claim_logic: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked),
+    export_logic_facts: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-export-logic-facts")?.checked),
+  };
 }
 
 function renderGraph(container: HTMLElement): void {
@@ -2102,7 +2701,7 @@ function renderBiomedDetail(
   } else if (view === "evidence") {
     root.innerHTML += '<div class="biomed-section"><div class="biomed-title">Evidence Browser</div><div class="biomed-muted">Select an evidence row to inspect entities, methods, and limitations.</div></div>';
   } else {
-    renderAsk(root);
+    renderAskWorkspace(root);
   }
   attachDetailTabs(root, item, dispatch);
 }
@@ -2111,6 +2710,7 @@ window.AkashicDashboard.registerPlugin({
   id: "biomed_evidence",
   label: "Biomedical Evidence",
   viewLabel: "biomed",
+  layout: "workbench",
   pageSize: 25,
   rowKey: "evidence_id",
   defaultSortBy: "updated_at",
@@ -2143,36 +2743,44 @@ window.AkashicDashboard.registerPlugin({
     return { items: data.items || [], total: data.total || 0 };
   },
 
-  renderFilters(container: HTMLElement, dispatch: PluginDispatch): void {
+  renderFilters(container: HTMLElement): void {
     container.innerHTML = `
-      <input class="filter-input" placeholder="Search evidence" value="${escapeHtml(dispatch.filters["q"] || "")}" data-filter="q" />
-      <select class="filter-input" data-filter="direction">
-        <option value="">all directions</option>
-        ${["supports", "contradicts", "inconclusive", "background"].map((value) => `
-          <option value="${value}" ${dispatch.filters["direction"] === value ? "selected" : ""}>${value}</option>
-        `).join("")}
-      </select>
-      <input class="filter-input" placeholder="Entity" value="${escapeHtml(dispatch.filters["entity"] || "")}" data-filter="entity" />
+      <div class="biomed-topbar-status" aria-label="Biomedical Evidence workspace status">
+        <span class="biomed-topbar-dot"></span>
+        <strong>research-only agent</strong>
+        <span>templates</span>
+        <span>controlled literature retrieval</span>
+        <span>audit · trace · provenance</span>
+      </div>
     `;
-    container.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-filter]").forEach((node) => {
-      node.addEventListener("change", () => dispatch.setFilter(node.dataset.filter || "", node.value));
-      if (node instanceof HTMLInputElement) {
-        node.addEventListener("keydown", (event) => {
-          if (event.key === "Enter") dispatch.setFilter(node.dataset.filter || "", node.value);
-        });
-      }
-    });
   },
 
   renderNavBody(container: HTMLElement, dispatch: PluginDispatch): void {
     const view = viewFromDispatch(dispatch);
-    container.innerHTML = renderTabs(view);
+    container.innerHTML = `
+      <div class="biomed-plugin-nav">
+        ${BIOMED_VIEW_ITEMS.map((item) => `
+          <button class="biomed-plugin-nav-item ${item.id === view ? "is-active" : ""}" data-biomed-view="${item.id}" type="button">
+            <span>${escapeHtml(item.label)}</span>
+            <small>${escapeHtml(item.description)}</small>
+          </button>
+        `).join("")}
+      </div>
+    `;
     container.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
       button.addEventListener("click", () => {
         dispatch.setFilter("_view", button.dataset.biomedView || "ask");
         dispatch.activate();
       });
     });
+  },
+
+  renderMain(container: HTMLElement, dispatch: PluginDispatch): void {
+    const view = viewFromDispatch(dispatch);
+    container.innerHTML = '<div class="biomed-wrap biomed-workbench-root"></div>';
+    const root = container.querySelector<HTMLElement>(".biomed-wrap");
+    if (!root) return;
+    renderBiomedWorkbench(root, view);
   },
 
   renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch?: PluginDispatch): void {
