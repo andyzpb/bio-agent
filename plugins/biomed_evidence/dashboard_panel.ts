@@ -121,9 +121,19 @@ interface LogicFactExport {
   warnings: string[];
 }
 
+interface LogicParserFrame {
+  parser_mode?: string;
+  parser_model?: string | null;
+  parser_prompt_hash?: string | null;
+  parser_warnings?: string[];
+  [key: string]: unknown;
+}
+
 interface LogicAuditResult {
   claim_id: string;
   evidence_ids: string[];
+  claim_frame?: LogicParserFrame | null;
+  evidence_frames?: LogicParserFrame[];
   logic_verdict: string;
   entailment_score: number;
   rules_triggered: string[];
@@ -436,6 +446,13 @@ function renderEvidenceDetail(item: EvidenceRow): string {
 function renderLogicAudit(logic: LogicAuditResult | null | undefined): string {
   if (!logic) return "";
   const factExport = logic.logic_fact_export;
+  const claimFrame = logic.claim_frame || null;
+  const evidenceFrames = logic.evidence_frames || [];
+  const parserFrames = [claimFrame, ...evidenceFrames].filter(Boolean) as LogicParserFrame[];
+  const parserModes = Array.from(new Set(parserFrames.map((frame) => frame.parser_mode).filter(Boolean)));
+  const parserModels = Array.from(new Set(parserFrames.map((frame) => frame.parser_model).filter(Boolean)));
+  const parserPromptHashes = Array.from(new Set(parserFrames.map((frame) => frame.parser_prompt_hash).filter(Boolean)));
+  const parserWarnings = Array.from(new Set(parserFrames.flatMap((frame) => frame.parser_warnings || [])));
   const mismatchLines = [
     ...(logic.predicate_mismatches || []).map((item) => `predicate: ${JSON.stringify(item)}`),
     ...(logic.scope_mismatches || []).map((item) => `scope: ${JSON.stringify(item)}`),
@@ -450,12 +467,26 @@ function renderLogicAudit(logic: LogicAuditResult | null | undefined): string {
         <div><span>Score</span><strong>${Math.round(logic.entailment_score * 100)}%</strong></div>
         <div><span>Evidence</span><strong>${escapeHtml(logic.evidence_ids.join(", ") || "-")}</strong></div>
         <div><span>Facts</span><strong>${factExport ? factExport.facts.length : 0}</strong></div>
+        <div><span>Parser</span><strong>${escapeHtml(parserModes.join(", ") || "-")}</strong></div>
+        <div><span>Model</span><strong>${escapeHtml(parserModels.join(", ") || "-")}</strong></div>
+        <div><span>Prompt</span><strong>${escapeHtml(parserPromptHashes.join(", ") || "-")}</strong></div>
       </div>
       <div class="biomed-evidence-finding">${escapeHtml(logic.reason)}</div>
       <div class="biomed-label">Triggered Rules</div>
       ${renderList(logic.rules_triggered)}
       ${mismatchLines.length ? `<div class="biomed-label">Mismatches</div>${renderList(mismatchLines)}` : ""}
+      ${parserWarnings.length ? `<div class="biomed-label">Parser Warnings</div>${renderList(parserWarnings)}` : ""}
       ${logic.warnings.length ? `<div class="biomed-label">Logic Warnings</div>${renderList(logic.warnings)}` : ""}
+      ${
+        parserFrames.length
+          ? `
+            <details class="biomed-logic-frames">
+              <summary>Parsed Logic Frames</summary>
+              <pre class="biomed-json">${escapeHtml(JSON.stringify({ claim_frame: claimFrame, evidence_frames: evidenceFrames }, null, 2))}</pre>
+            </details>
+          `
+          : ""
+      }
       ${
         factExport
           ? `
@@ -882,7 +913,7 @@ function renderAsk(container: HTMLElement): void {
           <div class="biomed-title">Ask Evidence Question</div>
           <div class="biomed-subtitle">Research-only biomedical evidence workflow</div>
         </div>
-        ${pill("V2.1")}
+        ${pill("V2.2")}
       </div>
       <div class="biomed-form">
         <label class="biomed-field">

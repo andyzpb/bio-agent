@@ -1,0 +1,66 @@
+{
+  "default_source": {
+    "type": "string",
+    "default": "mock"
+  },
+  "allow_live_pubmed_tools": {
+    "type": "boolean",
+    "default": false
+  },
+  "enable_prompt_context": {
+    "type": "boolean",
+    "default": true
+  },
+  "auto_use_active_project": {
+    "type": "boolean",
+    "default": false
+  },
+  "max_search_results": {
+    "type": "number",
+    "default": 10
+  },
+  "max_answer_papers": {
+    "type": "number",
+    "default": 10
+  },
+  "max_page_size": {
+    "type": "number",
+    "default": 100
+  },
+  "default_require_abstract": {
+    "type": "boolean",
+    "default": true
+  },
+  "default_use_llm_planner": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_execute_support_refute": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_use_llm_extractor": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_use_llm_synthesis": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_use_llm_verifier": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_use_llm_revision": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_use_llm_claim_logic": {
+    "type": "boolean",
+    "default": false
+  },
+  "default_export_logic_facts": {
+    "type": "boolean",
+    "default": false
+  }
+}

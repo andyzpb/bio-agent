@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Iterable, cast
 
@@ -21,6 +22,8 @@ from plugins.biomed_evidence.schemas import (
     EvidenceStrength,
     LogicAuditResult,
     LogicParserMode,
+    LogicalClaimFrame,
+    LogicalEvidenceFrame,
     RetrievalManifest,
     UncertaintyAudit,
 )
@@ -75,19 +78,28 @@ def validate_citation_support(
     retrieval_manifest: RetrievalManifest | None = None,
     use_llm_claim_logic: bool = False,
     export_logic_facts: bool = False,
+    logic_claim_frames: Mapping[str, LogicalClaimFrame] | None = None,
+    logic_evidence_frames: Mapping[str, LogicalEvidenceFrame] | None = None,
+    logic_parser_fallback_reason: str | None = None,
 ) -> CitationAuditResult:
     claims = extract_atomic_claims(answer)
     citation_ids = {citation.paper_id for citation in citations}
+    logic_parser_mode: LogicParserMode = (
+        "llm"
+        if use_llm_claim_logic and logic_claim_frames and logic_evidence_frames
+        else "fallback" if use_llm_claim_logic else "deterministic"
+    )
     claim_audits = [
         _audit_claim(
             claim,
             evidence_items,
             citation_ids,
             use_claim_logic=use_llm_claim_logic or export_logic_facts,
-            claim_logic_parser_mode=(
-                "fallback" if use_llm_claim_logic else "deterministic"
-            ),
+            claim_logic_parser_mode=logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
         for claim in claims
     ]
@@ -319,6 +331,9 @@ def _audit_claim(
     use_claim_logic: bool = False,
     claim_logic_parser_mode: LogicParserMode = "deterministic",
     export_logic_facts: bool = False,
+    logic_claim_frames: Mapping[str, LogicalClaimFrame] | None = None,
+    logic_evidence_frames: Mapping[str, LogicalEvidenceFrame] | None = None,
+    logic_parser_fallback_reason: str | None = None,
 ) -> ClaimAuditItem:
     cited_ids = claim.cited_paper_ids or _infer_cited_ids(
         claim.text, evidence_items, citation_ids
@@ -334,6 +349,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     candidates = [item for item in evidence_items if item.paper_id in cited_ids]
     if not candidates:
@@ -347,6 +365,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     ranked = sorted(
         ((item, _overlap(claim.text, _evidence_text(item))) for item in candidates),
@@ -367,6 +388,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     if (
         best.evidence_direction == "contradicts"
@@ -382,6 +406,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     if best.evidence_direction == "inconclusive":
         return _claim_audit(
@@ -394,6 +421,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     if score >= 0.14:
         return _claim_audit(
@@ -406,6 +436,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     if score >= 0.06:
         return _claim_audit(
@@ -418,6 +451,9 @@ def _audit_claim(
             use_claim_logic=use_claim_logic,
             claim_logic_parser_mode=claim_logic_parser_mode,
             export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
     return _claim_audit(
         claim,
@@ -429,6 +465,9 @@ def _audit_claim(
         use_claim_logic=use_claim_logic,
         claim_logic_parser_mode=claim_logic_parser_mode,
         export_logic_facts=export_logic_facts,
+        logic_claim_frames=logic_claim_frames,
+        logic_evidence_frames=logic_evidence_frames,
+        logic_parser_fallback_reason=logic_parser_fallback_reason,
     )
 
 
@@ -444,6 +483,9 @@ def _claim_audit(
     use_claim_logic: bool = False,
     claim_logic_parser_mode: LogicParserMode = "deterministic",
     export_logic_facts: bool = False,
+    logic_claim_frames: Mapping[str, LogicalClaimFrame] | None = None,
+    logic_evidence_frames: Mapping[str, LogicalEvidenceFrame] | None = None,
+    logic_parser_fallback_reason: str | None = None,
 ) -> ClaimAuditItem:
     best = evidence_items[0] if evidence_items else None
     audit_item = ClaimAuditItem(
@@ -468,6 +510,13 @@ def _claim_audit(
         claim,
         evidence_items,
         parser_mode=claim_logic_parser_mode,
+        claim_frame=(
+            logic_claim_frames.get(claim.claim_id)
+            if logic_claim_frames is not None
+            else None
+        ),
+        evidence_frames=logic_evidence_frames,
+        parser_fallback_reason=logic_parser_fallback_reason,
         export_facts=export_logic_facts,
     )
     return _merge_logic_audit(audit_item, logic)

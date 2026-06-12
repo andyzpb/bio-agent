@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from plugins.biomed_evidence.claim_logic_export import export_logic_facts
 from plugins.biomed_evidence.claim_logic_rules import audit_logical_support
 from plugins.biomed_evidence.schemas import (
@@ -29,6 +30,7 @@ def parse_logical_claim(
     parser_mode: LogicParserMode = "deterministic",
     parser_model: str | None = None,
     parser_prompt_hash: str | None = None,
+    parser_warnings: list[str] | None = None,
 ) -> LogicalClaimFrame:
     text = claim.text
     predicate = _predicate(text)
@@ -49,10 +51,10 @@ def parse_logical_claim(
         parser_mode=parser_mode,
         parser_model=parser_model,
         parser_prompt_hash=parser_prompt_hash,
-        parser_warnings=(
-            []
-            if parser_mode != "fallback"
-            else ["LLM claim parser unavailable; deterministic fallback used."]
+        parser_warnings=_parser_warnings(
+            parser_mode,
+            parser_warnings,
+            "LLM claim parser unavailable; deterministic fallback used.",
         ),
     )
 
@@ -63,6 +65,7 @@ def parse_logical_evidence(
     parser_mode: LogicParserMode = "deterministic",
     parser_model: str | None = None,
     parser_prompt_hash: str | None = None,
+    parser_warnings: list[str] | None = None,
 ) -> LogicalEvidenceFrame:
     text = _evidence_text(evidence)
     predicate = _predicate(text)
@@ -89,10 +92,10 @@ def parse_logical_evidence(
         parser_mode=parser_mode,
         parser_model=parser_model,
         parser_prompt_hash=parser_prompt_hash,
-        parser_warnings=(
-            []
-            if parser_mode != "fallback"
-            else ["LLM evidence parser unavailable; deterministic fallback used."]
+        parser_warnings=_parser_warnings(
+            parser_mode,
+            parser_warnings,
+            "LLM evidence parser unavailable; deterministic fallback used.",
         ),
     )
 
@@ -102,19 +105,53 @@ def audit_claim_logic(
     evidence_items: list[EvidenceItem],
     *,
     parser_mode: LogicParserMode = "deterministic",
+    claim_frame: LogicalClaimFrame | None = None,
+    evidence_frames: Mapping[str, LogicalEvidenceFrame] | None = None,
+    parser_model: str | None = None,
+    parser_prompt_hash: str | None = None,
+    parser_fallback_reason: str | None = None,
     export_facts: bool = False,
 ) -> LogicAuditResult:
-    claim_frame = parse_logical_claim(claim, parser_mode=parser_mode)
-    evidence_frames = [
-        parse_logical_evidence(item, parser_mode=parser_mode) for item in evidence_items
+    fallback_warnings = [parser_fallback_reason] if parser_fallback_reason else None
+    active_claim_frame = claim_frame or parse_logical_claim(
+        claim,
+        parser_mode=parser_mode,
+        parser_model=parser_model,
+        parser_prompt_hash=parser_prompt_hash,
+        parser_warnings=fallback_warnings,
+    )
+    active_evidence_frames = [
+        evidence_frames.get(item.evidence_id)
+        if evidence_frames is not None
+        else None
+        for item in evidence_items
     ]
-    result = audit_logical_support(claim_frame, evidence_frames)
+    parsed_evidence_frames = [
+        frame
+        if frame is not None
+        else parse_logical_evidence(
+            item,
+            parser_mode=parser_mode,
+            parser_model=parser_model,
+            parser_prompt_hash=parser_prompt_hash,
+            parser_warnings=fallback_warnings,
+        )
+        for item, frame in zip(evidence_items, active_evidence_frames, strict=True)
+    ]
+    result = audit_logical_support(active_claim_frame, parsed_evidence_frames)
+    parser_warnings = _merge_unique(
+        active_claim_frame.parser_warnings,
+        *[frame.parser_warnings for frame in parsed_evidence_frames],
+        result.warnings,
+    )
+    if parser_warnings:
+        result = result.model_copy(update={"warnings": parser_warnings})
     if export_facts:
         result = result.model_copy(
             update={
                 "logic_fact_export": export_logic_facts(
-                    claim_frame,
-                    evidence_frames,
+                    active_claim_frame,
+                    parsed_evidence_frames,
                     result,
                     format="text",
                 )
@@ -125,6 +162,29 @@ def audit_claim_logic(
 
 def prompt_hash(payload: object) -> str:
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
+
+
+def _parser_warnings(
+    parser_mode: LogicParserMode,
+    warnings: list[str] | None,
+    fallback_warning: str,
+) -> list[str]:
+    if parser_mode == "fallback":
+        return _merge_unique(warnings or [], [fallback_warning])
+    return _merge_unique(warnings or [])
+
+
+def _merge_unique(*groups: list[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for value in group:
+            clean = value.strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            merged.append(clean)
+    return merged
 
 
 def _predicate(text: str) -> LogicPredicate:

@@ -6,13 +6,13 @@ integrations, tool plugins, and a FastAPI dashboard.
 
 This repository also includes a portfolio-grade **Biomedical Evidence** plugin:
 a research-only biomedical literature assistant built on top of the framework.
-The current implementation is **V2.1 Claim Logic Entailment + Fact Export**.
+The current implementation is **V2.5 Controlled Literature Search Tool**.
 
 The biomedical direction is claim-level evidence trustworthiness: every answer
 should be traceable from question, routing, retrieval plan, retrieved papers,
 evidence spans, citations, audit, revision, and final output.
 
-## Current V2.1 Snapshot
+## Current V2.5 Snapshot
 
 Implemented now:
 
@@ -32,13 +32,33 @@ Implemented now:
 - Citation-grounded answers with deterministic claim-level audit, overclaim
   checks, conflict awareness, uncertainty calibration, audit/revise loop, and
   persisted trace.
-- V2.1 claim logic audit with schema-validated logical claim/evidence frames,
-  deterministic biomedical entailment rules, optional `logic_audit` attachment
-  to claim audits, and explicit fallback warnings when LLM claim parsing is
-  requested but unavailable.
-- V2.1 symbolic logic fact export for claim/evidence frames, alignments,
+- V2.2 claim logic audit with provider-backed LLM claim/evidence frame parsing
+  behind `use_llm_claim_logic`, JSON-only parser prompts, prompt hashes, model
+  metadata, schema validation, and explicit deterministic fallback reasons.
+- V2.3 framework-native integration for normal agent tool calls:
+  plugin config defaults, plugin KV preferences, `@on_tool_pre` biomedical
+  guardrails, source/count/LLM-flag policy mutation, project ID validation, and
+  conditional prompt context injection through the framework lifecycle.
+- V2.4 literature access readiness check for mock/PubMed sources. The check
+  exercises search, retrieval manifest creation, paper storage, abstract
+  coverage, NCBI identity metadata, and source readiness without requiring an
+  answer-generation run.
+- V2.5 controlled `search_literature` tool and
+  `POST /api/biomed/literature/search` endpoint. The tool returns normalized
+  paper records, source rank, abstracts when available, retrieval manifest,
+  coverage metrics, source trace, warnings, errors, and stored paper IDs
+  without synthesizing answers.
+- Deterministic biomedical entailment rules remain the source of record for
+  support, overclaim, scope, population, modality, and clinical-boundary
+  verdicts; the LLM parser may only formalize claim/evidence semantics.
+- Symbolic logic fact export for claim/evidence frames, alignments,
   non-entailment rules, triggered rules, mismatch facts, warnings, and final
   verdict facts. Fact export is deterministic and does not call an LLM.
+- Clinical refusal paths short-circuit before retrieval, claim-logic parsing,
+  and fact export, preventing misleading logic artifacts on patient-specific
+  requests.
+- Dashboard Audit/Trace views expose logic parser mode/model/prompt provenance,
+  fallback warnings, parsed logic frames, and symbolic fact exports.
 - Optional advisory verifier model. It records disagreement and review pressure,
   but deterministic audit remains the verifier of record.
 - V2.0 project evidence workspace:
@@ -52,12 +72,81 @@ Implemented now:
 Project memory is context only. It can influence planning preferences and
 post-retrieval filtering, but it is never treated as biomedical evidence.
 
-## Highlight: V2.1 Claim Logic Entailment + Fact Export
+## Highlight: V2.5 Controlled Literature Search Tool
 
-The latest hardening step adds a **schema-constrained biomedical claim
-logic parser**. Instead of asking an LLM to judge whether a citation supports a
-claim, V2.1 uses typed logical frames and then exports the
-deterministic reasoning trace as symbolic facts:
+V2.5 promotes literature retrieval into the agent's core controlled tool
+surface. The LLM planner can propose structured query parameters, but source
+access remains deterministic, manifest-backed, and guarded by the framework:
+
+```text
+planner query
+  -> search_literature
+  -> normalized papers + retrieval manifest + coverage/source trace
+  -> extraction / synthesis / audit
+```
+
+`search_literature` supports deterministic `mock` and opt-in `pubmed` sources,
+persists papers when requested, records abstract coverage and stored-paper
+coverage, and keeps every returned paper tied to a retrieval manifest. It does
+not generate answers, browse arbitrary websites, or bypass clinical/source/count
+guards. `check_literature_access` remains the separate readiness smoke path for
+confirming source connectivity before answer workflows.
+
+## Highlight: V2.3 Framework-Native Biomedical Guardrails
+
+V2.3 starts using the host framework as more than a tool registry. The
+Biomedical Evidence plugin now participates in the framework's native control
+points:
+
+```text
+agent turn / tool call
+  -> conditional biomedical prompt context
+  -> @on_tool_pre biomedical guardrail
+  -> plugin config defaults and caps
+  -> plugin KV for lightweight active project/source preferences
+  -> biomedical service trust path
+```
+
+The pre-tool guard blocks clinical or patient-specific biomedical tool calls
+before retrieval or LLM stages run, denies accidental live PubMed tool use when
+plugin config disallows it, caps oversized result requests, validates project
+IDs, applies safe default sources, and records explicit mutation/denial reasons
+in hook traces. The prompt module injects a short research-only boundary and
+active project context only when the turn is biomedical or a project is active.
+
+This layer does not replace service-level guardrails. It is an outer framework
+guard for ordinary agent tool use; the biomedical service still remains the
+source of record for retrieval, audit, revision, clinical refusal, and trace.
+
+## Highlight: V2.4 Literature Access Hardening
+
+V2.4 makes literature access an explicit, testable capability rather than an
+implicit option hidden behind `source=pubmed`. The new readiness path runs the
+same search, retrieval manifest, paper persistence, and abstract availability
+checks that downstream answer generation depends on:
+
+```text
+source readiness query
+  -> literature search
+  -> retrieval manifest
+  -> paper storage
+  -> abstract coverage check
+  -> readiness result + warnings/errors
+```
+
+This gives reviewers a direct way to confirm whether the app is connected to
+real literature infrastructure before judging planner, extractor, synthesis, or
+audit behavior. Live PubMed remains opt-in for tests/eval and ordinary agent
+tool calls, but the readiness result records whether NCBI email/API-key identity
+is configured and surfaces lower-rate-limit warnings without leaking secrets.
+
+## Highlight: V2.2 Provider-Backed Claim Logic Parser
+
+V2.2 added a **provider-backed, schema-constrained
+biomedical claim/evidence logic parser**. Instead of asking an LLM to judge
+whether a citation supports a claim, it lets the provider produce typed
+logical frames, validates them strictly, and then exports the deterministic
+reasoning trace as symbolic facts:
 
 ```text
 claim / evidence text
@@ -79,7 +168,10 @@ while deterministic code remains the source of record for support, overclaim,
 scope, population, modality, and clinical-boundary verdicts. The fact export
 layer is for inspectability, regression testing, and future
 Datalog/Prolog/Z3-style solver integration; it does not prove biomedical truth
-or override the audit verdict.
+or override the audit verdict. If the provider is unavailable, returns invalid
+JSON, misses a frame, or emits schema-invalid fields, V2.2 fails fast into the
+deterministic parser and records the fallback reason in audit warnings and
+trace metadata.
 
 ## Version Summary
 
@@ -107,29 +199,39 @@ or override the audit verdict.
 - V2.1: Claim logic entailment audit with schema-validated logical frames,
   deterministic semantic overclaim rules, audit/trace integration, and
   symbolic logic fact export.
-- V2.2 planned: Provider-backed LLM claim/evidence logic parser hardening,
-  stricter clinical-boundary short-circuiting, Logic Facts dashboard polish, and
-  expanded claim-logic eval gates.
+- V2.2: Provider-backed LLM claim/evidence logic parser hardening, strict
+  schema/fallback handling, clinical-boundary-before-logic enforcement,
+  parser provenance in trace/dashboard, and expanded claim-logic tests.
+- V2.3: Framework-native biomedical guardrails and context integration:
+  plugin config defaults, plugin KV state, `@on_tool_pre` clinical/source/count
+  guards, project ID validation, and conditional prompt context injection.
+- V2.4: Literature access hardening with explicit source readiness checks,
+  retrieval manifest and paper-storage smoke, abstract coverage metrics, API
+  and tool surface, and eval metrics.
+- V2.5: Controlled literature search tool with stable `search_literature`
+  envelope, normalized paper records, retrieval manifest/source trace, coverage
+  metrics, storage trace, framework guardrails, API route, and eval metrics.
 
-## Next Roadmap: V2.2
+## Next Roadmap: V2.6+
 
-V2.2 should turn the current V2.1 claim-logic base into a stronger
-LLM-assisted semantic parser path while preserving the deterministic audit as
-the source of record.
+V2.6+ should build on V2.5 by using the controlled retrieval tool in proactive,
+memory-aware, and telemetry workflows without weakening the biomedical trust
+path.
 
-Planned V2.2 scope:
+Planned next scope:
 
-- Add provider-backed LLM claim/evidence parsers for `use_llm_claim_logic`,
-  including JSON-only prompts, prompt hashes, model metadata, validation errors,
-  parser warnings, and explainable fallback reasons.
-- Keep final support, overclaim, scope, population, modality, and clinical
-  verdicts deterministic. The LLM may only formalize claim/evidence semantics.
-- Short-circuit clinical refusal paths before claim-logic parsing and fact
-  export, so clinical guardrails cannot create misleading `not_assessed` logic
-  artifacts.
-- Add a first-class dashboard Logic Facts panel for each audited claim,
-  including parsed frames, triggered rules, mismatch facts, exported symbolic
-  facts, parser mode/model, and fallback warnings.
+- Convert Research Watch into an opt-in proactive alert/content source after
+  the controlled search tool is stable. Watch pushes must include retrieval
+  IDs, snapshot IDs, relevance reasons, citation links, dashboard links, and
+  ACK mapped back to watch decision logs.
+- Bridge project context into the framework memory layer as context-only
+  records. Memory can influence preferences and active project selection, but
+  must never satisfy biomedical claims or replace retrieved evidence.
+- Add observe/eval telemetry for biomedical run IDs, retrieval manifests, audit
+  IDs, parser modes, revision actions, fallback reasons, and clinical refusals.
+- Add a first-class dashboard Logic Facts workspace with filtering, copy/export
+  controls, parser frame diffing, triggered-rule drilldowns, and better visual
+  grouping for multi-claim answers.
 - Expand golden claim-logic evals for association-to-causation,
   animal/in-vitro-to-human, mechanism-to-treatment, biomarker-to-diagnostic,
   nonlongitudinal-to-prognostic, weak-to-definitive, and inconclusive evidence
@@ -137,10 +239,12 @@ Planned V2.2 scope:
 - Add CI-visible metrics for parser schema success, fallback rate, expected
   verdict accuracy, expected rule recall, fact export determinism, expected fact
   recall, symbol normalization errors, and clinical-boundary-before-logic rate.
-- Re-run local Ollama smoke with `gpt-oss:120b-cloud` across planner,
-  extractor, synthesis, verifier, revision, and claim-logic parser paths.
+- Prototype optional Datalog/Prolog/Z3-style solver integration using exported
+  symbolic facts while keeping deterministic Python rules as the release gate.
+- Decide when live PubMed should enter main acceptance rather than optional
+  smoke, including rate-limit, reproducibility, and fixture strategy.
 
-Deferred after V2.2:
+Deferred after V2.5:
 
 - Richer project reviewer workflows: accept/reject review queue items, claim
   status transitions, reviewer notes, and decision provenance.
@@ -162,7 +266,10 @@ Retrieval expansion:
 
 - Keep live PubMed optional until reliability and rate-limit behavior are
   hardened further.
-- Add optional Europe PMC or Semantic Scholar adapters.
+- Add optional Europe PMC before any general web-search evidence source.
+- Treat general web search, if added later, as source discovery only; it should
+  not bypass structured literature source checks, manifest persistence,
+  citation audit, or biomedical trust gates.
 - Improve conflict search across claims and topics.
 - Add full-text/PDF ingestion only after abstract-level provenance and audit
   gates remain stable.
@@ -314,6 +421,8 @@ What recent evidence links microglial activation to Alzheimer's disease progress
 The plugin registers:
 
 - `plan_biomedical_search`
+- `check_literature_access`
+- `search_literature`
 - `search_biomedical_literature`
 - `fetch_biomedical_paper`
 - `extract_evidence`
@@ -348,6 +457,8 @@ Core routes are mounted under `/api/biomed`.
 Common routes:
 
 - `POST /api/biomed/plan`
+- `POST /api/biomed/literature/check`
+- `POST /api/biomed/literature/search`
 - `GET /api/biomed/search`
 - `GET /api/biomed/retrievals/{retrieval_id}`
 - `GET /api/biomed/papers`
@@ -396,7 +507,7 @@ are excluded from Git.
 Run targeted biomedical checks:
 
 ```bash
-python -m pytest -q tests/test_biomed_evidence.py tests/test_biomed_api.py tests/test_dashboard_api.py
+python -m pytest -q tests/test_biomed_framework_integration.py tests/test_biomed_evidence.py tests/test_biomed_api.py tests/test_dashboard_api.py
 python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
 npm ci
 npm run typecheck
@@ -424,6 +535,41 @@ Local audited answer smoke:
 
 ```bash
 uv run python main.py dashboard
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/check" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "microglia Alzheimer disease",
+    "source": "mock",
+    "max_results": 3
+  }' | jq '{
+    ok,
+    ready,
+    source,
+    item_count,
+    abstract_coverage,
+    retrieval_id: .retrieval_manifest.retrieval_id,
+    warnings
+  }'
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "microglia Alzheimer disease",
+    "source": "mock",
+    "max_results": 3,
+    "retrieval_intent": "primary",
+    "require_abstract": true,
+    "store": true
+  }' | jq '{
+    source,
+    item_count: .coverage.item_count,
+    abstract_coverage: .coverage.abstract_coverage,
+    stored: .coverage.stored_paper_count,
+    retrieval_id: .retrieval_manifest.retrieval_id,
+    first_paper: .items[0].paper_id,
+    warnings
+  }'
 
 curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
   -H "Content-Type: application/json" \
@@ -461,12 +607,13 @@ With no configured LLM provider, optional LLM stages may report `fallback`.
 The request should still return citations, a retrieval bundle, logic-audit
 metadata when requested, and an 11-step trace.
 
-Recent V2.1 Ollama smoke was run with the local Ollama Pro
-OpenAI-compatible endpoint and `gpt-oss:120b-cloud`. Planner, synthesis,
-advisory verifier, and revision returned through the LLM path; claim-logic
-audit and symbolic fact export were present in audit JSON and trace metadata.
-The current claim/evidence logic parser may still report deterministic
-`fallback`, which is the main V2.2 hardening target.
+V2.5 Ollama smoke should use the local Ollama Pro OpenAI-compatible endpoint
+and `gpt-oss:120b-cloud`. Planner, synthesis, advisory verifier, revision, and
+claim-logic parser paths can all return through the LLM provider; audit JSON and
+trace metadata expose parser mode/model/prompt provenance, fallback warnings,
+`logic_audit`, and symbolic fact exports. The framework pre-tool guard remains
+separate from the dashboard/API route smoke; it is covered by
+`tests/test_biomed_framework_integration.py`.
 
 ## Docker
 

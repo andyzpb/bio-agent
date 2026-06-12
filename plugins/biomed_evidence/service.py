@@ -13,6 +13,7 @@ from typing import Any, Iterable, cast
 import httpx
 
 from plugins.biomed_evidence.citation_auditor import (
+    extract_atomic_claims,
     find_conflicting_evidence as audit_conflicts,
     validate_citation_support,
 )
@@ -35,6 +36,7 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     AnswerWithEvidenceResult,
     AnswerRevision,
+    AtomicClaim,
     AuditedAnswerResult,
     BiomedProject,
     BiomedProjectCreateRequest,
@@ -60,6 +62,15 @@ from plugins.biomed_evidence.schemas import (
     GenerateProjectEvidenceBriefRequest,
     GraphEdge,
     GraphNode,
+    LiteratureAccessCheckRequest,
+    LiteratureAccessCheckResult,
+    LiteraturePaperRecord,
+    LiteratureSearchCoverage,
+    LiteratureSearchRequest,
+    LiteratureSearchResult,
+    LiteratureSourceTrace,
+    LogicalClaimFrame,
+    LogicalEvidenceFrame,
     PaperMetadata,
     PlanBiomedicalSearchRequest,
     PlanBiomedicalSearchResult,
@@ -92,6 +103,15 @@ class _SynthesisOutcome:
     mode: str
     model: str | None
     prompt_hash: str | None
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _LogicParserOutcome:
+    claim_frames: dict[str, LogicalClaimFrame]
+    evidence_frames: dict[str, LogicalEvidenceFrame]
+    prompt_hash: str | None
+    model: str | None
     fallback_reason: str | None = None
 
 
@@ -388,6 +408,203 @@ class BiomedEvidenceService:
     ) -> list[PaperMetadata]:
         return (await self.search_with_manifest(request)).items
 
+    async def search_literature(
+        self,
+        request: LiteratureSearchRequest,
+    ) -> LiteratureSearchResult:
+        if request.project_id and self.storage.get_project(request.project_id) is None:
+            raise ValueError("project not found")
+        publication_types = _clean_list(
+            [*request.publication_types, *request.article_types]
+        )
+        search_request = SearchBiomedicalLiteratureRequest(
+            query=request.query,
+            max_results=request.max_results,
+            date_from=request.date_from,
+            date_to=request.date_to,
+            source=request.source,
+            publication_types=publication_types,
+            study_types=_clean_list(request.study_types),
+            mesh_terms=_clean_list(request.mesh_terms),
+            species_terms=_clean_list(request.species_terms),
+            exclude_terms=_clean_list(request.exclude_terms),
+            store=request.store,
+        )
+        result = await self.search_with_manifest(search_request)
+        manifest = result.retrieval_manifest
+        records: list[LiteraturePaperRecord] = []
+        stored_paper_ids: list[str] = []
+        abstract_count = 0
+        skipped_no_abstract_count = 0
+        for index, item in enumerate(result.items, start=1):
+            stored = self.storage.get_paper(item.paper_id, source=item.source)
+            if stored is not None:
+                stored_paper_ids.append(stored.paper_id)
+            abstract = stored.abstract if stored is not None else None
+            mesh_terms = stored.mesh_terms if stored is not None else []
+            keywords = stored.keywords if stored is not None else []
+            abstract_available = bool((abstract or "").strip())
+            if abstract_available:
+                abstract_count += 1
+            elif request.require_abstract:
+                skipped_no_abstract_count += 1
+            records.append(
+                LiteraturePaperRecord(
+                    paper_id=item.paper_id,
+                    source=item.source,
+                    title=item.title,
+                    abstract=abstract,
+                    authors=item.authors,
+                    journal=item.journal,
+                    publication_date=item.publication_date,
+                    doi=item.doi,
+                    url=item.url,
+                    source_rank=index,
+                    abstract_available=abstract_available,
+                    mesh_terms=mesh_terms,
+                    keywords=keywords,
+                )
+            )
+        warnings = [*manifest.warnings]
+        if (
+            request.require_abstract
+            and result.items
+            and skipped_no_abstract_count == len(result.items)
+        ):
+            warnings.append(
+                "Literature search returned papers but no stored abstracts; evidence "
+                "extraction will be limited."
+            )
+        query_used = manifest.compiled_query or request.query
+        coverage = LiteratureSearchCoverage(
+            item_count=len(records),
+            abstract_count=abstract_count,
+            abstract_coverage=_safe_ratio(abstract_count, len(records)),
+            stored_paper_count=len(stored_paper_ids),
+            skipped_no_abstract_count=skipped_no_abstract_count,
+        )
+        source_trace = LiteratureSourceTrace(
+            source=request.source,
+            live=request.source == "pubmed",
+            query_used=query_used,
+            compiled_query=manifest.compiled_query,
+            retrieval_intent=request.retrieval_intent,
+            project_id=request.project_id,
+            store_requested=request.store,
+            require_abstract=request.require_abstract,
+            stored_paper_ids=stored_paper_ids,
+            unsupported_filters=manifest.unsupported_filters,
+            warnings=warnings,
+            errors=manifest.errors,
+        )
+        return LiteratureSearchResult(
+            source=request.source,
+            query=request.query,
+            query_used=query_used,
+            retrieval_intent=request.retrieval_intent,
+            live=request.source == "pubmed",
+            items=records,
+            retrieval_manifest=manifest,
+            coverage=coverage,
+            source_trace=source_trace,
+            warnings=warnings,
+            errors=manifest.errors,
+        )
+
+    async def check_literature_access(
+        self,
+        request: LiteratureAccessCheckRequest,
+    ) -> LiteratureAccessCheckResult:
+        checked_at = _now_iso()
+        warnings: list[str] = []
+        errors: list[str] = []
+        search_request = SearchBiomedicalLiteratureRequest(
+            query=request.query,
+            max_results=max(1, min(request.max_results, 10)),
+            date_from=request.date_from,
+            date_to=request.date_to,
+            source=request.source,
+        )
+        if request.source == "pubmed":
+            if not self.pubmed_client.email:
+                warnings.append(
+                    "NCBI_EMAIL is not configured; PubMed allows requests but "
+                    "tool/contact identity is recommended for live use."
+                )
+            if not self.pubmed_client.api_key:
+                warnings.append(
+                    "NCBI_API_KEY is not configured; PubMed rate limits may be lower."
+                )
+        try:
+            result = await self.search_with_manifest(search_request)
+        except LiteratureClientError as exc:
+            errors.append(str(exc))
+            return LiteratureAccessCheckResult(
+                source=request.source,
+                query=request.query,
+                live=request.source == "pubmed",
+                ok=False,
+                ready=False,
+                checked_at=checked_at,
+                ncbi_email_configured=bool(self.pubmed_client.email),
+                ncbi_api_key_configured=bool(self.pubmed_client.api_key),
+                warnings=warnings,
+                errors=errors,
+            )
+
+        items = result.items
+        stored_paper_count = 0
+        abstract_count = 0
+        for item in items:
+            stored = self.storage.get_paper(item.paper_id, source=item.source)
+            if stored is None:
+                stored = await self.fetch(
+                    FetchBiomedicalPaperRequest(
+                        paper_id=item.paper_id,
+                        source=item.source,
+                    )
+                )
+            if stored is None:
+                continue
+            stored_paper_count += 1
+            if (stored.abstract or "").strip():
+                abstract_count += 1
+        item_count = len(items)
+        if item_count == 0:
+            warnings.append("Literature source returned zero papers for the smoke query.")
+        if request.require_abstract and item_count > 0 and abstract_count == 0:
+            warnings.append(
+                "Literature source returned papers but no abstracts; evidence extraction "
+                "will be limited."
+            )
+        manifest = result.retrieval_manifest
+        warnings.extend(manifest.warnings)
+        errors.extend(manifest.errors)
+        ready = (
+            item_count > 0
+            and stored_paper_count > 0
+            and not errors
+            and (not request.require_abstract or abstract_count > 0)
+        )
+        return LiteratureAccessCheckResult(
+            source=request.source,
+            query=request.query,
+            live=request.source == "pubmed",
+            ok=not errors,
+            ready=ready,
+            checked_at=checked_at,
+            item_count=item_count,
+            abstract_count=abstract_count,
+            abstract_coverage=_safe_ratio(abstract_count, item_count),
+            stored_paper_count=stored_paper_count,
+            ncbi_email_configured=bool(self.pubmed_client.email),
+            ncbi_api_key_configured=bool(self.pubmed_client.api_key),
+            retrieval_manifest=manifest,
+            items=items,
+            warnings=warnings,
+            errors=errors,
+        )
+
     async def search_with_manifest(
         self,
         request: SearchBiomedicalLiteratureRequest,
@@ -411,8 +628,9 @@ class BiomedEvidenceService:
                 )
                 items = pubmed_result.items
                 trace = pubmed_result.trace
-                for paper in pubmed_result.papers:
-                    self.storage.upsert_paper(paper)
+                if request.store:
+                    for paper in pubmed_result.papers:
+                        self.storage.upsert_paper(paper)
             else:
                 items = await client.search(
                     request.query,
@@ -460,16 +678,17 @@ class BiomedEvidenceService:
             errors=errors,
         )
         self.storage.save_retrieval_manifest(manifest)
-        self.storage.link_retrieval_papers(
-            manifest.retrieval_id,
-            source=request.source,
-            paper_ids=returned_ids,
-        )
-        for item in items:
-            stored = self.storage.get_paper(item.paper_id, source=request.source)
-            paper = stored or await client.fetch(item.paper_id)
-            if paper is not None:
-                self.storage.upsert_paper(paper)
+        if request.store:
+            self.storage.link_retrieval_papers(
+                manifest.retrieval_id,
+                source=request.source,
+                paper_ids=returned_ids,
+            )
+            for item in items:
+                stored = self.storage.get_paper(item.paper_id, source=request.source)
+                paper = stored or await client.fetch(item.paper_id)
+                if paper is not None:
+                    self.storage.upsert_paper(paper)
         return SearchBiomedicalLiteratureResult(
             items=items,
             retrieval_manifest=manifest,
@@ -1266,13 +1485,7 @@ class BiomedEvidenceService:
             draft_result.question_classification
             and draft_result.question_classification.clinical_boundary
         )
-        use_claim_logic_for_audit = (
-            request.use_llm_claim_logic and not clinical_boundary
-        )
-        export_logic_facts_for_audit = (
-            request.export_logic_facts and not clinical_boundary
-        )
-        audit = self.audit_answer(
+        audit = await self._audit_answer_with_optional_logic(
             CitationAuditRequest(
                 answer=draft_result.answer,
                 citations=draft_result.citations,
@@ -1281,9 +1494,10 @@ class BiomedEvidenceService:
                 retrieval_id=draft_result.retrieval_id,
                 observed_uncertainty=draft_result.uncertainty_level,
                 retrieval_manifest=draft_result.retrieval_manifest,
-                use_llm_claim_logic=use_claim_logic_for_audit,
-                export_logic_facts=export_logic_facts_for_audit,
-            )
+                use_llm_claim_logic=request.use_llm_claim_logic,
+                export_logic_facts=request.export_logic_facts,
+            ),
+            clinical_boundary=clinical_boundary,
         )
         advisory_verifier = await self._llm_advisory_verifier_or_fallback(
             request=request,
@@ -1357,6 +1571,130 @@ class BiomedEvidenceService:
             trace=trace,
             final_action=revision.revision_action,
         )
+
+    async def _audit_answer_with_optional_logic(
+        self,
+        request: CitationAuditRequest,
+        *,
+        clinical_boundary: bool,
+    ) -> CitationAuditResult:
+        use_claim_logic = request.use_llm_claim_logic and not clinical_boundary
+        export_logic_facts = request.export_logic_facts and not clinical_boundary
+        active_request = request.model_copy(
+            update={
+                "use_llm_claim_logic": use_claim_logic,
+                "export_logic_facts": export_logic_facts,
+            }
+        )
+        if not use_claim_logic:
+            return self.audit_answer(active_request)
+        logic_outcome = await self._llm_claim_logic_frames_or_fallback(
+            answer=active_request.answer,
+            citations=active_request.citations,
+            evidence_items=active_request.evidence_items,
+        )
+        return self.audit_answer(
+            active_request,
+            logic_claim_frames=(
+                logic_outcome.claim_frames if logic_outcome.claim_frames else None
+            ),
+            logic_evidence_frames=(
+                logic_outcome.evidence_frames if logic_outcome.evidence_frames else None
+            ),
+            logic_parser_fallback_reason=logic_outcome.fallback_reason,
+        )
+
+    async def _llm_claim_logic_frames_or_fallback(
+        self,
+        *,
+        answer: str,
+        citations: list[Citation],
+        evidence_items: list[EvidenceItem],
+    ) -> _LogicParserOutcome:
+        claims = extract_atomic_claims(answer)
+        if not claims or not evidence_items:
+            return _LogicParserOutcome(
+                claim_frames={},
+                evidence_frames={},
+                prompt_hash=None,
+                model=None,
+                fallback_reason=(
+                    "LLM claim logic parser skipped because no atomic claims or "
+                    "evidence items were available."
+                ),
+            )
+        if self.revision_provider is None or not self.revision_model:
+            return _LogicParserOutcome(
+                claim_frames={},
+                evidence_frames={},
+                prompt_hash=None,
+                model=None,
+                fallback_reason=_llm_claim_logic_unavailable_reason(
+                    self.revision_provider,
+                    self.revision_model,
+                ),
+            )
+        prompt_payload = _llm_claim_logic_payload(
+            claims=claims,
+            citations=citations,
+            evidence_items=evidence_items,
+        )
+        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        try:
+            response = await self.revision_provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Parse biomedical answer claims and evidence spans into "
+                            "logical frames. Return one valid JSON object only. Use "
+                            "only the supplied claims and evidence items. Do not decide "
+                            "the final audit verdict."
+                        ),
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+                tools=[],
+                model=self.revision_model,
+                max_tokens=4200,
+                tool_choice="none",
+                disable_thinking=True,
+            )
+            parsed = _parse_json_object(str(getattr(response, "content", "") or ""))
+            claim_frames = _logic_claim_frames_from_llm(
+                parsed.get("claim_frames"),
+                claims=claims,
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+            )
+            evidence_frames = _logic_evidence_frames_from_llm(
+                parsed.get("evidence_frames"),
+                evidence_items=evidence_items,
+                model=self.revision_model,
+                prompt_hash=prompt_hash,
+            )
+            if set(claim_frames) != {claim.claim_id for claim in claims}:
+                raise ValueError("LLM claim logic parser returned incomplete claims.")
+            if set(evidence_frames) != {item.evidence_id for item in evidence_items}:
+                raise ValueError("LLM claim logic parser returned incomplete evidence.")
+            return _LogicParserOutcome(
+                claim_frames=claim_frames,
+                evidence_frames=evidence_frames,
+                prompt_hash=prompt_hash,
+                model=self.revision_model,
+            )
+        except Exception as exc:
+            return _LogicParserOutcome(
+                claim_frames={},
+                evidence_frames={},
+                prompt_hash=prompt_hash,
+                model=self.revision_model,
+                fallback_reason=(
+                    "LLM claim logic parser failed schema validation or parsing; "
+                    f"deterministic fallback used. {type(exc).__name__}: {exc}"
+                ),
+            )
 
     def _record_project_review_queue(
         self,
@@ -1567,7 +1905,7 @@ class BiomedEvidenceService:
             if not final_answer:
                 return None
             parsed["final_answer"] = final_answer
-            post_audit = self.audit_answer(
+            post_audit = await self._audit_answer_with_optional_logic(
                 CitationAuditRequest(
                     answer=final_answer,
                     citations=draft_result.citations,
@@ -1580,7 +1918,8 @@ class BiomedEvidenceService:
                     retrieval_manifest=draft_result.retrieval_manifest,
                     use_llm_claim_logic=request.use_llm_claim_logic,
                     export_logic_facts=request.export_logic_facts,
-                )
+                ),
+                clinical_boundary=clinical_boundary,
             )
             repair_changed_claims: list[str] = []
             repair_removed_claims: list[str] = []
@@ -1592,7 +1931,7 @@ class BiomedEvidenceService:
                 )
                 if not repaired_answer or repaired_answer == final_answer:
                     return None
-                repaired_audit = self.audit_answer(
+                repaired_audit = await self._audit_answer_with_optional_logic(
                     CitationAuditRequest(
                         answer=repaired_answer,
                         citations=draft_result.citations,
@@ -1606,7 +1945,8 @@ class BiomedEvidenceService:
                         retrieval_manifest=draft_result.retrieval_manifest,
                         use_llm_claim_logic=request.use_llm_claim_logic,
                         export_logic_facts=request.export_logic_facts,
-                    )
+                    ),
+                    clinical_boundary=clinical_boundary,
                 )
                 if repaired_audit.recommended_action in {"revise", "refuse_or_abstain"}:
                     return None
@@ -1727,8 +2067,8 @@ class BiomedEvidenceService:
                         parsed.get("uncertainty_level") or uncertainty,
                     ),
                     retrieval_manifest=retrieval_manifest,
-                    use_llm_claim_logic=request.use_llm_claim_logic,
-                    export_logic_facts=request.export_logic_facts,
+                    use_llm_claim_logic=False,
+                    export_logic_facts=False,
                 )
             )
             if synthesis_audit.recommended_action in {"revise", "refuse_or_abstain"}:
@@ -2103,7 +2443,14 @@ class BiomedEvidenceService:
     def get_retrieval_manifest(self, retrieval_id: str) -> RetrievalManifest | None:
         return self.storage.get_retrieval_manifest(retrieval_id)
 
-    def audit_answer(self, request: CitationAuditRequest) -> CitationAuditResult:
+    def audit_answer(
+        self,
+        request: CitationAuditRequest,
+        *,
+        logic_claim_frames: dict[str, LogicalClaimFrame] | None = None,
+        logic_evidence_frames: dict[str, LogicalEvidenceFrame] | None = None,
+        logic_parser_fallback_reason: str | None = None,
+    ) -> CitationAuditResult:
         audit = validate_citation_support(
             answer=request.answer,
             citations=request.citations,
@@ -2114,6 +2461,9 @@ class BiomedEvidenceService:
             retrieval_manifest=request.retrieval_manifest,
             use_llm_claim_logic=request.use_llm_claim_logic,
             export_logic_facts=request.export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
         self.storage.save_citation_audit(audit)
         return audit
@@ -2711,6 +3061,233 @@ def _evidence_item_from_llm(
         extractor_prompt_hash=prompt_hash,
         requires_expert_review=True,
     )
+
+
+def _llm_claim_logic_payload(
+    *,
+    claims: list[AtomicClaim],
+    citations: list[Citation],
+    evidence_items: list[EvidenceItem],
+) -> dict[str, object]:
+    return {
+        "instructions": [
+            "Parse each supplied atomic claim into exactly one LogicalClaimFrame.",
+            "Parse each supplied evidence item into exactly one LogicalEvidenceFrame.",
+            "Use only the supplied text; do not add outside biomedical facts.",
+            "Preserve claim_id, evidence_id, paper_id, claim_text, and evidence_text exactly.",
+            "Return all frames; missing frames make the parser fail.",
+            "Do not decide the final entailment verdict.",
+        ],
+        "allowed_values": {
+            "predicate": [
+                "associated_with",
+                "correlates_with",
+                "causes_or_drives",
+                "is_mechanistically_linked_to",
+                "increases",
+                "decreases",
+                "predicts",
+                "treats",
+                "diagnoses",
+                "is_marker_of",
+                "has_no_effect",
+                "uncertain_or_inconclusive",
+                "unspecified",
+            ],
+            "polarity": ["positive", "negative", "uncertain", "unspecified"],
+            "modality": [
+                "possible",
+                "definitive",
+                "strong",
+                "moderate",
+                "suggestive",
+                "inconclusive",
+                "unspecified",
+            ],
+            "population": [
+                "human",
+                "animal",
+                "in_vitro",
+                "mixed",
+                "unspecified",
+            ],
+            "claim_strength": [
+                "causal",
+                "association",
+                "mechanistic",
+                "prognostic",
+                "diagnostic",
+                "treatment",
+                "clinical",
+                "uncertainty",
+                "background",
+                "unspecified",
+            ],
+            "study_design": [
+                "randomized_trial",
+                "interventional",
+                "longitudinal",
+                "observational",
+                "cross_sectional",
+                "case_control",
+                "cohort",
+                "preclinical",
+                "in_vitro",
+                "review",
+                "meta_analysis",
+                "abstract_only",
+                "unspecified",
+            ],
+            "evidence_strength": [
+                "abstract_only",
+                "animal_or_in_vitro",
+                "observational",
+                "longitudinal",
+                "interventional",
+                "review_or_guideline",
+                "not_assessed",
+            ],
+        },
+        "logical_entity_schema": {
+            "text": "exact entity text",
+            "entity_type": "biological_process|disease|cell_type|pathway|gene|protein|drug|method|organism|unspecified",
+            "normalized_id": None,
+            "source_span": "optional exact source substring",
+        },
+        "claims": [
+            {
+                "claim_id": claim.claim_id,
+                "claim_text": claim.text,
+                "claim_type": claim.claim_type,
+                "cited_paper_ids": claim.cited_paper_ids,
+            }
+            for claim in claims
+        ],
+        "citations": [
+            {
+                "paper_id": citation.paper_id,
+                "title": citation.title,
+                "cited_claim": citation.cited_claim,
+            }
+            for citation in citations
+        ],
+        "evidence_items": [
+            {
+                "evidence_id": item.evidence_id,
+                "paper_id": item.paper_id,
+                "claim": item.claim,
+                "finding": item.finding,
+                "evidence_text": item.evidence_span or item.finding or item.claim,
+                "evidence_direction": item.evidence_direction,
+                "confidence": item.confidence,
+                "entities": [entity.model_dump(mode="json") for entity in item.entities],
+                "methods": item.methods,
+                "datasets_or_cohorts": item.datasets_or_cohorts,
+                "limitations": item.limitations,
+            }
+            for item in evidence_items
+        ],
+        "output_schema": {
+            "claim_frames": [
+                {
+                    "claim_id": "claim id from input",
+                    "claim_text": "exact claim_text from input",
+                    "subject": "LogicalEntity object",
+                    "predicate": "allowed predicate",
+                    "object": "LogicalEntity object",
+                    "polarity": "allowed polarity",
+                    "modality": "allowed modality",
+                    "population": "allowed population",
+                    "claim_strength": "allowed claim_strength",
+                    "scope": ["scope terms"],
+                    "qualifiers": ["qualifier terms"],
+                    "hedging": False,
+                    "source_spans": ["exact source substrings"],
+                }
+            ],
+            "evidence_frames": [
+                {
+                    "evidence_id": "evidence id from input",
+                    "paper_id": "paper id from input",
+                    "evidence_text": "exact evidence_text from input",
+                    "subject": "LogicalEntity object",
+                    "predicate": "allowed predicate",
+                    "object": "LogicalEntity object",
+                    "polarity": "allowed polarity",
+                    "modality": "allowed modality",
+                    "population": "allowed population",
+                    "model_system": "human cohort|mouse model|cell culture|other|null",
+                    "study_design": "allowed study_design",
+                    "evidence_strength": "allowed evidence_strength",
+                    "limitations": ["limitations"],
+                    "source_spans": ["exact source substrings"],
+                }
+            ],
+        },
+    }
+
+
+def _logic_claim_frames_from_llm(
+    value: object,
+    *,
+    claims: list[AtomicClaim],
+    model: str,
+    prompt_hash: str,
+) -> dict[str, LogicalClaimFrame]:
+    if not isinstance(value, list):
+        raise ValueError("claim_frames must be a list.")
+    claim_lookup = {claim.claim_id: claim for claim in claims}
+    frames: dict[str, LogicalClaimFrame] = {}
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("claim frame must be an object.")
+        claim_id = str(raw.get("claim_id") or "")
+        claim = claim_lookup.get(claim_id)
+        if claim is None:
+            raise ValueError(f"unknown claim_id: {claim_id}")
+        payload = {
+            **raw,
+            "claim_id": claim.claim_id,
+            "claim_text": claim.text,
+            "parser_mode": "llm",
+            "parser_model": model,
+            "parser_prompt_hash": prompt_hash,
+            "parser_warnings": _coerce_string_list(raw.get("parser_warnings")),
+        }
+        frames[claim.claim_id] = LogicalClaimFrame.model_validate(payload)
+    return frames
+
+
+def _logic_evidence_frames_from_llm(
+    value: object,
+    *,
+    evidence_items: list[EvidenceItem],
+    model: str,
+    prompt_hash: str,
+) -> dict[str, LogicalEvidenceFrame]:
+    if not isinstance(value, list):
+        raise ValueError("evidence_frames must be a list.")
+    evidence_lookup = {item.evidence_id: item for item in evidence_items}
+    frames: dict[str, LogicalEvidenceFrame] = {}
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("evidence frame must be an object.")
+        evidence_id = str(raw.get("evidence_id") or "")
+        item = evidence_lookup.get(evidence_id)
+        if item is None:
+            raise ValueError(f"unknown evidence_id: {evidence_id}")
+        payload = {
+            **raw,
+            "evidence_id": item.evidence_id,
+            "paper_id": item.paper_id,
+            "evidence_text": item.evidence_span or item.finding or item.claim,
+            "parser_mode": "llm",
+            "parser_model": model,
+            "parser_prompt_hash": prompt_hash,
+            "parser_warnings": _coerce_string_list(raw.get("parser_warnings")),
+        }
+        frames[item.evidence_id] = LogicalEvidenceFrame.model_validate(payload)
+    return frames
 
 
 def _llm_synthesis_payload(
@@ -4196,12 +4773,33 @@ def _logic_audit_trace(audit: CitationAuditResult) -> dict[str, object]:
     ]
     verdict_counts: dict[str, int] = {}
     rules: dict[str, int] = {}
+    parser_modes: dict[str, int] = {}
+    parser_models: set[str] = set()
+    parser_prompt_hashes: set[str] = set()
+    parser_warning_count = 0
     fact_exports = 0
     fact_count = 0
+
+    def count_parser_frame(
+        frame: LogicalClaimFrame | LogicalEvidenceFrame | None,
+    ) -> None:
+        nonlocal parser_warning_count
+        if frame is None:
+            return
+        parser_modes[frame.parser_mode] = parser_modes.get(frame.parser_mode, 0) + 1
+        if frame.parser_model:
+            parser_models.add(frame.parser_model)
+        if frame.parser_prompt_hash:
+            parser_prompt_hashes.add(frame.parser_prompt_hash)
+        parser_warning_count += len(frame.parser_warnings)
+
     for logic in logic_results:
         verdict_counts[logic.logic_verdict] = (
             verdict_counts.get(logic.logic_verdict, 0) + 1
         )
+        count_parser_frame(logic.claim_frame)
+        for frame in logic.evidence_frames:
+            count_parser_frame(frame)
         if logic.logic_fact_export is not None:
             fact_exports += 1
             fact_count += len(logic.logic_fact_export.facts)
@@ -4212,6 +4810,10 @@ def _logic_audit_trace(audit: CitationAuditResult) -> dict[str, object]:
         "claim_count": len(logic_results),
         "verdict_counts": verdict_counts,
         "rules_triggered": rules,
+        "parser_mode_counts": parser_modes,
+        "parser_models": sorted(parser_models),
+        "parser_prompt_hashes": sorted(parser_prompt_hashes),
+        "parser_warning_count": parser_warning_count,
         "fact_export_count": fact_exports,
         "fact_count": fact_count,
     }
@@ -4314,6 +4916,14 @@ def _llm_planner_unavailable_reason(provider: object | None, model: str) -> str:
     if not model:
         return "LLM planner was requested, but no planner model is configured."
     return "LLM planner was requested, but the planner adapter fell back to deterministic planning."
+
+
+def _llm_claim_logic_unavailable_reason(provider: object | None, model: str) -> str:
+    if provider is None:
+        return "LLM claim logic parser was requested, but no framework provider is configured for this service instance."
+    if not model:
+        return "LLM claim logic parser was requested, but no parser model is configured."
+    return "LLM claim logic parser was requested, but deterministic logic parsing was used."
 
 
 def _matching_failed_claim(
@@ -4550,3 +5160,9 @@ def _next_check(now_iso: str, schedule: str) -> str | None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 4)

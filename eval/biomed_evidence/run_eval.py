@@ -13,6 +13,8 @@ from plugins.biomed_evidence.schemas import (
     BiomedProjectCreateRequest,
     EvidenceExtractionRequest,
     GenerateProjectEvidenceBriefRequest,
+    LiteratureAccessCheckRequest,
+    LiteratureSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
     SearchBiomedicalLiteratureRequest,
@@ -47,6 +49,23 @@ async def _run(args: argparse.Namespace) -> dict:
     ]
     service = BiomedEvidenceService(Path(tempfile.mkdtemp(prefix="biomed-eval-")))
     started = time.monotonic()
+    literature_check = await service.check_literature_access(
+        LiteratureAccessCheckRequest(
+            source=args.source,
+            query="microglia Alzheimer disease",
+            max_results=min(max(1, args.max_papers), 3),
+        )
+    )
+    literature_search = await service.search_literature(
+        LiteratureSearchRequest(
+            source=args.source,
+            query="microglia Alzheimer disease",
+            max_results=min(max(1, args.max_papers), 3),
+            retrieval_intent="primary",
+            require_abstract=True,
+            store=True,
+        )
+    )
     answer_results: list[dict] = []
     citation_checks: list[bool] = []
     refusal_checks: list[bool] = []
@@ -92,6 +111,10 @@ async def _run(args: argparse.Namespace) -> dict:
     project_brief_audit_checks: list[bool] = []
     project_trace_checks: list[bool] = []
     clinical_boundary_before_memory_checks: list[bool] = []
+    logic_trace_checks: list[bool] = []
+    logic_fact_export_checks: list[bool] = []
+    logic_parser_fallback_rates: list[float] = []
+    clinical_boundary_before_logic_checks: list[bool] = []
     try:
         for case in cases:
             audited = await service.answer_with_audit(
@@ -104,6 +127,8 @@ async def _run(args: argparse.Namespace) -> dict:
                     use_llm_extractor=True,
                     use_llm_synthesis=True,
                     use_llm_verifier=True,
+                    use_llm_claim_logic=True,
+                    export_logic_facts=True,
                 )
             )
             result = audited.answer_result
@@ -169,7 +194,36 @@ async def _run(args: argparse.Namespace) -> dict:
                 )
             if case.get("expected_refusal"):
                 clinical_revision_checks.append(audited.final_action == "refuse")
+                logic_trace = _logic_trace(audited.trace)
+                clinical_boundary_before_logic_checks.append(
+                    not bool(logic_trace.get("enabled"))
+                    and logic_trace.get("claim_count") == 0
+                    and logic_trace.get("fact_export_count") == 0
+                )
             if not case.get("expected_refusal"):
+                logic_trace = _logic_trace(audited.trace)
+                parser_mode_counts = logic_trace.get("parser_mode_counts")
+                fallback_count = (
+                    int(parser_mode_counts.get("fallback", 0))
+                    if isinstance(parser_mode_counts, dict)
+                    else 0
+                )
+                parser_count = (
+                    sum(int(value) for value in parser_mode_counts.values())
+                    if isinstance(parser_mode_counts, dict)
+                    else 0
+                )
+                logic_trace_checks.append(
+                    bool(logic_trace.get("enabled"))
+                    and int(logic_trace.get("claim_count") or 0) >= 1
+                )
+                logic_fact_export_checks.append(
+                    int(logic_trace.get("fact_export_count") or 0) >= 1
+                    and int(logic_trace.get("fact_count") or 0) >= 1
+                )
+                logic_parser_fallback_rates.append(
+                    fallback_count / parser_count if parser_count else 0.0
+                )
                 manifest_checks.append(_manifest_valid(result.retrieval_manifest))
                 retrieval_bundle_checks.append(
                     _retrieval_bundle_valid(result.retrieval_bundle)
@@ -290,6 +344,7 @@ async def _run(args: argparse.Namespace) -> dict:
                     "extraction_modes": sorted(
                         {item.extraction_mode for item in result.evidence_summary}
                     ),
+                    "logic_trace": _logic_trace(audited.trace),
                 }
             )
 
@@ -346,6 +401,8 @@ async def _run(args: argparse.Namespace) -> dict:
                 use_llm_extractor=True,
                 use_llm_synthesis=True,
                 use_llm_verifier=True,
+                use_llm_claim_logic=True,
+                export_logic_facts=True,
             )
         )
         project_result = project_audited.answer_result
@@ -459,6 +516,23 @@ async def _run(args: argparse.Namespace) -> dict:
             "retrieval_manifest_validity": rate(manifest_checks),
             "retrieval_repeatability": rate(repeatability_checks),
             "retrieval_count_stability": rate(count_stability_checks),
+            "literature_access_ready": 1.0 if literature_check.ready else 0.0,
+            "literature_access_item_count": literature_check.item_count,
+            "literature_access_abstract_coverage": literature_check.abstract_coverage,
+            "literature_access_live": literature_check.live,
+            "literature_search_manifest_validity": (
+                1.0
+                if _manifest_valid(literature_search.retrieval_manifest)
+                else 0.0
+            ),
+            "literature_search_item_count": literature_search.coverage.item_count,
+            "literature_search_stored_paper_count": (
+                literature_search.coverage.stored_paper_count
+            ),
+            "literature_search_abstract_coverage": (
+                literature_search.coverage.abstract_coverage
+            ),
+            "literature_search_warning_count": len(literature_search.warnings),
             "claim_support_rate": _average(claim_support_rates),
             "citation_precision": _average(citation_precision_rates),
             "unsupported_claim_rate": _average(unsupported_claim_rates),
@@ -517,6 +591,12 @@ async def _run(args: argparse.Namespace) -> dict:
             "clinical_boundary_before_memory_rate": rate(
                 clinical_boundary_before_memory_checks
             ),
+            "logic_trace_completeness": rate(logic_trace_checks),
+            "logic_fact_export_success_rate": rate(logic_fact_export_checks),
+            "logic_parser_fallback_rate": _average(logic_parser_fallback_rates),
+            "clinical_boundary_before_logic_rate": rate(
+                clinical_boundary_before_logic_checks
+            ),
             "latency_seconds": round(time.monotonic() - started, 4),
         }
         return {
@@ -532,6 +612,15 @@ async def _run(args: argparse.Namespace) -> dict:
                 }
                 for item in repeat_runs
             ],
+            "literature_search": {
+                "retrieval_id": (
+                    literature_search.retrieval_manifest.retrieval_id
+                ),
+                "paper_ids": [paper.paper_id for paper in literature_search.items],
+                "coverage": literature_search.coverage.model_dump(mode="json"),
+                "warnings": literature_search.warnings,
+                "errors": literature_search.errors,
+            },
             "watch": {
                 "watch_id": watch.watch_id,
                 "decisions": [item.model_dump(mode="json") for item in decisions],
@@ -580,6 +669,19 @@ def _plan_trace_complete(trace: list[object]) -> bool:
 
 def _verifier_trace_complete(trace: list[object]) -> bool:
     return any(str(getattr(item, "step", "")) == "advisory_verify" for item in trace)
+
+
+def _logic_trace(trace: list[object]) -> dict[str, object]:
+    for item in trace:
+        if str(getattr(item, "step", "")) != "audit":
+            continue
+        metadata = getattr(item, "metadata", {})
+        if not isinstance(metadata, dict):
+            return {}
+        logic = metadata.get("logic_audit")
+        if isinstance(logic, dict):
+            return logic
+    return {}
 
 
 def _retrieval_bundle_valid(bundle: object) -> bool:

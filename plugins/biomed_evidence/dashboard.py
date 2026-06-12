@@ -17,6 +17,8 @@ from plugins.biomed_evidence.schemas import (
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     GenerateProjectEvidenceBriefRequest,
+    LiteratureAccessCheckRequest,
+    LiteratureSearchRequest,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
@@ -59,6 +61,23 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "items": [item.model_dump(mode="json") for item in result.items],
             "retrieval_manifest": result.retrieval_manifest.model_dump(mode="json"),
         }
+
+    @app.post("/api/biomed/literature/check")
+    async def check_literature_access(
+        payload: LiteratureAccessCheckRequest,
+    ) -> dict[str, Any]:
+        result = await service.check_literature_access(payload)
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/literature/search")
+    async def search_literature(payload: LiteratureSearchRequest) -> dict[str, Any]:
+        try:
+            result = await service.search_literature(payload)
+        except LiteratureClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
 
     @app.get("/api/biomed/retrievals/{retrieval_id}")
     def get_retrieval_manifest(retrieval_id: str) -> dict[str, Any]:

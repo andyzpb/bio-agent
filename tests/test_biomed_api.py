@@ -28,6 +28,41 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert retrieval.status_code == 200
         assert retrieval.json()["returned_paper_ids"]
 
+        literature_check = client.post(
+            "/api/biomed/literature/check",
+            json={
+                "query": "microglia Alzheimer",
+                "source": "mock",
+                "max_results": 2,
+            },
+        )
+        assert literature_check.status_code == 200
+        literature_payload = literature_check.json()
+        assert literature_payload["ok"] is True
+        assert literature_payload["ready"] is True
+        assert literature_payload["item_count"] >= 1
+        assert literature_payload["retrieval_manifest"]["source"] == "mock"
+
+        literature_search = client.post(
+            "/api/biomed/literature/search",
+            json={
+                "query": "microglia Alzheimer",
+                "source": "mock",
+                "max_results": 2,
+                "retrieval_intent": "primary",
+                "require_abstract": True,
+                "store": True,
+            },
+        )
+        assert literature_search.status_code == 200
+        literature_search_payload = literature_search.json()
+        assert literature_search_payload["source"] == "mock"
+        assert literature_search_payload["items"]
+        assert literature_search_payload["coverage"]["item_count"] >= 1
+        assert literature_search_payload["coverage"]["abstract_count"] >= 1
+        assert literature_search_payload["source_trace"]["stored_paper_ids"]
+        assert literature_search_payload["retrieval_manifest"]["returned_paper_ids"]
+
         plan = client.post(
             "/api/biomed/plan",
             json={

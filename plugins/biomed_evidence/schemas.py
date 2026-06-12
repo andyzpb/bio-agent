@@ -454,6 +454,38 @@ class SearchBiomedicalLiteratureRequest(BaseModel):
     mesh_terms: list[str] = Field(default_factory=list)
     species_terms: list[str] = Field(default_factory=list)
     exclude_terms: list[str] = Field(default_factory=list)
+    store: bool = True
+
+
+class LiteratureSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    max_results: int = 10
+    date_from: str | None = None
+    date_to: str | None = None
+    source: Literal["pubmed", "mock"] = "mock"
+    mesh_terms: list[str] = Field(default_factory=list)
+    article_types: list[str] = Field(default_factory=list)
+    publication_types: list[str] = Field(default_factory=list)
+    study_types: list[str] = Field(default_factory=list)
+    species_terms: list[str] = Field(default_factory=list)
+    exclude_terms: list[str] = Field(default_factory=list)
+    retrieval_intent: RetrievalIntent = "unknown"
+    project_id: str | None = None
+    require_abstract: bool = True
+    store: bool = True
+
+
+class LiteratureAccessCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = "microglia Alzheimer disease"
+    max_results: int = 3
+    date_from: str | None = None
+    date_to: str | None = None
+    source: Literal["pubmed", "mock"] = "pubmed"
+    require_abstract: bool = True
 
 
 class RetrievalManifest(BaseModel):
@@ -486,6 +518,88 @@ class SearchBiomedicalLiteratureResult(BaseModel):
 
     items: list[PaperMetadata] = Field(default_factory=list)
     retrieval_manifest: RetrievalManifest
+
+
+class LiteraturePaperRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: str
+    source: Literal["pubmed", "mock"]
+    title: str
+    abstract: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    journal: str | None = None
+    publication_date: str | None = None
+    doi: str | None = None
+    url: str | None = None
+    source_rank: int
+    abstract_available: bool
+    mesh_terms: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+
+
+class LiteratureSearchCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_count: int = 0
+    abstract_count: int = 0
+    abstract_coverage: float = 0.0
+    stored_paper_count: int = 0
+    skipped_no_abstract_count: int = 0
+
+
+class LiteratureSourceTrace(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["pubmed", "mock"]
+    live: bool = False
+    query_used: str
+    compiled_query: str
+    retrieval_intent: RetrievalIntent = "unknown"
+    project_id: str | None = None
+    store_requested: bool = True
+    require_abstract: bool = True
+    stored_paper_ids: list[str] = Field(default_factory=list)
+    unsupported_filters: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class LiteratureSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["pubmed", "mock"]
+    query: str
+    query_used: str
+    retrieval_intent: RetrievalIntent = "unknown"
+    live: bool = False
+    items: list[LiteraturePaperRecord] = Field(default_factory=list)
+    retrieval_manifest: RetrievalManifest
+    coverage: LiteratureSearchCoverage
+    source_trace: LiteratureSourceTrace
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class LiteratureAccessCheckResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["pubmed", "mock"]
+    query: str
+    live: bool = False
+    ok: bool
+    ready: bool
+    checked_at: str
+    item_count: int = 0
+    abstract_count: int = 0
+    abstract_coverage: float = 0.0
+    stored_paper_count: int = 0
+    ncbi_email_configured: bool = False
+    ncbi_api_key_configured: bool = False
+    retrieval_manifest: RetrievalManifest | None = None
+    items: list[PaperMetadata] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class RetrievalBundleRecord(BaseModel):

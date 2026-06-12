@@ -353,6 +353,17 @@
   line-height: 1.4;
 }
 
+.biomed-logic-frames summary {
+  cursor: pointer;
+  color: var(--text-soft, #6c6a64);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.biomed-logic-frames[open] summary {
+  margin-bottom: 6px;
+}
+
 .biomed-provenance {
   border: 1px solid var(--line, #e6dfd8);
   border-radius: 8px;

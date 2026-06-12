@@ -6,7 +6,9 @@ PubMed retrieval, structured router/planner output, planner-driven
 primary/support/refute retrieval bundles, structured evidence extraction, cited
 answers, retrieval manifests, claim-level citation audit, audit/revise traces,
 claim logic entailment audit, symbolic logic fact export, project evidence
-workspaces, a lightweight evidence graph, and Research Watch decision logs. It is
+workspaces, framework-native tool guardrails, prompt context injection,
+literature-source readiness checks, the controlled `search_literature` tool, a
+lightweight evidence graph, and Research Watch decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
 
@@ -25,24 +27,56 @@ Runtime storage is created under the active workspace:
 biomed_evidence/biomed.db
 ```
 
+Use `/api/biomed/literature/check` or the `check_literature_access` tool to
+verify source readiness before running live literature workflows. The readiness
+check exercises search, retrieval manifest creation, paper persistence, and
+abstract coverage.
+
 Optional LLM planner, extractor, synthesizer, verifier, and revision paths use
 the framework-configured provider. They are request-gated with
 `use_llm_planner`, `use_llm_extractor`, `use_llm_synthesis`,
 `use_llm_verifier`, `use_llm_revision`, and `use_llm_claim_logic`; default
-demos, tests, and eval remain deterministic and keyless. Claim logic currently
-falls back to deterministic frame parsing when provider-backed claim parsing is
-unavailable.
+demos, tests, and eval remain deterministic and keyless. With
+`use_llm_claim_logic=true`, V2.2 attempts provider-backed claim/evidence logic
+frame parsing and then validates every frame strictly before deterministic
+entailment rules run. If the provider is unavailable or emits invalid JSON,
+missing frames, or schema-invalid fields, the audit fails fast into
+deterministic frame parsing and records the fallback reason.
 
-V2.1 claim logic can be enabled with `use_llm_claim_logic=true`; symbolic fact
+Claim logic can be enabled with `use_llm_claim_logic=true`; symbolic fact
 export can be added with `export_logic_facts=true`. The fact exporter is a
 deterministic transformation over validated logical frames and audit results. It
 does not call an LLM and does not override the deterministic audit verdict.
+
+## Framework Integration
+
+V2.3 uses the host framework's plugin lifecycle instead of keeping every
+control point inside the biomedical service:
+
+- `_conf_schema.json` defines safe plugin defaults: mock source, disabled live
+  PubMed tool calls, count caps, prompt-context injection, active-project
+  policy, controlled-search abstract requirement, and optional default LLM
+  flags.
+- Plugin KV stores lightweight local preferences such as last source, active
+  project ID, active watch ID, and last LLM option set. KV is never biomedical
+  evidence.
+- `@on_tool_pre` guards all Biomedical Evidence tools during ordinary agent
+  tool calls. It denies clinical or patient-specific requests, prevents
+  accidental live PubMed use when disabled, caps oversized requests, validates
+  project IDs, applies safe defaults, and records hook trace reasons.
+- `prompt_render_modules()` injects a concise research-only boundary and active
+  project context only when the turn is biomedical or a project is active.
+
+The framework guard is an outer safety layer. API/dashboard service routes keep
+their existing service-level validation, refusal, audit, and trace behavior.
 
 ## Tools
 
 Registered agent tools:
 
 - `plan_biomedical_search`
+- `check_literature_access`
+- `search_literature`
 - `search_biomedical_literature`
 - `fetch_biomedical_paper`
 - `extract_evidence`
@@ -77,6 +111,31 @@ Search responses include a `retrieval_manifest` with source, original query,
 compiled query, API parameters, pagination, result counts, warnings, and
 returned paper IDs.
 
+Literature access checks return `ok`, `ready`, source liveness, item count,
+abstract coverage, stored-paper count, NCBI identity flags, retrieval manifest,
+items, warnings, and errors.
+
+## V2.5 Controlled Literature Search Tool
+
+V2.5 promotes literature retrieval into the agent's core controlled tool
+surface. The `search_literature` tool wraps the existing biomedical search
+service contract with a clearer agent-facing boundary:
+
+```text
+planner query
+  -> search_literature
+  -> normalized papers + retrieval manifest + coverage/source trace
+  -> extraction / synthesis / audit
+```
+
+The tool supports `mock` and `pubmed`, returns structured paper records,
+manifest metadata, coverage metrics, source trace, warnings, errors, and stored
+paper IDs. It persists papers when requested and keeps
+`check_literature_access` as the separate readiness/smoke path. It must not
+generate answers, browse arbitrary websites, or bypass the framework
+`@on_tool_pre` clinical/source/count/project guards. Europe PMC is the preferred
+next structured adapter after the PubMed path is stable.
+
 Planner-enabled answer responses can also include a `retrieval_bundle` with
 primary/support/refute retrieval records, per-query manifest IDs, deduped paper
 IDs, duplicate IDs, and bundle warnings. Extracted evidence carries
@@ -84,7 +143,8 @@ IDs, duplicate IDs, and bundle warnings. Extracted evidence carries
 
 Audit responses can include `ClaimAuditItem.logic_audit` with parsed logical
 claim/evidence frames, deterministic entailment verdicts, triggered rules,
-mismatch details, and optional symbolic logic facts.
+mismatch details, parser mode/model/prompt provenance, fallback warnings, and
+optional symbolic logic facts.
 
 Project-enabled answer responses include `project_id` and
 `project_context_trace`. Saved papers are prioritized after retrieval; rejected
@@ -132,6 +192,8 @@ conflict checks, and export.
 Common routes:
 
 - `POST /api/biomed/plan`
+- `POST /api/biomed/literature/check`
+- `POST /api/biomed/literature/search`
 - `GET /api/biomed/search`
 - `POST /api/biomed/answer`
 - `POST /api/biomed/answer/audited`
@@ -163,7 +225,7 @@ provider/model is configured, and persists the trace for reviewer inspection.
 Useful local checks:
 
 ```bash
-python -m pytest -q tests/test_biomed_evidence.py tests/test_biomed_api.py
+python -m pytest -q tests/test_biomed_framework_integration.py tests/test_biomed_evidence.py tests/test_biomed_api.py
 python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
 python -m eval.biomed_evidence.run_eval --source pubmed --live-pubmed --output /tmp/biomed_live_eval_results.json
 npm run typecheck
@@ -171,9 +233,36 @@ npm run build
 docker build -t bio-agent-biomed:latest .
 ```
 
-Planner, retrieval-bundle, and V2.1 claim-logic API smoke:
+Literature search, retrieval-bundle, and V2.5 claim-logic API smoke:
 
 ```bash
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/check" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "microglia Alzheimer disease",
+    "source": "mock",
+    "max_results": 3
+  }' | jq '{ok, ready, source, item_count, abstract_coverage, warnings}'
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "microglia Alzheimer disease",
+    "source": "mock",
+    "max_results": 3,
+    "retrieval_intent": "primary",
+    "require_abstract": true,
+    "store": true
+  }' | jq '{
+    source,
+    item_count: .coverage.item_count,
+    abstract_coverage: .coverage.abstract_coverage,
+    stored: .coverage.stored_paper_count,
+    retrieval_id: .retrieval_manifest.retrieval_id,
+    first_paper: .items[0].paper_id,
+    warnings
+  }'
+
 curl -s -X POST "http://127.0.0.1:2236/api/biomed/plan" \
   -H "Content-Type: application/json" \
   -d '{
@@ -206,6 +295,8 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
     multi_query: .answer_result.retrieval_bundle.executed_multi_query,
     retrieval_records: (.answer_result.retrieval_bundle.records | length),
     logic_trace: ([.trace[] | select(.step=="audit") | .metadata.logic_audit][0]),
+    parser_modes: ([.trace[] | select(.step=="audit") | .metadata.logic_audit.parser_mode_counts][0]),
+    parser_models: ([.trace[] | select(.step=="audit") | .metadata.logic_audit.parser_models][0]),
     logic_verdicts: [.audit.claim_audits[] | .logic_audit.logic_verdict],
     fact_exports: [.audit.claim_audits[] | .logic_audit.logic_fact_export.export_id],
     trace_steps: (.trace | length)
@@ -213,7 +304,9 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
 ```
 
 For local Ollama Pro testing, configure the OpenAI-compatible base URL and run
-the same smoke with `gpt-oss:120b-cloud`. V2.1 is expected to expose
-`logic_audit` and symbolic fact exports even when the claim/evidence logic
-parser reports deterministic `fallback`; provider-backed logic parsing is the
-V2.2 hardening target.
+the same smoke with `gpt-oss:120b-cloud`. V2.5 should expose `logic_audit`,
+symbolic fact exports, parser mode/model/prompt provenance, and explainable
+fallback warnings if the provider-backed logic parser is unavailable or returns
+schema-invalid frames. Framework pre-tool behavior is covered by
+`tests/test_biomed_framework_integration.py`; dashboard/API routes keep their
+existing explicit request flags.

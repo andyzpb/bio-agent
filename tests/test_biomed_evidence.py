@@ -17,6 +17,8 @@ from plugins.biomed_evidence.schemas import (
     BiomedProjectCreateRequest,
     EvidenceExtractionRequest,
     GenerateProjectEvidenceBriefRequest,
+    LiteratureAccessCheckRequest,
+    LiteratureSearchRequest,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
@@ -842,6 +844,157 @@ async def test_pubmed_search_trace_records_retry_and_redacts_api_key() -> None:
 
 
 @pytest.mark.asyncio
+async def test_literature_access_check_reports_mock_readiness(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.check_literature_access(
+            LiteratureAccessCheckRequest(
+                source="mock",
+                query="microglia Alzheimer",
+                max_results=2,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.ok is True
+    assert result.ready is True
+    assert result.live is False
+    assert result.item_count >= 1
+    assert result.abstract_count >= 1
+    assert result.retrieval_manifest is not None
+    assert result.retrieval_manifest.source == "mock"
+
+
+@pytest.mark.asyncio
+async def test_search_literature_returns_normalized_mock_records_and_trace(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.search_literature(
+            LiteratureSearchRequest(
+                source="mock",
+                query="microglia Alzheimer",
+                max_results=2,
+                mesh_terms=["Microglia"],
+                article_types=["Review"],
+                retrieval_intent="support",
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.source == "mock"
+    assert result.live is False
+    assert result.retrieval_intent == "support"
+    assert result.items
+    assert result.items[0].source_rank == 1
+    assert result.items[0].paper_id
+    assert result.items[0].abstract_available is True
+    assert result.items[0].abstract
+    assert result.coverage.item_count == len(result.items)
+    assert result.coverage.abstract_count >= 1
+    assert result.coverage.stored_paper_count == len(result.items)
+    assert result.source_trace.stored_paper_ids
+    assert result.source_trace.retrieval_intent == "support"
+    assert result.retrieval_manifest.source == "mock"
+    assert result.retrieval_manifest.returned_paper_ids
+    assert "mock:mesh_terms" in result.retrieval_manifest.unsupported_filters
+    assert "mock:publication_types" in result.retrieval_manifest.unsupported_filters
+
+
+@pytest.mark.asyncio
+async def test_literature_access_check_reports_pubmed_readiness_with_fake_http(
+    tmp_path: Path,
+) -> None:
+    fake = _FakePubMedClient()
+    service = BiomedEvidenceService(
+        tmp_path,
+        http_client=cast(httpx.AsyncClient, fake),
+    )
+    service.pubmed_client.retry_backoff_seconds = 0.0
+    try:
+        result = await service.check_literature_access(
+            LiteratureAccessCheckRequest(
+                source="pubmed",
+                query="microglia",
+                max_results=2,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.ok is True
+    assert result.ready is True
+    assert result.live is True
+    assert result.item_count == 2
+    assert result.abstract_count == 2
+    assert result.abstract_coverage == 1.0
+    assert result.stored_paper_count == 2
+    assert result.retrieval_manifest is not None
+    assert result.retrieval_manifest.source == "pubmed"
+    assert result.retrieval_manifest.api_endpoints
+    assert any("NCBI_EMAIL is not configured" in item for item in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_search_literature_returns_pubmed_manifest_with_fake_http(
+    tmp_path: Path,
+) -> None:
+    fake = _FakePubMedClient()
+    service = BiomedEvidenceService(
+        tmp_path,
+        http_client=cast(httpx.AsyncClient, fake),
+    )
+    service.pubmed_client.retry_backoff_seconds = 0.0
+    try:
+        result = await service.search_literature(
+            LiteratureSearchRequest(
+                source="pubmed",
+                query="microglia Alzheimer",
+                max_results=2,
+                mesh_terms=["Microglia"],
+                article_types=["Review"],
+                exclude_terms=["case report"],
+                retrieval_intent="refute",
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.source == "pubmed"
+    assert result.live is True
+    assert result.query_used == result.retrieval_manifest.compiled_query
+    assert '"Microglia"[MeSH Terms]' in result.query_used
+    assert '"Review"[Publication Type]' in result.query_used
+    assert "NOT" in result.query_used
+    assert result.coverage.item_count == len(result.items)
+    assert result.coverage.abstract_count >= 1
+    assert result.coverage.stored_paper_count >= 1
+    assert result.source_trace.live is True
+    assert result.source_trace.retrieval_intent == "refute"
+    assert result.source_trace.stored_paper_ids
+    assert result.retrieval_manifest.api_endpoints
+
+
+@pytest.mark.asyncio
+async def test_search_literature_rejects_missing_project(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="project not found"):
+            await service.search_literature(
+                LiteratureSearchRequest(
+                    source="mock",
+                    query="microglia Alzheimer",
+                    project_id="missing-project",
+                )
+            )
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
 async def test_watch_check_scores_and_dedupes_decisions(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
@@ -914,6 +1067,8 @@ async def test_biomed_plugin_registers_tools(tmp_path: Path) -> None:
     )
     try:
         await manager.load_all()
+        assert tools.has_tool("check_literature_access")
+        assert tools.has_tool("search_literature")
         assert tools.has_tool("search_biomedical_literature")
         assert tools.has_tool("plan_biomedical_search")
         assert tools.has_tool("answer_with_evidence")

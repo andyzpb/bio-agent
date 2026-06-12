@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from agent.plugins import Plugin, tool
+from agent.lifecycle.types import PreToolCtx, PromptRenderCtx
+from agent.plugins import Plugin, on_tool_pre, tool
+from agent.prompting import PromptSectionRender
+from agent.tool_hooks import HookOutcome
+from plugins.biomed_evidence.guardrails import is_clinical_request
+from plugins.biomed_evidence.literature_client import LiteratureClientError
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    BiomedProject,
     BiomedProjectCreateRequest,
     BiomedProjectUpdateRequest,
     BiomedicalPaper,
@@ -18,14 +24,147 @@ from plugins.biomed_evidence.schemas import (
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     GenerateProjectEvidenceBriefRequest,
+    LiteratureAccessCheckRequest,
+    LiteratureSearchRequest,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
-    SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
     WatchTopicUpdateRequest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
+
+_PROMPT_CTX_SLOT = "prompt:ctx"
+
+_BIOMED_TOOL_NAMES = frozenset(
+    {
+        "plan_biomedical_search",
+        "check_literature_access",
+        "search_literature",
+        "search_biomedical_literature",
+        "fetch_biomedical_paper",
+        "extract_evidence",
+        "answer_with_evidence",
+        "answer_with_audit",
+        "create_biomed_project",
+        "list_biomed_projects",
+        "update_biomed_project",
+        "record_project_paper_decision",
+        "save_project_paper",
+        "reject_project_paper",
+        "list_project_paper_decisions",
+        "record_project_claim",
+        "save_project_claim",
+        "list_project_evidence",
+        "list_project_review_queue",
+        "generate_project_evidence_brief",
+        "watch_research_topic",
+        "list_research_watch_topics",
+        "update_research_watch_topic",
+        "delete_research_watch_topic",
+        "get_evidence_graph",
+        "export_evidence_report",
+        "validate_citation_support",
+        "audit_biomedical_answer",
+        "find_conflicting_evidence",
+    }
+)
+
+_TOOLS_WITH_SOURCE = frozenset(
+    {
+        "plan_biomedical_search",
+        "check_literature_access",
+        "search_literature",
+        "search_biomedical_literature",
+        "fetch_biomedical_paper",
+        "answer_with_evidence",
+        "answer_with_audit",
+        "record_project_paper_decision",
+        "save_project_paper",
+        "reject_project_paper",
+        "find_conflicting_evidence",
+    }
+)
+
+_TOOLS_WITH_PROJECT_ID = frozenset(
+    {
+        "search_literature",
+        "answer_with_evidence",
+        "answer_with_audit",
+        "update_biomed_project",
+        "record_project_paper_decision",
+        "save_project_paper",
+        "reject_project_paper",
+        "list_project_paper_decisions",
+        "record_project_claim",
+        "save_project_claim",
+        "list_project_evidence",
+        "list_project_review_queue",
+        "generate_project_evidence_brief",
+    }
+)
+
+_TOOLS_WITH_OPTIONAL_ACTIVE_PROJECT = frozenset(
+    {
+        "search_literature",
+        "answer_with_evidence",
+        "answer_with_audit",
+        "list_project_evidence",
+        "list_project_review_queue",
+        "generate_project_evidence_brief",
+    }
+)
+
+_TOOL_LLM_FLAGS: dict[str, tuple[str, ...]] = {
+    "plan_biomedical_search": ("use_llm_planner",),
+    "answer_with_evidence": (
+        "use_llm_planner",
+        "execute_support_refute",
+        "use_llm_extractor",
+        "use_llm_synthesis",
+    ),
+    "answer_with_audit": (
+        "use_llm_revision",
+        "use_llm_planner",
+        "execute_support_refute",
+        "use_llm_extractor",
+        "use_llm_synthesis",
+        "use_llm_verifier",
+        "use_llm_claim_logic",
+        "export_logic_facts",
+    ),
+    "validate_citation_support": (
+        "use_llm_claim_logic",
+        "export_logic_facts",
+    ),
+}
+
+_BIOMED_INTENT_TERMS = (
+    "biomedical",
+    "pubmed",
+    "citation",
+    "evidence",
+    "paper",
+    "abstract",
+    "study",
+    "trial",
+    "cohort",
+    "gene",
+    "protein",
+    "disease",
+    "alzheimer",
+    "microglia",
+    "microglial",
+    "amyloid",
+    "tau",
+    "neuro",
+    "cancer",
+    "inflammation",
+    "pathway",
+    "patient",
+    "dose",
+    "treatment",
+)
 
 
 class BiomedEvidencePlugin(Plugin):
@@ -39,6 +178,50 @@ class BiomedEvidencePlugin(Plugin):
         service = getattr(self, "_service", None)
         if service is not None:
             await service.aclose()
+
+    def prompt_render_modules(self) -> list[object]:
+        return [BiomedPromptContextModule(self)]
+
+    @on_tool_pre()
+    async def guard_biomedical_tool(self, event: PreToolCtx) -> HookOutcome | None:
+        if event.tool_name not in _BIOMED_TOOL_NAMES:
+            return None
+        args = dict(event.arguments)
+        clinical_text = _clinical_signal_text(event, args)
+        if is_clinical_request(clinical_text):
+            return HookOutcome(
+                decision="deny",
+                reason=(
+                    "biomed_evidence guardrail: clinical_or_patient_specific_boundary. "
+                    "Reframe the request as a non-clinical biomedical research question."
+                ),
+                extra_message=(
+                    "Biomedical Evidence tools are research-only and were not executed "
+                    "for a clinical or patient-specific request."
+                ),
+            )
+
+        messages: list[str] = []
+        project_error = self._validate_or_apply_project(event.tool_name, args, messages)
+        if project_error:
+            return HookOutcome(decision="deny", reason=project_error)
+        source_error = self._apply_source_policy(event.tool_name, args, messages)
+        if source_error:
+            return HookOutcome(decision="deny", reason=source_error)
+        self._apply_count_caps(args, messages)
+        self._apply_search_defaults(event.tool_name, args, messages)
+        self._apply_default_llm_flags(event.tool_name, args, messages)
+        self._remember_tool_preferences(args)
+        reason = "; ".join(messages)
+        if args != event.arguments:
+            return HookOutcome(
+                updated_input=args,
+                reason=reason,
+                extra_message=reason,
+            )
+        if reason:
+            return HookOutcome(reason=reason, extra_message=reason)
+        return None
 
     @tool(
         name="plan_biomedical_search",
@@ -75,6 +258,119 @@ class BiomedEvidencePlugin(Plugin):
         return _dump(result.model_dump(mode="json"))
 
     @tool(
+        name="check_literature_access",
+        risk="read-only",
+        search_hint="check live PubMed biomedical literature access readiness",
+    )
+    async def check_literature_access(
+        self,
+        event,
+        query: str = "microglia Alzheimer disease",
+        max_results: int = 3,
+        source: Literal["pubmed", "mock"] = "pubmed",
+        date_from: str | None = None,
+        date_to: str | None = None,
+        require_abstract: bool = True,
+    ) -> str:
+        """Check whether the configured literature source is usable end to end.
+
+        Args:
+            query: Smoke query used for source readiness.
+            max_results: Maximum papers to retrieve.
+            source: Literature source, normally pubmed for live readiness.
+            date_from: Optional publication date lower bound.
+            date_to: Optional publication date upper bound.
+            require_abstract: Require at least one fetched abstract for readiness.
+        """
+        result = await self._service.check_literature_access(
+            LiteratureAccessCheckRequest(
+                query=query,
+                max_results=max_results,
+                source=source,
+                date_from=date_from,
+                date_to=date_to,
+                require_abstract=require_abstract,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="search_literature",
+        risk="read-only",
+        search_hint="controlled biomedical literature search PubMed mock retrieval manifest",
+    )
+    async def search_literature(
+        self,
+        event,
+        query: str,
+        max_results: int = 10,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        source: Literal["pubmed", "mock"] = "mock",
+        mesh_terms: list[str] | None = None,
+        article_types: list[str] | None = None,
+        publication_types: list[str] | None = None,
+        study_types: list[str] | None = None,
+        species_terms: list[str] | None = None,
+        exclude_terms: list[str] | None = None,
+        retrieval_intent: Literal["primary", "support", "refute", "unknown"] = "unknown",
+        project_id: str | None = None,
+        require_abstract: bool = True,
+        store: bool = True,
+    ) -> str:
+        """Run controlled biomedical literature retrieval without synthesizing an answer.
+
+        Args:
+            query: Biomedical literature query.
+            max_results: Maximum number of papers to return.
+            date_from: Optional publication date lower bound.
+            date_to: Optional publication date upper bound.
+            source: Literature source, default mock for deterministic demos.
+            mesh_terms: Optional MeSH terms for structured sources.
+            article_types: Optional publication/article type filters.
+            publication_types: Optional PubMed publication type filters.
+            study_types: Optional study-design hints.
+            species_terms: Optional species MeSH terms.
+            exclude_terms: Optional exclusion terms.
+            retrieval_intent: Retrieval purpose for downstream trace.
+            project_id: Optional project context for validation and trace only.
+            require_abstract: Whether abstract coverage should be reported as required.
+            store: Persist retrieved papers for downstream evidence workflows.
+        """
+        try:
+            result = await self._service.search_literature(
+                LiteratureSearchRequest(
+                    query=query,
+                    max_results=max_results,
+                    date_from=date_from,
+                    date_to=date_to,
+                    source=source,
+                    mesh_terms=mesh_terms or [],
+                    article_types=article_types or [],
+                    publication_types=publication_types or [],
+                    study_types=study_types or [],
+                    species_terms=species_terms or [],
+                    exclude_terms=exclude_terms or [],
+                    retrieval_intent=retrieval_intent,
+                    project_id=project_id,
+                    require_abstract=require_abstract,
+                    store=store,
+                )
+            )
+        except ValueError:
+            return _dump({"error": "project_not_found", "project_id": project_id})
+        except LiteratureClientError as exc:
+            return _dump(
+                {
+                    "error": "literature_client_error",
+                    "message": str(exc),
+                    "source": source,
+                    "query": query,
+                }
+            )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
         name="search_biomedical_literature",
         risk="read-only",
         search_hint="PubMed biomedical literature paper search mock",
@@ -97,21 +393,26 @@ class BiomedEvidencePlugin(Plugin):
             date_to: Optional publication date upper bound.
             source: Literature source, default mock for deterministic demos.
         """
-        result = await self._service.search_with_manifest(
-            SearchBiomedicalLiteratureRequest(
-                query=query,
-                max_results=max_results,
-                date_from=date_from,
-                date_to=date_to,
-                source=source,
+        try:
+            result = await self._service.search_literature(
+                LiteratureSearchRequest(
+                    query=query,
+                    max_results=max_results,
+                    date_from=date_from,
+                    date_to=date_to,
+                    source=source,
+                )
             )
-        )
-        return _dump(
-            {
-                "items": [item.model_dump(mode="json") for item in result.items],
-                "retrieval_manifest": result.retrieval_manifest.model_dump(mode="json"),
-            }
-        )
+        except LiteratureClientError as exc:
+            return _dump(
+                {
+                    "error": "literature_client_error",
+                    "message": str(exc),
+                    "source": source,
+                    "query": query,
+                }
+            )
+        return _dump(result.model_dump(mode="json"))
 
     @tool(
         name="fetch_biomedical_paper",
@@ -976,6 +1277,282 @@ class BiomedEvidencePlugin(Plugin):
         )
         return report
 
+    def _validate_or_apply_project(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        messages: list[str],
+    ) -> str:
+        project_id = _clean_str(args.get("project_id"))
+        if (
+            not project_id
+            and tool_name in _TOOLS_WITH_OPTIONAL_ACTIVE_PROJECT
+            and _config_bool(self, "auto_use_active_project", False)
+        ):
+            active_project_id = _clean_str(self.context.kv_store.get("active_project_id"))
+            if active_project_id:
+                args["project_id"] = active_project_id
+                project_id = active_project_id
+                messages.append("applied active biomedical project from plugin KV")
+        if not project_id or tool_name not in _TOOLS_WITH_PROJECT_ID:
+            return ""
+        service = getattr(self, "_service", None)
+        if not isinstance(service, BiomedEvidenceService):
+            return "biomed_evidence guardrail: service_unavailable_for_project_validation"
+        if service.get_project(project_id) is None:
+            return f"biomed_evidence guardrail: project_not_found ({project_id})"
+        return ""
+
+    def _apply_source_policy(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        messages: list[str],
+    ) -> str:
+        if tool_name not in _TOOLS_WITH_SOURCE:
+            return ""
+        source = _clean_str(args.get("source"))
+        if not source:
+            source = _config_str(self, "default_source", "mock")
+            args["source"] = source
+            messages.append(f"applied default biomedical source: {source}")
+        if source not in {"mock", "pubmed"}:
+            return f"biomed_evidence guardrail: unsupported_source ({source})"
+        if source == "pubmed" and not _config_bool(
+            self,
+            "allow_live_pubmed_tools",
+            False,
+        ):
+            return (
+                "biomed_evidence guardrail: live PubMed tool calls are disabled "
+                "by plugin config; use source=mock or enable allow_live_pubmed_tools."
+            )
+        return ""
+
+    def _apply_count_caps(self, args: dict[str, Any], messages: list[str]) -> None:
+        _cap_int_arg(
+            args,
+            "max_results",
+            _config_int(self, "max_search_results", 10),
+            messages,
+        )
+        _cap_int_arg(
+            args,
+            "max_papers",
+            _config_int(self, "max_answer_papers", 10),
+            messages,
+        )
+        _cap_int_arg(
+            args,
+            "page_size",
+            _config_int(self, "max_page_size", 100),
+            messages,
+        )
+
+    def _apply_search_defaults(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        messages: list[str],
+    ) -> None:
+        if tool_name != "search_literature" or "require_abstract" in args:
+            return
+        value = _config_bool(self, "default_require_abstract", True)
+        args["require_abstract"] = value
+        messages.append(
+            "applied default biomedical search requirement: "
+            f"require_abstract={str(value).lower()}"
+        )
+
+    def _apply_default_llm_flags(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        messages: list[str],
+    ) -> None:
+        for flag in _TOOL_LLM_FLAGS.get(tool_name, ()):
+            if flag in args:
+                continue
+            value = _config_bool(self, f"default_{flag}", False)
+            if not value:
+                continue
+            args[flag] = True
+            messages.append(f"applied default biomedical LLM flag: {flag}=true")
+
+    def _remember_tool_preferences(self, args: dict[str, Any]) -> None:
+        source = _clean_str(args.get("source"))
+        if source:
+            self.context.kv_store.set("last_source", source)
+        project_id = _clean_str(args.get("project_id"))
+        if project_id:
+            self.context.kv_store.set("active_project_id", project_id)
+        watch_id = _clean_str(args.get("watch_id"))
+        if watch_id:
+            self.context.kv_store.set("active_watch_id", watch_id)
+        llm_options = {
+            key: bool(args[key])
+            for flags in _TOOL_LLM_FLAGS.values()
+            for key in flags
+            if key in args
+        }
+        if llm_options:
+            self.context.kv_store.set("last_llm_options", llm_options)
+
+    def active_project_prompt_context(self) -> str:
+        project = self._active_project()
+        if project is None:
+            return ""
+        pieces = [
+            f"- Active project: {project.name} ({project.project_id})",
+        ]
+        if project.research_question:
+            pieces.append(f"- Research question: {project.research_question}")
+        if project.include_keywords:
+            pieces.append(
+                "- Include keywords: " + ", ".join(project.include_keywords[:8])
+            )
+        if project.exclude_keywords:
+            pieces.append(
+                "- Exclude keywords: " + ", ".join(project.exclude_keywords[:8])
+            )
+        if project.preferred_methods:
+            pieces.append(
+                "- Preferred methods: " + ", ".join(project.preferred_methods[:8])
+            )
+        return "\n".join(pieces)
+
+    def should_inject_prompt_context(self, content: str) -> bool:
+        if not _config_bool(self, "enable_prompt_context", True):
+            return False
+        if self._active_project() is not None:
+            return True
+        text = content.lower()
+        return any(term in text for term in _BIOMED_INTENT_TERMS) or is_clinical_request(
+            content
+        )
+
+    def _active_project(self) -> BiomedProject | None:
+        project_id = _clean_str(self.context.kv_store.get("active_project_id"))
+        if not project_id:
+            return None
+        service = getattr(self, "_service", None)
+        if not isinstance(service, BiomedEvidenceService):
+            return None
+        return service.get_project(project_id)
+
+
+class BiomedPromptContextModule:
+    slot = "biomed_evidence.prompt_context"
+    requires = ("prompt_render.emit", _PROMPT_CTX_SLOT)
+    produces = (_PROMPT_CTX_SLOT,)
+
+    def __init__(self, plugin: BiomedEvidencePlugin) -> None:
+        self._plugin = plugin
+
+    async def run(self, frame: Any) -> Any:
+        ctx = frame.slots.get(_PROMPT_CTX_SLOT)
+        if not isinstance(ctx, PromptRenderCtx):
+            return frame
+        if not self._plugin.should_inject_prompt_context(ctx.content):
+            return frame
+        project_context = self._plugin.active_project_prompt_context()
+        default_source = _config_str(self._plugin, "default_source", "mock")
+        live_pubmed = _config_bool(self._plugin, "allow_live_pubmed_tools", False)
+        lines = [
+            "### Biomedical Evidence Plugin Context",
+            "- Biomedical Evidence is research-only. Refuse or redirect diagnosis, dosing, treatment, prognosis, and patient-specific medical requests.",
+            "- Use retrieved literature, citations, evidence spans, and audit results for biomedical factual claims.",
+            "- Project memory, saved papers, rejected papers, and preferences are context only; never cite them as biomedical evidence.",
+            f"- Default biomedical tool source: {default_source}. Live PubMed tool calls enabled: {str(live_pubmed).lower()}.",
+        ]
+        if project_context:
+            lines.append(project_context)
+            lines.append(
+                "- Treat the active project as retrieval preference context, not as a source of biomedical facts."
+            )
+        ctx.system_sections_bottom.append(
+            PromptSectionRender(
+                name="biomed_evidence_context",
+                content="\n".join(lines),
+                is_static=False,
+            )
+        )
+        return frame
+
 
 def _dump(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _clinical_signal_text(event: PreToolCtx, args: dict[str, Any]) -> str:
+    parts = [event.request_text]
+    for key in (
+        "question",
+        "query",
+        "claim",
+        "topic",
+        "research_question",
+        "project_context",
+        "answer",
+    ):
+        value = args.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    return "\n".join(part for part in parts if part)
+
+
+def _cap_int_arg(
+    args: dict[str, Any],
+    key: str,
+    cap: int,
+    messages: list[str],
+) -> None:
+    if key not in args or cap <= 0:
+        return
+    try:
+        value = int(args[key])
+    except (TypeError, ValueError):
+        return
+    if value <= cap:
+        return
+    args[key] = cap
+    messages.append(f"capped {key} from {value} to {cap}")
+
+
+def _config_bool(plugin: BiomedEvidencePlugin, key: str, default: bool) -> bool:
+    config = getattr(plugin.context, "config", None)
+    if config is None:
+        return default
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _config_int(plugin: BiomedEvidencePlugin, key: str, default: int) -> int:
+    config = getattr(plugin.context, "config", None)
+    if config is None:
+        return default
+    try:
+        return int(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_str(plugin: BiomedEvidencePlugin, key: str, default: str) -> str:
+    config = getattr(plugin.context, "config", None)
+    if config is None:
+        return default
+    value = config.get(key, default)
+    if value is None:
+        return default
+    cleaned = str(value).strip()
+    return cleaned or default
+
+
+def _clean_str(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()

@@ -18,6 +18,15 @@ python -m eval.biomed_evidence.run_eval \
 - `retrieval_manifest_validity`: retrieval manifests contain IDs, queries, and returned paper IDs.
 - `retrieval_repeatability`: repeated mock retrievals return the same ordered paper IDs.
 - `retrieval_count_stability`: repeated retrievals return the same result count.
+- `literature_access_ready`: source readiness check succeeded before answer eval.
+- `literature_access_item_count`: papers returned by the readiness check.
+- `literature_access_abstract_coverage`: fraction of readiness-check papers with stored abstracts.
+- `literature_access_live`: whether the readiness check used a live source.
+- `literature_search_manifest_validity`: V2.5 controlled search returned a valid retrieval manifest.
+- `literature_search_item_count`: normalized paper records returned by `search_literature`.
+- `literature_search_stored_paper_count`: returned papers persisted for downstream workflows.
+- `literature_search_abstract_coverage`: fraction of controlled-search records with abstracts.
+- `literature_search_warning_count`: explicit warnings surfaced by controlled search.
 - `claim_support_rate`: audited atomic claims marked supported or partially supported.
 - `citation_precision`: citations that support at least one audited claim.
 - `unsupported_claim_rate`: audited claims that are uncited, irrelevant, or insufficiently supported.
@@ -48,6 +57,19 @@ python -m eval.biomed_evidence.run_eval \
   --source pubmed \
   --live-pubmed \
   --output /tmp/biomed_live_eval_results.json
+```
+
+For a narrower dashboard/API smoke before running full eval:
+
+```bash
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/check" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"microglia Alzheimer disease","source":"pubmed","max_results":3}' | jq
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/literature/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"microglia Alzheimer disease","source":"pubmed","max_results":3,"retrieval_intent":"primary","require_abstract":true,"store":true}' \
+  | jq '{source, item_count:.coverage.item_count, stored:.coverage.stored_paper_count, abstract_coverage:.coverage.abstract_coverage, retrieval_id:.retrieval_manifest.retrieval_id, warnings}'
 ```
 
 ## Interpretation
