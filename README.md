@@ -46,17 +46,19 @@ Implemented now:
 Project memory is context only. It can influence planning preferences and
 post-retrieval filtering, but it is never treated as biomedical evidence.
 
-## Roadmap Highlight: V2.1 Claim Logic Entailment
+## Roadmap Highlight: V2.1 Claim Logic Entailment + Fact Export
 
 The next planned hardening step is a **schema-constrained biomedical claim
 logic parser**. Instead of asking an LLM to judge whether a citation supports a
-claim, V2.1 will use the LLM only as a semantic parser:
+claim, V2.1 will use the LLM only as a semantic parser and then export the
+deterministic reasoning trace as symbolic facts:
 
 ```text
 claim / evidence text
   -> LLM-assisted logical frame parsing
   -> Pydantic schema validation
   -> deterministic biomedical entailment rules
+  -> symbolic logic fact export
   -> audit verdict, triggered rules, mismatch trace, and revision pressure
 ```
 
@@ -68,7 +70,10 @@ actually entail the generated claim.
 
 The key trust boundary is that the LLM helps formalize language, while
 deterministic code remains the source of record for support, overclaim, scope,
-population, modality, and clinical-boundary verdicts.
+population, modality, and clinical-boundary verdicts. The fact export layer is
+for inspectability, regression testing, and future Datalog/Prolog/Z3-style
+solver integration; it does not prove biomedical truth or override the audit
+verdict.
 
 ## Version Summary
 
@@ -105,10 +110,14 @@ Near-term V2.1:
 - Deterministic biomedical entailment rules for association-to-causation,
   animal/in-vitro-to-human, mechanism-to-treatment, weak-to-definitive,
   diagnostic, prognostic, population, scope, and modality overclaims.
+- Symbolic logic fact export for parsed claim/evidence frames, alignments,
+  non-entailment rules, triggered rules, mismatches, warnings, and final
+  verdicts.
 - `ClaimAuditItem` / audit JSON integration so logic verdicts, triggered rules,
   mismatches, and reasons appear in audit, trace, and dashboard output.
 - Golden tests and metrics for logic parser validity, expected rule recall,
-  expected verdict accuracy, fallback rate, clinical-boundary preservation, and
+  expected verdict accuracy, fact export determinism, expected fact recall,
+  symbol normalization, fallback rate, clinical-boundary preservation, and
   project-memory isolation.
 
 After V2.1:
@@ -239,6 +248,7 @@ User question
   -> citation-grounded draft answer
   -> deterministic claim-level audit
   -> optional claim logic parser + deterministic entailment audit
+  -> optional symbolic logic fact export
   -> optional advisory verifier
   -> deterministic or LLM-backed revision
   -> final answer + citations + trace + project review queue update
