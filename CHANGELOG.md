@@ -1,5 +1,46 @@
 # Changelog
 
+## Release 1.5 - 2026-06-13
+
+Release 1.5 makes Biomedical Evidence a review-first evidence workspace rather
+than a flag-heavy dashboard panel.
+
+### Added
+
+- Review-first Biomedical Evidence workspace with `Review`, `Run`, `Projects`,
+  `Watch`, `Advanced`, and `Boundary` navigation.
+- Snapshot-backed Run Evidence Review as the default claim QA surface, with
+  claim cards, support reasons, evidence cards, validation, graph hash, audit
+  action, and links to trace/provenance/export.
+- Advanced raw graph/audit/trace/evidence inspection for debugging without
+  making raw node browsing the primary workflow.
+- Desktop and mobile screenshot-level validation for the Codex-style workspace.
+
+### Changed
+
+- Reworked the dashboard shell toward a Codex-style neutral workspace: compact
+  left navigation, reduced visual noise, neutral black/gray palette, and fewer
+  visible columns by default.
+- Moved Responsible AI content into the `Boundary` workspace surface.
+- Updated public documentation to make Release 1.5 the current baseline and to
+  move the next roadmap step to the Review Decision Loop.
+
+## Release 1.4.1 - 2026-06-13
+
+Release 1.4.1 hardens Evidence Graph and Run Evidence Review contracts.
+
+### Added
+
+- Deterministic mixed/qualified claim support aggregation with support status
+  reasons and evidence counts.
+- Evidence cards that pull methods and limitations through graph edges and
+  preserve paper/evidence IDs, confidence, retrieval intent, and extraction
+  mode.
+- Related-vs-directed path semantics through `path_mode` and a directed path
+  option.
+- Regression tests for mixed support aggregation, method-edge evidence cards,
+  path semantics, graph export redaction, and clinical refusal graphs.
+
 ## Release 1.0 - 2026-06-12
 
 Release 1.0 stabilizes the Biomedical Evidence plugin as a research-only,
@@ -60,4 +101,3 @@ toolized evidence workflow on top of the Akashic plugin framework.
 - Mathematical aids are advisory or deterministic packet-selection helpers.
   They cannot override citation audit, logic audit, source policy, result caps,
   or clinical refusal.
-

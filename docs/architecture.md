@@ -328,23 +328,20 @@ They are not treated as biomedical evidence.
 
 ## Dashboard Views
 
-The dashboard surfaces the workflow as an operational tool:
+The dashboard surfaces the workflow as a Review-first, Codex-style workspace:
 
-- **Ask**: citation-grounded answers, optional LLM stages, packet summary, and
-  answer trace.
-- **Evidence**: extracted claims, entities, methods, limitations, confidence,
-  spans, and retrieval provenance.
-- **Graph**: typed Evidence Graph v1 with topic/entity/paper/run filters,
-  validation summary, node inspection, evidence cards, path lookup, and redacted
-  JSON export.
-- **Audit**: claim-level citation audit, logic verdicts, conflicts, and
-  revision pressure.
-- **Trace**: classify, plan, retrieve, extract, gap, packet, audit, revise, and
-  finalize metadata, plus memory effects, budget snapshots, telemetry, packet
-  selection, Obsidian export, and provenance results.
+- **Review**: default entry point for answer-run evidence QA. It shows recent
+  runs, graph snapshot status, validation, claim cards, support reasons,
+  evidence cards, audit action, and links to trace, provenance, raw graph, and
+  redacted export.
+- **Run**: template-first citation-grounded answer workflow with optional LLM
+  stages, support/refute retrieval, packet summary, and project context.
 - **Projects**: paper decisions, claims, review queue, and evidence briefs.
 - **Watch**: topic monitoring, snapshots, relevance scores, and decisions.
-- **Responsible AI**: research-only boundary and clinical refusal behavior.
+- **Advanced**: raw evidence browser, typed Evidence Graph v1 explorer,
+  claim-level Audit, Trace, related/directed path lookup, and JSON export.
+- **Boundary**: research-only boundary, memory-as-context policy, clinical
+  refusal behavior, and retrieval limitations.
 
 ## Data Boundaries
 

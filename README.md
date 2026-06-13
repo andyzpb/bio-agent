@@ -8,8 +8,8 @@ showcases a **research-only biomedical evidence agent** built on that framework:
 it searches literature, extracts evidence, audits generated claims, and makes
 every answer inspectable.
 
-Current biomedical baseline: **Release 1.4: graph-backed biomedical workspace
-with Run Evidence Review**.
+Current biomedical baseline: **Release 1.5: Review-first, Codex-style
+biomedical evidence workspace**.
 
 ## Why It Matters
 
@@ -52,6 +52,9 @@ and patient-specific advice are refused before retrieval or LLM stages run.
 - **Review-first evidence graph**: typed Evidence Graph v1 and snapshot-backed
   Run Evidence Review turn each answer run into auditable claim cards,
   validation, graph hash, and links to trace/provenance/export.
+- **Codex-style evidence workspace**: the dashboard now opens around Review,
+  Run, Projects, Watch, Advanced, and Boundary surfaces, with raw graph/audit/
+  trace inspection progressively disclosed behind Advanced actions.
 - **Math-oriented review aids**: submodular-style packet selection,
   contextual-bandit-style retrieval advisory, Markov-style step telemetry, and
   PROV/OpenLineage-compatible provenance graphs are used as advisory and
@@ -100,8 +103,10 @@ uv run python main.py dashboard
 
 Open `http://127.0.0.1:2236` and select **Biomedical Evidence**.
 
-The dashboard includes Ask, Evidence, Graph, Audit, Trace, Projects, Research
-Watch, export, and Responsible AI surfaces. A useful research prompt:
+The Biomedical Evidence panel is review-first. The primary navigation is
+`Review`, `Run`, `Projects`, `Watch`, `Advanced`, and `Boundary`; raw graph,
+audit, trace, evidence browser, provenance, and redacted export tools live
+behind Review actions or the Advanced surface. A useful research prompt:
 
 ```text
 What recent evidence links microglial activation to Alzheimer's disease progression?
@@ -173,20 +178,22 @@ Completed baseline:
 - Release 1.1 live PubMed/Ollama smoke artifact automation;
 - Release 1.2 saved tool-chain templates and biomedical workflow skills;
 - Release 1.3 advisory math review signals;
-- Release 1.4 Codex-style biomedical workspace shell, Evidence Graph v1, and
-  Run Evidence Review.
+- Release 1.4 Codex-style biomedical workspace shell;
+- Release 1.4.1 Evidence Review hardening: deterministic mixed support,
+  complete evidence cards, and related-vs-directed path semantics;
+- Release 1.5 Review-first Evidence Graph workspace with compact Codex-style
+  shell, recent-run review, Advanced raw graph/audit/trace access, and
+  screenshot-validated desktop/mobile layouts.
 
 Next:
 
-- Release 1.4.1 hardens Evidence Graph review contracts: deterministic mixed
-  claim support, complete evidence cards, and clear related-vs-directed path
-  semantics.
-- Release 1.5 makes Run Evidence Review the primary graph workspace, with raw
-  node/edge inspection as an advanced view.
-- Release 1.6 adds graph snapshot lifecycle: backfill, stale snapshot detection,
+- Release 1.6 adds a Review Decision Loop: accept, needs-more-evidence,
+  flag-overclaim, reject, reviewer notes, persisted decisions, trace events, and
+  review packet export.
+- Release 1.7 adds graph snapshot lifecycle: backfill, stale snapshot detection,
   snapshot diffs, and review queue capture.
-- Release 1.7 moves Research Watch drift detection onto graph-backed snapshots.
-- Release 1.8 strengthens advisory Argument Graph semantics while keeping
+- Release 1.8 moves Research Watch drift detection onto graph-backed snapshots.
+- Release 1.9 strengthens advisory Argument Graph semantics while keeping
   citation and logic audit authoritative.
 - Release 2.0 adds opt-in full-text/PDF ingestion behind the same Evidence
   Graph, review, audit, and provenance contracts.

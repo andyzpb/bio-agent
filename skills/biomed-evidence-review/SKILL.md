@@ -20,6 +20,8 @@ project notes, Obsidian exports, or reviewer comments as biomedical evidence.
   uncertainty across papers.
 - The user wants an evidence packet, audit trace, provenance, or export after a
   biomedical answer.
+- The user wants to inspect a completed answer run through Run Evidence Review
+  claim cards, evidence cards, graph validation, or provenance links.
 
 Do not use this skill for diagnosis, dosing, treatment choice, prognosis, or
 patient-specific clinical advice. Use `biomed-clinical-boundary` first for those
@@ -39,6 +41,7 @@ requests.
    - `analyze_coverage_gaps`
    - `build_evidence_packet`
    - `answer_with_audit`
+   - `get_run_evidence_review`
    - `get_answer_trace`
    - `export_provenance_graph`
 4. Use `source=mock` unless the user explicitly asks for live PubMed or the
@@ -67,6 +70,8 @@ Return the final answer only after checking:
 - audit/revision results are included or summarized;
 - run IDs, retrieval IDs, packet IDs, and provenance are available when the user
   asks for inspection.
+- Run Evidence Review is available for completed runs when reviewer-facing
+  claim cards, graph snapshot status, or support reasons are needed.
 
 Memory may guide retrieval preferences, but evidence must come from retrieved
 papers and stored manifests.

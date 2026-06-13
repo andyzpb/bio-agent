@@ -10,18 +10,26 @@ This case extends a collaborative Akashic plugin-based agent framework with a
 Biomedical Evidence plugin:
 
 - deterministic mock literature search and optional PubMed retrieval;
+- controlled `search_literature` tool with retrieval manifests, coverage, and
+  source trace;
 - structured evidence extraction from abstracts;
 - citation-grounded biomedical research answers;
 - claim-level citation audit with support verdicts, overclaim detection, and
   uncertainty calibration;
 - audit/revise answer loop with persisted draft, final answer, revision action,
   and trace steps;
-- retrieval manifests for source, query, pagination, warnings, and returned paper IDs;
-- lightweight evidence graph over papers, claims, entities, methods, datasets, and limitations;
+- logic audit and symbolic fact export for inspectable overclaim checks;
+- retrieval manifests for source, query, pagination, warnings, and returned
+  paper IDs;
+- typed Biomedical Evidence Graph v1 over papers, evidence spans, claims,
+  entities, methods, limitations, retrieval manifests, packets, answer runs, and
+  audits;
+- snapshot-backed Run Evidence Review with claim cards, support reasons,
+  evidence cards, graph validation, trace/provenance/export links, and
+  clinical-refusal zero-claim reviews;
 - Research Watch topics with relevance scoring, retrieval snapshots, and push/skip decision logs;
-- dashboard views for asking questions, inspecting evidence, reviewing graph
-  structure, running citation audits, inspecting traces, and checking
-  responsible AI boundaries.
+- review-first Codex-style dashboard workspace with `Review`, `Run`,
+  `Projects`, `Watch`, `Advanced`, and `Boundary` surfaces.
 
 ## Demo
 
@@ -61,9 +69,10 @@ Biomedical Evidence plugin:
 
 The case is implemented as Portfolio V1, not only a prototype. It includes:
 
-- registered agent tools for biomedical search, paper fetch, extraction,
-  answering, citation audit, conflict checks, watch management, graph
-  retrieval, and export;
+- registered agent tools for biomedical planning, controlled literature search,
+  multi-pass retrieval, batch extraction, evidence-packet construction,
+  answering, citation audit, conflict checks, Run Evidence Review, watch
+  management, graph retrieval, provenance export, and one-way Obsidian export;
 - `/api/biomed/*` FastAPI routes for dashboard use and automated tests;
 - local SQLite persistence at `biomed_evidence/biomed.db`;
 - deterministic mock data for offline demos and optional PubMed retrieval through NCBI E-utilities;
@@ -72,13 +81,14 @@ The case is implemented as Portfolio V1, not only a prototype. It includes:
 - persisted answer audits and claim audits;
 - persisted answer revisions and agent trace steps;
 - Research Watch check events with push/skip decisions and relevance reasons;
-- markdown and JSON report export.
+- markdown, redacted JSON, graph, packet, and provenance export.
 
 ## Validation
 
 The implementation has been checked with Python type checking, targeted
-biomedical/API tests, dashboard type checking, plugin/dashboard builds, the mock
-biomedical eval runner, and a root Docker image build.
+biomedical/API/graph tests, dashboard type checking, plugin/dashboard builds,
+the mock biomedical eval runner, Docker dashboard rebuilds, and desktop/mobile
+browser screenshot validation for the review-first workspace.
 
 ## Responsible AI Boundary
 

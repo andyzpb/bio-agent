@@ -10,7 +10,8 @@ workspaces, framework-native tool guardrails, prompt context injection,
 literature-source readiness checks, the controlled `search_literature` tool, a
 coverage matrix, gap-directed follow-up searches, structured evidence packets, a
 typed Biomedical Evidence Graph v1, Obsidian one-way export, provenance graph
-export, and Research Watch decision logs. It is
+export, snapshot-backed Run Evidence Review, a review-first Codex-style
+dashboard workspace, and Research Watch decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
 
@@ -105,6 +106,17 @@ Registered agent tools:
 - `validate_evidence_graph`
 - `find_evidence_path`
 - `export_evidence_graph_json`
+- `get_run_evidence_review`
+- `run_multi_pass_literature_search`
+- `extract_evidence_batch`
+- `analyze_coverage_gaps`
+- `build_evidence_packet`
+- `get_evidence_packet`
+- `get_answer_trace`
+- `export_provenance_graph`
+- `export_evidence_packet_to_obsidian`
+- `export_project_to_obsidian`
+- `export_research_watch_to_obsidian`
 - `export_evidence_report`
 - `validate_citation_support`
 - `audit_biomedical_answer`
@@ -303,33 +315,22 @@ uv run python main.py dashboard
 
 Open `http://127.0.0.1:2236` and choose `Biomedical Evidence`.
 
-The panel includes:
+The panel is review-first and uses a Codex-style workspace shell:
 
-- Ask: answer biomedical research questions with citations, optional LLM
-  planner/extractor/synthesis/verifier/revision, optional support/refute
-  retrieval, and optional project context.
+- Review: default entry point for answer-run evidence QA. It loads recent runs,
+  snapshot status, graph validation, claim cards, support reasons, evidence
+  cards, paper IDs, audit action, and links to trace/provenance/export.
+- Run: template-first workflow runner for citation-grounded biomedical research
+  answers, optional LLM stages, support/refute retrieval, and project context.
 - Projects: create project workspaces, record saved/rejected/needs-review paper
   decisions, record project claims, inspect review queue items, and generate
   evidence briefs.
-- Evidence: browse extracted claims, entities, limitations, and confidence.
-- Graph: inspect the typed Evidence Graph v1 with topic/entity/paper/run
-  filters, validation summary, node inspector, evidence cards, path lookup, and
-  redacted JSON export.
-- Review: inspect answer-run claim status, evidence cards, graph validation,
-  immutable snapshot metadata, and related graph/trace/provenance artifacts.
 - Watch: create, update, check, and review research-watch topics, snapshots,
   and push/skip decisions.
-- Audit: inspect atomic claims, citation-support verdicts, overclaims,
-  conflict awareness, uncertainty calibration, claim-logic verdicts, symbolic
-  fact exports, and recommended action.
-- Trace: inspect planner validation, retrieval bundle metadata, draft answer,
-  final answer, revision mode/action, removed/softened claims, added
-  limitations, V2.6 evidence packet metadata, coverage/gap decisions,
-  logic-audit summary metadata, ordered agent steps, memory effects, budget
-  snapshots, step telemetry, packet selection, Obsidian export, and provenance
-  graph output.
-- Responsible AI: review the research-only operating boundary and retrieval
-  limitations.
+- Advanced: raw evidence browser, typed Evidence Graph v1 explorer, citation/
+  logic Audit, Trace, related/directed path lookup, and redacted JSON export.
+- Boundary: research-only operating boundary, clinical refusal behavior,
+  memory-as-context policy, and retrieval limitations.
 
 ## API
 
