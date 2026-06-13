@@ -25,6 +25,7 @@ from plugins.biomed_evidence.schemas import (
     SearchBiomedicalLiteratureRequest,
     WatchTopicCreateRequest,
 )
+from plugins.biomed_evidence.guardrails import RESEARCH_USE_DISCLAIMER
 from plugins.biomed_evidence.service import BiomedEvidenceService
 
 
@@ -50,6 +51,7 @@ async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
     assert result.citations
     assert result.evidence_summary
     assert "research support only" in result.disclaimer
+    assert RESEARCH_USE_DISCLAIMER not in result.answer
     assert any(
         item.evidence_direction == "supports" for item in result.evidence_summary
     )
@@ -729,6 +731,7 @@ async def test_answer_can_use_audit_gated_llm_synthesis(tmp_path: Path) -> None:
     assert result.synthesis_prompt_hash
     assert result.synthesis_fallback_reason is None
     assert "[MOCK-PMID-" in result.answer
+    assert RESEARCH_USE_DISCLAIMER not in result.answer
 
 
 @pytest.mark.asyncio

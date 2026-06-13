@@ -10,16 +10,18 @@ def shortest_path(
     source: str,
     target: str,
     *,
+    directed: bool = False,
     max_depth: int = 6,
 ) -> list[str]:
-    """Return node IDs for the shortest undirected path, or an empty list."""
+    """Return node IDs for the shortest path, or an empty list."""
 
     if source == target:
         return [source]
     adjacency: dict[str, list[str]] = {}
     for edge in graph.edges:
         adjacency.setdefault(edge.source, []).append(edge.target)
-        adjacency.setdefault(edge.target, []).append(edge.source)
+        if not directed:
+            adjacency.setdefault(edge.target, []).append(edge.source)
     queue: deque[tuple[str, list[str]]] = deque([(source, [source])])
     seen = {source}
     while queue:

@@ -1498,6 +1498,7 @@ class RunEvidenceReviewSummary(BaseModel):
     supported: int = 0
     contradicted: int = 0
     qualified: int = 0
+    mixed: int = 0
     unsupported: int = 0
     not_assessed: int = 0
     validation_ok: bool = False
@@ -1514,6 +1515,8 @@ class RunEvidenceReviewClaim(BaseModel):
     claim_node_id: str
     claim_text: str
     support_status: str = "not_assessed"
+    support_status_reason: str | None = None
+    support_counts: dict[str, int] = Field(default_factory=dict)
     audit_verdict: CitationSupportVerdict | None = None
     support_score: float | None = None
     evidence_count: int = 0

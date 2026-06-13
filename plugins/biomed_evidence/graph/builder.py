@@ -79,6 +79,7 @@ class EvidenceGraphBuilder:
             self._warnings.append(message)
 
     def build(self, *, graph_id_seed: str | None = None) -> BiomedEvidenceGraph:
+        _aggregate_claim_support_properties(self._nodes, self._edges.values())
         graph_id = (
             f"evidence_graph:{stable_digest(graph_id_seed, length=20)}"
             if graph_id_seed
@@ -143,6 +144,8 @@ def build_graph_from_evidence(
                 "extraction_mode": _field(item, "extraction_mode"),
                 "requires_expert_review": _field(item, "requires_expert_review"),
                 "datasets_or_cohorts": _list_field(item, "datasets_or_cohorts"),
+                "methods": _list_field(item, "methods"),
+                "limitations": _list_field(item, "limitations"),
                 "retrieval_id": _field(item, "retrieval_id"),
             },
         )
@@ -473,6 +476,7 @@ def _add_audit(builder: EvidenceGraphBuilder, run_node: str, audit: Any) -> None
                 "recommended_action": _field(audit, "recommended_action"),
                 "support_score": _field(item, "support_score"),
                 "overclaim_reason": _field(item, "overclaim_reason"),
+                "reviewer_notes": _list_field(item, "reviewer_notes"),
             },
         )
         for evidence_id in _list_field(item, "evidence_ids"):
@@ -529,6 +533,83 @@ def _edge_type_from_verdict(verdict: str) -> EdgeType:
     return "EVIDENCE_PROVIDES_BACKGROUND_FOR_CLAIM"
 
 
+def _aggregate_claim_support_properties(
+    nodes: dict[str, BiomedEvidenceGraphNode],
+    edges: Iterable[BiomedEvidenceGraphEdge],
+) -> None:
+    counts_by_claim: dict[str, dict[str, int]] = {}
+    for edge in edges:
+        target = nodes.get(edge.target)
+        if target is None or target.type != "Claim":
+            continue
+        counts = counts_by_claim.setdefault(edge.target, _empty_support_counts())
+        if edge.type == "EVIDENCE_SUPPORTS_CLAIM":
+            counts["supported"] += 1
+        elif edge.type == "EVIDENCE_CONTRADICTS_CLAIM":
+            counts["contradicted"] += 1
+        elif edge.type == "EVIDENCE_QUALIFIES_CLAIM":
+            counts["qualified"] += 1
+        elif edge.type == "EVIDENCE_PROVIDES_BACKGROUND_FOR_CLAIM":
+            counts["background"] += 1
+        elif edge.type == "AUDIT_REVIEWS_CLAIM":
+            bucket = _support_status_from_verdict(
+                str(edge.properties.get("verdict") or "not_assessed")
+            )
+            if bucket in {"supported", "contradicted", "qualified", "unsupported"}:
+                counts[bucket] += 1
+            else:
+                counts["not_assessed"] += 1
+    for node_id, node in list(nodes.items()):
+        if node.type != "Claim":
+            continue
+        counts = counts_by_claim.get(node_id) or _empty_support_counts()
+        status, reason = _support_status_from_counts(counts)
+        nodes[node_id] = node.model_copy(
+            update={
+                "properties": {
+                    **node.properties,
+                    "support_status": status,
+                    "support_status_reason": reason,
+                    "support_counts": counts,
+                }
+            }
+        )
+
+
+def _empty_support_counts() -> dict[str, int]:
+    return {
+        "supported": 0,
+        "contradicted": 0,
+        "qualified": 0,
+        "unsupported": 0,
+        "background": 0,
+        "not_assessed": 0,
+    }
+
+
+def _support_status_from_counts(counts: dict[str, int]) -> tuple[str, str]:
+    supported = counts.get("supported", 0)
+    contradicted = counts.get("contradicted", 0)
+    qualified = counts.get("qualified", 0)
+    unsupported = counts.get("unsupported", 0)
+    background = counts.get("background", 0)
+    if supported and contradicted:
+        return "mixed", "Supporting and contradicting evidence are both linked."
+    if contradicted:
+        return "contradicted", "Contradicting evidence or audit verdict is linked."
+    if supported and (qualified or unsupported):
+        return "qualified", "Support is present but audit/evidence adds limitations."
+    if supported:
+        return "supported", "Supporting evidence is linked."
+    if unsupported:
+        return "unsupported", "Audit found insufficient, irrelevant, or missing support."
+    if qualified:
+        return "qualified", "Only qualifying or inconclusive evidence is linked."
+    if background:
+        return "not_assessed", "Only background evidence is linked."
+    return "not_assessed", "No evidence support status has been assessed."
+
+
 def _support_status_from_direction(direction: str) -> str:
     if direction == "supports":
         return "supported"
@@ -544,7 +625,14 @@ def _support_status_from_verdict(verdict: str) -> str:
         return "supported"
     if verdict == "contradicted":
         return "contradicted"
-    if verdict in {"overclaimed", "insufficient_evidence", "not_cited"}:
+    if verdict == "mixed_evidence":
+        return "qualified"
+    if verdict in {
+        "overclaimed",
+        "insufficient_evidence",
+        "irrelevant_citation",
+        "not_cited",
+    }:
         return "unsupported"
     return "not_assessed"
 

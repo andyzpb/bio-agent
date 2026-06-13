@@ -1733,9 +1733,10 @@ class BiomedEvidencePlugin(Plugin):
         paper_id: str = "",
         direction: str = "",
         run_id: str = "",
+        directed: bool = False,
         max_depth: int = 6,
     ) -> str:
-        """Find a short path between two v1 evidence graph node IDs."""
+        """Find a short related or directed path between two v1 graph node IDs."""
         graph = self._service.get_graph_v1(
             topic=topic,
             entity=entity,
@@ -1749,6 +1750,7 @@ class BiomedEvidencePlugin(Plugin):
             graph,
             source,
             target,
+            directed=directed,
             max_depth=max(1, min(max_depth, 20)),
         )
         if not path:
@@ -1760,15 +1762,34 @@ class BiomedEvidencePlugin(Plugin):
                 }
             )
         nodes = {node.id: node for node in graph.nodes}
+        path_edges = []
+        for left, right in zip(path, path[1:]):
+            edge = next(
+                (
+                    item
+                    for item in graph.edges
+                    if (item.source == left and item.target == right)
+                    or (
+                        not directed
+                        and item.source == right
+                        and item.target == left
+                    )
+                ),
+                None,
+            )
+            if edge is not None:
+                path_edges.append(edge.model_dump(mode="json"))
         return _dump(
             {
                 "schema_version": graph.schema_version,
+                "path_mode": "directed" if directed else "related_undirected",
                 "path": path,
                 "nodes": [
                     nodes[node_id].model_dump(mode="json")
                     for node_id in path
                     if node_id in nodes
                 ],
+                "edges": path_edges,
             }
         )
 

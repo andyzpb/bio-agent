@@ -661,6 +661,7 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         paper_id: str = "",
         direction: str = "",
         run_id: str = "",
+        directed: bool = False,
         max_depth: int = 6,
     ) -> dict[str, Any]:
         graph = service.get_graph_v1(
@@ -679,6 +680,7 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             graph,
             source,
             target,
+            directed=directed,
             max_depth=max(1, min(max_depth, 20)),
         )
         if not path:
@@ -698,7 +700,11 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
                     item
                     for item in graph.edges
                     if (item.source == left and item.target == right)
-                    or (item.source == right and item.target == left)
+                    or (
+                        not directed
+                        and item.source == right
+                        and item.target == left
+                    )
                 ),
                 None,
             )
@@ -706,6 +712,7 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
                 path_edges.append(edge.model_dump(mode="json"))
         return {
             "schema_version": graph.schema_version,
+            "path_mode": "directed" if directed else "related_undirected",
             "path": path,
             "nodes": [
                 nodes_by_id[node_id].model_dump(mode="json")

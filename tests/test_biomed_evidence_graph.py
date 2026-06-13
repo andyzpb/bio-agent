@@ -141,6 +141,7 @@ def test_build_graph_from_evidence_validates_and_builds_card() -> None:
     card = build_evidence_card(graph, claim_node_id)
     assert card.claim_text == item.claim
     assert card.evidence[0].paper_id == "PMID:1"
+    assert card.evidence[0].methods == ["single-cell RNA-seq"]
     assert card.limitations == ["Abstract-only extraction."]
 
     manifest_node_id = next(
@@ -149,6 +150,114 @@ def test_build_graph_from_evidence_validates_and_builds_card() -> None:
     path = shortest_path(graph, manifest_node_id, claim_node_id)
     assert path[0] == manifest_node_id
     assert path[-1] == claim_node_id
+    directed_path = shortest_path(
+        graph,
+        manifest_node_id,
+        claim_node_id,
+        directed=True,
+    )
+    assert directed_path == path
+    assert shortest_path(graph, claim_node_id, manifest_node_id, directed=True) == []
+
+
+def test_claim_support_aggregation_is_order_independent_for_mixed_evidence() -> None:
+    claim = "Microglial activation is associated with disease progression."
+    supporting = EvidenceItem(
+        evidence_id="ev-support",
+        paper_id="PMID:support",
+        claim=claim,
+        finding="Supportive association was reported.",
+        evidence_direction="supports",
+        confidence="medium",
+    )
+    contradicting = EvidenceItem(
+        evidence_id="ev-contradict",
+        paper_id="PMID:contradict",
+        claim=claim,
+        finding="No association was observed in a separate cohort.",
+        evidence_direction="contradicts",
+        confidence="medium",
+    )
+
+    forward = build_graph_from_evidence([supporting, contradicting])
+    reverse = build_graph_from_evidence([contradicting, supporting])
+
+    forward_claim = next(node for node in forward.nodes if node.type == "Claim")
+    reverse_claim = next(node for node in reverse.nodes if node.type == "Claim")
+
+    assert forward_claim.properties["support_status"] == "mixed"
+    assert reverse_claim.properties["support_status"] == "mixed"
+    assert forward_claim.properties["support_counts"] == reverse_claim.properties[
+        "support_counts"
+    ]
+    assert "Supporting and contradicting" in str(
+        forward_claim.properties["support_status_reason"]
+    )
+
+
+def test_evidence_card_reads_methods_from_method_edges() -> None:
+    graph = BiomedEvidenceGraph(
+        nodes=[
+            BiomedEvidenceGraphNode(
+                id="paper:edge-method",
+                type="Paper",
+                label="Paper edge method",
+                properties={"paper_id": "PMID:edge-method"},
+            ),
+            BiomedEvidenceGraphNode(
+                id="evidence:edge-method",
+                type="EvidenceSpan",
+                label="Evidence edge method",
+                properties={
+                    "evidence_id": "edge-method",
+                    "paper_id": "PMID:edge-method",
+                    "text": "Spatial profiling identified activated microglia.",
+                    "evidence_direction": "supports",
+                },
+            ),
+            BiomedEvidenceGraphNode(
+                id="claim:edge-method",
+                type="Claim",
+                label="Claim edge method",
+                properties={
+                    "claim_id": "edge-method",
+                    "text": "Activated microglia localize near plaques.",
+                    "support_status": "supported",
+                    "support_counts": {"supported": 1},
+                },
+            ),
+            BiomedEvidenceGraphNode(
+                id="method:spatial",
+                type="Method",
+                label="spatial transcriptomics",
+                properties={"name": "spatial transcriptomics"},
+            ),
+        ],
+        edges=[
+            BiomedEvidenceGraphEdge(
+                id="paper-evidence",
+                source="paper:edge-method",
+                target="evidence:edge-method",
+                type="PAPER_CONTAINS_EVIDENCE",
+            ),
+            BiomedEvidenceGraphEdge(
+                id="evidence-claim",
+                source="evidence:edge-method",
+                target="claim:edge-method",
+                type="EVIDENCE_SUPPORTS_CLAIM",
+            ),
+            BiomedEvidenceGraphEdge(
+                id="evidence-method",
+                source="evidence:edge-method",
+                target="method:spatial",
+                type="EVIDENCE_USES_METHOD",
+            ),
+        ],
+    )
+
+    card = build_evidence_card(graph, "claim:edge-method")
+
+    assert card.evidence[0].methods == ["spatial transcriptomics"]
 
 
 def test_validation_requires_supported_claim_evidence_edge() -> None:

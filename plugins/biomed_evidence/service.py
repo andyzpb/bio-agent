@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, cast
+from typing import Any, Iterable, Literal, cast
 
 import httpx
 
@@ -48,6 +48,7 @@ from plugins.biomed_evidence.graph import (
     graph_to_json_dict,
     validate_evidence_graph,
 )
+from plugins.biomed_evidence.graph.schema import GraphScopeKind
 from plugins.biomed_evidence.provenance_service import build_provenance_graph
 from plugins.biomed_evidence.schemas import (
     AdvisoryClaimReview,
@@ -2418,7 +2419,6 @@ class BiomedEvidenceService:
         limitations = _collect_limitations(evidence)
         if not citations and active_request.require_citations:
             answer = (
-                f"{RESEARCH_USE_DISCLAIMER}\n\n"
                 "I could not retrieve citation-backed evidence for this question in "
                 "the selected source. I will not make strong biomedical claims without "
                 "retrieved citations."
@@ -3374,8 +3374,9 @@ class BiomedEvidenceService:
                             "evidence, uncertainty, limitations, comparisons, or "
                             "recommendations must include at least one supplied citation "
                             "label. Use bracketed paper-id labels such as "
-                            "[MOCK-PMID-1001], not bare parenthetical identifiers. The "
-                            "research-use disclaimer may remain uncited. Do not add "
+                            "[MOCK-PMID-1001], not bare parenthetical identifiers. Do "
+                            "not include the research-use disclaimer in final_answer; "
+                            "the application displays that boundary separately. Do not add "
                             "future-work, expert-review, or causality caveats unless "
                             "they are directly grounded in supplied evidence and cited. "
                             "If you cannot produce a fully cited answer, copy draft_answer."
@@ -3535,7 +3536,9 @@ class BiomedEvidenceService:
                             "uncertainty statement, comparison, or interpretation must "
                             "include at least one supplied bracket citation such as "
                             "[MOCK-PMID-1001]. Do not add clinical advice or uncited "
-                            "future-work claims."
+                            "future-work claims. Do not include the research-use "
+                            "disclaimer in final_answer; the application displays that "
+                            "boundary separately."
                         ),
                     },
                     {"role": "user", "content": prompt_text},
@@ -5847,6 +5850,7 @@ def _llm_synthesis_payload(
             "Use bracket paper-id citations like [MOCK-PMID-1001] on every biomedical claim.",
             "Do not include uncited future-work, clinical, dosing, diagnosis, treatment, or patient-specific advice.",
             "Mention uncertainty and limitations only when supported by supplied evidence.",
+            "Do not include the research-use disclaimer in final_answer; it is displayed separately in UI and metadata.",
             "Return JSON with final_answer, uncertainty_level, and optional added_limitations.",
         ],
         "question": request.question,
@@ -6331,18 +6335,15 @@ def _executable_query(plan: BiomedicalQueryPlan) -> str:
 def _planning_abstention(classification: BiomedicalQuestionClassification) -> str:
     if classification.intent == "needs_clarification":
         return (
-            f"{RESEARCH_USE_DISCLAIMER}\n\n"
             "I need a more specific biomedical research question before I can "
             "retrieve and cite literature safely."
         )
     if classification.intent == "out_of_scope":
         return (
-            f"{RESEARCH_USE_DISCLAIMER}\n\n"
             "This request does not appear to be a biomedical literature research "
             "question, so I will not fabricate a biomedical evidence answer."
         )
     return (
-        f"{RESEARCH_USE_DISCLAIMER}\n\n"
         "The retrieval plan did not pass validation, so I will not answer with "
         "unsupported biomedical claims."
     )
@@ -6526,8 +6527,6 @@ def _compose_answer(
     for item in evidence:
         groups.setdefault(item.evidence_direction, []).append(item)
     lines = [
-        RESEARCH_USE_DISCLAIMER,
-        "",
         f"Research question: {question}",
     ]
     if project_context:
@@ -6974,6 +6973,7 @@ def _build_answer_revision(
         and audit.recommended_action == "pass"
         and not advisory_limitations
     ):
+        final_answer = _strip_research_disclaimer(draft_result.answer)
         return AnswerRevision(
             revision_id=_revision_id(draft_result.run_id, audit.audit_id),
             run_id=draft_result.run_id,
@@ -6981,8 +6981,8 @@ def _build_answer_revision(
             revision_mode=cast(Any, revision_mode),
             fallback_reason=fallback_reason,
             draft_answer=draft_result.answer,
-            final_answer=draft_result.answer,
-            revision_action="pass",
+            final_answer=final_answer or draft_result.answer,
+            revision_action="pass" if final_answer == draft_result.answer else "revise",
             created_at=now,
         )
 
@@ -7025,7 +7025,6 @@ def _build_answer_revision(
     final_answer = "\n".join(revised_lines).strip()
     if not final_answer or _only_policy_text(final_answer):
         final_answer = (
-            f"{RESEARCH_USE_DISCLAIMER}\n\n"
             "After claim-level audit, the draft did not contain enough "
             "citation-supported evidence to answer this biomedical research "
             "question without overclaiming."
@@ -7043,6 +7042,7 @@ def _build_answer_revision(
     )
     if added_limitations or conflict_or_uncertainty:
         final_answer = _append_audit_limitations(final_answer, added_limitations, audit)
+    final_answer = _strip_research_disclaimer(final_answer)
     return AnswerRevision(
         revision_id=_revision_id(draft_result.run_id, audit.audit_id),
         run_id=draft_result.run_id,
@@ -7506,7 +7506,7 @@ def _llm_revision_payload(
             "Keep citation labels exactly as provided.",
             "Do not introduce uncited biomedical claims.",
             "Every sentence that states biomedical evidence, uncertainty, limitations, comparisons, or recommendations must include at least one supplied citation label.",
-            "Only the research-use disclaimer may remain uncited.",
+            "Do not include the research-use disclaimer in final_answer; it is displayed separately in UI and metadata.",
             "Use bracketed paper-id labels such as [MOCK-PMID-1001]; do not use bare parenthetical identifiers such as (MOCK-PMID-1001).",
             "Do not add future-work, expert-review, or causality caveats unless they are directly grounded in supplied evidence and cited.",
             "Prefer concise bullets; place citation labels in the same sentence as the claim they support.",
@@ -7550,7 +7550,22 @@ def _parse_json_object(raw: str) -> dict[str, object]:
 
 def _normalize_llm_answer_text(raw: str) -> str:
     text = raw.strip()
-    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return _strip_research_disclaimer(normalized)
+
+
+def _strip_research_disclaimer(answer: str) -> str:
+    text = answer.strip()
+    if not text:
+        return ""
+    disclaimer = RESEARCH_USE_DISCLAIMER.strip()
+    if text == disclaimer:
+        return ""
+    if text.startswith(disclaimer):
+        text = text[len(disclaimer) :].lstrip()
+        if text.startswith("\n"):
+            text = text.lstrip()
+    return text.strip()
 
 
 def _coerce_string_list(value: object) -> list[str]:
@@ -7971,7 +7986,7 @@ def _graph_scope_kind(
     entity: str,
     paper_id: str,
     direction: str,
-) -> str:
+) -> GraphScopeKind:
     if paper_id.strip():
         return "paper"
     if entity.strip():
@@ -8098,12 +8113,25 @@ def _review_claims_from_graph(
             or card.get("support_status")
             or "not_assessed"
         )
+        support_counts = _coerce_review_int_dict(
+            node.properties.get("support_counts") or card.get("support_counts")
+        )
         claims.append(
             RunEvidenceReviewClaim(
                 claim_id=claim_id,
                 claim_node_id=node.id,
                 claim_text=claim_text,
                 support_status=support_status,
+                support_status_reason=(
+                    str(node.properties.get("support_status_reason"))
+                    if node.properties.get("support_status_reason") is not None
+                    else (
+                        str(card.get("support_status_reason"))
+                        if card.get("support_status_reason") is not None
+                        else None
+                    )
+                ),
+                support_counts=support_counts,
                 audit_verdict=audit_item.verdict if audit_item is not None else None,
                 support_score=(
                     audit_item.support_score if audit_item is not None else None
@@ -8141,6 +8169,7 @@ def _review_summary(
         "supported": 0,
         "contradicted": 0,
         "qualified": 0,
+        "mixed": 0,
         "unsupported": 0,
         "not_assessed": 0,
     }
@@ -8156,6 +8185,7 @@ def _review_summary(
         supported=counts["supported"],
         contradicted=counts["contradicted"],
         qualified=counts["qualified"],
+        mixed=counts["mixed"],
         unsupported=counts["unsupported"],
         not_assessed=counts["not_assessed"],
         validation_ok=bool(validation.get("ok")),
@@ -8183,7 +8213,13 @@ def _support_status_bucket(
     support_status: str,
 ) -> str:
     normalized = support_status.strip().lower()
-    if normalized in {"supported", "contradicted", "qualified", "unsupported"}:
+    if normalized in {
+        "supported",
+        "contradicted",
+        "qualified",
+        "mixed",
+        "unsupported",
+    }:
         return normalized
     return "not_assessed"
 
@@ -8191,7 +8227,7 @@ def _support_status_bucket(
 def _claim_review_action(
     support_status: str,
     audit_item: ClaimAuditItem | None,
-) -> str:
+) -> Literal["accept", "needs_review", "needs_revision"]:
     normalized_status = support_status.strip().lower()
     if audit_item is not None and audit_item.verdict in {
         "overclaimed",
@@ -8223,6 +8259,18 @@ def _unique_str(values: Iterable[object]) -> list[str]:
             continue
         seen.add(clean)
         output.append(clean)
+    return output
+
+
+def _coerce_review_int_dict(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, int] = {}
+    for key, item in value.items():
+        try:
+            output[str(key)] = int(item)
+        except (TypeError, ValueError):
+            continue
     return output
 
 

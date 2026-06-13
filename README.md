@@ -8,8 +8,8 @@ showcases a **research-only biomedical evidence agent** built on that framework:
 it searches literature, extracts evidence, audits generated claims, and makes
 every answer inspectable.
 
-Current biomedical baseline: **Release 1.2: Saved Biomedical Tool-Chain
-Templates with Workflow Skills**.
+Current biomedical baseline: **Release 1.4: graph-backed biomedical workspace
+with Run Evidence Review**.
 
 ## Why It Matters
 
@@ -49,6 +49,9 @@ and patient-specific advice are refused before retrieval or LLM stages run.
 - **Saved workflows**: Release 1.2 adds built-in and custom biomedical
   tool-chain templates plus workflow skills for evidence review, clinical
   boundary enforcement, and project/watch memory.
+- **Review-first evidence graph**: typed Evidence Graph v1 and snapshot-backed
+  Run Evidence Review turn each answer run into auditable claim cards,
+  validation, graph hash, and links to trace/provenance/export.
 - **Math-oriented review aids**: submodular-style packet selection,
   contextual-bandit-style retrieval advisory, Markov-style step telemetry, and
   PROV/OpenLineage-compatible provenance graphs are used as advisory and
@@ -168,16 +171,25 @@ Completed baseline:
 - deterministic packet selection, retrieval advisory, step telemetry, and
   provenance export;
 - Release 1.1 live PubMed/Ollama smoke artifact automation;
-- Release 1.2 saved tool-chain templates and biomedical workflow skills.
+- Release 1.2 saved tool-chain templates and biomedical workflow skills;
+- Release 1.3 advisory math review signals;
+- Release 1.4 Codex-style biomedical workspace shell, Evidence Graph v1, and
+  Run Evidence Review.
 
 Next:
 
-- Codex-style biomedical workspace shell with fewer visible toggles and stronger
-  progressive disclosure;
-- full-text/PDF ingestion behind the same provenance and audit gates;
-- stronger provenance visualization and human review events;
-- formal argumentation, conformal uncertainty, causal claim typing, topic drift,
-  and hypergraph evidence modeling.
+- Release 1.4.1 hardens Evidence Graph review contracts: deterministic mixed
+  claim support, complete evidence cards, and clear related-vs-directed path
+  semantics.
+- Release 1.5 makes Run Evidence Review the primary graph workspace, with raw
+  node/edge inspection as an advanced view.
+- Release 1.6 adds graph snapshot lifecycle: backfill, stale snapshot detection,
+  snapshot diffs, and review queue capture.
+- Release 1.7 moves Research Watch drift detection onto graph-backed snapshots.
+- Release 1.8 strengthens advisory Argument Graph semantics while keeping
+  citation and logic audit authoritative.
+- Release 2.0 adds opt-in full-text/PDF ingestion behind the same Evidence
+  Graph, review, audit, and provenance contracts.
 
 ## Documentation
 

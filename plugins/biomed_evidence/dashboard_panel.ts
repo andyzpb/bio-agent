@@ -1,18 +1,15 @@
 /// <reference path="../../types/akashic-dashboard.d.ts" />
 
-type BiomedView = "ask" | "projects" | "evidence" | "graph" | "review" | "watch" | "audit" | "trace" | "responsible";
+type BiomedView = "ask" | "projects" | "evidence" | "graph" | "review" | "watch" | "audit" | "trace" | "responsible" | "advanced";
 
 let biomedWorkflowTemplates: SavedToolChainTemplate[] = [];
 
 const BIOMED_VIEW_ITEMS: { id: BiomedView; label: string; description: string }[] = [
+  { id: "review", label: "Review", description: "evidence QA" },
   { id: "ask", label: "Run", description: "workflow" },
   { id: "projects", label: "Projects", description: "memory" },
-  { id: "evidence", label: "Evidence", description: "claims" },
-  { id: "graph", label: "Graph", description: "relations" },
-  { id: "review", label: "Review", description: "run QA" },
   { id: "watch", label: "Watch", description: "monitoring" },
-  { id: "audit", label: "Audit", description: "review" },
-  { id: "trace", label: "Trace", description: "provenance" },
+  { id: "advanced", label: "Advanced", description: "graph · audit · trace" },
   { id: "responsible", label: "Boundary", description: "policy" },
 ];
 
@@ -159,6 +156,7 @@ interface AnswerResult {
   limitations: string[];
   uncertainty_level: string;
   suggested_next_steps: string[];
+  not_medical_advice: boolean;
   disclaimer: string;
   synthesis_mode?: string;
   synthesis_model?: string | null;
@@ -635,6 +633,8 @@ interface BiomedEvidenceCard {
   claim_node_id: string;
   claim_text: string;
   support_status: string;
+  support_status_reason?: string | null;
+  support_counts: Record<string, number>;
   evidence: {
     evidence_id: string;
     evidence_node_id: string;
@@ -644,6 +644,8 @@ interface BiomedEvidenceCard {
     paper_title?: string | null;
     confidence?: string | null;
     evidence_direction?: string | null;
+    retrieval_intent?: string | null;
+    extraction_mode?: string | null;
     limitations: string[];
     methods: string[];
   }[];
@@ -670,6 +672,7 @@ interface RunEvidenceReviewSummary {
   supported: number;
   contradicted: number;
   qualified: number;
+  mixed: number;
   unsupported: number;
   not_assessed: number;
   validation_ok: boolean;
@@ -684,6 +687,8 @@ interface RunEvidenceReviewClaim {
   claim_node_id: string;
   claim_text: string;
   support_status: string;
+  support_status_reason?: string | null;
+  support_counts: Record<string, number>;
   audit_verdict?: string | null;
   support_score?: number | null;
   evidence_count: number;
@@ -773,10 +778,21 @@ interface ProjectEvidenceBrief {
 
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
   const value = dispatch?.filters["_view"];
-  if (value === "projects" || value === "graph" || value === "watch" || value === "audit" || value === "trace" || value === "responsible" || value === "evidence") {
+  if (
+    value === "ask"
+    || value === "projects"
+    || value === "graph"
+    || value === "review"
+    || value === "watch"
+    || value === "audit"
+    || value === "trace"
+    || value === "responsible"
+    || value === "evidence"
+    || value === "advanced"
+  ) {
     return value;
   }
-  return "ask";
+  return "review";
 }
 
 function pill(value: string): string {
@@ -787,6 +803,18 @@ function renderList(items: unknown[] | undefined): string {
   const values = (items || []).map((item) => String(item || "").trim()).filter(Boolean);
   if (!values.length) return '<span class="biomed-muted">None recorded</span>';
   return `<ul class="biomed-list">${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function compactId(value: string | null | undefined, front = 12, back = 8): string {
+  const clean = String(value || "").trim();
+  if (!clean || clean.length <= front + back + 1) return clean;
+  return `${clean.slice(0, front)}...${clean.slice(-back)}`;
+}
+
+function compactCode(value: string | null | undefined): string {
+  const clean = String(value || "").trim();
+  if (!clean) return "<code>-</code>";
+  return `<code title="${escapeHtml(clean)}">${escapeHtml(compactId(clean))}</code>`;
 }
 
 function countGraphTypes(items: { type: string }[]): Record<string, number> {
@@ -853,13 +881,14 @@ function renderGraphNodeInspector(graph: BiomedEvidenceGraphV1, nodeId: string):
 
 function renderBiomedEvidenceCard(card: BiomedEvidenceCard): string {
   return `
-    <div class="biomed-provenance">
+    <div class="biomed-provenance biomed-evidence-card-detail">
       <div class="biomed-provenance-grid">
         <div><span>Claim</span><code>${escapeHtml(card.claim_id)}</code></div>
         <div><span>Status</span><strong>${escapeHtml(card.support_status)}</strong></div>
         <div><span>Evidence</span><strong>${card.evidence.length}</strong></div>
         <div><span>Audits</span><strong>${card.audit_results.length}</strong></div>
       </div>
+      ${card.support_status_reason ? `<div class="biomed-evidence-finding">${escapeHtml(card.support_status_reason)}</div>` : ""}
       <div class="biomed-evidence-claim">${escapeHtml(card.claim_text)}</div>
       <div class="biomed-audit-table">
         ${card.evidence.map((item) => `
@@ -872,6 +901,9 @@ function renderBiomedEvidenceCard(card: BiomedEvidenceCard): string {
             </div>
             <div>${escapeHtml(item.text)}</div>
             ${item.paper_title ? `<div class="biomed-muted">${escapeHtml(item.paper_title)}</div>` : ""}
+            <div class="biomed-watch-meta">
+              retrieval ${escapeHtml(item.retrieval_intent || "-")} · extraction ${escapeHtml(item.extraction_mode || "-")}
+            </div>
             ${item.methods.length ? `<div class="biomed-label">Methods</div>${renderList(item.methods)}` : ""}
             ${item.limitations.length ? `<div class="biomed-label">Limitations</div>${renderList(item.limitations)}` : ""}
           </div>
@@ -953,6 +985,7 @@ function reviewFilterClaims(review: RunEvidenceReview, filter: string): RunEvide
   if (filter === "needs_review") return review.claims.filter((claim) => claim.review_action !== "accept");
   if (filter === "supported") return review.claims.filter((claim) => claim.support_status === "supported");
   if (filter === "contradicted") return review.claims.filter((claim) => claim.support_status === "contradicted");
+  if (filter === "mixed") return review.claims.filter((claim) => claim.support_status === "mixed");
   if (filter === "unsupported") {
     return review.claims.filter((claim) => ["unsupported", "qualified"].includes(claim.support_status));
   }
@@ -963,7 +996,7 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
   const summary = review.summary;
   const claims = reviewFilterClaims(review, filter);
   return `
-    <div class="biomed-provenance">
+    <div class="biomed-provenance biomed-review-status">
       <div class="biomed-provenance-grid">
         <div><span>Review</span><strong>${escapeHtml(review.schema_version)}</strong></div>
         <div><span>Run</span><code>${escapeHtml(review.run_id)}</code></div>
@@ -974,16 +1007,17 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
         <div><span>Claims</span><strong>${summary.total_claims}</strong></div>
         <div><span>Needs Review</span><strong>${review.claims.filter((claim) => claim.review_action !== "accept").length}</strong></div>
       </div>
-      ${review.snapshot.graph_hash ? `<div class="biomed-watch-meta">graph hash <code>${escapeHtml(review.snapshot.graph_hash)}</code></div>` : ""}
-      ${review.snapshot.snapshot_id ? `<div class="biomed-watch-meta">snapshot <code>${escapeHtml(review.snapshot.snapshot_id)}</code></div>` : ""}
+      ${review.snapshot.graph_hash ? `<div class="biomed-watch-meta">graph hash ${compactCode(review.snapshot.graph_hash)}</div>` : ""}
+      ${review.snapshot.snapshot_id ? `<div class="biomed-watch-meta">snapshot ${compactCode(review.snapshot.snapshot_id)}</div>` : ""}
       ${review.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(review.warnings)}` : ""}
       <div class="biomed-label">Validation</div>
       ${renderGraphValidation(review.validation)}
     </div>
-    <div class="biomed-provenance">
+    <div class="biomed-provenance biomed-review-counts">
       <div class="biomed-provenance-grid">
         <div><span>Supported</span><strong>${summary.supported}</strong></div>
         <div><span>Contradicted</span><strong>${summary.contradicted}</strong></div>
+        <div><span>Mixed</span><strong>${summary.mixed}</strong></div>
         <div><span>Qualified</span><strong>${summary.qualified}</strong></div>
         <div><span>Unsupported</span><strong>${summary.unsupported}</strong></div>
         <div><span>Not assessed</span><strong>${summary.not_assessed}</strong></div>
@@ -991,10 +1025,10 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
       </div>
     </div>
     <div class="biomed-action-row">
-      <button data-review-related="graph">Graph</button>
+      <button data-review-related="graph">Raw Graph</button>
       <button data-review-related="trace">Trace</button>
       <button data-review-related="provenance">Provenance</button>
-      <button data-review-related="export">JSON</button>
+      <button data-review-related="export">Export JSON</button>
     </div>
     ${summary.clinical_refusal && !claims.length ? `
       <div class="biomed-policy">
@@ -1002,9 +1036,9 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
         <span>This refusal run has zero biomedical evidence claims.</span>
       </div>
     ` : ""}
-    <div class="biomed-audit-table">
+    <div class="biomed-review-claim-list">
       ${claims.map((claim) => `
-        <div class="biomed-audit-row ${claim.review_action !== "accept" ? "is-failed" : ""}">
+        <article class="biomed-review-claim-card ${claim.review_action !== "accept" ? "is-failed" : ""}">
           <div class="biomed-audit-row-head">
             ${pill(claim.review_action)}
             ${pill(claim.support_status)}
@@ -1015,13 +1049,58 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
           <div class="biomed-watch-meta">
             score ${claim.support_score ?? "-"} · ${claim.evidence_count} evidence · ${claim.paper_ids.length} papers · ${claim.limitation_count} limitations
           </div>
+          ${claim.support_status_reason ? `<div class="biomed-evidence-finding">${escapeHtml(claim.support_status_reason)}</div>` : ""}
+          ${Object.keys(claim.support_counts || {}).length ? `<div class="biomed-watch-meta">support counts ${escapeHtml(JSON.stringify(claim.support_counts))}</div>` : ""}
           ${claim.paper_ids.length ? `<div class="biomed-label">Papers</div>${renderList(claim.paper_ids)}` : ""}
-          <details>
-            <summary>Evidence card</summary>
-            ${renderBiomedEvidenceCard(claim.evidence_card)}
-          </details>
-        </div>
+          <div class="biomed-action-row">
+            <button data-review-inspect-claim="${escapeHtml(claim.claim_node_id)}">Evidence Card</button>
+            <button data-review-json-claim="${escapeHtml(claim.claim_node_id)}">Inspect JSON</button>
+          </div>
+        </article>
       `).join("") || '<div class="biomed-muted">No claims match this filter.</div>'}
+    </div>
+  `;
+}
+
+function renderReviewMainPanel(
+  review: RunEvidenceReview,
+  trace: TracePayload | null,
+  filter: string,
+): string {
+  const answer = trace?.answer_run.answer || "";
+  const question = trace?.answer_run.evidence_packet?.question || "";
+  return `
+    <div class="biomed-review-main-head">
+      <div>
+        <div class="biomed-label">Selected Run</div>
+        <h2>${escapeHtml(question || "Evidence review")}</h2>
+      </div>
+      <div class="biomed-review-status-strip">
+        ${pill(review.snapshot.status)}
+        ${pill(review.summary.validation_ok ? "valid" : "invalid")}
+        ${review.summary.recommended_audit_action ? pill(review.summary.recommended_audit_action) : pill("pending_audit")}
+      </div>
+    </div>
+    ${
+      answer
+        ? `
+          <section class="biomed-review-answer">
+            <div class="biomed-label">Final Answer</div>
+            <p>${escapeHtml(answer)}</p>
+          </section>
+        `
+        : ""
+    }
+    ${renderRunEvidenceReview(review, filter)}
+  `;
+}
+
+function renderReviewInspectorEmpty(): string {
+  return `
+    <div class="biomed-review-inspector-empty">
+      <div class="biomed-label">Inspector</div>
+      <h3>Select a claim or action</h3>
+      <p>Evidence cards, trace, provenance, graph export, and related graph views appear here.</p>
     </div>
   `;
 }
@@ -1791,6 +1870,7 @@ function renderAuditedAnswer(result: AuditedAnswerResult): string {
     ${renderEvidencePacket(result.answer_result.evidence_packet)}
     <div class="biomed-label">Final Answer</div>
     <div class="biomed-answer">${renderMarkdown(result.final_answer)}</div>
+    ${renderBoundaryNotice(result.answer_result)}
     <div class="biomed-label">Audit</div>
     ${renderAuditResult(result.audit)}
     <div class="biomed-label">Advisory Verifier</div>
@@ -1834,6 +1914,16 @@ function currentFinalAnswer(context: WorkspaceRunContext): string {
   );
 }
 
+function renderBoundaryNotice(answer: AnswerResult): string {
+  const disclaimer = answer.disclaimer || "Research-only biomedical evidence support. Not medical advice.";
+  return `
+    <div class="biomed-boundary-notice" title="${escapeHtml(disclaimer)}">
+      <span>Boundary</span>
+      <strong>${answer.not_medical_advice ? "research-only · not medical advice" : "review required"}</strong>
+    </div>
+  `;
+}
+
 function renderWorkspaceRunSummary(context: WorkspaceRunContext): string {
   const answer = context.answer;
   const revision = currentRevisionFromContext(context);
@@ -1858,6 +1948,7 @@ function renderWorkspaceRunSummary(context: WorkspaceRunContext): string {
     <section class="biomed-output-band">
       <div class="biomed-label">Final Answer</div>
       <div class="biomed-answer biomed-answer-large">${renderMarkdown(currentFinalAnswer(context))}</div>
+      ${renderBoundaryNotice(answer)}
     </section>
     <section class="biomed-output-band">
       <div class="biomed-label">Evidence At A Glance</div>
@@ -2308,6 +2399,8 @@ function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
     renderBiomedWorkbenchPage(root, "Evidence graph", "Inspect paper, entity, and claim relationships for a topic.", renderGraph);
   } else if (view === "review") {
     renderBiomedWorkbenchPage(root, "Run evidence review", "Review answer-run claims, evidence cards, validation, and snapshot status.", renderReview);
+  } else if (view === "advanced") {
+    renderBiomedWorkbenchPage(root, "Advanced tools", "Inspect raw graph, citation audit, trace, provenance, and evidence records.", renderAdvanced);
   } else if (view === "projects") {
     renderBiomedWorkbenchPage(root, "Projects", "Keep research context, saved papers, claims, and reviewer queues organized.", renderProjects);
   } else if (view === "watch") {
@@ -2321,6 +2414,37 @@ function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
   } else {
     renderBiomedWorkbenchPage(root, "Evidence browser", "Browse retrieved evidence items from the current biomedical store.", renderEvidenceBrowser);
   }
+}
+
+function renderAdvanced(container: HTMLElement): void {
+  container.innerHTML = `
+    <div class="biomed-advanced-workspace">
+      <div class="biomed-advanced-switcher">
+        <button class="is-active" data-biomed-advanced="graph">Raw Graph</button>
+        <button data-biomed-advanced="evidence">Evidence</button>
+        <button data-biomed-advanced="audit">Audit</button>
+        <button data-biomed-advanced="trace">Trace</button>
+      </div>
+      <div id="biomed-advanced-panel"></div>
+    </div>
+  `;
+  const panel = container.querySelector<HTMLElement>("#biomed-advanced-panel");
+  const renderMode = (mode: string): void => {
+    if (!panel) return;
+    panel.replaceChildren();
+    if (mode === "evidence") renderEvidenceBrowser(panel);
+    else if (mode === "audit") renderAudit(panel);
+    else if (mode === "trace") renderTrace(panel);
+    else renderGraph(panel);
+  };
+  container.querySelectorAll<HTMLButtonElement>("[data-biomed-advanced]").forEach((button) => {
+    button.addEventListener("click", () => {
+      container.querySelectorAll<HTMLButtonElement>("[data-biomed-advanced]").forEach((item) => item.classList.remove("is-active"));
+      button.classList.add("is-active");
+      renderMode(button.dataset.biomedAdvanced || "graph");
+    });
+  });
+  renderMode("graph");
 }
 
 function renderEvidenceBrowser(container: HTMLElement): void {
@@ -2703,30 +2827,50 @@ function workspaceAnswerPayload(container: HTMLElement, audited: boolean): Recor
 }
 
 function renderReview(container: HTMLElement): void {
-  container.innerHTML += `
-    <div class="biomed-section">
-      <div class="biomed-title">Run Evidence Review</div>
-      <div class="biomed-form">
-        <div class="biomed-row">
+  container.innerHTML = `
+    <div class="biomed-review-workspace">
+      <aside class="biomed-review-rail">
+        <div>
+          <div class="biomed-label">Evidence Review</div>
+          <h2>Run review</h2>
+          <p>Open a recent run, inspect claim cards, and jump to trace, provenance, or redacted graph export.</p>
+        </div>
+        <label class="biomed-field">
+          <span>Run ID</span>
           <input id="biomed-review-run-id" placeholder="answer run id" />
+        </label>
+        <label class="biomed-field">
+          <span>Claim Filter</span>
           <select id="biomed-review-filter">
-            <option value="all">all claims</option>
             <option value="needs_review">needs review</option>
-            <option value="supported">supported</option>
+            <option value="all">all claims</option>
+            <option value="mixed">mixed</option>
             <option value="contradicted">contradicted</option>
             <option value="unsupported">unsupported/qualified</option>
+            <option value="supported">supported</option>
           </select>
+        </label>
+        <div class="biomed-review-rail-actions">
           <button id="biomed-review-load-btn">Load Review</button>
           <button id="biomed-review-snapshot-btn">Snapshot</button>
         </div>
-      </div>
-      <div class="biomed-label">Recent Runs</div>
-      <div id="biomed-review-recent-runs" class="biomed-result"></div>
-      <div id="biomed-review-result" class="biomed-result"></div>
-      <div id="biomed-review-related" class="biomed-result"></div>
+        <div class="biomed-label">Recent Runs</div>
+        <div id="biomed-review-recent-runs" class="biomed-review-run-list"></div>
+      </aside>
+      <main id="biomed-review-result" class="biomed-review-main">
+        <div class="biomed-empty-state">
+          <div class="biomed-label">No run selected</div>
+          <h2>Select a recent run</h2>
+          <p>The review loads snapshot status, graph validation, claim cards, evidence methods, limitations, and audit action.</p>
+        </div>
+      </main>
+      <aside id="biomed-review-inspector" class="biomed-review-inspector">
+        ${renderReviewInspectorEmpty()}
+      </aside>
     </div>
   `;
   let currentReview: RunEvidenceReview | null = null;
+  let currentTrace: TracePayload | null = null;
 
   const currentFilter = (): string => (
     container.querySelector<HTMLSelectElement>("#biomed-review-filter")?.value || "all"
@@ -2736,7 +2880,7 @@ function renderReview(container: HTMLElement): void {
     container.querySelectorAll<HTMLButtonElement>("[data-review-related]").forEach((button) => {
       button.addEventListener("click", async () => {
         if (!currentReview) return;
-        const target = container.querySelector<HTMLElement>("#biomed-review-related");
+        const target = container.querySelector<HTMLElement>("#biomed-review-inspector");
         if (!target) return;
         const kind = button.dataset.reviewRelated || "";
         target.innerHTML = renderLoading(`Loading ${kind}...`);
@@ -2762,21 +2906,50 @@ function renderReview(container: HTMLElement): void {
         }
       });
     });
+    container.querySelectorAll<HTMLButtonElement>("[data-review-inspect-claim]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!currentReview) return;
+        const target = container.querySelector<HTMLElement>("#biomed-review-inspector");
+        const claimNodeId = button.dataset.reviewInspectClaim || "";
+        const claim = currentReview.claims.find((item) => item.claim_node_id === claimNodeId);
+        if (!target || !claim) return;
+        target.innerHTML = `
+          <div class="biomed-label">Claim Inspector</div>
+          ${renderBiomedEvidenceCard(claim.evidence_card)}
+        `;
+      });
+    });
+    container.querySelectorAll<HTMLButtonElement>("[data-review-json-claim]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!currentReview) return;
+        const target = container.querySelector<HTMLElement>("#biomed-review-inspector");
+        const claimNodeId = button.dataset.reviewJsonClaim || "";
+        const claim = currentReview.claims.find((item) => item.claim_node_id === claimNodeId);
+        if (!target || !claim) return;
+        target.innerHTML = `
+          <div class="biomed-label">Claim JSON</div>
+          <pre class="biomed-json biomed-json-tall">${escapeHtml(JSON.stringify(claim, null, 2))}</pre>
+        `;
+      });
+    });
   };
 
-  const paintReview = (review: RunEvidenceReview): void => {
+  const paintReview = (review: RunEvidenceReview, trace: TracePayload | null): void => {
     currentReview = review;
+    currentTrace = trace;
     const target = container.querySelector<HTMLElement>("#biomed-review-result");
     if (!target) return;
-    target.innerHTML = renderRunEvidenceReview(review, currentFilter());
+    target.innerHTML = renderReviewMainPanel(review, trace, currentFilter());
+    const inspector = container.querySelector<HTMLElement>("#biomed-review-inspector");
+    if (inspector) inspector.innerHTML = renderReviewInspectorEmpty();
     attachReviewActions();
   };
 
   const loadReview = async (runId: string): Promise<void> => {
     const target = container.querySelector<HTMLElement>("#biomed-review-result");
-    const related = container.querySelector<HTMLElement>("#biomed-review-related");
+    const inspector = container.querySelector<HTMLElement>("#biomed-review-inspector");
     if (!target || !runId) return;
-    if (related) related.replaceChildren();
+    if (inspector) inspector.innerHTML = renderReviewInspectorEmpty();
     target.innerHTML = renderLoading("Loading evidence review...");
     try {
       let review = await api<RunEvidenceReview>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`);
@@ -2785,7 +2958,8 @@ function renderReview(container: HTMLElement): void {
         await api(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/snapshot`, { method: "POST" });
         review = await api<RunEvidenceReview>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`);
       }
-      paintReview(review);
+      const trace = await api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`).catch(() => null);
+      paintReview(review, trace);
     } catch (error) {
       target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
@@ -2808,7 +2982,7 @@ function renderReview(container: HTMLElement): void {
     }
   });
   container.querySelector<HTMLSelectElement>("#biomed-review-filter")?.addEventListener("change", () => {
-    if (currentReview) paintReview(currentReview);
+    if (currentReview) paintReview(currentReview, currentTrace);
   });
   void loadReviewRecentRuns(container, loadReview);
 }
@@ -2836,6 +3010,12 @@ async function loadReviewRecentRuns(
         await onSelect(runId);
       });
     });
+    const firstRunId = data.items[0]?.run_id || "";
+    if (firstRunId) {
+      const input = container.querySelector<HTMLInputElement>("#biomed-review-run-id");
+      if (input && !input.value) input.value = firstRunId;
+      if (input?.value === firstRunId) await onSelect(firstRunId);
+    }
   } catch (error) {
     target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
   }
@@ -2894,7 +3074,11 @@ function renderGraph(container: HTMLElement): void {
         </label>
       </div>
       <div class="biomed-action-row">
-        <button id="biomed-graph-path-btn">Path</button>
+        <label class="biomed-check">
+          <input id="biomed-graph-path-directed" type="checkbox" />
+          <span>Directed path</span>
+        </label>
+        <button id="biomed-graph-path-btn">Related Path</button>
       </div>
       <div id="biomed-graph-result" class="biomed-result"></div>
       <div id="biomed-graph-inspector" class="biomed-result"></div>
@@ -2986,12 +3170,16 @@ function renderGraph(container: HTMLElement): void {
       const params = paramsFromControls(false);
       params.set("source", source);
       params.set("target", dest);
-      const path = await api<{ schema_version: string; path: string[]; nodes: BiomedEvidenceGraphNode[]; edges: BiomedEvidenceGraphEdge[] }>(`/api/biomed/graph/v1/path?${params.toString()}`);
+      if (container.querySelector<HTMLInputElement>("#biomed-graph-path-directed")?.checked) {
+        params.set("directed", "true");
+      }
+      const path = await api<{ schema_version: string; path_mode: string; path: string[]; nodes: BiomedEvidenceGraphNode[]; edges: BiomedEvidenceGraphEdge[] }>(`/api/biomed/graph/v1/path?${params.toString()}`);
       target.innerHTML = `
-        <div class="biomed-label">Path</div>
+        <div class="biomed-label">${path.path_mode === "directed" ? "Directed Path" : "Related Path"}</div>
         <div class="biomed-provenance">
           <div class="biomed-provenance-grid">
             <div><span>Schema</span><strong>${escapeHtml(path.schema_version)}</strong></div>
+            <div><span>Mode</span><strong>${escapeHtml(path.path_mode)}</strong></div>
             <div><span>Nodes</span><strong>${path.nodes.length}</strong></div>
             <div><span>Edges</span><strong>${path.edges.length}</strong></div>
           </div>
@@ -3333,6 +3521,8 @@ function renderBiomedDetail(
   }
   if (view === "graph") {
     renderGraph(root);
+  } else if (view === "advanced") {
+    renderAdvanced(root);
   } else if (view === "review") {
     renderReview(root);
   } else if (view === "projects") {

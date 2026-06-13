@@ -152,6 +152,8 @@ class EvidenceCardEvidence(BaseModel):
     paper_title: str | None = None
     confidence: str | None = None
     evidence_direction: str | None = None
+    retrieval_intent: str | None = None
+    extraction_mode: str | None = None
     limitations: list[str] = Field(default_factory=list)
     methods: list[str] = Field(default_factory=list)
 
@@ -163,6 +165,8 @@ class EvidenceCard(BaseModel):
     claim_node_id: str
     claim_text: str
     support_status: str = "not_assessed"
+    support_status_reason: str | None = None
+    support_counts: dict[str, int] = Field(default_factory=dict)
     evidence: list[EvidenceCardEvidence] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     audit_results: list[dict[str, Any]] = Field(default_factory=list)
