@@ -40,6 +40,7 @@ from plugins.biomed_evidence.schemas import (
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
+    RunReviewDecisionRequest,
     SavedToolChainTemplateRunRequest,
     SavedToolChainTemplateSaveRequest,
     WatchTopicCreateRequest,
@@ -94,6 +95,9 @@ _BIOMED_TOOL_NAMES = frozenset(
         "find_evidence_path",
         "export_evidence_graph_json",
         "get_run_evidence_review",
+        "record_run_review_decision",
+        "list_run_review_decisions",
+        "export_run_review_packet",
         "export_evidence_report",
         "validate_citation_support",
         "audit_biomedical_answer",
@@ -1849,6 +1853,102 @@ class BiomedEvidencePlugin(Plugin):
         if review is None:
             return _dump({"error_code": "unknown_run_id", "run_id": run_id})
         return _dump(review.model_dump(mode="json"))
+
+    @tool(
+        name="record_run_review_decision",
+        risk="read-write",
+        search_hint="record reviewer decision accept needs more evidence overclaim reject claim",
+    )
+    async def record_run_review_decision(
+        self,
+        event,
+        run_id: str,
+        decision: Literal[
+            "accept",
+            "needs_more_evidence",
+            "flag_overclaim",
+            "reject",
+        ],
+        claim_id: str | None = None,
+        claim_node_id: str | None = None,
+        reviewer_note: str | None = None,
+        decision_source: Literal["api", "dashboard", "tool"] = "tool",
+        reviewer_id: str | None = None,
+    ) -> str:
+        """Record a reviewer decision for one claim in a run evidence review."""
+        try:
+            result = self._service.record_run_review_decision(
+                run_id,
+                RunReviewDecisionRequest(
+                    claim_id=claim_id,
+                    claim_node_id=claim_node_id,
+                    decision=decision,
+                    reviewer_note=reviewer_note,
+                    decision_source=decision_source,
+                    reviewer_id=reviewer_id,
+                ),
+            )
+        except ValueError as exc:
+            return _dump(
+                {
+                    "error_code": (
+                        "clinical_boundary"
+                        if "clinical refusal" in str(exc)
+                        else "invalid_review_decision"
+                    ),
+                    "message": str(exc),
+                    "run_id": run_id,
+                }
+            )
+        if result is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="list_run_review_decisions",
+        risk="read-only",
+        search_hint="list persisted reviewer decisions for biomedical answer run",
+    )
+    async def list_run_review_decisions(
+        self,
+        event,
+        run_id: str,
+        claim_id: str = "",
+    ) -> str:
+        """List reviewer decisions recorded for an answer run."""
+        decisions = self._service.list_run_review_decisions(
+            run_id,
+            claim_id=claim_id,
+        )
+        if decisions is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(
+            {
+                "items": [item.model_dump(mode="json") for item in decisions],
+                "total": len(decisions),
+                "run_id": run_id,
+            }
+        )
+
+    @tool(
+        name="export_run_review_packet",
+        risk="read-only",
+        search_hint="export biomedical run evidence review packet decisions policy",
+    )
+    async def export_run_review_packet(
+        self,
+        event,
+        run_id: str,
+        include_graph: bool = False,
+    ) -> str:
+        """Export a run evidence review packet with reviewer decisions."""
+        packet = self._service.export_run_review_packet(
+            run_id,
+            include_graph=include_graph,
+        )
+        if packet is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(packet.model_dump(mode="json"))
 
     @tool(
         name="export_evidence_report",

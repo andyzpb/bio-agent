@@ -107,6 +107,9 @@ Registered agent tools:
 - `find_evidence_path`
 - `export_evidence_graph_json`
 - `get_run_evidence_review`
+- `record_run_review_decision`
+- `list_run_review_decisions`
+- `export_run_review_packet`
 - `run_multi_pass_literature_search`
 - `extract_evidence_batch`
 - `analyze_coverage_gaps`
@@ -295,15 +298,20 @@ Legacy runs without snapshots can be backfilled with:
 POST /api/biomed/answer-runs/{run_id}/evidence-review/snapshot
 ```
 
-Read-only review access:
+Review access and decision loop:
 
 ```text
 GET /api/biomed/answer-runs/{run_id}/evidence-review
+POST /api/biomed/answer-runs/{run_id}/evidence-review/decisions
+GET /api/biomed/answer-runs/{run_id}/evidence-review/decisions
+GET /api/biomed/answer-runs/{run_id}/evidence-review/packet
 ```
 
-The `get_run_evidence_review` tool exposes the same read-only contract to agent
-workflows. Snapshot creation is intentionally not exposed as an agent tool in
-this phase.
+The `get_run_evidence_review`, `record_run_review_decision`,
+`list_run_review_decisions`, and `export_run_review_packet` tools expose the
+same review loop to agent workflows. Reviewer notes are persisted as QA
+metadata and are never treated as biomedical evidence. Snapshot creation is
+intentionally not exposed as an agent tool in this phase.
 
 ## Dashboard
 

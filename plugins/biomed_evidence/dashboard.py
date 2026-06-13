@@ -37,6 +37,7 @@ from plugins.biomed_evidence.schemas import (
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
+    RunReviewDecisionRequest,
     SavedToolChainTemplateRunRequest,
     SavedToolChainTemplateSaveRequest,
     SearchBiomedicalLiteratureRequest,
@@ -530,6 +531,62 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             ),
             "validation": snapshot.validation,
         }
+
+    @app.get("/api/biomed/answer-runs/{run_id}/evidence-review/decisions")
+    def list_answer_evidence_review_decisions(
+        run_id: str,
+        claim_id: str = "",
+    ) -> dict[str, Any]:
+        decisions = service.list_run_review_decisions(run_id, claim_id=claim_id)
+        if decisions is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return {
+            "items": [item.model_dump(mode="json") for item in decisions],
+            "total": len(decisions),
+            "run_id": run_id,
+        }
+
+    @app.post("/api/biomed/answer-runs/{run_id}/evidence-review/decisions")
+    def create_answer_evidence_review_decision(
+        run_id: str,
+        payload: RunReviewDecisionRequest,
+    ) -> dict[str, Any]:
+        try:
+            decision = service.record_run_review_decision(run_id, payload)
+        except ValueError as exc:
+            detail = {
+                "error_code": "invalid_review_decision",
+                "message": str(exc),
+                "run_id": run_id,
+            }
+            if "clinical refusal" in str(exc):
+                detail["error_code"] = "clinical_boundary"
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if decision is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return decision.model_dump(mode="json")
+
+    @app.get("/api/biomed/answer-runs/{run_id}/evidence-review/packet")
+    def export_answer_evidence_review_packet(
+        run_id: str,
+        include_graph: bool = False,
+    ) -> dict[str, Any]:
+        packet = service.export_run_review_packet(
+            run_id,
+            include_graph=include_graph,
+        )
+        if packet is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return packet.model_dump(mode="json")
 
     @app.get("/api/biomed/answer-runs/{run_id}/math-signals")
     def get_answer_math_signals(run_id: str) -> dict[str, Any]:

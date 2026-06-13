@@ -36,6 +36,13 @@ ProjectReviewItemType = Literal[
     "needs_expert_review",
 ]
 ProjectEvidenceBriefFormat = Literal["markdown", "json"]
+RunReviewDecisionValue = Literal[
+    "accept",
+    "needs_more_evidence",
+    "flag_overclaim",
+    "reject",
+]
+RunReviewDecisionSource = Literal["api", "dashboard", "tool"]
 ClaimType = Literal[
     "background",
     "association",
@@ -108,6 +115,7 @@ TraceStepName = Literal[
     "advisory_verify",
     "post_audit",
     "revise",
+    "review_decision",
     "finalize",
 ]
 TraceStepStatus = Literal["started", "completed", "skipped", "failed"]
@@ -1506,6 +1514,40 @@ class RunEvidenceReviewSummary(BaseModel):
     validation_warning_count: int = 0
     recommended_audit_action: AuditRecommendedAction | None = None
     clinical_refusal: bool = False
+    reviewer_accept: int = 0
+    reviewer_needs_more_evidence: int = 0
+    reviewer_flag_overclaim: int = 0
+    reviewer_reject: int = 0
+
+
+class RunReviewDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str | None = None
+    claim_node_id: str | None = None
+    decision: RunReviewDecisionValue
+    reviewer_note: str | None = None
+    decision_source: RunReviewDecisionSource = "api"
+    reviewer_id: str | None = None
+
+
+class RunReviewDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str
+    run_id: str
+    claim_id: str
+    claim_node_id: str
+    snapshot_id: str | None = None
+    audit_id: str | None = None
+    decision: RunReviewDecisionValue
+    reviewer_note: str | None = None
+    decision_source: RunReviewDecisionSource = "api"
+    reviewer_id: str | None = None
+    paper_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
 
 
 class RunEvidenceReviewClaim(BaseModel):
@@ -1524,6 +1566,7 @@ class RunEvidenceReviewClaim(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     limitation_count: int = 0
     review_action: Literal["accept", "needs_review", "needs_revision"] = "needs_review"
+    latest_decision: RunReviewDecision | None = None
     evidence_card: dict[str, Any] = Field(default_factory=dict)
     links: dict[str, str] = Field(default_factory=dict)
 
@@ -1542,6 +1585,17 @@ class RunEvidenceReview(BaseModel):
     validation: dict[str, Any] = Field(default_factory=dict)
     graph: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+class RunReviewPacket(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "biomed-review-packet-v1"
+    run_id: str
+    review: RunEvidenceReview
+    decisions: list[RunReviewDecision] = Field(default_factory=list)
+    exported_at: str
+    policy: dict[str, object] = Field(default_factory=dict)
 
 
 class AdvisoryClaimReview(BaseModel):

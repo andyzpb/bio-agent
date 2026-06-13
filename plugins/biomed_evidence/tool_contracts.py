@@ -114,6 +114,8 @@ def _register_defaults() -> None:
         "find_evidence_path",
         "export_evidence_graph_json",
         "get_run_evidence_review",
+        "list_run_review_decisions",
+        "export_run_review_packet",
         "export_evidence_report",
         "list_biomed_projects",
         "list_project_paper_decisions",
@@ -142,6 +144,7 @@ def _register_defaults() -> None:
         "delete_research_watch_topic",
         "save_biomed_workflow_template",
         "delete_biomed_workflow_template",
+        "record_run_review_decision",
     ):
         register_release_tool_contract(
             tool_name=tool_name,

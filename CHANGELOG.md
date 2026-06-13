@@ -1,5 +1,29 @@
 # Changelog
 
+## Release 1.6 - 2026-06-13
+
+Release 1.6 turns Run Evidence Review into a traceable reviewer decision loop.
+
+### Added
+
+- Persisted run review decisions for claim cards: `accept`,
+  `needs_more_evidence`, `flag_overclaim`, and `reject`.
+- Reviewer notes, decision source, linked claim/evidence/paper IDs, audit ID,
+  snapshot ID, and timestamps for each decision.
+- API and agent tools for recording decisions, listing decisions, and exporting
+  review packets.
+- `review_decision` trace events with explicit `reviewer_note_as_evidence=false`
+  metadata.
+- Review workspace controls for recording claim decisions and exporting review
+  packets.
+
+### Safety
+
+- Clinical refusal runs block claim review decisions, preserving the
+  research-only boundary.
+- Review packets preserve reviewer notes as QA artifacts only; they do not
+  become biomedical evidence.
+
 ## Release 1.5 - 2026-06-13
 
 Release 1.5 makes Biomedical Evidence a review-first evidence workspace rather

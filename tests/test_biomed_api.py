@@ -247,6 +247,67 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert review_payload["claims"]
         assert review_payload["claims"][0]["evidence_card"]["claim_text"]
         assert review_payload["claims"][0]["links"]["trace"].endswith("/trace")
+        first_review_claim = review_payload["claims"][0]
+
+        review_decision = client.post(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review/decisions",
+            json={
+                "claim_id": first_review_claim["claim_id"],
+                "claim_node_id": first_review_claim["claim_node_id"],
+                "decision": "needs_more_evidence",
+                "reviewer_note": "Need an additional independent cohort before accepting.",
+                "decision_source": "api",
+            },
+        )
+        assert review_decision.status_code == 200
+        review_decision_payload = review_decision.json()
+        assert review_decision_payload["decision"] == "needs_more_evidence"
+        assert review_decision_payload["claim_id"] == first_review_claim["claim_id"]
+        assert review_decision_payload["reviewer_note"]
+        assert review_decision_payload["evidence_ids"]
+
+        review_after_decision = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review",
+        )
+        assert review_after_decision.status_code == 200
+        review_after_decision_payload = review_after_decision.json()
+        decided_claim = next(
+            claim
+            for claim in review_after_decision_payload["claims"]
+            if claim["claim_id"] == first_review_claim["claim_id"]
+        )
+        assert decided_claim["latest_decision"]["decision"] == "needs_more_evidence"
+        assert (
+            review_after_decision_payload["summary"]["reviewer_needs_more_evidence"]
+            == 1
+        )
+
+        review_decisions = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review/decisions",
+        )
+        assert review_decisions.status_code == 200
+        assert review_decisions.json()["total"] == 1
+
+        review_packet = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review/packet",
+        )
+        assert review_packet.status_code == 200
+        review_packet_payload = review_packet.json()
+        assert review_packet_payload["schema_version"] == "biomed-review-packet-v1"
+        assert review_packet_payload["decisions"][0]["decision_id"] == (
+            review_decision_payload["decision_id"]
+        )
+        assert review_packet_payload["policy"]["reviewer_notes_are_evidence"] is False
+
+        trace_after_decision = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/trace",
+        )
+        assert trace_after_decision.status_code == 200
+        assert any(
+            step["step"] == "review_decision"
+            and step["metadata"]["reviewer_note_as_evidence"] is False
+            for step in trace_after_decision.json()["trace"]
+        )
 
         review_with_graph = client.get(
             f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review",
@@ -770,6 +831,16 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert clinical_review_payload["summary"]["clinical_refusal"] is True
         assert clinical_review_payload["summary"]["total_claims"] == 0
         assert clinical_review_payload["claims"] == []
+        clinical_decision = client.post(
+            f"/api/biomed/answer-runs/{clinical_run_id}/evidence-review/decisions",
+            json={
+                "claim_id": "claim:clinical-refusal",
+                "decision": "accept",
+                "reviewer_note": "Should not be accepted as biomedical evidence.",
+            },
+        )
+        assert clinical_decision.status_code == 400
+        assert clinical_decision.json()["detail"]["error_code"] == "clinical_boundary"
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:

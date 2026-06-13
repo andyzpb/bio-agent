@@ -680,6 +680,29 @@ interface RunEvidenceReviewSummary {
   validation_warning_count: number;
   recommended_audit_action?: string | null;
   clinical_refusal: boolean;
+  reviewer_accept: number;
+  reviewer_needs_more_evidence: number;
+  reviewer_flag_overclaim: number;
+  reviewer_reject: number;
+}
+
+type RunReviewDecisionValue = "accept" | "needs_more_evidence" | "flag_overclaim" | "reject";
+
+interface RunReviewDecision {
+  decision_id: string;
+  run_id: string;
+  claim_id: string;
+  claim_node_id: string;
+  snapshot_id?: string | null;
+  audit_id?: string | null;
+  decision: RunReviewDecisionValue;
+  reviewer_note?: string | null;
+  decision_source: "api" | "dashboard" | "tool";
+  reviewer_id?: string | null;
+  paper_ids: string[];
+  evidence_ids: string[];
+  created_at: string;
+  updated_at: string;
 }
 
 interface RunEvidenceReviewClaim {
@@ -696,6 +719,7 @@ interface RunEvidenceReviewClaim {
   evidence_ids: string[];
   limitation_count: number;
   review_action: "accept" | "needs_review" | "needs_revision";
+  latest_decision?: RunReviewDecision | null;
   evidence_card: BiomedEvidenceCard;
   links: Record<string, string>;
 }
@@ -1006,6 +1030,8 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
         <div><span>Clinical</span><strong>${summary.clinical_refusal ? "refusal" : "research"}</strong></div>
         <div><span>Claims</span><strong>${summary.total_claims}</strong></div>
         <div><span>Needs Review</span><strong>${review.claims.filter((claim) => claim.review_action !== "accept").length}</strong></div>
+        <div><span>Reviewer Accept</span><strong>${summary.reviewer_accept}</strong></div>
+        <div><span>Reviewer Flags</span><strong>${summary.reviewer_needs_more_evidence + summary.reviewer_flag_overclaim + summary.reviewer_reject}</strong></div>
       </div>
       ${review.snapshot.graph_hash ? `<div class="biomed-watch-meta">graph hash ${compactCode(review.snapshot.graph_hash)}</div>` : ""}
       ${review.snapshot.snapshot_id ? `<div class="biomed-watch-meta">snapshot ${compactCode(review.snapshot.snapshot_id)}</div>` : ""}
@@ -1028,6 +1054,7 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
       <button data-review-related="graph">Raw Graph</button>
       <button data-review-related="trace">Trace</button>
       <button data-review-related="provenance">Provenance</button>
+      <button data-review-related="packet">Review Packet</button>
       <button data-review-related="export">Export JSON</button>
     </div>
     ${summary.clinical_refusal && !claims.length ? `
@@ -1038,11 +1065,12 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
     ` : ""}
     <div class="biomed-review-claim-list">
       ${claims.map((claim) => `
-        <article class="biomed-review-claim-card ${claim.review_action !== "accept" ? "is-failed" : ""}">
+        <article class="biomed-review-claim-card ${claim.review_action !== "accept" ? "is-failed" : ""}" data-review-claim-card="${escapeHtml(claim.claim_node_id)}">
           <div class="biomed-audit-row-head">
             ${pill(claim.review_action)}
             ${pill(claim.support_status)}
             ${claim.audit_verdict ? pill(claim.audit_verdict) : ""}
+            ${claim.latest_decision ? pill(`reviewer_${claim.latest_decision.decision}`) : ""}
             <code>${escapeHtml(claim.claim_id)}</code>
           </div>
           <div class="biomed-evidence-claim">${escapeHtml(claim.claim_text)}</div>
@@ -1051,7 +1079,23 @@ function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): str
           </div>
           ${claim.support_status_reason ? `<div class="biomed-evidence-finding">${escapeHtml(claim.support_status_reason)}</div>` : ""}
           ${Object.keys(claim.support_counts || {}).length ? `<div class="biomed-watch-meta">support counts ${escapeHtml(JSON.stringify(claim.support_counts))}</div>` : ""}
+          ${claim.latest_decision ? `
+            <div class="biomed-review-decision-state">
+              <strong>${escapeHtml(claim.latest_decision.decision)}</strong>
+              <span>${escapeHtml(claim.latest_decision.updated_at)} · ${escapeHtml(claim.latest_decision.decision_source)}</span>
+              ${claim.latest_decision.reviewer_note ? `<p>${escapeHtml(claim.latest_decision.reviewer_note)}</p>` : ""}
+            </div>
+          ` : ""}
           ${claim.paper_ids.length ? `<div class="biomed-label">Papers</div>${renderList(claim.paper_ids)}` : ""}
+          <div class="biomed-review-decision-panel">
+            <textarea data-review-note placeholder="Reviewer note">${escapeHtml(claim.latest_decision?.reviewer_note || "")}</textarea>
+            <div class="biomed-action-row">
+              <button data-review-decision="accept" data-review-decision-claim="${escapeHtml(claim.claim_node_id)}">Accept</button>
+              <button data-review-decision="needs_more_evidence" data-review-decision-claim="${escapeHtml(claim.claim_node_id)}">Need More Evidence</button>
+              <button data-review-decision="flag_overclaim" data-review-decision-claim="${escapeHtml(claim.claim_node_id)}">Flag Overclaim</button>
+              <button data-review-decision="reject" data-review-decision-claim="${escapeHtml(claim.claim_node_id)}">Reject</button>
+            </div>
+          </div>
           <div class="biomed-action-row">
             <button data-review-inspect-claim="${escapeHtml(claim.claim_node_id)}">Evidence Card</button>
             <button data-review-json-claim="${escapeHtml(claim.claim_node_id)}">Inspect JSON</button>
@@ -2894,6 +2938,12 @@ function renderReview(container: HTMLElement): void {
           } else if (kind === "provenance") {
             const envelope = await api<ReleaseToolEnvelope<ProvenanceGraphResult>>(`/api/biomed/answer-runs/${encodeURIComponent(currentReview.run_id)}/provenance`);
             target.innerHTML = `<div class="biomed-label">Provenance</div>${renderProvenanceResult(envelope)}`;
+          } else if (kind === "packet") {
+            const packet = await api<Record<string, unknown>>(`/api/biomed/answer-runs/${encodeURIComponent(currentReview.run_id)}/evidence-review/packet`);
+            target.innerHTML = `
+              <div class="biomed-label">Review Packet</div>
+              <pre class="biomed-json biomed-json-tall">${escapeHtml(JSON.stringify(packet, null, 2))}</pre>
+            `;
           } else {
             const graph = await api<BiomedEvidenceGraphV1>(`/api/biomed/graph/v1/export/json?run_id=${encodeURIComponent(currentReview.run_id)}&validate=true`);
             target.innerHTML = `
@@ -2930,6 +2980,43 @@ function renderReview(container: HTMLElement): void {
           <div class="biomed-label">Claim JSON</div>
           <pre class="biomed-json biomed-json-tall">${escapeHtml(JSON.stringify(claim, null, 2))}</pre>
         `;
+      });
+    });
+    container.querySelectorAll<HTMLButtonElement>("[data-review-decision]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        if (!currentReview) return;
+        const claimNodeId = button.dataset.reviewDecisionClaim || "";
+        const decision = button.dataset.reviewDecision as RunReviewDecisionValue | undefined;
+        const claim = currentReview.claims.find((item) => item.claim_node_id === claimNodeId);
+        const target = container.querySelector<HTMLElement>("#biomed-review-inspector");
+        if (!claim || !decision || !target) return;
+        const card = button.closest<HTMLElement>("[data-review-claim-card]");
+        const note = card?.querySelector<HTMLTextAreaElement>("[data-review-note]")?.value.trim() || "";
+        target.innerHTML = renderLoading("Recording review decision...");
+        try {
+          const saved = await api<RunReviewDecision>(`/api/biomed/answer-runs/${encodeURIComponent(currentReview.run_id)}/evidence-review/decisions`, {
+            method: "POST",
+            body: JSON.stringify({
+              claim_id: claim.claim_id,
+              claim_node_id: claim.claim_node_id,
+              decision,
+              reviewer_note: note || null,
+              decision_source: "dashboard",
+            }),
+          });
+          await loadReview(currentReview.run_id);
+          const refreshedInspector = container.querySelector<HTMLElement>("#biomed-review-inspector");
+          if (refreshedInspector) {
+            refreshedInspector.innerHTML = `
+              <div class="biomed-label">Review Decision</div>
+              <h3>${escapeHtml(saved.decision)}</h3>
+              <p>${escapeHtml(saved.claim_id)}</p>
+              <pre class="biomed-json">${escapeHtml(JSON.stringify(saved, null, 2))}</pre>
+            `;
+          }
+        } catch (error) {
+          target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+        }
       });
     });
   };

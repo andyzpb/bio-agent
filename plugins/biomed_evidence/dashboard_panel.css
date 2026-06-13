@@ -1459,6 +1459,48 @@
   margin-top: 2px;
 }
 
+.biomed-review-decision-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #ececea;
+  border-radius: 8px;
+  background: #fcfcfb;
+}
+
+.biomed-review-decision-panel textarea {
+  min-height: 58px;
+  resize: vertical;
+  border: 1px solid #deded9;
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: var(--text, #171717);
+  background: #fff;
+  font: inherit;
+  line-height: 1.4;
+}
+
+.biomed-review-decision-state {
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  border-left: 3px solid var(--accent, #1f6f68);
+  background: #f7f8f7;
+}
+
+.biomed-review-decision-state strong {
+  color: var(--text, #171717);
+  font-size: 13px;
+}
+
+.biomed-review-decision-state span,
+.biomed-review-decision-state p {
+  margin: 0;
+  color: var(--text-soft, #5f6664);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .biomed-review-status,
 .biomed-review-counts {
   padding: 13px;

@@ -25,6 +25,7 @@ from plugins.biomed_evidence.schemas import (
     ProjectPaperDecision,
     ProjectReviewQueueItem,
     RetrievalManifest,
+    RunReviewDecision,
     SavedToolChainTemplate,
     WatchDecisionDetail,
     WatchSnapshot,
@@ -412,6 +413,70 @@ class BiomedStorage:
                 params,
             ).fetchone()
         return _evidence_graph_snapshot_from_row(row)
+
+    def save_run_review_decision(
+        self,
+        decision: RunReviewDecision,
+    ) -> RunReviewDecision:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_review_decisions(
+                    decision_id, run_id, claim_id, claim_node_id, snapshot_id,
+                    audit_id, decision, reviewer_note, decision_source, reviewer_id,
+                    paper_ids_json, evidence_ids_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(decision_id) DO UPDATE SET
+                    decision=excluded.decision,
+                    reviewer_note=excluded.reviewer_note,
+                    decision_source=excluded.decision_source,
+                    reviewer_id=excluded.reviewer_id,
+                    paper_ids_json=excluded.paper_ids_json,
+                    evidence_ids_json=excluded.evidence_ids_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    decision.decision_id,
+                    decision.run_id,
+                    decision.claim_id,
+                    decision.claim_node_id,
+                    decision.snapshot_id,
+                    decision.audit_id,
+                    decision.decision,
+                    decision.reviewer_note,
+                    decision.decision_source,
+                    decision.reviewer_id,
+                    _json(decision.paper_ids),
+                    _json(decision.evidence_ids),
+                    decision.created_at,
+                    decision.updated_at,
+                ),
+            )
+            self._db.commit()
+        return decision
+
+    def list_run_review_decisions(
+        self,
+        run_id: str,
+        *,
+        claim_id: str = "",
+    ) -> list[RunReviewDecision]:
+        clauses = ["run_id = ?"]
+        params: list[Any] = [run_id]
+        if claim_id.strip():
+            clauses.append("claim_id = ?")
+            params.append(claim_id.strip())
+        with self._lock:
+            rows = self._db.execute(
+                f"""
+                SELECT *
+                FROM biomed_review_decisions
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at ASC, decision_id ASC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_run_review_decision_from_row(row) for row in rows]
 
     def save_workflow_template(self, template: SavedToolChainTemplate) -> None:
         now = _now_iso()
@@ -924,6 +989,7 @@ class BiomedStorage:
                         WHEN 'revise' THEN 9
                         WHEN 'post_audit' THEN 10
                         WHEN 'finalize' THEN 11
+                        WHEN 'review_decision' THEN 12
                         ELSE 99
                     END,
                     created_at ASC
@@ -1771,6 +1837,25 @@ class BiomedStorage:
             );
             CREATE INDEX IF NOT EXISTS idx_biomed_graph_snapshots_run
                 ON biomed_evidence_graph_snapshots(run_id, created_at);
+            CREATE TABLE IF NOT EXISTS biomed_review_decisions(
+                decision_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL,
+                claim_node_id TEXT NOT NULL,
+                snapshot_id TEXT,
+                audit_id TEXT,
+                decision TEXT NOT NULL,
+                reviewer_note TEXT,
+                decision_source TEXT NOT NULL DEFAULT 'api',
+                reviewer_id TEXT,
+                paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES biomed_answer_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_biomed_review_decisions_run
+                ON biomed_review_decisions(run_id, created_at);
             CREATE TABLE IF NOT EXISTS biomed_workflow_templates(
                 template_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -2135,6 +2220,25 @@ def _evidence_graph_snapshot_from_row(
         source_ids=_json_dict(row["source_ids_json"]),
         created_at=str(row["created_at"]),
         snapshot_required=False,
+    )
+
+
+def _run_review_decision_from_row(row: sqlite3.Row) -> RunReviewDecision:
+    return RunReviewDecision(
+        decision_id=str(row["decision_id"]),
+        run_id=str(row["run_id"]),
+        claim_id=str(row["claim_id"]),
+        claim_node_id=str(row["claim_node_id"]),
+        snapshot_id=row["snapshot_id"],
+        audit_id=row["audit_id"],
+        decision=row["decision"],
+        reviewer_note=row["reviewer_note"],
+        decision_source=row["decision_source"],
+        reviewer_id=row["reviewer_id"],
+        paper_ids=_json_list(row["paper_ids_json"]),
+        evidence_ids=_json_list(row["evidence_ids_json"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 

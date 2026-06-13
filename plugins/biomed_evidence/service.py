@@ -138,6 +138,9 @@ from plugins.biomed_evidence.schemas import (
     RunEvidenceReview,
     RunEvidenceReviewClaim,
     RunEvidenceReviewSummary,
+    RunReviewDecision,
+    RunReviewDecisionRequest,
+    RunReviewPacket,
     SavedToolChainTemplate,
     SavedToolChainTemplateListResult,
     SavedToolChainTemplateRunRequest,
@@ -3922,11 +3925,22 @@ class BiomedEvidenceService:
             run_id=clean_run_id,
             audit=audit,
         )
+        latest_decisions = _latest_review_decisions_by_claim(
+            self.storage.list_run_review_decisions(clean_run_id)
+        )
+        if latest_decisions:
+            claims = [
+                claim.model_copy(
+                    update={"latest_decision": latest_decisions.get(claim.claim_id)}
+                )
+                for claim in claims
+            ]
         summary = _review_summary(
             graph_obj,
             claims=claims,
             validation=validation_json,
             audit=audit,
+            latest_decisions=latest_decisions,
         )
         return RunEvidenceReview(
             schema_version=EVIDENCE_REVIEW_SCHEMA_VERSION,
@@ -3940,6 +3954,117 @@ class BiomedEvidenceService:
             validation=validation_json,
             graph=graph_json if include_graph else None,
             warnings=warnings,
+        )
+
+    def record_run_review_decision(
+        self,
+        run_id: str,
+        request: RunReviewDecisionRequest,
+    ) -> RunReviewDecision | None:
+        clean_run_id = run_id.strip()
+        review = self.get_run_evidence_review(clean_run_id)
+        if review is None:
+            return None
+        if review.summary.clinical_refusal:
+            raise ValueError(
+                "clinical refusal runs do not accept claim review decisions"
+            )
+        claim = _find_review_claim(
+            review.claims,
+            claim_id=request.claim_id,
+            claim_node_id=request.claim_node_id,
+        )
+        if claim is None:
+            raise ValueError("claim not found in run evidence review")
+        now = _now_iso()
+        note = request.reviewer_note.strip() if request.reviewer_note else None
+        if note == "":
+            note = None
+        decision = RunReviewDecision(
+            decision_id=f"biomed-review-decision-{uuid.uuid4().hex[:12]}",
+            run_id=clean_run_id,
+            claim_id=claim.claim_id,
+            claim_node_id=claim.claim_node_id,
+            snapshot_id=review.snapshot.snapshot_id,
+            audit_id=review.audit_id,
+            decision=request.decision,
+            reviewer_note=note[:4000] if note else None,
+            decision_source=request.decision_source,
+            reviewer_id=(
+                request.reviewer_id.strip()[:200] if request.reviewer_id else None
+            ),
+            paper_ids=claim.paper_ids,
+            evidence_ids=claim.evidence_ids,
+            created_at=now,
+            updated_at=now,
+        )
+        saved = self.storage.save_run_review_decision(decision)
+        self.storage.save_agent_trace_steps(
+            [
+                AgentTraceStep(
+                    step_id=_trace_step_id(clean_run_id, "review_decision"),
+                    run_id=clean_run_id,
+                    step="review_decision",
+                    status="completed",
+                    input_summary=(
+                        f"{saved.decision} decision for claim {saved.claim_id}"
+                    ),
+                    output_summary="Reviewer decision recorded.",
+                    warnings=[],
+                    metadata={
+                        "decision_id": saved.decision_id,
+                        "decision": saved.decision,
+                        "claim_id": saved.claim_id,
+                        "claim_node_id": saved.claim_node_id,
+                        "snapshot_id": saved.snapshot_id,
+                        "audit_id": saved.audit_id,
+                        "decision_source": saved.decision_source,
+                        "reviewer_note_present": bool(saved.reviewer_note),
+                        "reviewer_note_as_evidence": False,
+                        "memory_as_evidence": False,
+                    },
+                    created_at=now,
+                )
+            ]
+        )
+        return saved
+
+    def list_run_review_decisions(
+        self,
+        run_id: str,
+        *,
+        claim_id: str = "",
+    ) -> list[RunReviewDecision] | None:
+        clean_run_id = run_id.strip()
+        if self.storage.get_answer_run(clean_run_id) is None:
+            return None
+        return self.storage.list_run_review_decisions(
+            clean_run_id,
+            claim_id=claim_id,
+        )
+
+    def export_run_review_packet(
+        self,
+        run_id: str,
+        *,
+        include_graph: bool = False,
+    ) -> RunReviewPacket | None:
+        clean_run_id = run_id.strip()
+        review = self.get_run_evidence_review(clean_run_id, include_graph=include_graph)
+        if review is None:
+            return None
+        decisions = self.storage.list_run_review_decisions(clean_run_id)
+        return RunReviewPacket(
+            run_id=clean_run_id,
+            review=review,
+            decisions=decisions,
+            exported_at=_now_iso(),
+            policy={
+                "research_only": True,
+                "reviewer_notes_are_evidence": False,
+                "memory_as_evidence": False,
+                "clinical_refusal": review.summary.clinical_refusal,
+            },
         )
 
     def create_watch(self, request: WatchTopicCreateRequest) -> WatchTopic:
@@ -8164,6 +8289,7 @@ def _review_summary(
     claims: list[RunEvidenceReviewClaim],
     validation: dict[str, Any],
     audit: CitationAuditResult | None,
+    latest_decisions: dict[str, RunReviewDecision] | None = None,
 ) -> RunEvidenceReviewSummary:
     counts = {
         "supported": 0,
@@ -8176,6 +8302,14 @@ def _review_summary(
     for claim in claims:
         bucket = _support_status_bucket(claim.support_status)
         counts[bucket] += 1
+    decision_counts = {
+        "accept": 0,
+        "needs_more_evidence": 0,
+        "flag_overclaim": 0,
+        "reject": 0,
+    }
+    for decision in (latest_decisions or {}).values():
+        decision_counts[decision.decision] += 1
     clinical_refusal = any(
         node.type == "AnswerRun" and bool(node.properties.get("clinical_refusal"))
         for node in graph.nodes
@@ -8195,6 +8329,10 @@ def _review_summary(
             audit.recommended_action if audit is not None else None
         ),
         clinical_refusal=clinical_refusal,
+        reviewer_accept=decision_counts["accept"],
+        reviewer_needs_more_evidence=decision_counts["needs_more_evidence"],
+        reviewer_flag_overclaim=decision_counts["flag_overclaim"],
+        reviewer_reject=decision_counts["reject"],
     )
 
 
@@ -8202,6 +8340,8 @@ def _review_links(run_id: str) -> dict[str, str]:
     return {
         "review": f"/api/biomed/answer-runs/{run_id}/evidence-review",
         "snapshot": f"/api/biomed/answer-runs/{run_id}/evidence-review/snapshot",
+        "decisions": f"/api/biomed/answer-runs/{run_id}/evidence-review/decisions",
+        "packet": f"/api/biomed/answer-runs/{run_id}/evidence-review/packet",
         "graph": f"/api/biomed/answer-runs/{run_id}/evidence-graph",
         "graph_export": f"/api/biomed/graph/v1/export/json?run_id={run_id}",
         "trace": f"/api/biomed/answer-runs/{run_id}/trace",
@@ -8242,6 +8382,38 @@ def _claim_review_action(
     ):
         return "accept"
     return "needs_review"
+
+
+def _latest_review_decisions_by_claim(
+    decisions: Iterable[RunReviewDecision],
+) -> dict[str, RunReviewDecision]:
+    latest: dict[str, RunReviewDecision] = {}
+    for decision in decisions:
+        current = latest.get(decision.claim_id)
+        if current is None or (decision.created_at, decision.decision_id) >= (
+            current.created_at,
+            current.decision_id,
+        ):
+            latest[decision.claim_id] = decision
+    return latest
+
+
+def _find_review_claim(
+    claims: Iterable[RunEvidenceReviewClaim],
+    *,
+    claim_id: str | None,
+    claim_node_id: str | None,
+) -> RunEvidenceReviewClaim | None:
+    clean_claim_id = (claim_id or "").strip()
+    clean_claim_node_id = (claim_node_id or "").strip()
+    if not clean_claim_id and not clean_claim_node_id:
+        return None
+    for claim in claims:
+        if clean_claim_id and claim.claim_id == clean_claim_id:
+            return claim
+        if clean_claim_node_id and claim.claim_node_id == clean_claim_node_id:
+            return claim
+    return None
 
 
 def _normalize_review_text(value: str) -> str:

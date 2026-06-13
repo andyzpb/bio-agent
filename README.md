@@ -183,13 +183,13 @@ Completed baseline:
   complete evidence cards, and related-vs-directed path semantics;
 - Release 1.5 Review-first Evidence Graph workspace with compact Codex-style
   shell, recent-run review, Advanced raw graph/audit/trace access, and
-  screenshot-validated desktop/mobile layouts.
+  screenshot-validated desktop/mobile layouts;
+- Release 1.6 Review Decision Loop with persisted accept/needs-more-evidence/
+  flag-overclaim/reject decisions, reviewer notes, trace events, and review
+  packet export.
 
 Next:
 
-- Release 1.6 adds a Review Decision Loop: accept, needs-more-evidence,
-  flag-overclaim, reject, reviewer notes, persisted decisions, trace events, and
-  review packet export.
 - Release 1.7 adds graph snapshot lifecycle: backfill, stale snapshot detection,
   snapshot diffs, and review queue capture.
 - Release 1.8 moves Research Watch drift detection onto graph-backed snapshots.
