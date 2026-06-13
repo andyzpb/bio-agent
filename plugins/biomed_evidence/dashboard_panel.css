@@ -32,6 +32,7 @@
 
 .biomed-tab,
 .biomed-row button,
+.biomed-action-row button,
 .biomed-watch-row button,
 .biomed-answer-meta button,
 #biomed-watch-create,
@@ -52,6 +53,7 @@
 
 .biomed-tab:hover,
 .biomed-row button:hover,
+.biomed-action-row button:hover,
 .biomed-watch-row button:hover,
 .biomed-answer-meta button:hover,
 #biomed-watch-create:hover,
@@ -196,6 +198,8 @@
 .biomed-form textarea,
 .biomed-form input,
 .biomed-form select,
+.biomed-field input,
+.biomed-field select,
 .biomed-row input,
 .biomed-row select {
   border: 1px solid var(--line, #e6dfd8);
@@ -294,6 +298,7 @@
 }
 
 .biomed-row button:disabled,
+.biomed-action-row button:disabled,
 .biomed-watch-row button:disabled,
 .biomed-answer-meta button:disabled,
 #biomed-watch-create:disabled,

@@ -66,3 +66,4 @@ lme_error_log_*.txt
 /locks/
 /start.sh
 docs/biomedical_evidence_graph_requirements.md
+docs/biomedical_evidence_graph_implementation_plan.md

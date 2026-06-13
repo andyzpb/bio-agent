@@ -586,6 +586,71 @@ interface ProvenanceGraphResult {
   warnings: string[];
 }
 
+interface BiomedEvidenceGraphNode {
+  id: string;
+  type: string;
+  label: string;
+  properties: Record<string, unknown>;
+}
+
+interface BiomedEvidenceGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  type: string;
+  properties: Record<string, unknown>;
+}
+
+interface BiomedEvidenceGraphValidation {
+  ok: boolean;
+  error_count: number;
+  warning_count: number;
+  issues: {
+    code: string;
+    message: string;
+    severity: string;
+    node_id?: string | null;
+    edge_id?: string | null;
+    data: Record<string, unknown>;
+  }[];
+}
+
+interface BiomedEvidenceGraphV1 {
+  schema_version: string;
+  graph_id?: string | null;
+  scope: {
+    kind: string;
+    identifiers: Record<string, string>;
+    filters: Record<string, unknown>;
+  };
+  nodes: BiomedEvidenceGraphNode[];
+  edges: BiomedEvidenceGraphEdge[];
+  warnings: string[];
+  validation?: BiomedEvidenceGraphValidation | null;
+}
+
+interface BiomedEvidenceCard {
+  claim_id: string;
+  claim_node_id: string;
+  claim_text: string;
+  support_status: string;
+  evidence: {
+    evidence_id: string;
+    evidence_node_id: string;
+    relation: string;
+    text: string;
+    paper_id?: string | null;
+    paper_title?: string | null;
+    confidence?: string | null;
+    evidence_direction?: string | null;
+    limitations: string[];
+    methods: string[];
+  }[];
+  limitations: string[];
+  audit_results: Record<string, unknown>[];
+  warnings: string[];
+}
+
 interface BiomedProject {
   project_id: string;
   name: string;
@@ -664,6 +729,166 @@ function renderList(items: unknown[] | undefined): string {
   const values = (items || []).map((item) => String(item || "").trim()).filter(Boolean);
   if (!values.length) return '<span class="biomed-muted">None recorded</span>';
   return `<ul class="biomed-list">${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function countGraphTypes(items: { type: string }[]): Record<string, number> {
+  return items.reduce<Record<string, number>>((acc, item) => {
+    acc[item.type] = (acc[item.type] || 0) + 1;
+    return acc;
+  }, {});
+}
+
+function renderGraphValidation(validation: BiomedEvidenceGraphValidation | null | undefined): string {
+  if (!validation) return '<div class="biomed-muted">Validation not requested.</div>';
+  return `
+    <div class="biomed-provenance-grid">
+      <div><span>Status</span><strong>${validation.ok ? "valid" : "invalid"}</strong></div>
+      <div><span>Errors</span><strong>${validation.error_count}</strong></div>
+      <div><span>Warnings</span><strong>${validation.warning_count}</strong></div>
+    </div>
+    ${validation.issues.length ? `
+      <div class="biomed-audit-table">
+        ${validation.issues.slice(0, 8).map((issue) => `
+          <div class="biomed-audit-row ${issue.severity === "error" ? "is-failed" : ""}">
+            <div class="biomed-audit-row-head">
+              ${pill(issue.severity)}
+              <code>${escapeHtml(issue.code)}</code>
+              ${issue.node_id ? `<code>${escapeHtml(issue.node_id)}</code>` : ""}
+              ${issue.edge_id ? `<code>${escapeHtml(issue.edge_id)}</code>` : ""}
+            </div>
+            <div class="biomed-muted">${escapeHtml(issue.message)}</div>
+          </div>
+        `).join("")}
+      </div>
+    ` : ""}
+  `;
+}
+
+function renderGraphNodeInspector(graph: BiomedEvidenceGraphV1, nodeId: string): string {
+  const node = graph.nodes.find((item) => item.id === nodeId);
+  if (!node) return '<div class="biomed-muted">No node selected.</div>';
+  const incoming = graph.edges.filter((edge) => edge.target === node.id);
+  const outgoing = graph.edges.filter((edge) => edge.source === node.id);
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Type</span><strong>${escapeHtml(node.type)}</strong></div>
+        <div><span>ID</span><code>${escapeHtml(node.id)}</code></div>
+        <div><span>Incoming</span><strong>${incoming.length}</strong></div>
+        <div><span>Outgoing</span><strong>${outgoing.length}</strong></div>
+      </div>
+      <div class="biomed-evidence-claim">${escapeHtml(node.label)}</div>
+      <pre class="biomed-json">${escapeHtml(JSON.stringify(node.properties, null, 2))}</pre>
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Incoming Edges</div>
+          ${renderList(incoming.slice(0, 10).map((edge) => `${edge.source} -> ${edge.type}`))}
+        </div>
+        <div>
+          <div class="biomed-label">Outgoing Edges</div>
+          ${renderList(outgoing.slice(0, 10).map((edge) => `${edge.type} -> ${edge.target}`))}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderBiomedEvidenceCard(card: BiomedEvidenceCard): string {
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Claim</span><code>${escapeHtml(card.claim_id)}</code></div>
+        <div><span>Status</span><strong>${escapeHtml(card.support_status)}</strong></div>
+        <div><span>Evidence</span><strong>${card.evidence.length}</strong></div>
+        <div><span>Audits</span><strong>${card.audit_results.length}</strong></div>
+      </div>
+      <div class="biomed-evidence-claim">${escapeHtml(card.claim_text)}</div>
+      <div class="biomed-audit-table">
+        ${card.evidence.map((item) => `
+          <div class="biomed-audit-row">
+            <div class="biomed-audit-row-head">
+              ${pill(item.relation)}
+              ${item.confidence ? pill(item.confidence) : ""}
+              ${item.evidence_direction ? pill(item.evidence_direction) : ""}
+              ${item.paper_id ? `<code>${escapeHtml(item.paper_id)}</code>` : ""}
+            </div>
+            <div>${escapeHtml(item.text)}</div>
+            ${item.paper_title ? `<div class="biomed-muted">${escapeHtml(item.paper_title)}</div>` : ""}
+            ${item.methods.length ? `<div class="biomed-label">Methods</div>${renderList(item.methods)}` : ""}
+            ${item.limitations.length ? `<div class="biomed-label">Limitations</div>${renderList(item.limitations)}` : ""}
+          </div>
+        `).join("") || '<div class="biomed-muted">No evidence linked.</div>'}
+      </div>
+      ${card.limitations.length ? `<div class="biomed-label">Claim Limitations</div>${renderList(card.limitations)}` : ""}
+      ${card.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(card.warnings)}` : ""}
+    </div>
+  `;
+}
+
+function renderBiomedEvidenceGraph(graph: BiomedEvidenceGraphV1): string {
+  const nodeCounts = countGraphTypes(graph.nodes);
+  const edgeCounts = countGraphTypes(graph.edges);
+  const claimNodes = graph.nodes.filter((node) => node.type === "Claim");
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Schema</span><strong>${escapeHtml(graph.schema_version)}</strong></div>
+        <div><span>Scope</span><strong>${escapeHtml(graph.scope.kind)}</strong></div>
+        <div><span>Nodes</span><strong>${graph.nodes.length}</strong></div>
+        <div><span>Edges</span><strong>${graph.edges.length}</strong></div>
+      </div>
+      <div class="biomed-two-col">
+        <div>
+          <div class="biomed-label">Node Types</div>
+          <pre class="biomed-json">${escapeHtml(JSON.stringify(nodeCounts, null, 2))}</pre>
+        </div>
+        <div>
+          <div class="biomed-label">Edge Types</div>
+          <pre class="biomed-json">${escapeHtml(JSON.stringify(edgeCounts, null, 2))}</pre>
+        </div>
+      </div>
+      <div class="biomed-label">Validation</div>
+      ${renderGraphValidation(graph.validation)}
+      ${graph.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(graph.warnings)}` : ""}
+    </div>
+    <div class="biomed-two-col">
+      <div>
+        <div class="biomed-label">Nodes</div>
+        <div class="biomed-audit-table">
+          ${graph.nodes.slice(0, 40).map((node) => `
+            <div class="biomed-audit-row">
+              <div class="biomed-audit-row-head">
+                ${pill(node.type)}
+                <code>${escapeHtml(node.id)}</code>
+              </div>
+              <div>${escapeHtml(node.label)}</div>
+              <div class="biomed-action-row">
+                <button data-graph-node-id="${escapeHtml(node.id)}">Inspect</button>
+                ${node.type === "Claim" ? `<button data-graph-card-id="${escapeHtml(node.id)}">Card</button>` : ""}
+              </div>
+            </div>
+          `).join("") || '<div class="biomed-muted">No graph nodes.</div>'}
+        </div>
+      </div>
+      <div>
+        <div class="biomed-label">Claims</div>
+        <div class="biomed-audit-table">
+          ${claimNodes.slice(0, 20).map((node) => `
+            <div class="biomed-audit-row">
+              <div class="biomed-audit-row-head">
+                ${pill(String(node.properties.support_status || "not_assessed"))}
+                <code>${escapeHtml(node.id)}</code>
+              </div>
+              <div>${escapeHtml(node.label)}</div>
+              <div class="biomed-action-row">
+                <button data-graph-card-id="${escapeHtml(node.id)}">Card</button>
+              </div>
+            </div>
+          `).join("") || '<div class="biomed-muted">No claim nodes.</div>'}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderEvidenceItem(item: EvidenceRow): string {
@@ -2344,35 +2569,179 @@ function renderGraph(container: HTMLElement): void {
   container.innerHTML += `
     <div class="biomed-section">
       <div class="biomed-title">Evidence Graph</div>
-      <div class="biomed-row">
-        <input id="biomed-graph-topic" placeholder="topic or entity" value="microglial activation Alzheimer's disease" />
-        <button id="biomed-graph-btn">Load</button>
+      <div class="biomed-form">
+        <div class="biomed-control-grid">
+          <label class="biomed-field">
+            <span>Topic</span>
+            <input id="biomed-graph-topic" value="microglial activation Alzheimer's disease" />
+          </label>
+          <label class="biomed-field">
+            <span>Entity</span>
+            <input id="biomed-graph-entity" />
+          </label>
+          <label class="biomed-field">
+            <span>Paper ID</span>
+            <input id="biomed-graph-paper" />
+          </label>
+          <label class="biomed-field">
+            <span>Run ID</span>
+            <input id="biomed-graph-run" />
+          </label>
+          <label class="biomed-field">
+            <span>Direction</span>
+            <select id="biomed-graph-direction">
+              <option value="">any</option>
+              <option value="supports">supports</option>
+              <option value="contradicts">contradicts</option>
+              <option value="inconclusive">inconclusive</option>
+              <option value="background">background</option>
+            </select>
+          </label>
+          <label class="biomed-check">
+            <input id="biomed-graph-validate" type="checkbox" checked />
+            <span>Validate</span>
+          </label>
+        </div>
+        <div class="biomed-action-row">
+          <button id="biomed-graph-btn">Load</button>
+          <button id="biomed-graph-export-btn">Export JSON</button>
+        </div>
+      </div>
+      <div class="biomed-two-col">
+        <label class="biomed-field">
+          <span>Source Node</span>
+          <input id="biomed-graph-path-source" />
+        </label>
+        <label class="biomed-field">
+          <span>Target Node</span>
+          <input id="biomed-graph-path-target" />
+        </label>
+      </div>
+      <div class="biomed-action-row">
+        <button id="biomed-graph-path-btn">Path</button>
       </div>
       <div id="biomed-graph-result" class="biomed-result"></div>
+      <div id="biomed-graph-inspector" class="biomed-result"></div>
+      <div id="biomed-graph-card" class="biomed-result"></div>
+      <div id="biomed-graph-path" class="biomed-result"></div>
+      <div id="biomed-graph-export" class="biomed-result"></div>
     </div>
   `;
+  let currentGraph: BiomedEvidenceGraphV1 | null = null;
+
+  const paramsFromControls = (includeValidate = true): URLSearchParams => {
+    const params = new URLSearchParams();
+    const topic = container.querySelector<HTMLInputElement>("#biomed-graph-topic")?.value.trim() || "";
+    const entity = container.querySelector<HTMLInputElement>("#biomed-graph-entity")?.value.trim() || "";
+    const paper = container.querySelector<HTMLInputElement>("#biomed-graph-paper")?.value.trim() || "";
+    const run = container.querySelector<HTMLInputElement>("#biomed-graph-run")?.value.trim() || "";
+    const direction = container.querySelector<HTMLSelectElement>("#biomed-graph-direction")?.value || "";
+    if (topic) params.set("topic", topic);
+    if (entity) params.set("entity", entity);
+    if (paper) params.set("paper_id", paper);
+    if (run) params.set("run_id", run);
+    if (direction) params.set("direction", direction);
+    if (includeValidate && container.querySelector<HTMLInputElement>("#biomed-graph-validate")?.checked) {
+      params.set("validate", "true");
+    }
+    return params;
+  };
+
+  const attachGraphActions = (): void => {
+    const inspector = container.querySelector<HTMLElement>("#biomed-graph-inspector");
+    const cardTarget = container.querySelector<HTMLElement>("#biomed-graph-card");
+    const sourceInput = container.querySelector<HTMLInputElement>("#biomed-graph-path-source");
+    const targetInput = container.querySelector<HTMLInputElement>("#biomed-graph-path-target");
+    container.querySelectorAll<HTMLButtonElement>("[data-graph-node-id]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const nodeId = button.getAttribute("data-graph-node-id") || "";
+        if (!currentGraph || !inspector) return;
+        inspector.innerHTML = `<div class="biomed-label">Inspector</div>${renderGraphNodeInspector(currentGraph, nodeId)}`;
+        if (sourceInput && !sourceInput.value) sourceInput.value = nodeId;
+        else if (targetInput && !targetInput.value) targetInput.value = nodeId;
+      });
+    });
+    container.querySelectorAll<HTMLButtonElement>("[data-graph-card-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const claimId = button.getAttribute("data-graph-card-id") || "";
+        if (!cardTarget) return;
+        cardTarget.innerHTML = '<div class="biomed-loading">Loading evidence card...</div>';
+        try {
+          const params = paramsFromControls(false);
+          const card = await api<BiomedEvidenceCard>(`/api/biomed/graph/v1/evidence-card/${encodeURIComponent(claimId)}?${params.toString()}`);
+          cardTarget.innerHTML = `<div class="biomed-label">Evidence Card</div>${renderBiomedEvidenceCard(card)}`;
+        } catch (error) {
+          cardTarget.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+        }
+      });
+    });
+  };
+
   container.querySelector<HTMLButtonElement>("#biomed-graph-btn")?.addEventListener("click", async () => {
     const resultNode = container.querySelector<HTMLElement>("#biomed-graph-result");
     if (!resultNode) return;
-    const topic = container.querySelector<HTMLInputElement>("#biomed-graph-topic")?.value || "";
-    resultNode.textContent = "Loading graph...";
+    resultNode.innerHTML = '<div class="biomed-loading">Loading graph...</div>';
+    container.querySelector<HTMLElement>("#biomed-graph-inspector")?.replaceChildren();
+    container.querySelector<HTMLElement>("#biomed-graph-card")?.replaceChildren();
+    container.querySelector<HTMLElement>("#biomed-graph-path")?.replaceChildren();
+    container.querySelector<HTMLElement>("#biomed-graph-export")?.replaceChildren();
     try {
-      const params = new URLSearchParams({ topic });
-      const graph = await api<{ nodes: { id: string; label: string; kind: string }[]; edges: { source: string; target: string; type: string }[] }>(`/api/biomed/graph?${params.toString()}`);
-      resultNode.innerHTML = `
-        <div class="biomed-two-col">
-          <div>
-            <div class="biomed-label">Nodes (${graph.nodes.length})</div>
-            ${renderList(graph.nodes.slice(0, 30).map((node) => `${node.kind}: ${node.label}`))}
+      const params = paramsFromControls(true);
+      const graph = await api<BiomedEvidenceGraphV1>(`/api/biomed/graph/v1?${params.toString()}`);
+      currentGraph = graph;
+      resultNode.innerHTML = renderBiomedEvidenceGraph(graph);
+      attachGraphActions();
+    } catch (error) {
+      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+
+  container.querySelector<HTMLButtonElement>("#biomed-graph-path-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-graph-path");
+    if (!target) return;
+    const source = container.querySelector<HTMLInputElement>("#biomed-graph-path-source")?.value.trim() || "";
+    const dest = container.querySelector<HTMLInputElement>("#biomed-graph-path-target")?.value.trim() || "";
+    if (!source || !dest) {
+      target.innerHTML = '<div class="biomed-error">Source and target node IDs are required.</div>';
+      return;
+    }
+    target.innerHTML = '<div class="biomed-loading">Loading path...</div>';
+    try {
+      const params = paramsFromControls(false);
+      params.set("source", source);
+      params.set("target", dest);
+      const path = await api<{ schema_version: string; path: string[]; nodes: BiomedEvidenceGraphNode[]; edges: BiomedEvidenceGraphEdge[] }>(`/api/biomed/graph/v1/path?${params.toString()}`);
+      target.innerHTML = `
+        <div class="biomed-label">Path</div>
+        <div class="biomed-provenance">
+          <div class="biomed-provenance-grid">
+            <div><span>Schema</span><strong>${escapeHtml(path.schema_version)}</strong></div>
+            <div><span>Nodes</span><strong>${path.nodes.length}</strong></div>
+            <div><span>Edges</span><strong>${path.edges.length}</strong></div>
           </div>
-          <div>
-            <div class="biomed-label">Edges (${graph.edges.length})</div>
-            ${renderList(graph.edges.slice(0, 30).map((edge) => `${edge.source} -> ${edge.type} -> ${edge.target}`))}
-          </div>
+          ${renderList(path.path)}
+          <div class="biomed-label">Edges</div>
+          ${renderList(path.edges.map((edge) => `${edge.source} -> ${edge.type} -> ${edge.target}`))}
         </div>
       `;
     } catch (error) {
-      resultNode.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+
+  container.querySelector<HTMLButtonElement>("#biomed-graph-export-btn")?.addEventListener("click", async () => {
+    const target = container.querySelector<HTMLElement>("#biomed-graph-export");
+    if (!target) return;
+    target.innerHTML = '<div class="biomed-loading">Exporting graph...</div>';
+    try {
+      const params = paramsFromControls(true);
+      const graph = await api<BiomedEvidenceGraphV1>(`/api/biomed/graph/v1/export/json?${params.toString()}`);
+      target.innerHTML = `
+        <div class="biomed-label">JSON Export</div>
+        <pre class="biomed-json biomed-json-tall">${escapeHtml(JSON.stringify(graph, null, 2))}</pre>
+      `;
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
   });
 }

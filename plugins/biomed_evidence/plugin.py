@@ -8,6 +8,12 @@ from agent.lifecycle.types import PreToolCtx, PromptRenderCtx
 from agent.plugins import Plugin, on_tool_pre, tool
 from agent.prompting import PromptSectionRender
 from agent.tool_hooks import HookOutcome
+from plugins.biomed_evidence.graph import (
+    build_evidence_card as build_graph_evidence_card,
+    graph_to_json_dict,
+    shortest_path as graph_shortest_path,
+    validate_evidence_graph as validate_graph_object,
+)
 from plugins.biomed_evidence.guardrails import is_clinical_request
 from plugins.biomed_evidence.literature_client import LiteratureClientError
 from plugins.biomed_evidence.schemas import (
@@ -83,6 +89,10 @@ _BIOMED_TOOL_NAMES = frozenset(
         "update_research_watch_topic",
         "delete_research_watch_topic",
         "get_evidence_graph",
+        "get_evidence_card",
+        "validate_evidence_graph",
+        "find_evidence_path",
+        "export_evidence_graph_json",
         "export_evidence_report",
         "validate_citation_support",
         "audit_biomedical_answer",
@@ -1648,6 +1658,155 @@ class BiomedEvidencePlugin(Plugin):
             direction=direction,
         )
         return _dump(graph.model_dump(mode="json"))
+
+    @tool(
+        name="get_evidence_card",
+        risk="read-only",
+        search_hint="biomedical evidence card claim support paper audit graph",
+    )
+    async def get_evidence_card(
+        self,
+        event,
+        claim_id: str,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Get an evidence card for a biomedical claim in the v1 evidence graph."""
+        graph = self._service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+        )
+        if graph is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        node_id = claim_id if claim_id.startswith("claim:") else f"claim:{claim_id}"
+        try:
+            card = build_graph_evidence_card(graph, node_id)
+        except ValueError:
+            return _dump({"error_code": "unknown_claim_id", "claim_id": claim_id})
+        return _dump(card.model_dump(mode="json"))
+
+    @tool(
+        name="validate_evidence_graph",
+        risk="read-only",
+        search_hint="validate biomedical evidence graph claim support provenance",
+    )
+    async def validate_evidence_graph(
+        self,
+        event,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Validate a v1 biomedical evidence graph built from current storage."""
+        graph = self._service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+        )
+        if graph is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(validate_graph_object(graph).model_dump(mode="json"))
+
+    @tool(
+        name="find_evidence_path",
+        risk="read-only",
+        search_hint="find path between biomedical evidence graph nodes claim paper entity",
+    )
+    async def find_evidence_path(
+        self,
+        event,
+        source: str,
+        target: str,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+        max_depth: int = 6,
+    ) -> str:
+        """Find a short path between two v1 evidence graph node IDs."""
+        graph = self._service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+        )
+        if graph is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        path = graph_shortest_path(
+            graph,
+            source,
+            target,
+            max_depth=max(1, min(max_depth, 20)),
+        )
+        if not path:
+            return _dump(
+                {
+                    "error_code": "graph_path_not_found",
+                    "source": source,
+                    "target": target,
+                }
+            )
+        nodes = {node.id: node for node in graph.nodes}
+        return _dump(
+            {
+                "schema_version": graph.schema_version,
+                "path": path,
+                "nodes": [
+                    nodes[node_id].model_dump(mode="json")
+                    for node_id in path
+                    if node_id in nodes
+                ],
+            }
+        )
+
+    @tool(
+        name="export_evidence_graph_json",
+        risk="read-only",
+        search_hint="export biomedical evidence graph json redacted schema v1",
+    )
+    async def export_evidence_graph_json(
+        self,
+        event,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+        validate: bool = True,
+    ) -> str:
+        """Export a redacted v1 biomedical evidence graph JSON object.
+
+        Args:
+            topic: Optional topic filter.
+            entity: Optional entity filter.
+            paper_id: Optional paper id filter.
+            direction: Optional evidence direction filter.
+            run_id: Optional answer run id for a run-scoped graph.
+            validate: Attach graph validation before export.
+        """
+        graph = self._service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+            validate=validate,
+        )
+        if graph is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(graph_to_json_dict(graph))
 
     @tool(
         name="export_evidence_report",

@@ -78,6 +78,11 @@ python -m eval.biomed_evidence.run_eval \
 - `submodular_duplicate_reduction_rate`: packet selection does not increase duplicate evidence.
 - `bandit_advisory_schema_validity`: retrieval advisory is schema-valid and advisory-only.
 - `provenance_graph_validity`: provenance graph links answer, evidence, manifests, audit, revision, and tools.
+- `evidence_graph_schema_validity`: v1 Evidence Graph exports include the expected schema version, node types, and edge types.
+- `evidence_graph_validation_rate`: generated topic/run graphs pass deterministic graph validation.
+- `evidence_graph_traceability_rate`: EvidenceSpan nodes trace to exactly one Paper and supported Claim nodes have support edges.
+- `clinical_refusal_graph_claim_rate`: clinical refusal run graphs contain zero biomedical Claim nodes.
+- `evidence_graph_export_redaction_rate`: graph JSON export excludes raw prompts, raw provider responses, API keys, tokens, authorization headers, and secrets.
 - `prompt_injection_boundary_success_rate`: prompt-injection-like clinical requests still hit the clinical boundary.
 
 ## Release 1.0 Gate

@@ -39,6 +39,13 @@ from plugins.biomed_evidence.obsidian_export import (
     export_project_note,
     export_watch_note,
 )
+from plugins.biomed_evidence.graph import (
+    BiomedEvidenceGraph,
+    GraphScope,
+    build_graph_from_evidence,
+    build_run_graph,
+    validate_evidence_graph,
+)
 from plugins.biomed_evidence.provenance_service import build_provenance_graph
 from plugins.biomed_evidence.schemas import (
     AdvisoryClaimReview,
@@ -3720,6 +3727,83 @@ class BiomedEvidenceService:
                     )
                 )
         return EvidenceGraph(nodes=list(nodes.values()), edges=edges)
+
+    def get_graph_v1(
+        self,
+        *,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+        validate: bool = False,
+    ) -> BiomedEvidenceGraph | None:
+        clean_run_id = run_id.strip()
+        if clean_run_id:
+            run = self.storage.get_answer_run(clean_run_id)
+            if run is None:
+                return None
+            graph = build_run_graph(
+                run,
+                audit=self.storage.get_latest_citation_audit_for_run(clean_run_id),
+                scope=GraphScope(
+                    kind="run",
+                    identifiers={"run_id": clean_run_id},
+                    filters={"validate": validate},
+                ),
+            )
+            return _with_graph_validation(graph, validate=validate)
+
+        rows, _ = self.storage.list_evidence(
+            q=topic,
+            paper_id=paper_id,
+            direction=direction,
+            entity=entity,
+            page=1,
+            page_size=200,
+        )
+        retrieval_manifests: list[RetrievalManifest] = []
+        seen_retrieval_ids: set[str] = set()
+        for row in rows:
+            retrieval_id = str(row.get("retrieval_id") or "").strip()
+            if not retrieval_id or retrieval_id in seen_retrieval_ids:
+                continue
+            seen_retrieval_ids.add(retrieval_id)
+            manifest = self.storage.get_retrieval_manifest(retrieval_id)
+            if manifest is not None:
+                retrieval_manifests.append(manifest)
+        scope_kind = _graph_scope_kind(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+        )
+        graph = build_graph_from_evidence(
+            rows,
+            retrieval_manifests=retrieval_manifests,
+            scope=GraphScope(
+                kind=scope_kind,
+                identifiers={
+                    key: value
+                    for key, value in {
+                        "paper_id": paper_id.strip(),
+                    }.items()
+                    if value
+                },
+                filters={
+                    key: value
+                    for key, value in {
+                        "topic": topic.strip(),
+                        "entity": entity.strip(),
+                        "paper_id": paper_id.strip(),
+                        "direction": direction.strip(),
+                        "validate": validate,
+                    }.items()
+                    if value not in {"", False}
+                },
+            ),
+        )
+        return _with_graph_validation(graph, validate=validate)
 
     def create_watch(self, request: WatchTopicCreateRequest) -> WatchTopic:
         now = _now_iso()
@@ -7733,6 +7817,34 @@ def _render_markdown_report(result: AnswerWithEvidenceResult) -> str:
 def _slug(value: str) -> str:
     clean = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
     return clean[:80] or hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _with_graph_validation(
+    graph: BiomedEvidenceGraph,
+    *,
+    validate: bool,
+) -> BiomedEvidenceGraph:
+    if not validate:
+        return graph
+    return graph.model_copy(update={"validation": validate_evidence_graph(graph)})
+
+
+def _graph_scope_kind(
+    *,
+    topic: str,
+    entity: str,
+    paper_id: str,
+    direction: str,
+) -> str:
+    if paper_id.strip():
+        return "paper"
+    if entity.strip():
+        return "entity"
+    if topic.strip():
+        return "topic"
+    if direction.strip():
+        return "custom"
+    return "global"
 
 
 def _decision_id(watch_id: str, paper_id: str) -> str:

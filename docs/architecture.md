@@ -146,6 +146,68 @@ The packet is intentionally smaller than the full retrieval bundle. It should
 be inspectable, stable, and suitable for replay, audit, dashboard display, and
 eval.
 
+## Evidence Graph And Provenance Graph
+
+Biomedical Evidence Graph v1 formalizes the claim/evidence/source relationships
+that were previously only implicit in retrieval manifests, evidence packets,
+answer runs, citation audits, and the lightweight dashboard graph. It is a typed
+property graph with `schema_version=biomed-evidence-graph-v1`.
+
+Evidence Graph nodes are research evidence objects:
+
+```text
+Paper
+EvidenceSpan
+Claim
+Entity
+Method
+Limitation
+RetrievalManifest
+EvidencePacket
+AnswerRun
+AuditResult
+```
+
+The main evidence path is:
+
+```text
+RetrievalManifest -> Paper -> EvidenceSpan -> Claim
+AnswerRun -> EvidencePacket -> EvidenceSpan
+AuditResult -> Claim
+```
+
+This graph answers product questions such as:
+
+- Which evidence spans support, contradict, qualify, or provide background for
+  a biomedical claim?
+- Which paper and retrieval manifest does each evidence span trace to?
+- Which answer run used a packet, cited a claim, and received an audit result?
+- Which entity, method, and limitation are attached to a claim or evidence
+  span?
+
+The Provenance Graph is a separate execution-lineage projection. It connects
+activities, tools, agents, trace steps, run artifacts, packet construction,
+audit, revision, and export events. It answers how an output was produced,
+rather than whether a biomedical claim is supported.
+
+The two graphs share stable IDs such as `run_id`, `paper_id`, `evidence_id`,
+`retrieval_id`, `packet_id`, and `audit_id`, but they do not collapse into one
+schema:
+
+| Concern | Evidence Graph | Provenance Graph |
+| --- | --- | --- |
+| Primary question | What supports this claim? | How was this run produced? |
+| Lifecycle | Reusable evidence projection | Usually run-scoped lineage |
+| Main users | researcher, reviewer, agent tools | reviewer, developer, auditor |
+| Export | redacted JSON property graph | PROV/OpenLineage-style lineage |
+
+Graph validation is deterministic. It rejects supported claims without support
+edges, evidence spans that do not trace to exactly one paper, clinical refusal
+run graphs that contain biomedical claims, and direction-derived edges that
+invert support and contradiction. JSON graph export is read-only and recursively
+redacts prompt fields, raw provider responses, API keys, tokens, authorization
+headers, and secret-like strings.
+
 ## Citation And Logic Audit
 
 Generated answers are decomposed into atomic claims. Each claim is checked
@@ -226,6 +288,9 @@ handing them runtime authority:
 - PROV/OpenLineage-style provenance graphs connect answer, paper, evidence,
   retrieval manifest, packet, audit, logic audit, revision, tools, activities,
   and agents while redacting prompts and provider raw responses.
+- Evidence Graph validation is a structural guardrail: it can fail graph
+  products that violate claim/evidence/source boundaries, but it does not infer
+  new biomedical facts.
 
 These tools are used for reviewer visibility, debugging, and future evaluation.
 They are not treated as biomedical evidence.
@@ -238,7 +303,9 @@ The dashboard surfaces the workflow as an operational tool:
   answer trace.
 - **Evidence**: extracted claims, entities, methods, limitations, confidence,
   spans, and retrieval provenance.
-- **Graph**: paper, entity, and claim relationships.
+- **Graph**: typed Evidence Graph v1 with topic/entity/paper/run filters,
+  validation summary, node inspection, evidence cards, path lookup, and redacted
+  JSON export.
 - **Audit**: claim-level citation audit, logic verdicts, conflicts, and
   revision pressure.
 - **Trace**: classify, plan, retrieve, extract, gap, packet, audit, revise, and
@@ -265,8 +332,8 @@ Default runtime data is usually under:
 Generated Obsidian Markdown export is one-way reviewer output. Exported notes
 are never imported back as biomedical evidence.
 
-Secrets and provider raw responses are redacted from provenance and release
-smoke artifacts.
+Secrets, prompt text, and provider raw responses are redacted from provenance,
+Evidence Graph JSON export, and release smoke artifacts.
 
 ## Release Smoke
 

@@ -9,8 +9,8 @@ claim logic entailment audit, symbolic logic fact export, project evidence
 workspaces, framework-native tool guardrails, prompt context injection,
 literature-source readiness checks, the controlled `search_literature` tool, a
 coverage matrix, gap-directed follow-up searches, structured evidence packets, a
-lightweight evidence graph, Obsidian one-way export, provenance graph export,
-and Research Watch decision logs. It is
+typed Biomedical Evidence Graph v1, Obsidian one-way export, provenance graph
+export, and Research Watch decision logs. It is
 implemented as a plugin on top of the collaborative Akashic framework, not as a
 standalone clinical system.
 
@@ -101,6 +101,10 @@ Registered agent tools:
 - `update_research_watch_topic`
 - `delete_research_watch_topic`
 - `get_evidence_graph`
+- `get_evidence_card`
+- `validate_evidence_graph`
+- `find_evidence_path`
+- `export_evidence_graph_json`
 - `export_evidence_report`
 - `validate_citation_support`
 - `audit_biomedical_answer`
@@ -215,6 +219,55 @@ Release 1.0 also adds deterministic/advisory mathematical aids:
 - Obsidian-compatible Markdown export for evidence packets, projects, and
   Watch topics. Export is one-way and disabled by default.
 
+## Biomedical Evidence Graph v1
+
+The v1 graph layer is an internal detachable module under
+`plugins/biomed_evidence/graph/`. It formalizes the previous dashboard graph as
+a typed property graph with `schema_version=biomed-evidence-graph-v1`.
+
+Node types:
+
+- `Paper`
+- `EvidenceSpan`
+- `Claim`
+- `Entity`
+- `Method`
+- `Limitation`
+- `RetrievalManifest`
+- `EvidencePacket`
+- `AnswerRun`
+- `AuditResult`
+
+Core paths:
+
+```text
+RetrievalManifest -> Paper -> EvidenceSpan -> Claim
+AnswerRun -> EvidencePacket -> EvidenceSpan
+AuditResult -> Claim
+```
+
+Evidence Graph and Provenance Graph are separate projections. The Evidence
+Graph represents claim/evidence/source relationships for evidence cards, path
+queries, validation, and redacted JSON export. The Provenance Graph represents
+execution lineage: tools, activities, agents, trace steps, and redacted runtime
+artifacts. They share stable IDs such as `run_id`, `paper_id`, `evidence_id`,
+`retrieval_id`, `packet_id`, and `audit_id`, but they answer different review
+questions.
+
+Graph validation enforces the first product invariants:
+
+- supported claims must have an incoming `EVIDENCE_SUPPORTS_CLAIM` edge from an
+  `EvidenceSpan`;
+- each `EvidenceSpan` must trace to exactly one `Paper`;
+- clinical refusal run graphs must not contain biomedical `Claim` nodes or
+  `ANSWER_CITES_CLAIM` edges;
+- direction-derived evidence edges cannot invert support and contradiction.
+
+The graph JSON export is read-only and does not write files. Export helpers and
+the `/api/biomed/graph/v1/export/json` route recursively redact raw prompts,
+provider responses, API keys, tokens, secrets, authorization headers, and common
+secret-like strings before returning payloads.
+
 ## Dashboard
 
 Start the dashboard:
@@ -234,7 +287,9 @@ The panel includes:
   decisions, record project claims, inspect review queue items, and generate
   evidence briefs.
 - Evidence: browse extracted claims, entities, limitations, and confidence.
-- Graph: inspect paper, claim, and entity links.
+- Graph: inspect the typed Evidence Graph v1 with topic/entity/paper/run
+  filters, validation summary, node inspector, evidence cards, path lookup, and
+  redacted JSON export.
 - Watch: create, update, check, and review research-watch topics, snapshots,
   and push/skip decisions.
 - Audit: inspect atomic claims, citation-support verdicts, overclaims,
@@ -266,12 +321,19 @@ Common routes:
 - `POST /api/biomed/answer/audited`
 - `POST /api/biomed/answer-runs/{run_id}/audit`
 - `GET /api/biomed/answer-runs/{run_id}/trace`
+- `GET /api/biomed/answer-runs/{run_id}/evidence-graph`
 - `GET /api/biomed/projects`
 - `POST /api/biomed/projects`
 - `POST /api/biomed/projects/{project_id}/papers`
 - `POST /api/biomed/projects/{project_id}/claims`
 - `GET /api/biomed/projects/{project_id}/review-queue`
 - `POST /api/biomed/projects/{project_id}/briefs`
+- `GET /api/biomed/graph/schema`
+- `GET /api/biomed/graph/v1`
+- `POST /api/biomed/graph/v1/validate`
+- `GET /api/biomed/graph/v1/evidence-card/{claim_id}`
+- `GET /api/biomed/graph/v1/path`
+- `GET /api/biomed/graph/v1/export/json`
 
 ## Safety Boundary
 
@@ -292,7 +354,7 @@ provider/model is configured, and persists the trace for reviewer inspection.
 Useful local checks:
 
 ```bash
-python -m pytest -q tests/test_biomed_framework_integration.py tests/test_biomed_evidence.py tests/test_biomed_api.py
+python -m pytest -q tests/test_biomed_evidence_graph.py tests/test_biomed_framework_integration.py tests/test_biomed_evidence.py tests/test_biomed_api.py
 python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_results.json
 python -m eval.biomed_evidence.run_eval --source pubmed --live-pubmed --output /tmp/biomed_live_eval_results.json
 npm run typecheck

@@ -6,6 +6,16 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
 
+from plugins.biomed_evidence.graph import (
+    EDGE_TYPES,
+    NODE_TYPES,
+    SCHEMA_VERSION,
+    BiomedEvidenceGraph,
+    build_evidence_card,
+    graph_to_json_dict,
+    shortest_path,
+    validate_evidence_graph,
+)
 from plugins.biomed_evidence.literature_client import LiteratureClientError
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
@@ -473,6 +483,19 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             raise HTTPException(status_code=404, detail="answer run not found")
         return result.model_dump(mode="json")
 
+    @app.get("/api/biomed/answer-runs/{run_id}/evidence-graph")
+    def get_answer_evidence_graph(
+        run_id: str,
+        validate: bool = False,
+    ) -> dict[str, Any]:
+        result = service.get_graph_v1(run_id=run_id, validate=validate)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return result.model_dump(mode="json")
+
     @app.get("/api/biomed/answer-runs/{run_id}/math-signals")
     def get_answer_math_signals(run_id: str) -> dict[str, Any]:
         result = service.get_answer_math_signals(run_id)
@@ -508,6 +531,178 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
     @app.post("/api/biomed/conflicts")
     def find_conflicting_evidence(payload: ConflictAuditRequest) -> dict[str, Any]:
         return service.find_conflicting_evidence(payload).model_dump(mode="json")
+
+    @app.get("/api/biomed/graph/schema")
+    def get_evidence_graph_schema() -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "node_types": list(NODE_TYPES),
+            "edge_types": list(EDGE_TYPES),
+        }
+
+    @app.get("/api/biomed/graph/v1")
+    def get_evidence_graph_v1(
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+        validate: bool = False,
+    ) -> dict[str, Any]:
+        result = service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+            validate=validate,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/graph/v1/validate")
+    def validate_evidence_graph_v1(payload: dict[str, Any]) -> dict[str, Any]:
+        raw_graph = payload.get("graph")
+        if isinstance(raw_graph, dict):
+            graph = BiomedEvidenceGraph.model_validate(raw_graph)
+        else:
+            graph = service.get_graph_v1(
+                topic=str(payload.get("topic") or ""),
+                entity=str(payload.get("entity") or ""),
+                paper_id=str(payload.get("paper_id") or ""),
+                direction=str(payload.get("direction") or ""),
+                run_id=str(payload.get("run_id") or ""),
+            )
+            if graph is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error_code": "unknown_run_id",
+                        "run_id": str(payload.get("run_id") or ""),
+                    },
+                )
+        return validate_evidence_graph(graph).model_dump(mode="json")
+
+    @app.get("/api/biomed/graph/v1/evidence-card/{claim_id}")
+    def get_evidence_graph_card(
+        claim_id: str,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+    ) -> dict[str, Any]:
+        graph = service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+        )
+        if graph is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        node_id = claim_id if claim_id.startswith("claim:") else f"claim:{claim_id}"
+        try:
+            return build_evidence_card(graph, node_id).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_claim_id", "claim_id": claim_id},
+            ) from exc
+
+    @app.get("/api/biomed/graph/v1/path")
+    def get_evidence_graph_path(
+        source: str,
+        target: str,
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+        max_depth: int = 6,
+    ) -> dict[str, Any]:
+        graph = service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+        )
+        if graph is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        path = shortest_path(
+            graph,
+            source,
+            target,
+            max_depth=max(1, min(max_depth, 20)),
+        )
+        if not path:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error_code": "graph_path_not_found",
+                    "source": source,
+                    "target": target,
+                },
+            )
+        nodes_by_id = {node.id: node for node in graph.nodes}
+        path_edges = []
+        for left, right in zip(path, path[1:]):
+            edge = next(
+                (
+                    item
+                    for item in graph.edges
+                    if (item.source == left and item.target == right)
+                    or (item.source == right and item.target == left)
+                ),
+                None,
+            )
+            if edge is not None:
+                path_edges.append(edge.model_dump(mode="json"))
+        return {
+            "schema_version": graph.schema_version,
+            "path": path,
+            "nodes": [
+                nodes_by_id[node_id].model_dump(mode="json")
+                for node_id in path
+                if node_id in nodes_by_id
+            ],
+            "edges": path_edges,
+        }
+
+    @app.get("/api/biomed/graph/v1/export/json")
+    def export_evidence_graph_json(
+        topic: str = "",
+        entity: str = "",
+        paper_id: str = "",
+        direction: str = "",
+        run_id: str = "",
+        validate: bool = False,
+    ) -> dict[str, Any]:
+        graph = service.get_graph_v1(
+            topic=topic,
+            entity=entity,
+            paper_id=paper_id,
+            direction=direction,
+            run_id=run_id,
+            validate=validate,
+        )
+        if graph is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return graph_to_json_dict(graph)
 
     @app.get("/api/biomed/graph")
     def get_evidence_graph(

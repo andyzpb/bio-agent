@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -167,6 +168,29 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert graph.json()["nodes"]
         assert graph.json()["edges"]
 
+        graph_schema = client.get("/api/biomed/graph/schema")
+        assert graph_schema.status_code == 200
+        graph_schema_payload = graph_schema.json()
+        assert graph_schema_payload["schema_version"] == "biomed-evidence-graph-v1"
+        assert "EvidenceSpan" in graph_schema_payload["node_types"]
+        assert "EVIDENCE_SUPPORTS_CLAIM" in graph_schema_payload["edge_types"]
+
+        graph_v1 = client.get(
+            "/api/biomed/graph/v1",
+            params={"topic": "microglial activation", "validate": True},
+        )
+        assert graph_v1.status_code == 200
+        graph_v1_payload = graph_v1.json()
+        assert graph_v1_payload["schema_version"] == "biomed-evidence-graph-v1"
+        assert graph_v1_payload["scope"]["kind"] == "topic"
+        assert graph_v1_payload["validation"]["ok"] is True
+        assert {"Paper", "EvidenceSpan", "Claim"}.issubset(
+            {node["type"] for node in graph_v1_payload["nodes"]}
+        )
+        assert {"PAPER_CONTAINS_EVIDENCE", "EVIDENCE_SUPPORTS_CLAIM"} & {
+            edge["type"] for edge in graph_v1_payload["edges"]
+        }
+
         audit = client.get(f"/api/biomed/audit/{payload['run_id']}")
         assert audit.status_code == 200
         assert audit.json()["run_id"] == payload["run_id"]
@@ -197,6 +221,107 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         audit = client.get(f"/api/biomed/audit/{payload['run_id']}")
         assert audit.status_code == 200
         assert audit.json()["latest_citation_audit"]["audit_id"] == audit_payload["audit_id"]
+
+        run_graph = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-graph",
+            params={"validate": True},
+        )
+        assert run_graph.status_code == 200
+        run_graph_payload = run_graph.json()
+        assert run_graph_payload["schema_version"] == "biomed-evidence-graph-v1"
+        assert run_graph_payload["scope"]["kind"] == "run"
+        assert run_graph_payload["validation"]["ok"] is True
+        assert {"AnswerRun", "Paper", "EvidenceSpan", "Claim", "AuditResult"}.issubset(
+            {node["type"] for node in run_graph_payload["nodes"]}
+        )
+        assert {"AUDIT_REVIEWS_ANSWER", "AUDIT_REVIEWS_CLAIM"}.issubset(
+            {edge["type"] for edge in run_graph_payload["edges"]}
+        )
+        run_claim_id = next(
+            edge["target"]
+            for edge in run_graph_payload["edges"]
+            if edge["type"].startswith("EVIDENCE_") and edge["target"].startswith("claim:")
+        )
+        run_answer_id = next(
+            node["id"] for node in run_graph_payload["nodes"] if node["type"] == "AnswerRun"
+        )
+
+        graph_validate = client.post(
+            "/api/biomed/graph/v1/validate",
+            json={"graph": run_graph_payload},
+        )
+        assert graph_validate.status_code == 200
+        assert graph_validate.json()["ok"] is True
+
+        graph_validate_by_run = client.post(
+            "/api/biomed/graph/v1/validate",
+            json={"run_id": payload["run_id"]},
+        )
+        assert graph_validate_by_run.status_code == 200
+        assert graph_validate_by_run.json()["ok"] is True
+
+        evidence_card = client.get(
+            f"/api/biomed/graph/v1/evidence-card/{run_claim_id}",
+            params={"run_id": payload["run_id"]},
+        )
+        assert evidence_card.status_code == 200
+        evidence_card_payload = evidence_card.json()
+        assert evidence_card_payload["claim_node_id"] == run_claim_id
+        assert evidence_card_payload["claim_text"]
+        assert evidence_card_payload["evidence"]
+
+        missing_card = client.get(
+            "/api/biomed/graph/v1/evidence-card/claim:unknown",
+            params={"run_id": payload["run_id"]},
+        )
+        assert missing_card.status_code == 404
+        assert missing_card.json()["detail"]["error_code"] == "unknown_claim_id"
+
+        graph_path = client.get(
+            "/api/biomed/graph/v1/path",
+            params={
+                "run_id": payload["run_id"],
+                "source": run_answer_id,
+                "target": run_claim_id,
+            },
+        )
+        assert graph_path.status_code == 200
+        graph_path_payload = graph_path.json()
+        assert graph_path_payload["path"][0] == run_answer_id
+        assert graph_path_payload["path"][-1] == run_claim_id
+        assert graph_path_payload["nodes"]
+        assert graph_path_payload["edges"]
+
+        missing_path = client.get(
+            "/api/biomed/graph/v1/path",
+            params={
+                "run_id": payload["run_id"],
+                "source": run_answer_id,
+                "target": "claim:does-not-exist",
+            },
+        )
+        assert missing_path.status_code == 404
+        assert missing_path.json()["detail"]["error_code"] == "graph_path_not_found"
+
+        graph_export = client.get(
+            "/api/biomed/graph/v1/export/json",
+            params={"run_id": payload["run_id"], "validate": True},
+        )
+        assert graph_export.status_code == 200
+        graph_export_payload = graph_export.json()
+        assert graph_export_payload["schema_version"] == "biomed-evidence-graph-v1"
+        assert graph_export_payload["validation"]["ok"] is True
+        graph_export_text = json.dumps(graph_export_payload)
+        assert "raw_provider_response" not in graph_export_text
+        assert "api_key" not in graph_export_text
+        assert "system_prompt" not in graph_export_text
+
+        missing_run_graph = client.get(
+            "/api/biomed/graph/v1",
+            params={"run_id": "unknown-run"},
+        )
+        assert missing_run_graph.status_code == 404
+        assert missing_run_graph.json()["detail"]["error_code"] == "unknown_run_id"
 
         conflict = client.post(
             "/api/biomed/conflicts",
@@ -574,6 +699,18 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert clinical_math_payload["status"] == "not_applicable"
         assert clinical_math_payload["advisory_only"] is True
         assert clinical_math_payload["argument_graph"]["status"] == "not_applicable"
+
+        clinical_graph = client.get(
+            f"/api/biomed/answer-runs/{clinical_run_id}/evidence-graph",
+            params={"validate": True},
+        )
+        assert clinical_graph.status_code == 200
+        clinical_graph_payload = clinical_graph.json()
+        assert clinical_graph_payload["validation"]["ok"] is True
+        assert {node["type"] for node in clinical_graph_payload["nodes"]} == {
+            "AnswerRun"
+        }
+        assert clinical_graph_payload["edges"] == []
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:

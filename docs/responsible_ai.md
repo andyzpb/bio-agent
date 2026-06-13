@@ -25,6 +25,10 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
   verifier of record.
 - Optional claim-logic parsing can assist frame extraction, but deterministic
   logic-audit rules remain the entailment verifier of record.
+- Biomedical Evidence Graph v1 validation checks structural evidence
+  invariants, including supported-claim support edges, evidence-to-paper
+  traceability, clinical refusal graphs without biomedical claims, and
+  support/contradiction direction consistency.
 
 ## Tool And Memory Boundary
 
@@ -47,6 +51,12 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
   manifests, packets, audits, revisions, activities, agents, and tools.
 - Provenance output redacts raw prompts, raw provider responses, API keys, and
   secrets.
+- Evidence Graph JSON export is read-only and recursively redacts raw prompt
+  fields, provider responses, API keys, tokens, authorization headers, secrets,
+  and common secret-like strings.
+- Evidence Graph and Provenance Graph share stable local IDs, but the former is
+  the claim/evidence/source relationship graph and the latter is the execution
+  lineage graph.
 
 ## Advisory Math Boundary
 
