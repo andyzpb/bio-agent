@@ -3585,9 +3585,7 @@ window.AkashicDashboard.registerPlugin({
       <div class="biomed-topbar-status" aria-label="Biomedical Evidence workspace status">
         <span class="biomed-topbar-dot"></span>
         <strong>research-only agent</strong>
-        <span>templates</span>
-        <span>controlled literature retrieval</span>
-        <span>audit · trace · provenance</span>
+        <span>literature · review · provenance</span>
       </div>
     `;
   },

@@ -399,8 +399,8 @@ function App(): React.ReactElement {
         <div className="brand">
           <div className="brand-mark">A</div>
           <div>
-            <div className="brand-title">Akashic Dashboard</div>
-            <div className="brand-sub">Session / Memory Explorer</div>
+            <div className="brand-title">Akashic</div>
+            <div className="brand-sub">Agent workspace</div>
           </div>
         </div>
         <TopbarFilters
