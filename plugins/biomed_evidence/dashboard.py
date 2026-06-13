@@ -496,6 +496,41 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             )
         return result.model_dump(mode="json")
 
+    @app.get("/api/biomed/answer-runs/{run_id}/evidence-review")
+    def get_answer_evidence_review(
+        run_id: str,
+        include_graph: bool = False,
+    ) -> dict[str, Any]:
+        result = service.get_run_evidence_review(
+            run_id,
+            include_graph=include_graph,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/answer-runs/{run_id}/evidence-review/snapshot")
+    def create_answer_evidence_review_snapshot(
+        run_id: str,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        snapshot = service.create_evidence_graph_snapshot(run_id, force=force)
+        if snapshot is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return {
+            "snapshot": snapshot.model_dump(
+                mode="json",
+                exclude={"graph", "validation"},
+            ),
+            "validation": snapshot.validation,
+        }
+
     @app.get("/api/biomed/answer-runs/{run_id}/math-signals")
     def get_answer_math_signals(run_id: str) -> dict[str, Any]:
         result = service.get_answer_math_signals(run_id)

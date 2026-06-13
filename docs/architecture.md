@@ -208,6 +208,37 @@ invert support and contradiction. JSON graph export is read-only and recursively
 redacts prompt fields, raw provider responses, API keys, tokens, authorization
 headers, and secret-like strings.
 
+## Run Evidence Review
+
+Run Evidence Review is the product-facing layer above Evidence Graph and
+Provenance Graph. It is centered on an answer run rather than on raw nodes and
+edges.
+
+After audited answer generation or a manual run audit, the service creates an
+immutable redacted Evidence Graph snapshot:
+
+```text
+AnswerRun + latest CitationAudit -> Evidence Graph v1 -> validation -> snapshot
+```
+
+The review response has `schema_version=biomed-evidence-review-v1` and
+aggregates:
+
+- snapshot metadata and graph hash;
+- validation result;
+- per-claim support status, audit verdict, support score, evidence card, paper
+  IDs, evidence IDs, and limitations;
+- run-level summary counts;
+- links to graph, trace, provenance, and redacted JSON export.
+
+Legacy runs can still be reviewed. If no persisted snapshot exists, the review
+endpoint returns a derived review with `snapshot.status=missing`; the dashboard
+then calls the snapshot backfill route and reloads the review.
+
+Review validation is a UI and evaluation gate. It surfaces structural evidence
+failures to reviewers and release metrics, but it does not convert graph
+structure into new biomedical truth and it does not hard-fail answer generation.
+
 ## Citation And Logic Audit
 
 Generated answers are decomposed into atomic claims. Each claim is checked

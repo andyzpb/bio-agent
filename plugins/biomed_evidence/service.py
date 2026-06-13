@@ -42,8 +42,10 @@ from plugins.biomed_evidence.obsidian_export import (
 from plugins.biomed_evidence.graph import (
     BiomedEvidenceGraph,
     GraphScope,
+    build_evidence_card,
     build_graph_from_evidence,
     build_run_graph,
+    graph_to_json_dict,
     validate_evidence_graph,
 )
 from plugins.biomed_evidence.provenance_service import build_provenance_graph
@@ -76,8 +78,11 @@ from plugins.biomed_evidence.schemas import (
     CoverageGapAnalysisRequest,
     CoverageGapAnalysisResult,
     CoverageStatus,
+    EVIDENCE_REVIEW_SCHEMA_VERSION,
     EvidenceBatchExtractionRequest,
     EvidenceBatchExtractionResult,
+    EvidenceGraphSnapshotMetadata,
+    EvidenceGraphSnapshotRecord,
     EvidenceExtractionRequest,
     EvidenceExtractionResult,
     EvidencePacketBuildRequest,
@@ -129,6 +134,9 @@ from plugins.biomed_evidence.schemas import (
     RetrievalIntent,
     RetrievalManifest,
     RetrievalSubquestion,
+    RunEvidenceReview,
+    RunEvidenceReviewClaim,
+    RunEvidenceReviewSummary,
     SavedToolChainTemplate,
     SavedToolChainTemplateListResult,
     SavedToolChainTemplateRunRequest,
@@ -3047,6 +3055,7 @@ class BiomedEvidenceService:
         self.storage.save_answer_revision(revision)
         self.storage.save_agent_trace_steps(trace)
         self.storage.save_answer_run(final_result, question=request.question)
+        self.create_evidence_graph_snapshot(final_result.run_id, force=True)
         return AuditedAnswerResult(
             answer_result=final_result,
             draft_answer=revision.draft_answer,
@@ -3805,6 +3814,131 @@ class BiomedEvidenceService:
         )
         return _with_graph_validation(graph, validate=validate)
 
+    def create_evidence_graph_snapshot(
+        self,
+        run_id: str,
+        *,
+        force: bool = False,
+    ) -> EvidenceGraphSnapshotRecord | None:
+        clean_run_id = run_id.strip()
+        run = self.storage.get_answer_run(clean_run_id)
+        if run is None:
+            return None
+        audit = self.storage.get_latest_citation_audit_for_run(clean_run_id)
+        audit_id = audit.audit_id if audit is not None else None
+        if not force:
+            existing = self.storage.get_latest_evidence_graph_snapshot(
+                clean_run_id,
+                audit_id=audit_id,
+                match_audit=True,
+            )
+            if existing is not None:
+                return existing
+        graph = build_run_graph(
+            run,
+            audit=audit,
+            scope=GraphScope(
+                kind="run",
+                identifiers={"run_id": clean_run_id},
+                filters={"snapshot": True, "validate": True},
+            ),
+        )
+        graph = _with_graph_validation(graph, validate=True)
+        graph_json = graph_to_json_dict(graph)
+        validation_json = cast(dict[str, Any], graph_json.get("validation") or {})
+        graph_hash = _canonical_graph_hash(graph_json)
+        snapshot = EvidenceGraphSnapshotRecord(
+            status="persisted",
+            snapshot_id=_evidence_graph_snapshot_id(
+                clean_run_id,
+                audit_id,
+                graph_hash,
+            ),
+            run_id=clean_run_id,
+            audit_id=audit_id,
+            schema_version=str(graph_json.get("schema_version") or graph.schema_version),
+            graph_id=cast(str | None, graph_json.get("graph_id")),
+            graph_hash=graph_hash,
+            graph=graph_json,
+            validation=validation_json,
+            source_ids=_evidence_graph_source_ids(graph_json),
+            created_at=_now_iso(),
+            snapshot_required=False,
+        )
+        return self.storage.save_evidence_graph_snapshot(snapshot)
+
+    def get_latest_evidence_graph_snapshot(
+        self,
+        run_id: str,
+    ) -> EvidenceGraphSnapshotRecord | None:
+        return self.storage.get_latest_evidence_graph_snapshot(run_id.strip())
+
+    def get_run_evidence_review(
+        self,
+        run_id: str,
+        *,
+        include_graph: bool = False,
+    ) -> RunEvidenceReview | None:
+        clean_run_id = run_id.strip()
+        run = self.storage.get_answer_run(clean_run_id)
+        if run is None:
+            return None
+        audit = self.storage.get_latest_citation_audit_for_run(clean_run_id)
+        snapshot_record = self.storage.get_latest_evidence_graph_snapshot(clean_run_id)
+        warnings: list[str] = []
+        if snapshot_record is not None:
+            graph_json = snapshot_record.graph
+            validation_json = snapshot_record.validation
+            snapshot_meta = _snapshot_metadata(snapshot_record)
+        else:
+            graph = self.get_graph_v1(run_id=clean_run_id, validate=True)
+            if graph is None:
+                return None
+            graph_json = graph_to_json_dict(graph)
+            validation_json = cast(dict[str, Any], graph_json.get("validation") or {})
+            snapshot_meta = EvidenceGraphSnapshotMetadata(
+                status="missing",
+                run_id=clean_run_id,
+                audit_id=audit.audit_id if audit is not None else None,
+                schema_version=str(
+                    graph_json.get("schema_version") or graph.schema_version
+                ),
+                graph_id=cast(str | None, graph_json.get("graph_id")),
+                graph_hash=_canonical_graph_hash(graph_json),
+                source_ids=_evidence_graph_source_ids(graph_json),
+                created_at=None,
+                snapshot_required=True,
+            )
+            warnings.append(
+                "No persisted evidence graph snapshot exists; review was derived "
+                "from current run/audit records."
+            )
+        graph_obj = BiomedEvidenceGraph.model_validate(graph_json)
+        claims = _review_claims_from_graph(
+            graph_obj,
+            run_id=clean_run_id,
+            audit=audit,
+        )
+        summary = _review_summary(
+            graph_obj,
+            claims=claims,
+            validation=validation_json,
+            audit=audit,
+        )
+        return RunEvidenceReview(
+            schema_version=EVIDENCE_REVIEW_SCHEMA_VERSION,
+            run_id=clean_run_id,
+            audit_id=audit.audit_id if audit is not None else None,
+            snapshot=snapshot_meta,
+            snapshot_required=snapshot_meta.snapshot_required,
+            summary=summary,
+            claims=claims,
+            links=_review_links(clean_run_id),
+            validation=validation_json,
+            graph=graph_json if include_graph else None,
+            warnings=warnings,
+        )
+
     def create_watch(self, request: WatchTopicCreateRequest) -> WatchTopic:
         now = _now_iso()
         watch = WatchTopic(
@@ -4037,7 +4171,7 @@ class BiomedEvidenceService:
         result = self.storage.get_answer_run(run_id)
         if result is None:
             return None
-        return self.audit_answer(
+        audit = self.audit_answer(
             CitationAuditRequest(
                 answer=result.answer,
                 citations=result.citations,
@@ -4048,6 +4182,8 @@ class BiomedEvidenceService:
                 retrieval_manifest=result.retrieval_manifest,
             )
         )
+        self.create_evidence_graph_snapshot(run_id, force=True)
+        return audit
 
     def get_citation_audit(self, audit_id: str) -> CitationAuditResult | None:
         return self.storage.get_citation_audit(audit_id)
@@ -7845,6 +7981,249 @@ def _graph_scope_kind(
     if direction.strip():
         return "custom"
     return "global"
+
+
+def _canonical_graph_hash(graph_json: dict[str, Any]) -> str:
+    payload = json.dumps(graph_json, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _evidence_graph_snapshot_id(
+    run_id: str,
+    audit_id: str | None,
+    graph_hash: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"{run_id}|{audit_id or ''}|{graph_hash}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"evidence-graph-snapshot-{digest}"
+
+
+def _evidence_graph_source_ids(graph_json: dict[str, Any]) -> dict[str, Any]:
+    values: dict[str, set[str]] = {
+        "run_ids": set(),
+        "audit_ids": set(),
+        "retrieval_ids": set(),
+        "packet_ids": set(),
+        "paper_ids": set(),
+        "evidence_ids": set(),
+        "claim_ids": set(),
+    }
+    for raw_node in graph_json.get("nodes", []):
+        if not isinstance(raw_node, dict):
+            continue
+        properties = raw_node.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        node_type = str(raw_node.get("type") or "")
+        if node_type == "AnswerRun":
+            _add_source_id(values, "run_ids", properties.get("run_id"))
+        elif node_type == "AuditResult":
+            _add_source_id(values, "audit_ids", properties.get("audit_id"))
+        elif node_type == "RetrievalManifest":
+            _add_source_id(values, "retrieval_ids", properties.get("retrieval_id"))
+        elif node_type == "EvidencePacket":
+            _add_source_id(values, "packet_ids", properties.get("packet_id"))
+        elif node_type == "Paper":
+            _add_source_id(values, "paper_ids", properties.get("paper_id"))
+        elif node_type == "EvidenceSpan":
+            _add_source_id(values, "evidence_ids", properties.get("evidence_id"))
+            _add_source_id(values, "paper_ids", properties.get("paper_id"))
+            _add_source_id(values, "retrieval_ids", properties.get("retrieval_id"))
+        elif node_type == "Claim":
+            _add_source_id(values, "claim_ids", properties.get("claim_id"))
+    return {key: sorted(items) for key, items in values.items()}
+
+
+def _add_source_id(
+    values: dict[str, set[str]],
+    key: str,
+    value: object,
+) -> None:
+    if value is None:
+        return
+    clean = str(value).strip()
+    if clean:
+        values[key].add(clean)
+
+
+def _snapshot_metadata(
+    snapshot: EvidenceGraphSnapshotRecord,
+) -> EvidenceGraphSnapshotMetadata:
+    return EvidenceGraphSnapshotMetadata(
+        status=snapshot.status,
+        snapshot_id=snapshot.snapshot_id,
+        run_id=snapshot.run_id,
+        audit_id=snapshot.audit_id,
+        schema_version=snapshot.schema_version,
+        graph_id=snapshot.graph_id,
+        graph_hash=snapshot.graph_hash,
+        source_ids=snapshot.source_ids,
+        created_at=snapshot.created_at,
+        snapshot_required=False,
+    )
+
+
+def _review_claims_from_graph(
+    graph: BiomedEvidenceGraph,
+    *,
+    run_id: str,
+    audit: CitationAuditResult | None,
+) -> list[RunEvidenceReviewClaim]:
+    audit_by_id: dict[str, ClaimAuditItem] = {}
+    audit_by_text: dict[str, ClaimAuditItem] = {}
+    if audit is not None:
+        for item in audit.claim_audits:
+            audit_by_id[item.claim_id] = item
+            audit_by_text[_normalize_review_text(item.claim)] = item
+    claims: list[RunEvidenceReviewClaim] = []
+    for node in sorted(
+        [item for item in graph.nodes if item.type == "Claim"],
+        key=lambda item: item.id,
+    ):
+        claim_id = str(node.properties.get("claim_id") or node.id)
+        claim_text = str(node.properties.get("text") or node.label)
+        audit_item = audit_by_id.get(claim_id) or audit_by_text.get(
+            _normalize_review_text(claim_text)
+        )
+        card_model = build_evidence_card(graph, node.id)
+        card = card_model.model_dump(mode="json")
+        evidence_items = [
+            item for item in card.get("evidence", []) if isinstance(item, dict)
+        ]
+        paper_ids = _unique_str(item.get("paper_id") for item in evidence_items)
+        evidence_ids = _unique_str(item.get("evidence_id") for item in evidence_items)
+        support_status = str(
+            node.properties.get("support_status")
+            or card.get("support_status")
+            or "not_assessed"
+        )
+        claims.append(
+            RunEvidenceReviewClaim(
+                claim_id=claim_id,
+                claim_node_id=node.id,
+                claim_text=claim_text,
+                support_status=support_status,
+                audit_verdict=audit_item.verdict if audit_item is not None else None,
+                support_score=(
+                    audit_item.support_score if audit_item is not None else None
+                ),
+                evidence_count=len(evidence_items),
+                paper_ids=paper_ids,
+                evidence_ids=evidence_ids,
+                limitation_count=len(
+                    [item for item in card.get("limitations", []) if str(item).strip()]
+                ),
+                review_action=_claim_review_action(support_status, audit_item),
+                evidence_card=card,
+                links={
+                    "evidence_card": (
+                        f"/api/biomed/graph/v1/evidence-card/{node.id}"
+                        f"?run_id={run_id}"
+                    ),
+                    "graph": f"/api/biomed/answer-runs/{run_id}/evidence-graph",
+                    "trace": f"/api/biomed/answer-runs/{run_id}/trace",
+                    "provenance": f"/api/biomed/answer-runs/{run_id}/provenance",
+                },
+            )
+        )
+    return claims
+
+
+def _review_summary(
+    graph: BiomedEvidenceGraph,
+    *,
+    claims: list[RunEvidenceReviewClaim],
+    validation: dict[str, Any],
+    audit: CitationAuditResult | None,
+) -> RunEvidenceReviewSummary:
+    counts = {
+        "supported": 0,
+        "contradicted": 0,
+        "qualified": 0,
+        "unsupported": 0,
+        "not_assessed": 0,
+    }
+    for claim in claims:
+        bucket = _support_status_bucket(claim.support_status)
+        counts[bucket] += 1
+    clinical_refusal = any(
+        node.type == "AnswerRun" and bool(node.properties.get("clinical_refusal"))
+        for node in graph.nodes
+    )
+    return RunEvidenceReviewSummary(
+        total_claims=len(claims),
+        supported=counts["supported"],
+        contradicted=counts["contradicted"],
+        qualified=counts["qualified"],
+        unsupported=counts["unsupported"],
+        not_assessed=counts["not_assessed"],
+        validation_ok=bool(validation.get("ok")),
+        validation_error_count=int(validation.get("error_count") or 0),
+        validation_warning_count=int(validation.get("warning_count") or 0),
+        recommended_audit_action=(
+            audit.recommended_action if audit is not None else None
+        ),
+        clinical_refusal=clinical_refusal,
+    )
+
+
+def _review_links(run_id: str) -> dict[str, str]:
+    return {
+        "review": f"/api/biomed/answer-runs/{run_id}/evidence-review",
+        "snapshot": f"/api/biomed/answer-runs/{run_id}/evidence-review/snapshot",
+        "graph": f"/api/biomed/answer-runs/{run_id}/evidence-graph",
+        "graph_export": f"/api/biomed/graph/v1/export/json?run_id={run_id}",
+        "trace": f"/api/biomed/answer-runs/{run_id}/trace",
+        "provenance": f"/api/biomed/answer-runs/{run_id}/provenance",
+    }
+
+
+def _support_status_bucket(
+    support_status: str,
+) -> str:
+    normalized = support_status.strip().lower()
+    if normalized in {"supported", "contradicted", "qualified", "unsupported"}:
+        return normalized
+    return "not_assessed"
+
+
+def _claim_review_action(
+    support_status: str,
+    audit_item: ClaimAuditItem | None,
+) -> str:
+    normalized_status = support_status.strip().lower()
+    if audit_item is not None and audit_item.verdict in {
+        "overclaimed",
+        "contradicted",
+        "insufficient_evidence",
+        "irrelevant_citation",
+        "not_cited",
+    }:
+        return "needs_revision"
+    if normalized_status == "supported" and (
+        audit_item is None or audit_item.verdict in {"supported", "partial_support"}
+    ):
+        return "accept"
+    return "needs_review"
+
+
+def _normalize_review_text(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def _unique_str(values: Iterable[object]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        clean = str(value).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        output.append(clean)
+    return output
 
 
 def _decision_id(watch_id: str, paper_id: str) -> str:

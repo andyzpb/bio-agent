@@ -29,6 +29,10 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
   invariants, including supported-claim support edges, evidence-to-paper
   traceability, clinical refusal graphs without biomedical claims, and
   support/contradiction direction consistency.
+- Run Evidence Review surfaces graph validation, audit verdicts, evidence
+  cards, and immutable graph snapshot metadata as a reviewer and eval gate. It
+  does not turn graph structure into a new biomedical fact source, and it does
+  not override deterministic citation audit.
 
 ## Tool And Memory Boundary
 
@@ -54,6 +58,9 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - Evidence Graph JSON export is read-only and recursively redacts raw prompt
   fields, provider responses, API keys, tokens, authorization headers, secrets,
   and common secret-like strings.
+- Run Evidence Review snapshots store redacted graph JSON and validation
+  metadata so old answer-run reviews remain reproducible without exposing raw
+  prompts, provider responses, or secrets.
 - Evidence Graph and Provenance Graph share stable local IDs, but the former is
   the claim/evidence/source relationship graph and the latter is the execution
   lineage graph.

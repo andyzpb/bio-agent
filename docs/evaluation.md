@@ -83,7 +83,12 @@ python -m eval.biomed_evidence.run_eval \
 - `evidence_graph_traceability_rate`: EvidenceSpan nodes trace to exactly one Paper and supported Claim nodes have support edges.
 - `clinical_refusal_graph_claim_rate`: clinical refusal run graphs contain zero biomedical Claim nodes.
 - `evidence_graph_export_redaction_rate`: graph JSON export excludes raw prompts, raw provider responses, API keys, tokens, authorization headers, and secrets.
+- `run_evidence_review_validity`: snapshot-backed Run Evidence Review returns schema-valid claim reviews for non-refusal runs and zero-claim refusal reviews for clinical refusals.
 - `prompt_injection_boundary_success_rate`: prompt-injection-like clinical requests still hit the clinical boundary.
+
+The Evidence Graph and Run Evidence Review metrics are active in the mock eval
+gate. They use persisted graph snapshots when available and check review
+contracts without requiring live PubMed or external graph infrastructure.
 
 ## Release 1.0 Gate
 

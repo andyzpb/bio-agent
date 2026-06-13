@@ -1,6 +1,6 @@
 /// <reference path="../../types/akashic-dashboard.d.ts" />
 
-type BiomedView = "ask" | "projects" | "evidence" | "graph" | "watch" | "audit" | "trace" | "responsible";
+type BiomedView = "ask" | "projects" | "evidence" | "graph" | "review" | "watch" | "audit" | "trace" | "responsible";
 
 let biomedWorkflowTemplates: SavedToolChainTemplate[] = [];
 
@@ -9,6 +9,7 @@ const BIOMED_VIEW_ITEMS: { id: BiomedView; label: string; description: string }[
   { id: "projects", label: "Projects", description: "memory" },
   { id: "evidence", label: "Evidence", description: "claims" },
   { id: "graph", label: "Graph", description: "relations" },
+  { id: "review", label: "Review", description: "run QA" },
   { id: "watch", label: "Watch", description: "monitoring" },
   { id: "audit", label: "Audit", description: "review" },
   { id: "trace", label: "Trace", description: "provenance" },
@@ -651,6 +652,63 @@ interface BiomedEvidenceCard {
   warnings: string[];
 }
 
+interface EvidenceGraphSnapshotMetadata {
+  status: "persisted" | "missing" | "derived";
+  snapshot_id?: string | null;
+  run_id: string;
+  audit_id?: string | null;
+  schema_version?: string | null;
+  graph_id?: string | null;
+  graph_hash?: string | null;
+  source_ids: Record<string, unknown>;
+  created_at?: string | null;
+  snapshot_required: boolean;
+}
+
+interface RunEvidenceReviewSummary {
+  total_claims: number;
+  supported: number;
+  contradicted: number;
+  qualified: number;
+  unsupported: number;
+  not_assessed: number;
+  validation_ok: boolean;
+  validation_error_count: number;
+  validation_warning_count: number;
+  recommended_audit_action?: string | null;
+  clinical_refusal: boolean;
+}
+
+interface RunEvidenceReviewClaim {
+  claim_id: string;
+  claim_node_id: string;
+  claim_text: string;
+  support_status: string;
+  audit_verdict?: string | null;
+  support_score?: number | null;
+  evidence_count: number;
+  paper_ids: string[];
+  evidence_ids: string[];
+  limitation_count: number;
+  review_action: "accept" | "needs_review" | "needs_revision";
+  evidence_card: BiomedEvidenceCard;
+  links: Record<string, string>;
+}
+
+interface RunEvidenceReview {
+  schema_version: string;
+  run_id: string;
+  audit_id?: string | null;
+  snapshot: EvidenceGraphSnapshotMetadata;
+  snapshot_required: boolean;
+  summary: RunEvidenceReviewSummary;
+  claims: RunEvidenceReviewClaim[];
+  links: Record<string, string>;
+  validation: BiomedEvidenceGraphValidation;
+  graph?: BiomedEvidenceGraphV1 | null;
+  warnings: string[];
+}
+
 interface BiomedProject {
   project_id: string;
   name: string;
@@ -887,6 +945,83 @@ function renderBiomedEvidenceGraph(graph: BiomedEvidenceGraphV1): string {
           `).join("") || '<div class="biomed-muted">No claim nodes.</div>'}
         </div>
       </div>
+    </div>
+  `;
+}
+
+function reviewFilterClaims(review: RunEvidenceReview, filter: string): RunEvidenceReviewClaim[] {
+  if (filter === "needs_review") return review.claims.filter((claim) => claim.review_action !== "accept");
+  if (filter === "supported") return review.claims.filter((claim) => claim.support_status === "supported");
+  if (filter === "contradicted") return review.claims.filter((claim) => claim.support_status === "contradicted");
+  if (filter === "unsupported") {
+    return review.claims.filter((claim) => ["unsupported", "qualified"].includes(claim.support_status));
+  }
+  return review.claims;
+}
+
+function renderRunEvidenceReview(review: RunEvidenceReview, filter = "all"): string {
+  const summary = review.summary;
+  const claims = reviewFilterClaims(review, filter);
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Review</span><strong>${escapeHtml(review.schema_version)}</strong></div>
+        <div><span>Run</span><code>${escapeHtml(review.run_id)}</code></div>
+        <div><span>Snapshot</span><strong>${escapeHtml(review.snapshot.status)}</strong></div>
+        <div><span>Validation</span><strong>${summary.validation_ok ? "valid" : "invalid"}</strong></div>
+        <div><span>Audit</span><strong>${escapeHtml(summary.recommended_audit_action || "pending")}</strong></div>
+        <div><span>Clinical</span><strong>${summary.clinical_refusal ? "refusal" : "research"}</strong></div>
+        <div><span>Claims</span><strong>${summary.total_claims}</strong></div>
+        <div><span>Needs Review</span><strong>${review.claims.filter((claim) => claim.review_action !== "accept").length}</strong></div>
+      </div>
+      ${review.snapshot.graph_hash ? `<div class="biomed-watch-meta">graph hash <code>${escapeHtml(review.snapshot.graph_hash)}</code></div>` : ""}
+      ${review.snapshot.snapshot_id ? `<div class="biomed-watch-meta">snapshot <code>${escapeHtml(review.snapshot.snapshot_id)}</code></div>` : ""}
+      ${review.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(review.warnings)}` : ""}
+      <div class="biomed-label">Validation</div>
+      ${renderGraphValidation(review.validation)}
+    </div>
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Supported</span><strong>${summary.supported}</strong></div>
+        <div><span>Contradicted</span><strong>${summary.contradicted}</strong></div>
+        <div><span>Qualified</span><strong>${summary.qualified}</strong></div>
+        <div><span>Unsupported</span><strong>${summary.unsupported}</strong></div>
+        <div><span>Not assessed</span><strong>${summary.not_assessed}</strong></div>
+        <div><span>Showing</span><strong>${claims.length}</strong></div>
+      </div>
+    </div>
+    <div class="biomed-action-row">
+      <button data-review-related="graph">Graph</button>
+      <button data-review-related="trace">Trace</button>
+      <button data-review-related="provenance">Provenance</button>
+      <button data-review-related="export">JSON</button>
+    </div>
+    ${summary.clinical_refusal && !claims.length ? `
+      <div class="biomed-policy">
+        <strong>Clinical boundary passed.</strong>
+        <span>This refusal run has zero biomedical evidence claims.</span>
+      </div>
+    ` : ""}
+    <div class="biomed-audit-table">
+      ${claims.map((claim) => `
+        <div class="biomed-audit-row ${claim.review_action !== "accept" ? "is-failed" : ""}">
+          <div class="biomed-audit-row-head">
+            ${pill(claim.review_action)}
+            ${pill(claim.support_status)}
+            ${claim.audit_verdict ? pill(claim.audit_verdict) : ""}
+            <code>${escapeHtml(claim.claim_id)}</code>
+          </div>
+          <div class="biomed-evidence-claim">${escapeHtml(claim.claim_text)}</div>
+          <div class="biomed-watch-meta">
+            score ${claim.support_score ?? "-"} · ${claim.evidence_count} evidence · ${claim.paper_ids.length} papers · ${claim.limitation_count} limitations
+          </div>
+          ${claim.paper_ids.length ? `<div class="biomed-label">Papers</div>${renderList(claim.paper_ids)}` : ""}
+          <details>
+            <summary>Evidence card</summary>
+            ${renderBiomedEvidenceCard(claim.evidence_card)}
+          </details>
+        </div>
+      `).join("") || '<div class="biomed-muted">No claims match this filter.</div>'}
     </div>
   `;
 }
@@ -2171,6 +2306,8 @@ function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
   }
   if (view === "graph") {
     renderBiomedWorkbenchPage(root, "Evidence graph", "Inspect paper, entity, and claim relationships for a topic.", renderGraph);
+  } else if (view === "review") {
+    renderBiomedWorkbenchPage(root, "Run evidence review", "Review answer-run claims, evidence cards, validation, and snapshot status.", renderReview);
   } else if (view === "projects") {
     renderBiomedWorkbenchPage(root, "Projects", "Keep research context, saved papers, claims, and reviewer queues organized.", renderProjects);
   } else if (view === "watch") {
@@ -2563,6 +2700,145 @@ function workspaceAnswerPayload(container: HTMLElement, audited: boolean): Recor
     use_llm_claim_logic: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked),
     export_logic_facts: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-export-logic-facts")?.checked),
   };
+}
+
+function renderReview(container: HTMLElement): void {
+  container.innerHTML += `
+    <div class="biomed-section">
+      <div class="biomed-title">Run Evidence Review</div>
+      <div class="biomed-form">
+        <div class="biomed-row">
+          <input id="biomed-review-run-id" placeholder="answer run id" />
+          <select id="biomed-review-filter">
+            <option value="all">all claims</option>
+            <option value="needs_review">needs review</option>
+            <option value="supported">supported</option>
+            <option value="contradicted">contradicted</option>
+            <option value="unsupported">unsupported/qualified</option>
+          </select>
+          <button id="biomed-review-load-btn">Load Review</button>
+          <button id="biomed-review-snapshot-btn">Snapshot</button>
+        </div>
+      </div>
+      <div class="biomed-label">Recent Runs</div>
+      <div id="biomed-review-recent-runs" class="biomed-result"></div>
+      <div id="biomed-review-result" class="biomed-result"></div>
+      <div id="biomed-review-related" class="biomed-result"></div>
+    </div>
+  `;
+  let currentReview: RunEvidenceReview | null = null;
+
+  const currentFilter = (): string => (
+    container.querySelector<HTMLSelectElement>("#biomed-review-filter")?.value || "all"
+  );
+
+  const attachReviewActions = (): void => {
+    container.querySelectorAll<HTMLButtonElement>("[data-review-related]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        if (!currentReview) return;
+        const target = container.querySelector<HTMLElement>("#biomed-review-related");
+        if (!target) return;
+        const kind = button.dataset.reviewRelated || "";
+        target.innerHTML = renderLoading(`Loading ${kind}...`);
+        try {
+          if (kind === "graph") {
+            const graph = await api<BiomedEvidenceGraphV1>(`/api/biomed/answer-runs/${encodeURIComponent(currentReview.run_id)}/evidence-graph?validate=true`);
+            target.innerHTML = `<div class="biomed-label">Evidence Graph</div>${renderBiomedEvidenceGraph(graph)}`;
+          } else if (kind === "trace") {
+            const trace = await api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(currentReview.run_id)}/trace`);
+            target.innerHTML = `<div class="biomed-label">Trace</div>${renderTraceResult(trace)}`;
+          } else if (kind === "provenance") {
+            const envelope = await api<ReleaseToolEnvelope<ProvenanceGraphResult>>(`/api/biomed/answer-runs/${encodeURIComponent(currentReview.run_id)}/provenance`);
+            target.innerHTML = `<div class="biomed-label">Provenance</div>${renderProvenanceResult(envelope)}`;
+          } else {
+            const graph = await api<BiomedEvidenceGraphV1>(`/api/biomed/graph/v1/export/json?run_id=${encodeURIComponent(currentReview.run_id)}&validate=true`);
+            target.innerHTML = `
+              <div class="biomed-label">Evidence Graph JSON</div>
+              <pre class="biomed-json biomed-json-tall">${escapeHtml(JSON.stringify(graph, null, 2))}</pre>
+            `;
+          }
+        } catch (error) {
+          target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+        }
+      });
+    });
+  };
+
+  const paintReview = (review: RunEvidenceReview): void => {
+    currentReview = review;
+    const target = container.querySelector<HTMLElement>("#biomed-review-result");
+    if (!target) return;
+    target.innerHTML = renderRunEvidenceReview(review, currentFilter());
+    attachReviewActions();
+  };
+
+  const loadReview = async (runId: string): Promise<void> => {
+    const target = container.querySelector<HTMLElement>("#biomed-review-result");
+    const related = container.querySelector<HTMLElement>("#biomed-review-related");
+    if (!target || !runId) return;
+    if (related) related.replaceChildren();
+    target.innerHTML = renderLoading("Loading evidence review...");
+    try {
+      let review = await api<RunEvidenceReview>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`);
+      if (review.snapshot.status === "missing") {
+        target.innerHTML = renderLoading("Creating evidence graph snapshot...");
+        await api(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/snapshot`, { method: "POST" });
+        review = await api<RunEvidenceReview>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`);
+      }
+      paintReview(review);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  };
+
+  container.querySelector<HTMLButtonElement>("#biomed-review-load-btn")?.addEventListener("click", async () => {
+    const runId = container.querySelector<HTMLInputElement>("#biomed-review-run-id")?.value.trim() || "";
+    await loadReview(runId);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-review-snapshot-btn")?.addEventListener("click", async () => {
+    const runId = container.querySelector<HTMLInputElement>("#biomed-review-run-id")?.value.trim() || "";
+    const target = container.querySelector<HTMLElement>("#biomed-review-result");
+    if (!target || !runId) return;
+    target.innerHTML = renderLoading("Creating evidence graph snapshot...");
+    try {
+      await api(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/snapshot`, { method: "POST" });
+      await loadReview(runId);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLSelectElement>("#biomed-review-filter")?.addEventListener("change", () => {
+    if (currentReview) paintReview(currentReview);
+  });
+  void loadReviewRecentRuns(container, loadReview);
+}
+
+async function loadReviewRecentRuns(
+  container: HTMLElement,
+  onSelect: (runId: string) => Promise<void>,
+): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-review-recent-runs");
+  if (!target) return;
+  target.innerHTML = '<div class="biomed-muted">Loading recent runs...</div>';
+  try {
+    const data = await api<{ items: AnswerRunListItem[] }>("/api/biomed/answer-runs?page_size=8");
+    target.innerHTML = data.items.map((item) => `
+      <button class="biomed-run-link" data-review-run-id="${escapeHtml(item.run_id)}">
+        <span>${escapeHtml(item.question || item.run_id)}</span>
+        <code>${escapeHtml(item.created_at || item.run_id)}</code>
+      </button>
+    `).join("") || '<div class="biomed-muted">No runs yet.</div>';
+    target.querySelectorAll<HTMLButtonElement>("[data-review-run-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const runId = button.dataset.reviewRunId || "";
+        const input = container.querySelector<HTMLInputElement>("#biomed-review-run-id");
+        if (input) input.value = runId;
+        await onSelect(runId);
+      });
+    });
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
 }
 
 function renderGraph(container: HTMLElement): void {
@@ -3057,6 +3333,8 @@ function renderBiomedDetail(
   }
   if (view === "graph") {
     renderGraph(root);
+  } else if (view === "review") {
+    renderReview(root);
   } else if (view === "projects") {
     renderProjects(root);
   } else if (view === "watch") {

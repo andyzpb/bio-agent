@@ -191,6 +191,16 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
             edge["type"] for edge in graph_v1_payload["edges"]
         }
 
+        pre_audit_review = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review",
+        )
+        assert pre_audit_review.status_code == 200
+        pre_audit_review_payload = pre_audit_review.json()
+        assert pre_audit_review_payload["schema_version"] == "biomed-evidence-review-v1"
+        assert pre_audit_review_payload["snapshot"]["status"] == "missing"
+        assert pre_audit_review_payload["snapshot_required"] is True
+        assert pre_audit_review_payload["claims"]
+
         audit = client.get(f"/api/biomed/audit/{payload['run_id']}")
         assert audit.status_code == 200
         assert audit.json()["run_id"] == payload["run_id"]
@@ -221,6 +231,41 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         audit = client.get(f"/api/biomed/audit/{payload['run_id']}")
         assert audit.status_code == 200
         assert audit.json()["latest_citation_audit"]["audit_id"] == audit_payload["audit_id"]
+
+        review = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review",
+        )
+        assert review.status_code == 200
+        review_payload = review.json()
+        assert review_payload["schema_version"] == "biomed-evidence-review-v1"
+        assert review_payload["snapshot"]["status"] == "persisted"
+        assert review_payload["snapshot"]["snapshot_id"]
+        assert review_payload["snapshot"]["audit_id"] == audit_payload["audit_id"]
+        assert review_payload["snapshot_required"] is False
+        assert review_payload["summary"]["total_claims"] >= 1
+        assert review_payload["summary"]["validation_ok"] is True
+        assert review_payload["claims"]
+        assert review_payload["claims"][0]["evidence_card"]["claim_text"]
+        assert review_payload["claims"][0]["links"]["trace"].endswith("/trace")
+
+        review_with_graph = client.get(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review",
+            params={"include_graph": True},
+        )
+        assert review_with_graph.status_code == 200
+        assert review_with_graph.json()["graph"]["schema_version"] == (
+            "biomed-evidence-graph-v1"
+        )
+
+        snapshot = client.post(
+            f"/api/biomed/answer-runs/{payload['run_id']}/evidence-review/snapshot",
+        )
+        assert snapshot.status_code == 200
+        snapshot_payload = snapshot.json()
+        assert snapshot_payload["snapshot"]["snapshot_id"] == (
+            review_payload["snapshot"]["snapshot_id"]
+        )
+        assert snapshot_payload["validation"]["ok"] is True
 
         run_graph = client.get(
             f"/api/biomed/answer-runs/{payload['run_id']}/evidence-graph",
@@ -322,6 +367,11 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         )
         assert missing_run_graph.status_code == 404
         assert missing_run_graph.json()["detail"]["error_code"] == "unknown_run_id"
+        missing_review = client.get(
+            "/api/biomed/answer-runs/unknown-run/evidence-review",
+        )
+        assert missing_review.status_code == 404
+        assert missing_review.json()["detail"]["error_code"] == "unknown_run_id"
 
         conflict = client.post(
             "/api/biomed/conflicts",
@@ -711,6 +761,15 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
             "AnswerRun"
         }
         assert clinical_graph_payload["edges"] == []
+        clinical_review = client.get(
+            f"/api/biomed/answer-runs/{clinical_run_id}/evidence-review",
+        )
+        assert clinical_review.status_code == 200
+        clinical_review_payload = clinical_review.json()
+        assert clinical_review_payload["snapshot"]["status"] == "persisted"
+        assert clinical_review_payload["summary"]["clinical_refusal"] is True
+        assert clinical_review_payload["summary"]["total_claims"] == 0
+        assert clinical_review_payload["claims"] == []
 
 
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:

@@ -85,6 +85,7 @@ def test_release_tool_contract_registry_and_source_policy() -> None:
     assert "validate_evidence_graph" in contracts
     assert "find_evidence_path" in contracts
     assert "export_evidence_graph_json" in contracts
+    assert "get_run_evidence_review" in contracts
 
     search_contract = get_release_tool_metadata("search_literature")
     assert search_contract.risk_level == "external_network"
@@ -94,6 +95,9 @@ def test_release_tool_contract_registry_and_source_policy() -> None:
     assert graph_export_contract.risk_level == "read_only"
     assert graph_export_contract.side_effects == ["read_storage"]
     assert graph_export_contract.requires_confirmation is False
+    review_contract = get_release_tool_metadata("get_run_evidence_review")
+    assert review_contract.risk_level == "read_only"
+    assert review_contract.side_effects == ["read_storage"]
 
     blocked = release_source_policy_error(
         tool_name="search_literature",
@@ -148,6 +152,7 @@ def test_release_tool_contracts_api(tmp_path: Path) -> None:
     assert tools["export_evidence_packet_to_obsidian"]["requires_confirmation"] is True
     assert tools["export_evidence_graph_json"]["risk_level"] == "read_only"
     assert tools["export_evidence_graph_json"]["side_effects"] == ["read_storage"]
+    assert tools["get_run_evidence_review"]["risk_level"] == "read_only"
 
 
 def test_step_telemetry_summary_is_advisory_only() -> None:

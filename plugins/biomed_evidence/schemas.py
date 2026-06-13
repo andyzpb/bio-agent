@@ -1468,6 +1468,79 @@ class CitationAuditResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+EVIDENCE_REVIEW_SCHEMA_VERSION = "biomed-evidence-review-v1"
+
+
+class EvidenceGraphSnapshotMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["persisted", "missing", "derived"] = "persisted"
+    snapshot_id: str | None = None
+    run_id: str
+    audit_id: str | None = None
+    schema_version: str | None = None
+    graph_id: str | None = None
+    graph_hash: str | None = None
+    source_ids: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+    snapshot_required: bool = False
+
+
+class EvidenceGraphSnapshotRecord(EvidenceGraphSnapshotMetadata):
+    graph: dict[str, Any] = Field(default_factory=dict)
+    validation: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunEvidenceReviewSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_claims: int = 0
+    supported: int = 0
+    contradicted: int = 0
+    qualified: int = 0
+    unsupported: int = 0
+    not_assessed: int = 0
+    validation_ok: bool = False
+    validation_error_count: int = 0
+    validation_warning_count: int = 0
+    recommended_audit_action: AuditRecommendedAction | None = None
+    clinical_refusal: bool = False
+
+
+class RunEvidenceReviewClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str
+    claim_node_id: str
+    claim_text: str
+    support_status: str = "not_assessed"
+    audit_verdict: CitationSupportVerdict | None = None
+    support_score: float | None = None
+    evidence_count: int = 0
+    paper_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    limitation_count: int = 0
+    review_action: Literal["accept", "needs_review", "needs_revision"] = "needs_review"
+    evidence_card: dict[str, Any] = Field(default_factory=dict)
+    links: dict[str, str] = Field(default_factory=dict)
+
+
+class RunEvidenceReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = EVIDENCE_REVIEW_SCHEMA_VERSION
+    run_id: str
+    audit_id: str | None = None
+    snapshot: EvidenceGraphSnapshotMetadata
+    snapshot_required: bool = False
+    summary: RunEvidenceReviewSummary
+    claims: list[RunEvidenceReviewClaim] = Field(default_factory=list)
+    links: dict[str, str] = Field(default_factory=dict)
+    validation: dict[str, Any] = Field(default_factory=dict)
+    graph: dict[str, Any] | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class AdvisoryClaimReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

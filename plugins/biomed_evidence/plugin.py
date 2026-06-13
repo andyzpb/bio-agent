@@ -93,6 +93,7 @@ _BIOMED_TOOL_NAMES = frozenset(
         "validate_evidence_graph",
         "find_evidence_path",
         "export_evidence_graph_json",
+        "get_run_evidence_review",
         "export_evidence_report",
         "validate_citation_support",
         "audit_biomedical_answer",
@@ -1807,6 +1808,26 @@ class BiomedEvidencePlugin(Plugin):
         if graph is None:
             return _dump({"error_code": "unknown_run_id", "run_id": run_id})
         return _dump(graph_to_json_dict(graph))
+
+    @tool(
+        name="get_run_evidence_review",
+        risk="read-only",
+        search_hint="review biomedical answer run claims evidence cards validation snapshot",
+    )
+    async def get_run_evidence_review(
+        self,
+        event,
+        run_id: str,
+        include_graph: bool = False,
+    ) -> str:
+        """Get a product-facing evidence review for an answer run."""
+        review = self._service.get_run_evidence_review(
+            run_id,
+            include_graph=include_graph,
+        )
+        if review is None:
+            return _dump({"error_code": "unknown_run_id", "run_id": run_id})
+        return _dump(review.model_dump(mode="json"))
 
     @tool(
         name="export_evidence_report",

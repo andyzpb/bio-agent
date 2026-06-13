@@ -113,6 +113,7 @@ def _register_defaults() -> None:
         "validate_evidence_graph",
         "find_evidence_path",
         "export_evidence_graph_json",
+        "get_run_evidence_review",
         "export_evidence_report",
         "list_biomed_projects",
         "list_project_paper_decisions",

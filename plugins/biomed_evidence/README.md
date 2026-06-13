@@ -268,6 +268,31 @@ the `/api/biomed/graph/v1/export/json` route recursively redact raw prompts,
 provider responses, API keys, tokens, secrets, authorization headers, and common
 secret-like strings before returning payloads.
 
+## Run Evidence Review
+
+Run Evidence Review is the product-facing layer above Evidence Graph v1. For an
+answer run, it persists an immutable redacted graph snapshot after audited
+answer generation or manual run audit, then returns a compact review contract:
+claim statuses, audit verdicts, evidence cards, paper/evidence IDs, validation
+summary, and links to graph, trace, provenance, and JSON export views.
+
+Snapshot-backed review uses `schema_version=biomed-evidence-review-v1`.
+Legacy runs without snapshots can be backfilled with:
+
+```text
+POST /api/biomed/answer-runs/{run_id}/evidence-review/snapshot
+```
+
+Read-only review access:
+
+```text
+GET /api/biomed/answer-runs/{run_id}/evidence-review
+```
+
+The `get_run_evidence_review` tool exposes the same read-only contract to agent
+workflows. Snapshot creation is intentionally not exposed as an agent tool in
+this phase.
+
 ## Dashboard
 
 Start the dashboard:
@@ -290,6 +315,8 @@ The panel includes:
 - Graph: inspect the typed Evidence Graph v1 with topic/entity/paper/run
   filters, validation summary, node inspector, evidence cards, path lookup, and
   redacted JSON export.
+- Review: inspect answer-run claim status, evidence cards, graph validation,
+  immutable snapshot metadata, and related graph/trace/provenance artifacts.
 - Watch: create, update, check, and review research-watch topics, snapshots,
   and push/skip decisions.
 - Audit: inspect atomic claims, citation-support verdicts, overclaims,
@@ -322,6 +349,8 @@ Common routes:
 - `POST /api/biomed/answer-runs/{run_id}/audit`
 - `GET /api/biomed/answer-runs/{run_id}/trace`
 - `GET /api/biomed/answer-runs/{run_id}/evidence-graph`
+- `GET /api/biomed/answer-runs/{run_id}/evidence-review`
+- `POST /api/biomed/answer-runs/{run_id}/evidence-review/snapshot`
 - `GET /api/biomed/projects`
 - `POST /api/biomed/projects`
 - `POST /api/biomed/projects/{project_id}/papers`

@@ -18,6 +18,7 @@ from plugins.biomed_evidence.schemas import (
     BiomedicalPaper,
     CitationAuditResult,
     ConflictAuditResult,
+    EvidenceGraphSnapshotRecord,
     EvidenceItem,
     ProjectClaimRecord,
     ProjectEvidenceBrief,
@@ -329,6 +330,88 @@ class BiomedStorage:
             page=page,
             page_size=page_size,
         )
+
+    def save_evidence_graph_snapshot(
+        self,
+        snapshot: EvidenceGraphSnapshotRecord,
+    ) -> EvidenceGraphSnapshotRecord:
+        if not snapshot.snapshot_id:
+            raise ValueError("snapshot_id is required")
+        created_at = snapshot.created_at or _now_iso()
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT OR IGNORE INTO biomed_evidence_graph_snapshots(
+                    snapshot_id, run_id, audit_id, schema_version, graph_id,
+                    graph_json, graph_hash, validation_json, source_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.snapshot_id,
+                    snapshot.run_id,
+                    snapshot.audit_id,
+                    snapshot.schema_version,
+                    snapshot.graph_id,
+                    _json(snapshot.graph),
+                    snapshot.graph_hash,
+                    _json(snapshot.validation),
+                    _json(snapshot.source_ids),
+                    created_at,
+                ),
+            )
+            self._db.commit()
+        saved = self.get_evidence_graph_snapshot(snapshot.snapshot_id)
+        return saved or snapshot.model_copy(update={"created_at": created_at})
+
+    def get_evidence_graph_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> EvidenceGraphSnapshotRecord | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT snapshot_id, run_id, audit_id, schema_version, graph_id,
+                       graph_json, graph_hash, validation_json, source_ids_json,
+                       created_at
+                FROM biomed_evidence_graph_snapshots
+                WHERE snapshot_id=?
+                """,
+                (snapshot_id,),
+            ).fetchone()
+        return _evidence_graph_snapshot_from_row(row)
+
+    def get_latest_evidence_graph_snapshot(
+        self,
+        run_id: str,
+        *,
+        audit_id: str | None = None,
+        match_audit: bool = False,
+    ) -> EvidenceGraphSnapshotRecord | None:
+        where = "run_id=?"
+        params: tuple[Any, ...] = (run_id,)
+        if match_audit:
+            if audit_id is None:
+                where += " AND audit_id IS NULL"
+            else:
+                where += " AND audit_id=?"
+                params = (run_id, audit_id)
+        elif audit_id is not None:
+            where += " AND audit_id=?"
+            params = (run_id, audit_id)
+        with self._lock:
+            row = self._db.execute(
+                f"""
+                SELECT snapshot_id, run_id, audit_id, schema_version, graph_id,
+                       graph_json, graph_hash, validation_json, source_ids_json,
+                       created_at
+                FROM biomed_evidence_graph_snapshots
+                WHERE {where}
+                ORDER BY created_at DESC, snapshot_id DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        return _evidence_graph_snapshot_from_row(row)
 
     def save_workflow_template(self, template: SavedToolChainTemplate) -> None:
         now = _now_iso()
@@ -1673,6 +1756,21 @@ class BiomedStorage:
                 retrieval_id TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS biomed_evidence_graph_snapshots(
+                snapshot_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                audit_id TEXT,
+                schema_version TEXT NOT NULL,
+                graph_id TEXT,
+                graph_json TEXT NOT NULL,
+                graph_hash TEXT NOT NULL,
+                validation_json TEXT NOT NULL DEFAULT '{}',
+                source_ids_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES biomed_answer_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_biomed_graph_snapshots_run
+                ON biomed_evidence_graph_snapshots(run_id, created_at);
             CREATE TABLE IF NOT EXISTS biomed_workflow_templates(
                 template_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -2016,6 +2114,27 @@ def _trace_step_from_row(row: sqlite3.Row) -> AgentTraceStep:
         warnings=_json_list(row["warnings_json"]),
         metadata=metadata,
         created_at=str(row["created_at"]),
+    )
+
+
+def _evidence_graph_snapshot_from_row(
+    row: sqlite3.Row | None,
+) -> EvidenceGraphSnapshotRecord | None:
+    if row is None:
+        return None
+    return EvidenceGraphSnapshotRecord(
+        status="persisted",
+        snapshot_id=str(row["snapshot_id"]),
+        run_id=str(row["run_id"]),
+        audit_id=row["audit_id"],
+        schema_version=str(row["schema_version"]),
+        graph_id=row["graph_id"],
+        graph_hash=str(row["graph_hash"]),
+        graph=_json_dict(row["graph_json"]),
+        validation=_json_dict(row["validation_json"]),
+        source_ids=_json_dict(row["source_ids_json"]),
+        created_at=str(row["created_at"]),
+        snapshot_required=False,
     )
 
 

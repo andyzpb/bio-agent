@@ -21,9 +21,12 @@ from plugins.biomed_evidence.graph.schema import (
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     BiomedicalEntity,
+    Citation,
+    CitationAuditRequest,
     EvidenceItem,
     RetrievalManifest,
 )
+from plugins.biomed_evidence.service import BiomedEvidenceService
 
 
 def test_graph_ids_are_stable_and_normalized() -> None:
@@ -306,3 +309,108 @@ def test_validation_rejects_claims_in_refusal_run_scope() -> None:
         "clinical_refusal_cites_claim",
         "clinical_refusal_has_claim",
     } <= {issue.code for issue in validation.issues}
+
+
+def test_snapshot_storage_contract_is_deterministic_and_immutable(tmp_path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    evidence = EvidenceItem(
+        evidence_id="ev-snapshot-1",
+        paper_id="PMID:42",
+        claim="Microglial activation is associated with disease progression.",
+        finding="The abstract reports microglial activation in progression.",
+        evidence_direction="supports",
+        entities=[
+            BiomedicalEntity(
+                name="microglial activation",
+                entity_type="cell_type",
+            )
+        ],
+        methods=["single-cell RNA-seq"],
+        limitations=["Abstract-only extraction."],
+        confidence="medium",
+        evidence_span="The abstract reports microglial activation in progression.",
+    )
+    run = AnswerWithEvidenceResult(
+        run_id="run-snapshot",
+        retrieval_id="ret-snapshot",
+        answer="Microglial activation is associated with disease progression [PMID:42].",
+        citations=[
+            Citation(
+                paper_id="PMID:42",
+                title="Microglial activation in progression",
+                source="mock",
+                cited_claim=evidence.claim,
+            )
+        ],
+        evidence_summary=[evidence],
+        limitations=["Abstract-only extraction."],
+        uncertainty_level="medium",
+        disclaimer="Research support only.",
+    )
+
+    try:
+        table = service.storage._db.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='biomed_evidence_graph_snapshots'
+            """
+        ).fetchone()
+        assert table is not None
+
+        service.storage.save_answer_run(run, question="What is microglial activation?")
+        first = service.create_evidence_graph_snapshot(run.run_id)
+        assert first is not None
+        assert first.snapshot_id
+        assert first.audit_id is None
+        assert first.validation["ok"] is True
+        assert first.graph["schema_version"] == "biomed-evidence-graph-v1"
+
+        second = service.create_evidence_graph_snapshot(run.run_id)
+        assert second is not None
+        assert second.snapshot_id == first.snapshot_id
+        assert second.created_at == first.created_at
+
+        forced = service.create_evidence_graph_snapshot(run.run_id, force=True)
+        assert forced is not None
+        assert forced.snapshot_id == first.snapshot_id
+        assert forced.created_at == first.created_at
+
+        audit = service.audit_answer(
+            CitationAuditRequest(
+                answer=run.answer,
+                citations=run.citations,
+                evidence_items=run.evidence_summary,
+                run_id=run.run_id,
+                retrieval_id=run.retrieval_id,
+                observed_uncertainty=run.uncertainty_level,
+            )
+        )
+        audited_snapshot = service.create_evidence_graph_snapshot(
+            run.run_id,
+            force=True,
+        )
+        assert audited_snapshot is not None
+        assert audited_snapshot.audit_id == audit.audit_id
+        assert audited_snapshot.snapshot_id != first.snapshot_id
+
+        review = service.get_run_evidence_review(run.run_id)
+        assert review is not None
+        assert review.snapshot.status == "persisted"
+        assert review.snapshot.snapshot_id == audited_snapshot.snapshot_id
+        assert review.summary.total_claims >= 1
+        assert review.claims[0].evidence_card["claim_text"]
+
+        rows = service.storage._db.execute(
+            """
+            SELECT snapshot_id FROM biomed_evidence_graph_snapshots
+            WHERE run_id=?
+            ORDER BY created_at ASC
+            """,
+            (run.run_id,),
+        ).fetchall()
+        assert [row["snapshot_id"] for row in rows] == [
+            first.snapshot_id,
+            audited_snapshot.snapshot_id,
+        ]
+    finally:
+        service.close()
