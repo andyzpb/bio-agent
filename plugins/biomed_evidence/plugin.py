@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from agent.lifecycle.types import PreToolCtx, PromptRenderCtx
+from agent.lifecycle.types import BeforeTurnCtx, PreToolCtx, PromptRenderCtx
 from agent.plugins import Plugin, on_tool_pre, tool
 from agent.prompting import PromptSectionRender
 from agent.tool_hooks import HookOutcome
@@ -14,7 +14,7 @@ from plugins.biomed_evidence.graph import (
     shortest_path as graph_shortest_path,
     validate_evidence_graph as validate_graph_object,
 )
-from plugins.biomed_evidence.guardrails import is_clinical_request
+from plugins.biomed_evidence.guardrails import clinical_refusal, is_clinical_request
 from plugins.biomed_evidence.literature_client import LiteratureClientError
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
@@ -48,11 +48,14 @@ from plugins.biomed_evidence.schemas import (
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
 from plugins.biomed_evidence.tool_contracts import (
+    get_release_tool_metadata,
     list_release_tool_contracts,
     release_source_policy_error,
 )
 
 _PROMPT_CTX_SLOT = "prompt:ctx"
+_SESSION_SLOT = "session:session"
+_SESSION_CTX_SLOT = "session:ctx"
 
 _RELEASE_TOOL_NAMES = frozenset(
     item.tool_name for item in list_release_tool_contracts()
@@ -184,6 +187,27 @@ _TOOL_LLM_FLAGS: dict[str, tuple[str, ...]] = {
     "extract_evidence_batch": ("use_llm_extractor",),
 }
 
+_SENSITIVE_CHAT_TOOL_NAMES = frozenset(
+    item.tool_name for item in list_release_tool_contracts() if item.requires_confirmation
+) | frozenset(
+    {
+        "create_biomed_project",
+        "update_biomed_project",
+        "record_project_paper_decision",
+        "save_project_paper",
+        "reject_project_paper",
+        "record_project_claim",
+        "save_project_claim",
+        "generate_project_evidence_brief",
+        "watch_research_topic",
+        "update_research_watch_topic",
+        "delete_research_watch_topic",
+        "save_biomed_workflow_template",
+        "delete_biomed_workflow_template",
+        "record_run_review_decision",
+    }
+)
+
 _BIOMED_INTENT_TERMS = (
     "biomedical",
     "pubmed",
@@ -224,6 +248,9 @@ class BiomedEvidencePlugin(Plugin):
         if service is not None:
             await service.aclose()
 
+    def before_turn_modules(self) -> list[object]:
+        return [BiomedClinicalBoundaryBeforeMemoryModule()]
+
     def prompt_render_modules(self) -> list[object]:
         return [BiomedPromptContextModule(self)]
 
@@ -246,6 +273,11 @@ class BiomedEvidencePlugin(Plugin):
                     "for a clinical or patient-specific request."
                 ),
             )
+        sensitive_action_outcome = self._deny_chat_sensitive_action_without_approval(
+            event
+        )
+        if sensitive_action_outcome is not None:
+            return sensitive_action_outcome
 
         messages: list[str] = []
         project_error = self._validate_or_apply_project(event.tool_name, args, messages)
@@ -268,6 +300,30 @@ class BiomedEvidencePlugin(Plugin):
         if reason:
             return HookOutcome(reason=reason, extra_message=reason)
         return None
+
+    def _deny_chat_sensitive_action_without_approval(
+        self,
+        event: PreToolCtx,
+    ) -> HookOutcome | None:
+        if event.source != "passive" or event.channel != "dashboard":
+            return None
+        if event.tool_name not in _SENSITIVE_CHAT_TOOL_NAMES:
+            return None
+        metadata = get_release_tool_metadata(event.tool_name)
+        return HookOutcome(
+            decision="deny",
+            reason=(
+                "biomed_evidence_confirmation_required: "
+                f"{event.tool_name} is marked requires_confirmation=true "
+                "and Dashboard Chat does not yet provide a durable approval "
+                "resume flow for sensitive Biomedical Evidence actions."
+            ),
+            extra_message=(
+                "Sensitive Biomedical Evidence action was not executed. Use the "
+                "Biomedical Evidence workspace or a future framework approval flow "
+                f"to confirm this {metadata.risk_level} action."
+            ),
+        )
 
     @tool(
         name="plan_biomedical_search",
@@ -2167,6 +2223,43 @@ class BiomedEvidencePlugin(Plugin):
         return service.get_project(project_id)
 
 
+class BiomedClinicalBoundaryBeforeMemoryModule:
+    slot = "biomed_evidence.clinical_boundary_before_memory"
+    requires = ("before_turn.acquire_session", _SESSION_SLOT)
+    produces = (_SESSION_CTX_SLOT,)
+
+    async def run(self, frame: Any) -> Any:
+        if _SESSION_CTX_SLOT in frame.slots:
+            return frame
+        state = frame.input
+        content = state.msg.content
+        if not is_clinical_request(content):
+            return frame
+        session = cast(Any, frame.slots[_SESSION_SLOT])
+        message_count = len(list(getattr(session, "messages", [])))
+        frame.slots[_SESSION_CTX_SLOT] = BeforeTurnCtx(
+            session_key=state.session_key,
+            channel=state.msg.context_channel,
+            chat_id=state.msg.context_chat_id,
+            content=content,
+            timestamp=state.msg.timestamp,
+            retrieved_memory_block="",
+            retrieval_trace_raw=None,
+            history_messages=(),
+            abort=True,
+            abort_reply=clinical_refusal(),
+            extra_metadata={
+                "clinical_boundary_before_memory": True,
+                "biomed_evidence_clinical_boundary": {
+                    "stage": "before_turn",
+                    "before_context_prepare": True,
+                    "history_message_count": message_count,
+                },
+            },
+        )
+        return frame
+
+
 class BiomedPromptContextModule:
     slot = "biomed_evidence.prompt_context"
     requires = ("prompt_render.emit", _PROMPT_CTX_SLOT)
@@ -2187,8 +2280,10 @@ class BiomedPromptContextModule:
         lines = [
             "### Biomedical Evidence Plugin Context",
             "- Biomedical Evidence is research-only. Refuse or redirect diagnosis, dosing, treatment, prognosis, and patient-specific medical requests.",
+            "- Biomedical factual answers must call Biomedical Evidence tools such as search_literature, run_multi_pass_literature_search, answer_with_evidence, answer_with_audit, validate_citation_support, or get_run_evidence_review before making claims.",
             "- Use retrieved literature, citations, evidence spans, and audit results for biomedical factual claims.",
             "- Project memory, saved papers, rejected papers, and preferences are context only; never cite them as biomedical evidence.",
+            "- Memory, project notes, and dashboard history can guide workflow but cannot support biomedical claims unless confirmed by evidence-tool output.",
             f"- Default biomedical tool source: {default_source}. Live PubMed tool calls enabled: {str(live_pubmed).lower()}.",
         ]
         if project_context:

@@ -145,6 +145,8 @@ class AppRuntime:
                 manual_memory_optimizer=self._memory_optimizer,
                 memory_admin=self.memory_runtime.engine,
                 memory_store=self.memory_runtime.markdown.store,
+                message_bus=self.bus,
+                event_bus=event_bus,
                 biomed_revision_provider=self.light_provider or self.provider,
                 biomed_revision_model=getattr(
                     self.config,

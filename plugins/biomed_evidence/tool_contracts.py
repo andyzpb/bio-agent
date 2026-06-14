@@ -150,6 +150,7 @@ def _register_defaults() -> None:
             tool_name=tool_name,
             risk_level="writes_storage",
             side_effects=["read_storage", "write_storage"],
+            requires_confirmation=True,
         )
 
     for tool_name in (

@@ -207,7 +207,7 @@ Next:
 | Deployment and local smoke | [docs/deployment.md](./docs/deployment.md) |
 | Evaluation and release gates | [docs/evaluation.md](./docs/evaluation.md) |
 | Responsible AI boundary | [docs/responsible_ai.md](./docs/responsible_ai.md) |
-| Requirements and roadmap history | [docs/biomedical_evidence_agent_requirements.md](./docs/biomedical_evidence_agent_requirements.md) |
+| Release 1.0 implementation plan | [docs/release_1_0_implementation_plan.md](./docs/release_1_0_implementation_plan.md) |
 | Case study | [cases/ki-biomed-research-assistant/README.md](./cases/ki-biomed-research-assistant/README.md) |
 
 ## Non-Goals
