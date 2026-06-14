@@ -12,7 +12,10 @@ from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
 from agent.tools.tool_search import ToolSearchTool
 from bus.event_bus import EventBus
-from bus.events_lifecycle import ToolCallCompleted, ToolCallStarted
+from bus.events_lifecycle import (
+    ToolCallCompleted,
+    ToolCallStarted,
+)
 import plugins.context_pressure.plugin as context_pressure_plugin
 from plugins.context_pressure.plugin import ContextPressureStopModule
 

@@ -18,6 +18,8 @@ import { attachJsonViewers, installDashboardGlobals, jvPlaceholder, loadPluginAs
 import { PluginDetail, PluginMain } from "./PluginDetail";
 import type {
   DashboardColumn,
+  ChatEventRow,
+  ChatStatus,
   MessageRow,
   PageResult,
   PluginBatchAction,
@@ -137,6 +139,16 @@ function App(): React.ReactElement {
   const [activeProactiveKey, setActiveProactiveKey] = useState<string | null>(null);
   const [activeProactiveDetail, setActiveProactiveDetail] = useState<ProactiveTick | null>(null);
   const [activeProactiveSteps, setActiveProactiveSteps] = useState<ProactiveStep[]>([]);
+  const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
+  const [chatSessionKey, setChatSessionKey] = useState("dashboard:default");
+  const [chatInput, setChatInput] = useState("");
+  const [chatEvents, setChatEvents] = useState<ChatEventRow[]>([]);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatConnected, setChatConnected] = useState(false);
+  const [chatLiveEvent, setChatLiveEvent] = useState<string>("");
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const chatStreamRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
+  const chatSeqRef = useRef<Record<string, number>>({});
   const [hiddenPlugins, setHiddenPlugins] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
@@ -146,6 +158,8 @@ function App(): React.ReactElement {
   const currentPlugin = plugins.find((plugin) => plugin.id === currentPluginId) ?? null;
   const currentPluginState = currentPluginId ? pluginState[currentPluginId] : null;
   const currentPluginLayout = currentPlugin?.layout ?? "table";
+  const isChatView = viewMode === "chat";
+  const dashboardSessions = useMemo(() => sessions.filter((session) => session.key.startsWith("dashboard:")), [sessions]);
 
   const channels = useMemo(() => Array.from(new Set(sessions.map((session) => session.key.split(":")[0]).filter(Boolean))), [sessions]);
 
@@ -190,6 +204,106 @@ function App(): React.ReactElement {
     setProactiveOverview(await api<ProactiveOverview>("/api/dashboard/proactive/overview"));
   }, []);
 
+  const loadChatStatus = useCallback(async () => {
+    setChatStatus(await api<ChatStatus>("/api/dashboard/chat/status"));
+  }, []);
+
+  const loadChatHistory = useCallback(async (sessionKey: string) => {
+    const params = new URLSearchParams();
+    params.set("session_key", sessionKey);
+    params.set("page_size", "120");
+    const payload = await api<PageResult<MessageRow> & { session_key?: string }>(`/api/dashboard/chat/history?${params.toString()}`);
+    const history = chatHistoryToEvents(payload.items ?? []);
+    setChatEvents((current) => [
+      ...history,
+      ...current.filter((event) => event.session_key === sessionKey && event.source !== "history"),
+    ]);
+  }, []);
+
+  const appendChatEvent = useCallback((event: Partial<ChatEventRow> & { event: string }): void => {
+    const now = new Date().toISOString();
+    const row = normalizeChatEvent(event, chatSessionKey, now);
+    setChatEvents((current) => mergeChatEvent(current, row));
+  }, [chatSessionKey]);
+
+  const startChatStream = useCallback(async (sessionKey: string): Promise<void> => {
+    chatAbortRef.current?.abort();
+    chatStreamRef.current?.cancel().catch(() => {});
+    const controller = new AbortController();
+    chatAbortRef.current = controller;
+    setChatConnected(false);
+    setChatLiveEvent("");
+    const params = new URLSearchParams();
+    params.set("session_key", sessionKey);
+    const sinceSeq = getStoredChatSeq(sessionKey);
+    chatSeqRef.current[sessionKey] = sinceSeq;
+    if (sinceSeq > 0) params.set("since_seq", String(sinceSeq));
+    const response = await fetch(`/api/dashboard/chat/stream?${params.toString()}`, {
+      signal: controller.signal,
+      headers: { Accept: "text/event-stream" },
+    });
+    if (!response.ok || !response.body) {
+      const payload = await response.json().catch(() => ({})) as { detail?: string };
+      throw new Error(payload.detail || `请求失败: ${response.status}`);
+    }
+    const reader = response.body.getReader();
+    chatStreamRef.current = reader;
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n\n");
+      buffer = chunks.pop() ?? "";
+      for (const chunk of chunks) {
+        const parsed = parseSseChunk(chunk);
+        if (!parsed) continue;
+        if (parsed.event === "connected") {
+          setChatConnected(true);
+          continue;
+        }
+        updateStoredChatSeq(sessionKey, parsed.data);
+        handleChatSsePayload(parsed.event, parsed.data, {
+          appendChatEvent,
+          setChatSending,
+          setChatLiveEvent,
+        });
+      }
+    }
+  }, [appendChatEvent]);
+
+  const sendChatMessage = useCallback(async () => {
+    const content = chatInput.trim();
+    if (!content || chatSending) return;
+    setChatInput("");
+    setChatSending(true);
+    appendChatEvent({
+      event: "user",
+      kind: "user",
+      label: "You",
+      content,
+      detail: content,
+      session_key: chatSessionKey,
+      source: "local",
+    });
+    try {
+      await api("/api/dashboard/chat/messages", {
+        method: "POST",
+        body: JSON.stringify({ content, session_key: chatSessionKey }),
+      });
+    } catch (exc) {
+      setChatSending(false);
+      appendChatEvent({
+        event: "error",
+        kind: "error",
+        label: "Send failed",
+        detail: exc instanceof Error ? exc.message : String(exc),
+        session_key: chatSessionKey,
+      });
+    }
+  }, [appendChatEvent, chatInput, chatSending, chatSessionKey]);
+
   const loadProactivePanel = useCallback(async () => {
     const params = new URLSearchParams();
     params.set("page", String(proactivePage));
@@ -232,12 +346,14 @@ function App(): React.ReactElement {
     if (viewMode === "proactive") {
       await loadProactiveOverview();
       await loadProactivePanel();
+    } else if (viewMode === "chat") {
+      await loadChatStatus();
     } else if (viewMode.startsWith("plugin:")) {
       await loadPluginPanel(viewMode.slice(7));
     } else {
       await loadMessages();
     }
-  }, [loadMessages, loadPluginPanel, loadProactiveOverview, loadProactivePanel, loadSessions, viewMode]);
+  }, [loadChatStatus, loadMessages, loadPluginPanel, loadProactiveOverview, loadProactivePanel, loadSessions, viewMode]);
 
   useEffect(() => {
     const refresh = (): void => {
@@ -274,8 +390,9 @@ function App(): React.ReactElement {
       await loadSessions();
       await loadMessages();
       await loadProactiveOverview();
+      await loadChatStatus();
     });
-  }, [loadMessages, loadProactiveOverview, loadSessions, run]);
+  }, [loadChatStatus, loadMessages, loadProactiveOverview, loadSessions, run]);
 
   useEffect(() => {
     for (const plugin of plugins) {
@@ -303,6 +420,7 @@ function App(): React.ReactElement {
     focusView(next);
     void run(async () => {
       if (next === "sessions") await loadMessages();
+      else if (next === "chat") await loadChatStatus();
       else if (next === "proactive") {
         await loadProactiveOverview();
         await loadProactivePanel();
@@ -338,6 +456,28 @@ function App(): React.ReactElement {
   useEffect(() => {
     if (viewMode === "proactive") void run(loadProactivePanel);
   }, [loadProactivePanel, run, viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "chat" || !chatStatus?.enabled) return;
+    void run(async () => {
+      await loadChatHistory(chatSessionKey);
+    });
+  }, [chatSessionKey, chatStatus?.enabled, loadChatHistory, run, viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "chat" || !chatStatus?.enabled) {
+      return;
+    }
+    void startChatStream(chatSessionKey).catch((exc) => {
+      if (exc instanceof DOMException && exc.name === "AbortError") return;
+      setError(exc instanceof Error ? exc.message : String(exc));
+    });
+    return () => {
+      chatAbortRef.current?.abort();
+      chatStreamRef.current?.cancel().catch(() => {});
+      setChatConnected(false);
+    };
+  }, [chatSessionKey, chatStatus?.enabled, startChatStream, viewMode]);
 
   const currentPageCount = currentPluginState
     ? pageCount(currentPluginState.total, currentPluginState.pageSize)
@@ -393,8 +533,10 @@ function App(): React.ReactElement {
       && currentPlugin.renderMain,
   );
 
+  const shellClassName = `shell${isChatView ? " chat-shell" : ""}`;
+
   return (
-    <div className="shell">
+    <div className={shellClassName}>
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">A</div>
@@ -453,6 +595,31 @@ function App(): React.ReactElement {
             </select>
           </div>
           <nav className="explorer-nav">
+            <NavGroup label="Chat" count={dashboardSessions.length} active={viewMode === "chat"} open={!!navOpen.chat} onToggle={() => toggleNav("chat")}>
+              <button className={`all-messages-row ${viewMode === "chat" && chatSessionKey === "dashboard:default" ? "active" : ""}`} type="button" onClick={() => {
+                setChatSessionKey("dashboard:default");
+                selectView("chat");
+              }}>
+                <span>dashboard:default</span><strong>{chatStatus?.enabled ? "on" : "off"}</strong>
+              </button>
+              <div className="session-list">
+                {dashboardSessions.filter((session) => session.key !== "dashboard:default").map((session) => (
+                  <button key={session.key} className={`session-item ${chatSessionKey === session.key ? "active" : ""}`} type="button" onClick={() => {
+                    setChatSessionKey(session.key);
+                    setChatEvents([]);
+                    setChatLiveEvent("");
+                    selectView("chat");
+                  }}>
+                    <div className="nav-item-row">
+                      <span className="nav-type-dot memory-type-profile" />
+                      <span className="nav-item-name mono">{formatSessionKeyForTable(session.key)}</span>
+                      <span className="nav-item-count">{session.message_count}</span>
+                    </div>
+                    <div className="nav-item-desc">{relativeTime(session.updated_at)}</div>
+                  </button>
+                ))}
+              </div>
+            </NavGroup>
             <NavGroup label="Sessions" count={totalMessages || totalSessionMessages(sessions)} active={viewMode === "sessions"} open={!!navOpen.sessions} onToggle={() => toggleNav("sessions")}>
               <button className={`all-messages-row ${viewMode === "sessions" && !activeSessionKey ? "active" : ""}`} type="button" onClick={() => {
                 setActiveSessionKey(null);
@@ -537,7 +704,31 @@ function App(): React.ReactElement {
           </nav>
         </aside>
 
-        {isPluginWorkbench && currentPlugin && currentDispatch ? (
+        {isChatView ? (
+          <ChatPane
+            status={chatStatus}
+            sessionKey={chatSessionKey}
+            setSessionKey={(value) => {
+              setChatSessionKey(value);
+              setChatEvents([]);
+              setChatLiveEvent("");
+            }}
+            connected={chatConnected}
+            events={chatEvents}
+            input={chatInput}
+            setInput={setChatInput}
+            sending={chatSending}
+            liveEvent={chatLiveEvent}
+            onSend={() => void run(sendChatMessage)}
+            onOpenSession={() => {
+              setActiveSessionKey(chatSessionKey);
+              setActiveSession(sessions.find((session) => session.key === chatSessionKey) ?? null);
+              setActiveMessage(null);
+              setMessagePage(1);
+              selectView("sessions");
+            }}
+          />
+        ) : isPluginWorkbench && currentPlugin && currentDispatch ? (
           <section className="plugin-workbench-pane">
             <PluginMain plugin={currentPlugin} dispatch={currentDispatch} />
           </section>
@@ -711,6 +902,136 @@ function PluginTopbarAction(props: {
   return <div ref={ref} />;
 }
 
+function ChatPane(props: {
+  status: ChatStatus | null;
+  sessionKey: string;
+  setSessionKey(value: string): void;
+  connected: boolean;
+  events: ChatEventRow[];
+  input: string;
+  setInput(value: string): void;
+  sending: boolean;
+  liveEvent: string;
+  onSend(): void;
+  onOpenSession(): void;
+}): React.ReactElement {
+  const disabled = !props.status?.enabled;
+  const streamRef = useRef<HTMLDivElement>(null);
+  const latestContentKey = props.events
+    .map((event) => `${event.id}:${event.content ?? ""}:${event.detail ?? ""}`)
+    .join("|");
+
+  useEffect(() => {
+    if (disabled) return;
+    const el = streamRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [disabled, latestContentKey, props.liveEvent, props.sending]);
+
+  return (
+    <section className="chat-pane">
+      <header className="chat-head">
+        <div>
+          <div className="chat-title">Dashboard Chat</div>
+          <div className="chat-subtitle">
+            <span className={`chat-dot ${props.connected && !disabled ? "on" : ""}`} />
+            <code>{props.sessionKey}</code>
+          </div>
+        </div>
+        <div className="chat-head-actions">
+          <label className="chat-session-input">
+            <span>session</span>
+            <input
+              type="text"
+              value={props.sessionKey}
+              onChange={(event) => props.setSessionKey(event.target.value.trim() || "dashboard:default")}
+              disabled={props.sending}
+            />
+          </label>
+          <button className="ghost" type="button" onClick={props.onOpenSession}>查看 session</button>
+        </div>
+      </header>
+      {disabled ? (
+        <div className="chat-disabled">
+          <div className="detail-empty-title">完整 runtime 未启用</div>
+          <div className="detail-empty-text">{props.status?.reason || "Dashboard Chat requires python main.py."}</div>
+        </div>
+      ) : (
+        <>
+          <div className="chat-stream" ref={streamRef}>
+            {props.events.length ? props.events.map((event) => <ChatEventItem
+              key={event.id}
+              event={event}
+            />) : (
+              <div className="chat-empty">
+                <div className="chat-empty-kicker">Agent Console</div>
+                <div className="chat-empty-title">Start a session with the agent.</div>
+                <div className="chat-empty-text">Responses stream through the same runtime, tools, guardrails, and session history used by other agent channels.</div>
+                <div className="chat-empty-prompts">
+                  {[
+                    "Summarize the current workspace state.",
+                    "List the next useful steps for this session.",
+                    "Check recent memory for relevant context.",
+                  ].map((prompt) => (
+                    <button key={prompt} type="button" onClick={() => props.setInput(prompt)}>{prompt}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {props.sending && (
+              <div className="chat-event chat-event-running">
+                <span className="status-pill">running</span>
+                <span>{props.liveEvent || "等待 agent 回复"}</span>
+              </div>
+            )}
+          </div>
+          <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); props.onSend(); }}>
+            <textarea
+              value={props.input}
+              placeholder="Send a message to the agent..."
+              onChange={(event) => props.setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  props.onSend();
+                }
+              }}
+              disabled={props.sending}
+            />
+            <button className="primary" type="submit" disabled={props.sending || !props.input.trim()}>
+              {props.sending ? "发送中" : "发送"}
+            </button>
+          </form>
+        </>
+      )}
+    </section>
+  );
+}
+
+function ChatEventItem(props: {
+  event: ChatEventRow;
+}): React.ReactElement {
+  const event = props.event;
+  if (event.kind === "user") {
+    return <div className="chat-message user"><div className="chat-bubble">{event.content || event.detail}</div></div>;
+  }
+  if (event.kind === "assistant" && (event.content || event.detail || event.pending)) {
+    const content = event.content || event.detail || "";
+    return <div className={`chat-message assistant${event.pending ? " pending" : ""}`}><div className="chat-bubble" dangerouslySetInnerHTML={{ __html: renderMarkdown(content || " ") }} /></div>;
+  }
+  if (event.event === "error") {
+    return <div className="chat-event error"><span className="status-pill proactive-result-busy">error</span><span>{event.detail}</span></div>;
+  }
+  if (event.event === "user_message_accepted") {
+    return <div className="chat-event"><span className="status-pill">accepted</span><span>{event.detail || "Message accepted"}</span></div>;
+  }
+  if (event.kind === "tool") {
+    const status = event.status || (event.event === "tool_started" ? "started" : "tool");
+    return <div className="chat-event chat-tool-event"><span className="status-pill">{status}</span><span>{event.tool_name || event.label}</span>{event.detail && <small>{event.detail}</small>}</div>;
+  }
+  return <div className="chat-event"><span className="status-pill">{event.kind}</span><span>{event.label}</span>{event.detail && <small>{event.detail}</small>}</div>;
+}
+
 function TopbarFilters(props: {
   viewMode: ViewMode;
   messageSearch: string;
@@ -740,6 +1061,10 @@ function TopbarFilters(props: {
           <div className="filter-row">
             <div className="active-session-chip"><span>result</span><code>{proactiveSectionLabel(props.proactiveSection)}</code></div>
             {props.proactiveSessionFilter && <Chip label="session" value={props.proactiveSessionFilter} onClear={props.clearProactiveSession} />}
+          </div>
+        ) : props.viewMode === "chat" ? (
+          <div className="filter-row">
+            <div className="active-session-chip"><span>mode</span><code>chat</code></div>
           </div>
         ) : (
           <div className="filter-row">
@@ -967,6 +1292,338 @@ function toggleSet(id: string, checked: boolean, source: Set<string>, update: (v
   update(next);
 }
 
+function chatHistoryToEvents(items: MessageRow[]): ChatEventRow[] {
+  const events: ChatEventRow[] = [];
+  for (const item of items) {
+    events.push(normalizeChatEvent({
+      event: item.role === "assistant" ? "assistant_message" : "user_message",
+      kind: item.role,
+      label: item.role === "assistant" ? "Assistant" : "You",
+      role: item.role,
+      content: item.content,
+      detail: item.content,
+      seq: item.seq,
+      source: "history",
+    }, item.session_key, item.ts));
+  }
+  return events;
+}
+
+function normalizeChatEvent(
+  event: Partial<ChatEventRow> & { event: string },
+  fallbackSessionKey: string,
+  createdAt: string,
+): ChatEventRow {
+  const sessionKey = String(event.session_key || fallbackSessionKey);
+  const kind = String(event.kind || event.event);
+  const label = String(event.label || event.event);
+  return {
+    id: `${sessionKey}-${event.seq ?? createdAt}-${event.event}-${Math.random().toString(36).slice(2)}`,
+    session_key: sessionKey,
+    seq: typeof event.seq === "number" ? event.seq : undefined,
+    event: event.event,
+    kind,
+    label,
+    role: event.role,
+    content: event.content,
+    detail: event.detail ?? event.content ?? event.content_delta ?? event.thinking_delta,
+    content_delta: event.content_delta,
+    thinking_delta: event.thinking_delta,
+    thinking: event.thinking,
+    tool_name: event.tool_name,
+    call_id: event.call_id,
+    arguments: event.arguments,
+    final_arguments: event.final_arguments,
+    status: event.status,
+    iteration: event.iteration,
+    has_more: event.has_more,
+    final: event.final,
+    source: event.source,
+    pending: event.pending,
+    ts: event.ts,
+    created_at: createdAt,
+  };
+}
+
+function mergeChatEvent(current: ChatEventRow[], next: ChatEventRow): ChatEventRow[] {
+  if (next.event === "assistant_delta") {
+    const index = [...current].reverse().findIndex((item) => item.session_key === next.session_key && item.kind === "assistant" && item.pending);
+    if (index >= 0) {
+      const actualIndex = current.length - 1 - index;
+      const target = current[actualIndex];
+      const mergedContent = `${target.content ?? ""}${next.content_delta ?? ""}`;
+      const mergedThinking = `${target.thinking ?? ""}${next.thinking_delta ?? ""}`;
+      const merged: ChatEventRow = {
+        ...target,
+        content: mergedContent,
+        detail: mergedContent || target.detail,
+        thinking: mergedThinking || target.thinking,
+        final: next.has_more === false,
+        pending: next.has_more !== false,
+        ts: next.ts ?? target.ts,
+      };
+      return [...current.slice(0, actualIndex), merged, ...current.slice(actualIndex + 1)];
+    }
+    return [
+      ...current,
+      {
+        ...next,
+        kind: "assistant",
+        label: "Assistant",
+        role: "assistant",
+        content: next.content_delta ?? "",
+        detail: next.content_delta ?? "",
+        thinking: next.thinking_delta,
+        pending: true,
+        final: false,
+      },
+    ];
+  }
+  if (next.event === "assistant_message") {
+    const targetIndex = [...current].reverse().findIndex((item) => item.session_key === next.session_key && item.kind === "assistant" && item.pending);
+    if (targetIndex >= 0) {
+      const actualIndex = current.length - 1 - targetIndex;
+      const target = current[actualIndex];
+      const merged: ChatEventRow = {
+        ...target,
+        event: "assistant_message",
+        kind: "assistant",
+        label: "Assistant",
+        role: "assistant",
+        content: next.content ?? target.content,
+        detail: next.content ?? target.detail ?? target.content,
+        thinking: next.thinking ?? target.thinking,
+        final: true,
+        pending: false,
+        ts: next.ts ?? target.ts,
+      };
+      return [...current.slice(0, actualIndex), merged, ...current.slice(actualIndex + 1)];
+    }
+  }
+  return [...current, next];
+}
+
+function parseSseChunk(chunk: string): { event: string; data: Record<string, unknown> } | null {
+  let event = "";
+  const dataLines: string[] = [];
+  for (const line of chunk.split("\n")) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+  if (!event || !dataLines.length) return null;
+  try {
+    return { event, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
+  } catch {
+    return null;
+  }
+}
+
+function chatSeqStorageKey(sessionKey: string): string {
+  return `akashic.dashboard.chat.seq.${sessionKey}`;
+}
+
+function getStoredChatSeq(sessionKey: string): number {
+  try {
+    const value = Number(window.sessionStorage.getItem(chatSeqStorageKey(sessionKey)) || "0");
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function updateStoredChatSeq(sessionKey: string, data: Record<string, unknown>, opts?: { authoritative?: boolean }): void {
+  const candidates = [data.seq, data.latest_seq];
+  const next = Math.max(
+    0,
+    ...candidates
+      .map((value) => (typeof value === "number" ? value : Number(value)))
+      .filter((value) => Number.isFinite(value)),
+  );
+  if (next <= 0) return;
+  try {
+    const current = getStoredChatSeq(sessionKey);
+    if (opts?.authoritative || next > current) {
+      window.sessionStorage.setItem(chatSeqStorageKey(sessionKey), String(next));
+    }
+  } catch {
+    return;
+  }
+}
+
+function handleChatSsePayload(
+  event: string,
+  data: Record<string, unknown>,
+  ctx: {
+    appendChatEvent(event: Partial<ChatEventRow> & { event: string }): void;
+    setChatSending(value: boolean): void;
+    setChatLiveEvent(value: string): void;
+  },
+): void {
+  if (event === "connected") {
+    return;
+  }
+  const seq = readChatSeq(data);
+  if (event === "user_message_accepted") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "system",
+      label: "Message accepted",
+      detail: String(data.detail ?? data.content_preview ?? "Message accepted"),
+      session_key: String(data.session_key ?? ""),
+      source: "live",
+    });
+    return;
+  }
+  if (event === "turn_started") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "system",
+      label: String(data.label ?? "Agent started"),
+      detail: String(data.detail ?? ""),
+      session_key: String(data.session_key ?? ""),
+      source: "live",
+    });
+    ctx.setChatLiveEvent(String(data.label ?? data.detail ?? "Agent started"));
+    return;
+  }
+  if (event === "assistant_delta") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "assistant",
+      label: "Assistant streaming",
+      detail: String(data.content_delta ?? data.thinking_delta ?? ""),
+      content_delta: typeof data.content_delta === "string" ? data.content_delta : undefined,
+      thinking_delta: typeof data.thinking_delta === "string" ? data.thinking_delta : undefined,
+      session_key: String(data.session_key ?? ""),
+      pending: true,
+      source: "live",
+    });
+    ctx.setChatLiveEvent(String(data.content_delta ?? data.thinking_delta ?? "Assistant streaming"));
+    return;
+  }
+  if (event === "assistant_message") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "assistant",
+      label: "Assistant",
+      detail: String(data.content ?? ""),
+      session_key: String(data.session_key ?? ""),
+      content: String(data.content ?? ""),
+      thinking: typeof data.thinking === "string" ? data.thinking : undefined,
+      final: true,
+      pending: false,
+      source: "live",
+    });
+    ctx.setChatSending(false);
+    ctx.setChatLiveEvent("");
+    return;
+  }
+  if (event === "tool_started") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "tool",
+      label: String(data.label ?? data.tool_name ?? "Tool started"),
+      detail: String(data.tool_name ?? ""),
+      session_key: String(data.session_key ?? ""),
+      tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
+      call_id: typeof data.call_id === "string" ? data.call_id : undefined,
+      arguments: data.arguments,
+      iteration: typeof data.iteration === "number" ? data.iteration : undefined,
+      source: "live",
+    });
+    ctx.setChatLiveEvent(String(data.label ?? data.tool_name ?? "Tool started"));
+    return;
+  }
+  if (event === "tool_completed") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "tool",
+      label: String(data.label ?? data.tool_name ?? "Tool completed"),
+      detail: String(data.detail ?? ""),
+      session_key: String(data.session_key ?? ""),
+      tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
+      call_id: typeof data.call_id === "string" ? data.call_id : undefined,
+      arguments: data.arguments,
+      final_arguments: data.final_arguments,
+      status: typeof data.status === "string" ? data.status : undefined,
+      iteration: typeof data.iteration === "number" ? data.iteration : undefined,
+      source: "live",
+    });
+    ctx.setChatLiveEvent(String(data.label ?? data.tool_name ?? "Tool completed"));
+    return;
+  }
+  if (event === "step") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "system",
+      label: String(data.label ?? "Assistant response ready"),
+      detail: String(data.detail ?? ""),
+      session_key: String(data.session_key ?? ""),
+      iteration: typeof data.iteration === "number" ? data.iteration : undefined,
+      has_more: typeof data.has_more === "boolean" ? data.has_more : undefined,
+      source: "live",
+    });
+    ctx.setChatLiveEvent(String(data.label ?? data.kind ?? "running"));
+    if (data.has_more === false) {
+      ctx.setChatSending(false);
+    }
+    return;
+  }
+  if (event === "done") {
+    ctx.setChatSending(false);
+    ctx.setChatLiveEvent("");
+    return;
+  }
+  if (event === "error") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "error",
+      label: String(data.label ?? "Error"),
+      detail: String(data.detail ?? data.message ?? "Error"),
+      session_key: String(data.session_key ?? ""),
+      source: "live",
+    });
+    ctx.setChatSending(false);
+    ctx.setChatLiveEvent("");
+    return;
+  }
+  ctx.appendChatEvent({
+    event,
+    seq,
+    kind: String(data.kind ?? "system"),
+    label: String(data.label ?? event),
+    detail: String(data.detail ?? data.content_delta ?? data.message ?? ""),
+    content_delta: typeof data.content_delta === "string" ? data.content_delta : undefined,
+    thinking_delta: typeof data.thinking_delta === "string" ? data.thinking_delta : undefined,
+    tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
+    call_id: typeof data.call_id === "string" ? data.call_id : undefined,
+    arguments: data.arguments,
+    final_arguments: data.final_arguments,
+    status: typeof data.status === "string" ? data.status : undefined,
+    iteration: typeof data.iteration === "number" ? data.iteration : undefined,
+    has_more: typeof data.has_more === "boolean" ? data.has_more : undefined,
+    source: "live",
+    session_key: String(data.session_key ?? ""),
+  });
+}
+
+function readChatSeq(data: Record<string, unknown>): number | undefined {
+  const raw = data.seq;
+  const value = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
 function gridTemplate(columns: DashboardColumn[]): string {
   return columns.map((col) => col.flex ? "1fr" : col.width ? `${col.width}px` : "auto").join(" ");
 }
@@ -1002,6 +1659,7 @@ function proactiveSectionCount(section: string, overview: ProactiveOverview | nu
 
 function viewLabel(viewMode: ViewMode, plugin: PluginConfig | null): string {
   if (plugin) return plugin.viewLabel || plugin.label;
+  if (viewMode === "chat") return "chat";
   if (viewMode === "proactive") return "proactive";
   return "messages";
 }
