@@ -25,6 +25,7 @@ from agent.looping.ports import (
     MemoryServices,
     SessionServices,
 )
+from agent.tool_hooks.approval import ToolApprovalBroker
 from agent.mcp.registry import McpServerRegistry
 from agent.provider import LLMProvider
 from agent.retrieval.default_pipeline import DefaultMemoryRetrievalPipeline
@@ -83,6 +84,7 @@ class CoreRuntime:
     peer_poller: PeerAgentPoller | None
     agent_provider: LLMProvider | None = None
     plugin_manager: "PluginManager | None" = None
+    tool_approval_broker: ToolApprovalBroker | None = None
 
     async def start(self) -> None:
         self.mcp_registry.start_connect_all_background()
@@ -434,6 +436,7 @@ def build_core_runtime(
 ) -> CoreRuntime:
     bus = MessageBus()
     event_bus = EventBus()
+    tool_approval_broker = ToolApprovalBroker()
     provider, light_provider, agent_provider = build_providers(config)
     vl_provider = build_vl_provider(config)
     # agent_provider is used for the AgentLoop (QA / tool calling).
@@ -471,6 +474,7 @@ def build_core_runtime(
         event_bus=event_bus,
         memory_runtime=memory_runtime,
     )
+    loop_deps.tool_approval_broker = tool_approval_broker
     loop = AgentLoop(
         loop_deps,
         AgentLoopConfig(
@@ -524,6 +528,7 @@ def build_core_runtime(
         peer_process_manager=peer_pm,
         peer_poller=peer_poller,
         plugin_manager=plugin_manager,
+        tool_approval_broker=tool_approval_broker,
     )
 
 

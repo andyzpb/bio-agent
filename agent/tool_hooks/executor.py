@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import hashlib
+import json
 from typing import Any, Awaitable, Callable
 
 from agent.tool_hooks.base import ToolHook
 from agent.tool_hooks.types import (
     HookContext,
+    HookOutcome,
     HookTraceItem,
     ToolExecutionRequest,
     ToolExecutionResult,
@@ -51,7 +54,7 @@ class ToolExecutor:
 
         try:
             # pre_hook 是唯一允许改输入/直接 deny 的阶段。
-            denied_reason, current_arguments = await self._run_pre_hooks(
+            pre_decision, current_arguments = await self._run_pre_hooks(
                 request=request,
                 current_arguments=current_arguments,
                 extra_messages=extra_messages,
@@ -67,14 +70,34 @@ class ToolExecutor:
                 post_hook_trace=post_trace,
             )
         final_arguments = dict(current_arguments)
-        if denied_reason:
+        if pre_decision.decision == "deny":
+            reason = pre_decision.reason.strip() or "工具调用被拦截"
             return ToolExecutionResult(
                 status="denied",
-                output=denied_reason,
+                output=reason,
                 final_arguments=final_arguments,
                 extra_messages=extra_messages,
                 pre_hook_trace=pre_trace,
                 post_hook_trace=post_trace,
+                reason=reason,
+            )
+        if pre_decision.decision == "approval_required":
+            reason = pre_decision.reason.strip() or "工具调用需要用户确认"
+            risk = pre_decision.risk.strip() or "approval_required"
+            approval_id = pre_decision.approval_id.strip() or _approval_id(
+                request,
+                final_arguments,
+            )
+            return ToolExecutionResult(
+                status="approval_required",
+                output=reason,
+                final_arguments=final_arguments,
+                extra_messages=extra_messages,
+                pre_hook_trace=pre_trace,
+                post_hook_trace=post_trace,
+                approval_id=approval_id,
+                risk=risk,
+                reason=reason,
             )
 
         try:
@@ -151,7 +174,7 @@ class ToolExecutor:
         extra_messages: list[str] = []
         pre_trace: list[HookTraceItem] = []
         try:
-            denied_reason, current_arguments = await self._run_pre_hooks(
+            pre_decision, current_arguments = await self._run_pre_hooks(
                 request=request,
                 current_arguments=current_arguments,
                 extra_messages=extra_messages,
@@ -165,13 +188,33 @@ class ToolExecutor:
                 extra_messages=extra_messages,
                 pre_hook_trace=pre_trace,
             )
-        if denied_reason:
+        if pre_decision.decision == "deny":
+            reason = pre_decision.reason.strip() or "工具调用被拦截"
             return ToolExecutionResult(
                 status="denied",
-                output=denied_reason,
+                output=reason,
                 final_arguments=dict(current_arguments),
                 extra_messages=extra_messages,
                 pre_hook_trace=pre_trace,
+                reason=reason,
+            )
+        if pre_decision.decision == "approval_required":
+            final_arguments = dict(current_arguments)
+            reason = pre_decision.reason.strip() or "工具调用需要用户确认"
+            risk = pre_decision.risk.strip() or "approval_required"
+            approval_id = pre_decision.approval_id.strip() or _approval_id(
+                request,
+                final_arguments,
+            )
+            return ToolExecutionResult(
+                status="approval_required",
+                output=reason,
+                final_arguments=final_arguments,
+                extra_messages=extra_messages,
+                pre_hook_trace=pre_trace,
+                approval_id=approval_id,
+                risk=risk,
+                reason=reason,
             )
         return ToolExecutionResult(
             status="success",
@@ -181,6 +224,82 @@ class ToolExecutor:
             pre_hook_trace=pre_trace,
         )
 
+    async def execute_approved(
+        self,
+        request: ToolExecutionRequest,
+        final_arguments: dict[str, Any],
+        invoker: ToolInvoker,
+        *,
+        pre_hook_trace: Sequence[HookTraceItem] | None = None,
+    ) -> ToolExecutionResult:
+        """Execute an already-approved tool call without rerunning pre hooks."""
+        extra_messages: list[str] = []
+        post_trace: list[HookTraceItem] = []
+        final_args = dict(final_arguments)
+        pre_trace = list(pre_hook_trace or [])
+        try:
+            output = await invoker(request.tool_name, final_args)
+        except Exception as exc:
+            error_text = str(exc)
+            try:
+                await self._run_post_hooks(
+                    HookContext(
+                        event="post_tool_error",
+                        request=request,
+                        current_arguments=final_args,
+                        error=error_text,
+                    ),
+                    extra_messages=extra_messages,
+                    traces=post_trace,
+                )
+            except HookExecutionError as hook_exc:
+                return ToolExecutionResult(
+                    status="error",
+                    output=f"工具执行出错: {hook_exc}",
+                    final_arguments=final_args,
+                    extra_messages=extra_messages,
+                    pre_hook_trace=pre_trace,
+                    post_hook_trace=post_trace,
+                )
+            return ToolExecutionResult(
+                status="error",
+                output=f"工具执行出错: {error_text}",
+                final_arguments=final_args,
+                extra_messages=extra_messages,
+                pre_hook_trace=pre_trace,
+                post_hook_trace=post_trace,
+            )
+
+        try:
+            await self._run_post_hooks(
+                HookContext(
+                    event="post_tool_use",
+                    request=request,
+                    current_arguments=final_args,
+                    result=output,
+                ),
+                extra_messages=extra_messages,
+                traces=post_trace,
+                fail_open=True,
+            )
+        except HookExecutionError as exc:
+            return ToolExecutionResult(
+                status="error",
+                output=f"工具执行出错: {exc}",
+                final_arguments=final_args,
+                extra_messages=extra_messages,
+                pre_hook_trace=pre_trace,
+                post_hook_trace=post_trace,
+            )
+        return ToolExecutionResult(
+            status="success",
+            output=output,
+            final_arguments=final_args,
+            extra_messages=extra_messages,
+            pre_hook_trace=pre_trace,
+            post_hook_trace=post_trace,
+        )
+
     async def _run_pre_hooks(
         self,
         *,
@@ -188,7 +307,7 @@ class ToolExecutor:
         current_arguments: dict[str, Any],
         extra_messages: list[str],
         traces: list[HookTraceItem],
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[HookOutcome, dict[str, Any]]:
         for hook in self._hooks:
             if hook.event != "pre_tool_use":
                 continue
@@ -226,12 +345,22 @@ class ToolExecutor:
                     decision=outcome.decision,
                     reason=outcome.reason,
                     extra_message=outcome.extra_message,
+                    approval_id=outcome.approval_id,
+                    risk=outcome.risk,
                 )
             )
             if outcome.decision == "deny":
                 reason = outcome.reason.strip() or "工具调用被拦截"
-                return reason, current_arguments
-        return "", current_arguments
+                return HookOutcome(decision="deny", reason=reason), current_arguments
+            if outcome.decision == "approval_required":
+                reason = outcome.reason.strip() or "工具调用需要用户确认"
+                return HookOutcome(
+                    decision="approval_required",
+                    reason=reason,
+                    approval_id=outcome.approval_id,
+                    risk=outcome.risk,
+                ), current_arguments
+        return HookOutcome(), current_arguments
 
     async def _run_post_hooks(
         self,
@@ -291,5 +420,22 @@ class ToolExecutor:
                     decision=outcome.decision,
                     reason=outcome.reason,
                     extra_message=outcome.extra_message,
+                    approval_id=outcome.approval_id,
+                    risk=outcome.risk,
                 )
             )
+
+
+def _approval_id(
+    request: ToolExecutionRequest,
+    final_arguments: dict[str, Any],
+) -> str:
+    payload = {
+        "call_id": request.call_id,
+        "tool_name": request.tool_name,
+        "session_key": request.session_key,
+        "arguments": final_arguments,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return f"approval-{digest}"

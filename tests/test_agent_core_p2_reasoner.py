@@ -8,11 +8,19 @@ from agent.core.passive_turn import DefaultReasoner
 from agent.core.runtime_support import LLMServices, ToolDiscoveryState
 from agent.looping.ports import LLMConfig
 from agent.provider import LLMResponse, ToolCall
+from agent.tool_hooks.approval import ToolApprovalBroker
+from agent.tool_hooks.base import ToolHook
+from agent.tool_hooks.types import HookContext, HookOutcome
 from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
 from agent.tools.tool_search import ToolSearchTool
 from bus.event_bus import EventBus
-from bus.events_lifecycle import ToolCallCompleted, ToolCallStarted
+from bus.events_lifecycle import (
+    ToolApprovalRequired,
+    ToolApprovalResolved,
+    ToolCallCompleted,
+    ToolCallStarted,
+)
 import plugins.context_pressure.plugin as context_pressure_plugin
 from plugins.context_pressure.plugin import ContextPressureStopModule
 
@@ -67,6 +75,21 @@ class _TimeoutProvider:
     async def chat(self, **kwargs: Any) -> LLMResponse:
         self.calls.append(kwargs)
         raise asyncio.TimeoutError
+
+
+class _ApprovalHook(ToolHook):
+    name = "approval"
+    event = "pre_tool_use"
+
+    def matches(self, ctx: HookContext) -> bool:
+        return ctx.request.tool_name == "dummy"
+
+    async def run(self, _ctx: HookContext) -> HookOutcome:
+        return HookOutcome(
+            decision="approval_required",
+            reason="needs confirmation",
+            risk="writes_storage",
+        )
 
 
 def test_default_reasoner_runs_tool_loop_and_returns_reasoner_result():
@@ -435,6 +458,146 @@ def test_default_reasoner_observes_blocked_tool_lifecycle_events():
     assert completed_events[0].final_arguments == {"x": 1}
     assert completed_events[0].status == "blocked"
     assert "select:hidden_tool" in completed_events[0].result_preview
+
+
+def test_default_reasoner_pauses_for_approval_then_resumes_tool_once():
+    async def _run() -> tuple[Any, _DummyTool, list[str], list[ToolCallCompleted], list[ToolApprovalResolved]]:
+        provider = _Provider(
+            [
+                LLMResponse(
+                    content="",
+                    tool_calls=[ToolCall("c1", "dummy", {"x": 7})],
+                ),
+                LLMResponse(content="final", tool_calls=[]),
+            ]
+        )
+        tools = ToolRegistry()
+        tool = _DummyTool()
+        tools.register(tool, always_on=True)
+        event_bus = EventBus()
+        broker = ToolApprovalBroker(ttl_seconds=5)
+        order: list[str] = []
+        completed_events: list[ToolCallCompleted] = []
+        resolved_events: list[ToolApprovalResolved] = []
+
+        async def _approve(event: ToolApprovalRequired) -> None:
+            order.append("approval_required")
+            await broker.approve(event.approval_id)
+
+        event_bus.on(ToolApprovalRequired, _approve)
+        event_bus.on(
+            ToolApprovalResolved,
+            lambda event: order.append("approval_resolved") or resolved_events.append(event),
+        )
+        event_bus.on(
+            ToolCallCompleted,
+            lambda event: order.append(f"completed:{event.status}") or completed_events.append(event),
+        )
+        reasoner = DefaultReasoner(
+            llm=cast(Any, LLMServices(provider=cast(Any, provider), light_provider=cast(Any, provider))),
+            llm_config=LLMConfig(model="m", max_iterations=4, max_tokens=512),
+            tools=tools,
+            discovery=ToolDiscoveryState(),
+            tool_search_enabled=False,
+            memory_window=40,
+            event_bus=event_bus,
+            tool_approval_broker=broker,
+        )
+        reasoner.add_tool_hooks([_ApprovalHook()])
+
+        result = await reasoner.run(
+            [{"role": "user", "content": "hi"}],
+            tool_event_session_key="dashboard:default",
+            tool_event_channel="dashboard",
+            tool_event_chat_id="default",
+        )
+        return result, tool, order, completed_events, resolved_events
+
+    result, tool, order, completed_events, resolved_events = asyncio.run(_run())
+
+    assert result.reply == "final"
+    assert tool.calls == [{"x": 7}]
+    assert order == [
+        "completed:approval_required",
+        "approval_required",
+        "approval_resolved",
+        "completed:success",
+    ]
+    assert completed_events[0].status == "approval_required"
+    assert completed_events[0].approval_id.startswith("approval-")
+    assert completed_events[0].risk == "writes_storage"
+    assert completed_events[1].status == "success"
+    assert resolved_events[0].status == "approved"
+    assert result.metadata["tools_used"] == ["dummy"]
+
+
+def test_default_reasoner_rejected_approval_does_not_execute_tool():
+    async def _run() -> tuple[Any, _DummyTool, list[str], list[ToolCallCompleted], list[ToolApprovalResolved]]:
+        provider = _Provider(
+            [
+                LLMResponse(
+                    content="",
+                    tool_calls=[ToolCall("c1", "dummy", {"x": 7})],
+                ),
+                LLMResponse(content="not executed", tool_calls=[]),
+            ]
+        )
+        tools = ToolRegistry()
+        tool = _DummyTool()
+        tools.register(tool, always_on=True)
+        event_bus = EventBus()
+        broker = ToolApprovalBroker(ttl_seconds=5)
+        order: list[str] = []
+        completed_events: list[ToolCallCompleted] = []
+        resolved_events: list[ToolApprovalResolved] = []
+
+        async def _reject(event: ToolApprovalRequired) -> None:
+            order.append("approval_required")
+            await broker.reject(event.approval_id)
+
+        event_bus.on(ToolApprovalRequired, _reject)
+        event_bus.on(
+            ToolApprovalResolved,
+            lambda event: order.append("approval_resolved") or resolved_events.append(event),
+        )
+        event_bus.on(
+            ToolCallCompleted,
+            lambda event: order.append(f"completed:{event.status}") or completed_events.append(event),
+        )
+        reasoner = DefaultReasoner(
+            llm=cast(Any, LLMServices(provider=cast(Any, provider), light_provider=cast(Any, provider))),
+            llm_config=LLMConfig(model="m", max_iterations=4, max_tokens=512),
+            tools=tools,
+            discovery=ToolDiscoveryState(),
+            tool_search_enabled=False,
+            memory_window=40,
+            event_bus=event_bus,
+            tool_approval_broker=broker,
+        )
+        reasoner.add_tool_hooks([_ApprovalHook()])
+
+        result = await reasoner.run(
+            [{"role": "user", "content": "hi"}],
+            tool_event_session_key="dashboard:default",
+            tool_event_channel="dashboard",
+            tool_event_chat_id="default",
+        )
+        return result, tool, order, completed_events, resolved_events
+
+    result, tool, order, completed_events, resolved_events = asyncio.run(_run())
+
+    assert result.reply == "not executed"
+    assert tool.calls == []
+    assert order == [
+        "completed:approval_required",
+        "approval_required",
+        "approval_resolved",
+        "completed:rejected",
+    ]
+    assert completed_events[1].status == "rejected"
+    assert "未执行" in completed_events[1].result_preview
+    assert resolved_events[0].status == "rejected"
+    assert result.metadata["tools_used"] == []
 
 
 def test_default_reasoner_unlocks_tool_search_visibility():

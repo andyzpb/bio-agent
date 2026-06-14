@@ -78,6 +78,7 @@ def _is_nonempty(value: str) -> bool:
 
 
 _STREAM_SUPPORT_POLICIES: dict[str, StreamSupportPolicy] = {
+    "dashboard": _is_nonempty,
     "telegram": _is_positive_int,
     # 飞书私聊渠道：chat_id 形如 oc_xxx，全程支持流式预览（卡片 PATCH 消费 StreamDeltaReady）。
     "feishu": _is_nonempty,
@@ -292,6 +293,7 @@ class AgentLoop:
             context=self._context,
             session_manager=self.session_manager,
             event_bus=self._event_bus,
+            tool_approval_broker=deps.tool_approval_broker,
         )
 
         # 3. 最后串 passive prepare / execute / commit 主链。

@@ -1,5 +1,5 @@
 export type SortOrder = "asc" | "desc";
-export type BuiltinView = "sessions" | "proactive";
+export type BuiltinView = "sessions" | "proactive" | "chat";
 export type ViewMode = BuiltinView | `plugin:${string}`;
 
 export interface PageResult<T> {
@@ -29,6 +29,47 @@ export interface MessageRow {
   tool_chain: unknown;
   extra: Record<string, unknown>;
   ts: string;
+}
+
+export interface ChatStatus {
+  enabled: boolean;
+  reason: string;
+  default_session_key: string;
+  streaming: boolean;
+  session_key?: string;
+  latest_seq?: number;
+  active?: boolean;
+  replay_limit?: number;
+}
+
+export interface ChatEventRow {
+  id: string;
+  session_key: string;
+  event: string;
+  kind: string;
+  label: string;
+  seq?: number;
+  role?: string;
+  content?: string;
+  detail?: string;
+  content_delta?: string;
+  thinking_delta?: string;
+  thinking?: string;
+  tool_name?: string;
+  call_id?: string;
+  approval_id?: string;
+  risk?: string;
+  reason?: string;
+  arguments?: unknown;
+  final_arguments?: unknown;
+  status?: string;
+  iteration?: number;
+  has_more?: boolean;
+  final?: boolean;
+  source?: "history" | "live" | "local";
+  pending?: boolean;
+  ts?: string;
+  created_at: string;
 }
 
 export interface ProactiveOverview {

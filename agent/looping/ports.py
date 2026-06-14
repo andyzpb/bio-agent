@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from core.memory.runtime import MemoryRuntime
     from proactive_v2.presence import PresenceStore
     from session.manager import SessionManager
+    from agent.tool_hooks.approval import ToolApprovalBroker
 
 
 # ── Config dataclasses（参数，不含服务对象）───────────────────────────────────
@@ -88,6 +89,7 @@ class AgentLoopDeps:
     tool_discovery: "ToolDiscoveryState | None" = None
     reasoner: "Reasoner | None" = None
     core_runner: "CoreRunner | None" = None
+    tool_approval_broker: "ToolApprovalBroker | None" = None
 
 @dataclass
 class AgentLoopConfig:

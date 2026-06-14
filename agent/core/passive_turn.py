@@ -17,6 +17,7 @@ from agent.core.types import (
 from agent.prompting import DEFAULT_CONTEXT_TRIM_PLANS, is_context_frame
 from agent.provider import ContentSafetyError, ContextLengthError
 from agent.retrieval.protocol import RetrievalRequest, RetrievalResult
+from agent.tool_hooks.approval import PendingToolApproval, ToolApprovalBroker
 from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
 from agent.tool_runtime import (
     append_assistant_tool_calls,
@@ -29,6 +30,8 @@ from agent.turns.outbound import OutboundDispatch, OutboundPort
 from bus.event_bus import EventBus
 from bus.events import InboundMessage, OutboundMessage
 from bus.events_lifecycle import (
+    ToolApprovalRequired,
+    ToolApprovalResolved,
     ToolCallCompleted,
     ToolCallStarted,
 )
@@ -134,6 +137,66 @@ def _disabled_tools_from_msg(msg: object) -> set[str]:
     if isinstance(raw, (list, tuple, set)):
         return {str(item) for item in raw if str(item)}
     return set()
+
+
+def _approval_resolution_tool_result(status: str, reason: str) -> str:
+    if status == "rejected":
+        return "用户已拒绝本次工具调用，工具未执行。"
+    if status == "expired":
+        return "本次工具调用确认已超时，工具未执行。"
+    if status == "missing":
+        return "本次工具调用确认状态已失效，工具未执行。"
+    detail = reason.strip()
+    return f"工具调用未执行，确认状态为 {status}。" + (f" 原因：{detail}" if detail else "")
+
+
+def _hook_trace_payload(items: list[object]) -> list[dict[str, Any]]:
+    return [
+        {
+            "hook_name": getattr(item, "hook_name", ""),
+            "event": getattr(item, "event", ""),
+            "matched": bool(getattr(item, "matched", False)),
+            "decision": getattr(item, "decision", ""),
+            "reason": getattr(item, "reason", ""),
+            "extra_message": getattr(item, "extra_message", ""),
+            "approval_id": getattr(item, "approval_id", ""),
+            "risk": getattr(item, "risk", ""),
+        }
+        for item in items
+    ]
+
+
+def _tool_chain_call(
+    *,
+    call_id: str,
+    name: str,
+    status: str,
+    arguments: dict[str, Any],
+    final_arguments: dict[str, Any],
+    pre_hook_trace: list[object],
+    post_hook_trace: list[object],
+    result: Any,
+    approval_id: str = "",
+    risk: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "call_id": call_id,
+        "name": name,
+        "status": status,
+        "arguments": arguments,
+        "final_arguments": final_arguments,
+        "pre_hook_trace": _hook_trace_payload(pre_hook_trace),
+        "post_hook_trace": _hook_trace_payload(post_hook_trace),
+        "result": result,
+    }
+    if approval_id:
+        payload["approval_id"] = approval_id
+    if risk:
+        payload["risk"] = risk
+    if reason:
+        payload["reason"] = reason
+    return payload
 
 
 class _NoopOutboundPort:
@@ -360,10 +423,10 @@ class PassiveTurnPipeline:
             if before_turn.abort:
                 return await self._control_outbound(
                     state,
-                    OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
+                    self._outbound_message(
+                        msg,
                         content=before_turn.abort_reply,
+                        session_key=key,
                     ),
                 )
 
@@ -374,10 +437,10 @@ class PassiveTurnPipeline:
             if before_reasoning.abort:
                 return await self._control_outbound(
                     state,
-                    OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
+                    self._outbound_message(
+                        msg,
                         content=before_reasoning.abort_reply,
+                        session_key=key,
                     ),
                 )
 
@@ -397,10 +460,10 @@ class PassiveTurnPipeline:
             logger.exception("PassiveTurnPipeline.run failed before dispatch session=%s", key)
             return await self._control_outbound(
                 state,
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                self._outbound_message(
+                    msg,
                     content="处理消息时出错，请稍后再试。",
+                    session_key=key,
                 ),
             )
 
@@ -416,6 +479,23 @@ class PassiveTurnPipeline:
                 outbound=after_reasoning.outbound,
                 ctx=after_reasoning.ctx,
             )
+        )
+
+    @staticmethod
+    def _outbound_message(
+        msg: InboundMessage,
+        *,
+        content: str,
+        session_key: str,
+    ) -> OutboundMessage:
+        metadata: dict[str, Any] = {}
+        if session_key != msg.session_key:
+            metadata["session_key_override"] = session_key
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata=metadata,
         )
 
     # 供外部调用方（如 spawn completion）复用 AfterReasoning + dispatch 流程。
@@ -620,6 +700,7 @@ class DefaultReasoner(Reasoner):
         context: "ContextBuilder | None" = None,
         session_manager: "SessionManager | None" = None,
         event_bus: "EventBus | None" = None,
+        tool_approval_broker: ToolApprovalBroker | None = None,
     ) -> None:
         self._llm = llm
         self._llm_config = llm_config
@@ -630,6 +711,7 @@ class DefaultReasoner(Reasoner):
         self._context = context
         self._session_manager = session_manager
         self._event_bus = event_bus
+        self._approval_broker = tool_approval_broker
         self._prompt_render_plugin_modules: list[object] = []
         self._before_step_plugin_modules: list[object] = []
         self._after_step_plugin_modules: list[object] = []
@@ -659,6 +741,10 @@ class DefaultReasoner(Reasoner):
 
     def add_tool_hooks(self, hooks: list["ToolHook"]) -> None:
         self._tool_executor.add_hooks(hooks)
+
+    @property
+    def tool_approval_broker(self) -> ToolApprovalBroker | None:
+        return self._approval_broker
 
     def add_prompt_render_plugin_modules(
         self,
@@ -1131,27 +1217,24 @@ class DefaultReasoner(Reasoner):
                                 final_arguments=exec_result.final_arguments,
                                 status=exec_result.status,
                                 result_preview=support.log_preview(result),
+                                approval_id=exec_result.approval_id,
+                                risk=exec_result.risk,
+                                reason=exec_result.reason,
                             )
                             iter_calls.append(
-                                {
-                                    "call_id": tool_call.id,
-                                    "name": tool_call.name,
-                                    "status": exec_result.status,
-                                    "arguments": tool_call.arguments,
-                                    "final_arguments": exec_result.final_arguments,
-                                    "pre_hook_trace": [
-                                        {
-                                            "hook_name": item.hook_name,
-                                            "event": item.event,
-                                            "matched": item.matched,
-                                            "decision": item.decision,
-                                            "reason": item.reason,
-                                            "extra_message": item.extra_message,
-                                        }
-                                        for item in exec_result.pre_hook_trace
-                                    ],
-                                    "result": result,
-                                }
+                                _tool_chain_call(
+                                    call_id=tool_call.id,
+                                    name=tool_call.name,
+                                    status=exec_result.status,
+                                    arguments=tool_call.arguments,
+                                    final_arguments=exec_result.final_arguments,
+                                    pre_hook_trace=exec_result.pre_hook_trace,
+                                    post_hook_trace=exec_result.post_hook_trace,
+                                    result=result,
+                                    approval_id=exec_result.approval_id,
+                                    risk=exec_result.risk,
+                                    reason=exec_result.reason,
+                                )
                             )
                             for skipped in response.tool_calls[tool_batch_index + 1:]:
                                 append_tool_result(
@@ -1247,22 +1330,158 @@ class DefaultReasoner(Reasoner):
                         tool_name=tool_call.name,
                         arguments=dict(tool_call.arguments),
                     ))
+                    tool_request = ToolExecutionRequest(
+                        call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        arguments=tool_call.arguments,
+                        source="passive",
+                        session_key=tool_event_session_key,
+                        channel=tool_event_channel,
+                        chat_id=tool_event_chat_id,
+                        tool_batch=tool_batch,
+                        tool_batch_index=tool_batch_index,
+                    )
                     exec_result = await self._tool_executor.execute(
-                        ToolExecutionRequest(
-                            call_id=tool_call.id,
-                            tool_name=tool_call.name,
-                            arguments=tool_call.arguments,
-                            source="passive",
-                            session_key=tool_event_session_key,
-                            channel=tool_event_channel,
-                            chat_id=tool_event_chat_id,
-                            tool_batch=tool_batch,
-                            tool_batch_index=tool_batch_index,
-                        ),
+                        tool_request,
                         # 真实工具执行入口仍是 ToolRegistry.execute；
                         # hook 只负责拦截与记录，不替代 registry。
                         self._tools.execute,
                     )
+                    if exec_result.status == "approval_required":
+                        await self._observe_tool_call_completed(
+                            session_key=tool_event_session_key,
+                            channel=tool_event_channel,
+                            chat_id=tool_event_chat_id,
+                            iteration=iteration + 1,
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            final_arguments=exec_result.final_arguments,
+                            status=exec_result.status,
+                            result_preview=str(exec_result.output),
+                            approval_id=exec_result.approval_id,
+                            risk=exec_result.risk,
+                            reason=exec_result.reason,
+                        )
+                        if self._approval_broker is None:
+                            result = (
+                                "工具调用需要用户确认，但当前运行时未启用 approval broker；"
+                                "工具未执行。"
+                            )
+                            await self._bus.fanout(AfterToolResultCtx(
+                                session_key=tool_event_session_key,
+                                channel=tool_event_channel,
+                                chat_id=tool_event_chat_id,
+                                tool_name=tool_call.name,
+                                arguments=dict(exec_result.final_arguments),
+                                result=result,
+                                status="denied",
+                            ))
+                            append_tool_result(
+                                messages,
+                                tool_call_id=tool_call.id,
+                                content=result,
+                                tool_name=tool_call.name,
+                            )
+                            iter_calls.append(
+                                _tool_chain_call(
+                                    call_id=tool_call.id,
+                                    name=tool_call.name,
+                                    status="denied",
+                                    arguments=tool_call.arguments,
+                                    final_arguments=exec_result.final_arguments,
+                                    pre_hook_trace=exec_result.pre_hook_trace,
+                                    post_hook_trace=exec_result.post_hook_trace,
+                                    result=result,
+                                    approval_id=exec_result.approval_id,
+                                    risk=exec_result.risk,
+                                    reason=exec_result.reason,
+                                )
+                            )
+                            continue
+                        pending = await self._approval_broker.submit(
+                            approval_id=exec_result.approval_id,
+                            request=tool_request,
+                            final_arguments=exec_result.final_arguments,
+                            reason=exec_result.reason,
+                            risk=exec_result.risk,
+                            output=exec_result.output,
+                            pre_hook_trace=exec_result.pre_hook_trace,
+                        )
+                        await self._observe_tool_approval_required(pending)
+                        resolution = await self._approval_broker.wait_for_resolution(
+                            exec_result.approval_id,
+                        )
+                        approval_status = resolution.status
+                        await self._observe_tool_approval_resolved(
+                            session_key=tool_event_session_key,
+                            channel=tool_event_channel,
+                            chat_id=tool_event_chat_id,
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            approval_id=exec_result.approval_id,
+                            status=approval_status,
+                            risk=exec_result.risk,
+                            reason=exec_result.reason,
+                        )
+                        if approval_status == "approved":
+                            exec_result = await self._tool_executor.execute_approved(
+                                tool_request,
+                                exec_result.final_arguments,
+                                self._tools.execute,
+                                pre_hook_trace=exec_result.pre_hook_trace,
+                            )
+                        else:
+                            result = _approval_resolution_tool_result(
+                                approval_status,
+                                exec_result.reason,
+                            )
+                            await self._bus.fanout(AfterToolResultCtx(
+                                session_key=tool_event_session_key,
+                                channel=tool_event_channel,
+                                chat_id=tool_event_chat_id,
+                                tool_name=tool_call.name,
+                                arguments=dict(exec_result.final_arguments),
+                                result=result,
+                                status=approval_status,
+                            ))
+                            await self._observe_tool_call_completed(
+                                session_key=tool_event_session_key,
+                                channel=tool_event_channel,
+                                chat_id=tool_event_chat_id,
+                                iteration=iteration + 1,
+                                call_id=tool_call.id,
+                                tool_name=tool_call.name,
+                                arguments=tool_call.arguments,
+                                final_arguments=exec_result.final_arguments,
+                                status=approval_status,
+                                result_preview=result,
+                                approval_id=exec_result.approval_id,
+                                risk=exec_result.risk,
+                                reason=exec_result.reason,
+                            )
+                            append_tool_result(
+                                messages,
+                                tool_call_id=tool_call.id,
+                                content=result,
+                                tool_name=tool_call.name,
+                            )
+                            iter_calls.append(
+                                _tool_chain_call(
+                                    call_id=tool_call.id,
+                                    name=tool_call.name,
+                                    status=approval_status,
+                                    arguments=tool_call.arguments,
+                                    final_arguments=exec_result.final_arguments,
+                                    pre_hook_trace=exec_result.pre_hook_trace,
+                                    post_hook_trace=exec_result.post_hook_trace,
+                                    result=result,
+                                    approval_id=exec_result.approval_id,
+                                    risk=exec_result.risk,
+                                    reason=exec_result.reason,
+                                )
+                            )
+                            continue
                     if exec_result.status == "success":
                         tools_used.append(tool_call.name)
                     result = exec_result.output
@@ -1289,6 +1508,9 @@ class DefaultReasoner(Reasoner):
                         final_arguments=exec_result.final_arguments,
                         status=exec_result.status,
                         result_preview=normalized.preview(),
+                        approval_id=exec_result.approval_id,
+                        risk=exec_result.risk,
+                        reason=exec_result.reason,
                     )
                     logger.info(
                         "[工具结果←] %s  结果预览=%s  result_len=%d",
@@ -1329,36 +1551,19 @@ class DefaultReasoner(Reasoner):
                     # tool_chain 持久化的是“执行后的事实”：
                     # 最终参数、hook trace、结果预览，供后续回放与 session 复原。
                     iter_calls.append(
-                        {
-                            "call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "status": exec_result.status,
-                            "arguments": tool_call.arguments,
-                            "final_arguments": exec_result.final_arguments,
-                            "pre_hook_trace": [
-                                {
-                                    "hook_name": item.hook_name,
-                                    "event": item.event,
-                                    "matched": item.matched,
-                                    "decision": item.decision,
-                                    "reason": item.reason,
-                                    "extra_message": item.extra_message,
-                                }
-                                for item in exec_result.pre_hook_trace
-                            ],
-                            "post_hook_trace": [
-                                {
-                                    "hook_name": item.hook_name,
-                                    "event": item.event,
-                                    "matched": item.matched,
-                                    "decision": item.decision,
-                                    "reason": item.reason,
-                                    "extra_message": item.extra_message,
-                                }
-                                for item in exec_result.post_hook_trace
-                            ],
-                            "result": normalized.preview(),
-                        }
+                        _tool_chain_call(
+                            call_id=tool_call.id,
+                            name=tool_call.name,
+                            status=exec_result.status,
+                            arguments=tool_call.arguments,
+                            final_arguments=exec_result.final_arguments,
+                            pre_hook_trace=exec_result.pre_hook_trace,
+                            post_hook_trace=exec_result.post_hook_trace,
+                            result=normalized.preview(),
+                            approval_id=exec_result.approval_id,
+                            risk=exec_result.risk,
+                            reason=exec_result.reason,
+                        )
                     )
                     if _is_tool_loop_guard_denial(exec_result):
                         logger.warning(
@@ -1572,6 +1777,9 @@ class DefaultReasoner(Reasoner):
         final_arguments: dict[str, Any],
         status: str,
         result_preview: str,
+        approval_id: str = "",
+        risk: str = "",
+        reason: str = "",
     ) -> None:
         if self._event_bus is None or not session_key:
             return
@@ -1587,6 +1795,59 @@ class DefaultReasoner(Reasoner):
                 final_arguments=dict(final_arguments),
                 status=status,
                 result_preview=result_preview,
+                approval_id=approval_id,
+                risk=risk,
+                reason=reason,
+            )
+        )
+
+    async def _observe_tool_approval_required(
+        self,
+        approval: PendingToolApproval,
+    ) -> None:
+        if self._event_bus is None or not approval.request.session_key:
+            return
+        await self._event_bus.observe(
+            ToolApprovalRequired(
+                session_key=approval.request.session_key,
+                channel=approval.request.channel,
+                chat_id=approval.request.chat_id,
+                call_id=approval.request.call_id,
+                tool_name=approval.request.tool_name,
+                approval_id=approval.approval_id,
+                risk=approval.risk,
+                reason=approval.reason,
+                arguments=dict(approval.request.arguments),
+                final_arguments=dict(approval.final_arguments),
+            )
+        )
+
+    async def _observe_tool_approval_resolved(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        call_id: str,
+        tool_name: str,
+        approval_id: str,
+        status: str,
+        risk: str = "",
+        reason: str = "",
+    ) -> None:
+        if self._event_bus is None or not session_key:
+            return
+        await self._event_bus.observe(
+            ToolApprovalResolved(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                approval_id=approval_id,
+                status=status,
+                risk=risk,
+                reason=reason,
             )
         )
 

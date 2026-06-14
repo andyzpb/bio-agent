@@ -106,3 +106,33 @@ class ToolCallCompleted:
     final_arguments: dict[str, Any]
     status: str
     result_preview: str
+    approval_id: str = ""
+    risk: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ToolApprovalRequired:
+    session_key: str
+    channel: str
+    chat_id: str
+    call_id: str
+    tool_name: str
+    approval_id: str
+    risk: str
+    reason: str
+    arguments: dict[str, Any]
+    final_arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolApprovalResolved:
+    session_key: str
+    channel: str
+    chat_id: str
+    call_id: str
+    tool_name: str
+    approval_id: str
+    status: str
+    risk: str = ""
+    reason: str = ""

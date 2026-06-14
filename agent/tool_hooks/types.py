@@ -5,8 +5,17 @@ from typing import Any, Literal
 
 HookEvent = Literal["pre_tool_use", "post_tool_use", "post_tool_error"]
 ToolSource = Literal["passive", "proactive", "subagent"]
-ToolExecStatus = Literal["success", "denied", "error"]
-HookDecision = Literal["pass", "deny"]
+ToolExecStatus = Literal[
+    "success",
+    "denied",
+    "error",
+    "approval_required",
+    "approved",
+    "rejected",
+    "expired",
+    "missing",
+]
+HookDecision = Literal["pass", "deny", "approval_required"]
 
 
 @dataclass
@@ -38,6 +47,8 @@ class HookOutcome:
     updated_input: dict[str, Any] | None = None
     extra_message: str = ""
     reason: str = ""
+    approval_id: str = ""
+    risk: str = ""
 
 
 @dataclass
@@ -48,6 +59,8 @@ class HookTraceItem:
     decision: HookDecision = "pass"
     reason: str = ""
     extra_message: str = ""
+    approval_id: str = ""
+    risk: str = ""
 
 
 def _empty_str_list() -> list[str]:
@@ -70,3 +83,6 @@ class ToolExecutionResult:
     extra_messages: list[str] = field(default_factory=_empty_str_list)
     pre_hook_trace: list[HookTraceItem] = field(default_factory=_empty_pre_trace)
     post_hook_trace: list[HookTraceItem] = field(default_factory=_empty_post_trace)
+    approval_id: str = ""
+    risk: str = ""
+    reason: str = ""
