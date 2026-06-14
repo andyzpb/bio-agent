@@ -47,6 +47,42 @@ The synthesis step receives a curated evidence packet. It does not consume raw
 search noise, duplicate abstracts, untraceable summaries, project memory, or
 reviewer notes as factual evidence.
 
+## Framework Agent Surface
+
+The Biomedical Evidence plugin sits on top of the shared agent framework. The
+framework owns the generic agent runtime:
+
+- inbound and outbound messages;
+- passive turns;
+- lifecycle phases;
+- session history;
+- memory retrieval;
+- tool execution and tool hooks;
+- event streaming;
+- dashboard chat transport.
+
+The plugin contributes biomedical behavior through normal extension points:
+
+- registered tools;
+- prompt render modules;
+- before-turn modules;
+- pre-tool hooks;
+- FastAPI plugin routes;
+- dashboard plugin panel.
+
+This separation matters most for Dashboard Chat. Chat is a generic `dashboard`
+channel. Browser messages are published as ordinary framework `InboundMessage`
+objects, assistant output comes back through the agent loop, and lifecycle/tool
+events are streamed as sanitized Server-Sent Events. Biomedical Evidence does
+not own a separate chat backend, approval broker, or resume loop.
+
+Sensitive biomedical actions, such as project writes, watch/template writes,
+review decisions, and file exports, are marked through tool metadata. Until the
+framework has durable approval and resume semantics, those actions are denied
+from Dashboard Chat by plugin policy. Read-only evidence review, trace,
+provenance, and evidence inspection stay available through ordinary tools and
+workspace views.
+
 ## Trust Layers
 
 | Layer | Role |
@@ -339,9 +375,14 @@ The dashboard surfaces the workflow as a Review-first, Codex-style workspace:
 - **Projects**: paper decisions, claims, review queue, and evidence briefs.
 - **Watch**: topic monitoring, snapshots, relevance scores, and decisions.
 - **Advanced**: raw evidence browser, typed Evidence Graph v1 explorer,
-  claim-level Audit, Trace, related/directed path lookup, and JSON export.
+  run-centric Audit, run-centric Trace/Export, related/directed path lookup,
+  and JSON export.
 - **Boundary**: research-only boundary, memory-as-context policy, clinical
   refusal behavior, and retrieval limitations.
+
+Trace/Export and Audit are run-centric. A reviewer starts from recent answer
+runs, loads the trace or latest audit, then inspects the evidence packet,
+provenance graph, or one-way Obsidian export for the same run.
 
 ## Data Boundaries
 

@@ -2,18 +2,14 @@
 
 Biomedical Evidence is a research-only Akashic plugin for citation-grounded
 biomedical literature work. It supports deterministic mock demos, optional
-PubMed retrieval, structured router/planner output, planner-driven
-primary/support/refute and Release 1.0 multi-pass retrieval bundles, structured evidence extraction, cited
-answers, retrieval manifests, claim-level citation audit, audit/revise traces,
-claim logic entailment audit, symbolic logic fact export, project evidence
-workspaces, framework-native tool guardrails, prompt context injection,
-literature-source readiness checks, the controlled `search_literature` tool, a
-coverage matrix, gap-directed follow-up searches, structured evidence packets, a
-typed Biomedical Evidence Graph v1, Obsidian one-way export, provenance graph
-export, snapshot-backed Run Evidence Review, a review-first Codex-style
-dashboard workspace, and Research Watch decision logs. It is
-implemented as a plugin on top of the collaborative Akashic framework, not as a
-standalone clinical system.
+PubMed retrieval, structured planning, multi-pass retrieval bundles, evidence
+extraction, citation-grounded answers, claim-level audit, logic audit,
+audit/revise traces, project workspaces, Research Watch, Evidence Graph v1,
+Run Evidence Review, provenance export, one-way Obsidian export, and a
+review-first dashboard workspace.
+
+It is implemented as a plugin on top of the collaborative Akashic framework,
+not as a standalone clinical system and not as a separate chat runtime.
 
 ## Default Mode
 
@@ -69,6 +65,14 @@ control point inside the biomedical service:
   project IDs, applies safe defaults, and records hook trace reasons.
 - `prompt_render_modules()` injects a concise research-only boundary and active
   project context only when the turn is biomedical or a project is active.
+- `before_turn_modules()` adds a clinical boundary guard that can abort
+  patient-specific or clinical requests before memory/context preparation.
+- Dashboard Chat uses the framework's generic `dashboard` channel. Biomedical
+  behavior remains plugin-side through prompt modules, before-turn modules,
+  tool hooks, and registered tools.
+- Sensitive write/export/review tools marked `requires_confirmation=true` deny
+  in Dashboard Chat until the framework provides durable approval and
+  resume-after-approval semantics.
 
 The framework guard is an outer safety layer. API/dashboard service routes keep
 their existing service-level validation, refusal, audit, and trace behavior.
@@ -335,10 +339,16 @@ The panel is review-first and uses a Codex-style workspace shell:
   evidence briefs.
 - Watch: create, update, check, and review research-watch topics, snapshots,
   and push/skip decisions.
-- Advanced: raw evidence browser, typed Evidence Graph v1 explorer, citation/
-  logic Audit, Trace, related/directed path lookup, and redacted JSON export.
+- Advanced: raw evidence browser, typed Evidence Graph v1 explorer, run-centric
+  citation/logic Audit, run-centric Trace/Export, related/directed path lookup,
+  and redacted JSON export.
 - Boundary: research-only operating boundary, clinical refusal behavior,
   memory-as-context policy, and retrieval limitations.
+
+Trace/Export and Audit now start from recent answer runs. Reviewers can load a
+run, inspect trace or latest audit, build an evidence packet, view provenance,
+and trigger disabled-by-default one-way Obsidian export without leaving the
+run context.
 
 ## API
 

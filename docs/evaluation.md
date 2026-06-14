@@ -90,6 +90,16 @@ The Evidence Graph and Run Evidence Review metrics are active in the mock eval
 gate. They use persisted graph snapshots when available and check review
 contracts without requiring live PubMed or external graph infrastructure.
 
+Dashboard Chat is covered by targeted framework/plugin tests rather than by the
+mock biomedical eval runner:
+
+- `tests/test_dashboard_api.py` checks chat status, message acceptance,
+  streaming, history, and redaction behavior.
+- `tests/test_biomed_framework_integration.py` checks the clinical before-turn
+  guard and deny-by-default sensitive biomedical tool policy in Dashboard Chat.
+- `tests/test_biomed_release_contracts.py` checks which release tools require
+  confirmation before they can write/export/review.
+
 ## Release 1.0 Gate
 
 The Release 1.0 mock gate is:

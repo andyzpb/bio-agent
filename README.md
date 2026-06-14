@@ -3,95 +3,33 @@
 Read more about the design: https://andyzpb.github.io/blog/biomedical-evidence-agent/
 
 Akashic is a plugin-based AI agent framework with memory, tools, background
-workflows, channel integrations, and a FastAPI dashboard. This repository
-showcases a **research-only biomedical evidence agent** built on that framework:
-it searches literature, extracts evidence, audits generated claims, and makes
-every answer inspectable.
+workflows, channel integrations, and a FastAPI dashboard. This repository shows
+how that framework can power a **research-only biomedical evidence agent**:
+search papers, extract evidence, audit claims, and make every answer
+inspectable.
 
-Current biomedical baseline: **Release 1.5: Review-first, Codex-style
-biomedical evidence workspace**.
+Current biomedical baseline: **Release 1.6: Review Decision Loop**, with
+generic Dashboard Chat and run-centric Trace/Audit/Export workspaces.
 
-## Why It Matters
+## Highlights
 
-Biomedical answers are only useful when reviewers can inspect how they were
-produced. This project treats retrieval manifests, evidence spans, citation
-audit, logic audit, revision, provenance, and trace as first-class objects.
-
-The core rule:
-
-> Project memory, model output, and reviewer notes can guide workflow, but
-> biomedical claims must be grounded in retrieved papers and auditable evidence.
-
-It is not a clinical decision system. Diagnosis, treatment, dosing, prognosis,
-and patient-specific advice are refused before retrieval or LLM stages run.
-
-## What Makes It Interesting
-
-- **Controlled literature retrieval**: `search_literature` queries mock data or
-  opt-in live PubMed and returns normalized papers, source trace, coverage, and
-  retrieval manifests. It never answers directly.
-- **Bounded research loop**: the planner creates primary/support/refute/
-  mechanism/limitation subquestions, retrieval runs per query, coverage gaps
-  are scored, and at most one controlled follow-up pass is allowed.
-- **Evidence packet contract**: synthesis consumes a curated packet, not raw
-  search noise, duplicate abstracts, project memory, or unsupported summaries.
-- **Multi-layer audit**: citation support, conflict, uncertainty, overclaiming,
-  clinical boundary, and claim-logic entailment are checked before final output.
-- **LLM-assisted but not LLM-trusted**: planner, extractor, synthesizer,
-  verifier, revision, and logic parser can use an OpenAI-compatible provider,
-  but invalid output falls back into deterministic gates.
-- **Toolized workflow**: Release 1.0 exposes retrieval, batch extraction,
-  coverage-gap analysis, packet building, trace lookup, Obsidian export, and
-  provenance export as structured tools.
-- **Replayable live smoke**: Release 1.1 adds a dashboard-level PubMed + Ollama
-  smoke runner that captures redacted artifacts for trace, packet, manifest,
-  provenance, and clinical guardrail regression.
-- **Saved workflows**: Release 1.2 adds built-in and custom biomedical
-  tool-chain templates plus workflow skills for evidence review, clinical
-  boundary enforcement, and project/watch memory.
-- **Review-first evidence graph**: typed Evidence Graph v1 and snapshot-backed
-  Run Evidence Review turn each answer run into auditable claim cards,
-  validation, graph hash, and links to trace/provenance/export.
-- **Codex-style evidence workspace**: the dashboard now opens around Review,
-  Run, Projects, Watch, Advanced, and Boundary surfaces, with raw graph/audit/
-  trace inspection progressively disclosed behind Advanced actions.
-- **Math-oriented review aids**: submodular-style packet selection,
-  contextual-bandit-style retrieval advisory, Markov-style step telemetry, and
-  PROV/OpenLineage-compatible provenance graphs are used as advisory and
-  traceability layers.
-
-## Overall Architecture
-
-```text
-research question
-  -> clinical/research boundary check
-  -> router and structured planner
-  -> retrieval subquestions with intents
-  -> search_literature tool
-  -> retrieval bundle and manifest IDs
-  -> evidence extraction
-  -> coverage matrix and gap decisions
-  -> optional bounded follow-up retrieval
-  -> evidence packet
-  -> synthesis
-  -> citation audit and logic audit
-  -> revision
-  -> final answer, citations, trace, and eval record
-```
-
-| Layer | Responsibility |
-| --- | --- |
-| Router and guardrail | Classify research, clinical, clarification, and out-of-scope cases. |
-| Planner | Produce structured queries, intents, and retrieval subquestions. |
-| Retrieval tool | Fetch papers from controlled sources and persist manifests. |
-| Extractor | Convert abstracts into claim/entity/method/limitation evidence spans. |
-| Coverage and gaps | Mark covered, weak, missing, conflicted, and source-limited areas. |
-| Evidence packet | Provide the compact, auditable contract consumed by synthesis. |
-| Synthesizer | Draft a research answer from packet evidence only. |
-| Auditor and reviser | Check support, overclaiming, logic entailment, conflict, and uncertainty. |
-| Trace and provenance | Preserve every decision, fallback, manifest, audit, and exported artifact. |
-
-More architecture detail lives in [docs/architecture.md](./docs/architecture.md).
+- **Evidence-first answers**: retrieval, extraction, evidence packets,
+  synthesis, citation audit, logic audit, and revision are separate,
+  inspectable steps.
+- **Reviewable claims**: Evidence Graph v1 and Run Evidence Review turn each
+  answer run into claim cards with support/refute/limitation links, reviewer
+  decisions, trace, provenance, and graph hash.
+- **Framework-native Dashboard Chat**: chat runs through the shared `dashboard`
+  channel, agent loop, session history, event stream, and tool hooks; biomedical
+  policy stays in the plugin.
+- **Research-only safety**: clinical or patient-specific prompts are refused
+  before memory, retrieval, LLM calls, export, or provenance work.
+- **Toolized workflow**: retrieval, batch extraction, gap analysis, packet
+  building, trace lookup, provenance export, Obsidian export, and release smoke
+  are exposed as structured tools.
+- **Works offline by default**: demos and evals use deterministic mock
+  literature data. Live PubMed and OpenAI-compatible/Ollama LLM providers are
+  opt-in.
 
 ## Dashboard
 
@@ -101,25 +39,19 @@ Run locally:
 uv run python main.py dashboard
 ```
 
-Open `http://127.0.0.1:2236` and select **Biomedical Evidence**.
+Open `http://127.0.0.1:2236` and select **Biomedical Evidence**. The panel is
+review-first: ask a question, inspect the answer run, review claim support,
+trace the evidence packet, and export redacted provenance when needed.
 
-The Biomedical Evidence panel is review-first. The primary navigation is
-`Review`, `Run`, `Projects`, `Watch`, `Advanced`, and `Boundary`; raw graph,
-audit, trace, evidence browser, provenance, and redacted export tools live
-behind Review actions or the Advanced surface. A useful research prompt:
+Try:
 
 ```text
 What recent evidence links microglial activation to Alzheimer's disease progression?
 ```
 
-A clinical-boundary regression prompt:
-
-```text
-What dose should my mother take for Alzheimer disease?
-```
-
-The second prompt should refuse or redirect and must not produce dosing advice,
-citations, or an evidence-based biomedical answer.
+Patient-specific clinical requests are refused by design. Dashboard Chat is a
+generic framework channel, with sensitive biomedical write/export/review tools
+blocked until durable approval and resume support exists.
 
 ## Quickstart
 
@@ -142,79 +74,16 @@ Docker dashboard:
 docker compose up -d --build
 ```
 
-## Runtime Modes
-
-Default demos and evals use deterministic `mock` literature data and require no
-external API keys. Live PubMed and LLM stages are opt-in. The local release
-smoke path has been exercised with Ollama Pro `gpt-oss:120b-cloud`.
-
-## Release Smoke
-
-Run the repeatable dashboard-level smoke against a running dashboard:
-
-```bash
-.venv/bin/python -m eval.biomed_evidence.run_release_smoke \
-  --source pubmed \
-  --ollama-model gpt-oss:120b-cloud \
-  --output-dir /tmp/biomed_release_smoke
-```
-
-The runner captures redacted JSON plus `report.md` for Ollama connectivity,
-dashboard readiness, live PubMed readiness/search, audited answer, trace,
-evidence packet, provenance graph, retrieval manifest, and clinical guardrail
-regression. Exit codes distinguish code regression, external PubMed
-instability, LLM unavailability, guardrail failure, and dashboard
-unavailability.
-
-## Roadmap
-
-Completed baseline:
-
-- Release 1.0 toolized multi-pass evidence workflow;
-- structured release tool contracts and fail-fast errors;
-- project workspace, Research Watch, and one-way Obsidian export;
-- deterministic packet selection, retrieval advisory, step telemetry, and
-  provenance export;
-- Release 1.1 live PubMed/Ollama smoke artifact automation;
-- Release 1.2 saved tool-chain templates and biomedical workflow skills;
-- Release 1.3 advisory math review signals;
-- Release 1.4 Codex-style biomedical workspace shell;
-- Release 1.4.1 Evidence Review hardening: deterministic mixed support,
-  complete evidence cards, and related-vs-directed path semantics;
-- Release 1.5 Review-first Evidence Graph workspace with compact Codex-style
-  shell, recent-run review, Advanced raw graph/audit/trace access, and
-  screenshot-validated desktop/mobile layouts;
-- Release 1.6 Review Decision Loop with persisted accept/needs-more-evidence/
-  flag-overclaim/reject decisions, reviewer notes, trace events, and review
-  packet export.
-
-Next:
-
-- Release 1.7 adds graph snapshot lifecycle: backfill, stale snapshot detection,
-  snapshot diffs, and review queue capture.
-- Release 1.8 moves Research Watch drift detection onto graph-backed snapshots.
-- Release 1.9 strengthens advisory Argument Graph semantics while keeping
-  citation and logic audit authoritative.
-- Release 2.0 adds opt-in full-text/PDF ingestion behind the same Evidence
-  Graph, review, audit, and provenance contracts.
-
 ## Documentation
 
 | Topic | File |
 | --- | --- |
 | Architecture and trust model | [docs/architecture.md](./docs/architecture.md) |
 | Biomedical plugin details | [plugins/biomed_evidence/README.md](./plugins/biomed_evidence/README.md) |
-| Deployment and local smoke | [docs/deployment.md](./docs/deployment.md) |
 | Evaluation and release gates | [docs/evaluation.md](./docs/evaluation.md) |
+| Deployment and local smoke | [docs/deployment.md](./docs/deployment.md) |
 | Responsible AI boundary | [docs/responsible_ai.md](./docs/responsible_ai.md) |
-| Release 1.0 implementation plan | [docs/release_1_0_implementation_plan.md](./docs/release_1_0_implementation_plan.md) |
 | Case study | [cases/ki-biomed-research-assistant/README.md](./cases/ki-biomed-research-assistant/README.md) |
-
-## Non-Goals
-
-No clinical decision support, no memory-as-evidence, no general web search
-snippets as biomedical evidence, and no replacement of deterministic audit with
-advisory LLM judgment.
 
 ## License
 

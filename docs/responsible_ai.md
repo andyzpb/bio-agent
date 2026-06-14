@@ -38,6 +38,9 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 
 - Clinical or patient-specific prompts are refused before memory, retrieval,
   LLM calls, export, or provenance graph construction.
+- Dashboard Chat is a generic framework channel, but biomedical safety still
+  applies before memory/context preparation through the plugin before-turn
+  guard.
 - Project memory can influence planner preferences, include/exclude terms,
   saved-paper priority, rejected-paper filtering, and review queues.
 - Project memory, Watch topics, Obsidian notes, reviewer comments, and model
@@ -45,6 +48,10 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - Release tool errors are structured and fail fast for `clinical_boundary`,
   `source_policy_blocked`, `budget_exceeded`, `export_path_blocked`,
   `unknown_run_id`, and related policy failures.
+- Sensitive biomedical write/export/review tools are marked as requiring
+  confirmation. Until the framework provides durable approval and
+  resume-after-approval, those tools deny from Dashboard Chat and do not write
+  storage, export files, or record review decisions.
 
 ## Export And Provenance Boundary
 
@@ -55,6 +62,9 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
   manifests, packets, audits, revisions, activities, agents, and tools.
 - Provenance output redacts raw prompts, raw provider responses, API keys, and
   secrets.
+- Dashboard Chat streamed events and history responses redact raw prompts,
+  provider raw responses, secrets, authorization headers, and API-key-like
+  values before sending data to the browser.
 - Evidence Graph JSON export is read-only and recursively redacts raw prompt
   fields, provider responses, API keys, tokens, authorization headers, secrets,
   and common secret-like strings.

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Refreshed public documentation around Release 1.6, framework-native
+  Dashboard Chat, and run-centric Trace/Audit/Export review paths.
+- Kept README focused on GitHub-facing highlights while moving implementation
+  detail into architecture, plugin, evaluation, deployment, and responsible-AI
+  docs.
+
+### Safety
+
+- Documented the Dashboard Chat boundary: clinical requests still stop before
+  memory/retrieval/LLM work, and sensitive biomedical write/export/review tools
+  deny until framework-level durable approval and resume support exists.
+
 ## Release 1.6 - 2026-06-13
 
 Release 1.6 turns Run Evidence Review into a traceable reviewer decision loop.
