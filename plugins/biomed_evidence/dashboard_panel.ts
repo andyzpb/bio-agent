@@ -332,6 +332,13 @@ interface AuditedAnswerResult {
   final_action: string;
 }
 
+interface AuditRunPayload extends AnswerResult {
+  latest_citation_audit?: CitationAuditResult | null;
+  latest_advisory_verifier?: AdvisoryVerifierResult | null;
+  latest_revision?: AnswerRevision | null;
+  trace?: AgentTraceStep[] | null;
+}
+
 interface TracePayload {
   run_id: string;
   answer_run: AnswerResult;
@@ -1165,74 +1172,6 @@ function renderEvidenceItem(item: EvidenceRow): string {
   `;
 }
 
-function renderRetrievalBundle(bundle: RetrievalBundle | null | undefined): string {
-  if (!bundle) return '<div class="biomed-muted">No retrieval bundle recorded.</div>';
-  const coverageRows = bundle.coverage_matrix || [];
-  const gapDecisions = bundle.gap_decisions || [];
-  return `
-    <div class="biomed-provenance">
-      <div class="biomed-provenance-grid">
-        <div><span>Bundle</span><code>${escapeHtml(bundle.bundle_id)}</code></div>
-        <div><span>Source</span><strong>${escapeHtml(bundle.source)}</strong></div>
-        <div><span>Mode</span><strong>${bundle.executed_multi_query ? "multi-query" : "single-query"}</strong></div>
-        <div><span>Papers</span><strong>${bundle.deduped_paper_ids.length}</strong></div>
-        <div><span>Stop</span><strong>${escapeHtml(bundle.stop_reason || "-")}</strong></div>
-        <div><span>Gaps</span><strong>${coverageRows.filter((row) => row.coverage_status !== "covered").length}</strong></div>
-      </div>
-      ${bundle.warnings?.length ? `<div class="biomed-label">Warnings</div>${renderList(bundle.warnings)}` : ""}
-      ${coverageRows.length ? `
-        <div class="biomed-label">Coverage Matrix</div>
-        <div class="biomed-audit-table">
-          ${coverageRows.map((row) => `
-            <div class="biomed-audit-row">
-              <div class="biomed-audit-row-head">
-                ${pill(row.retrieval_intent)}
-                ${pill(row.coverage_status)}
-                ${pill(`pass ${row.pass_index}`)}
-                <span>${row.evidence_count}/${row.papers_found} evidence</span>
-              </div>
-              <div class="biomed-evidence-claim">${escapeHtml(row.subquestion)}</div>
-              ${row.gap_reason ? `<div class="biomed-evidence-finding">${escapeHtml(row.gap_reason)}</div>` : ""}
-            </div>
-          `).join("")}
-        </div>
-      ` : ""}
-      ${gapDecisions.length ? `
-        <div class="biomed-label">Gap Follow-up</div>
-        ${gapDecisions.map((gap) => `
-          <div class="biomed-evidence-item">
-            <div class="biomed-evidence-head">
-              ${pill(gap.retrieval_intent)}
-              ${pill(gap.executed ? "executed" : "skipped")}
-              ${gap.retrieval_id ? `<code>${escapeHtml(gap.retrieval_id)}</code>` : ""}
-            </div>
-            <code class="biomed-query">${escapeHtml(gap.followup_query)}</code>
-            <div class="biomed-evidence-finding">${escapeHtml(gap.reason)}</div>
-            ${gap.stop_reason ? `<div class="biomed-muted">${escapeHtml(gap.stop_reason)}</div>` : ""}
-          </div>
-        `).join("")}
-      ` : ""}
-      <div class="biomed-label">Retrieval Records</div>
-      ${bundle.records.map((record) => `
-        <div class="biomed-evidence-item">
-          <div class="biomed-evidence-head">
-            ${pill(record.intent)}
-            ${record.pass_index ? pill(`pass ${record.pass_index}`) : ""}
-            ${record.coverage ? pill(`${record.coverage.item_count} items`) : ""}
-            ${record.retrieval_id ? `<code>${escapeHtml(record.retrieval_id)}</code>` : ""}
-          </div>
-          <code class="biomed-query">${escapeHtml(record.query)}</code>
-          ${record.reason ? `<div class="biomed-evidence-finding">${escapeHtml(record.reason)}</div>` : ""}
-          ${record.returned_paper_ids.length ? renderList(record.returned_paper_ids) : '<div class="biomed-muted">No papers returned.</div>'}
-          ${record.added_paper_ids?.length ? `<div class="biomed-label">Added Papers</div>${renderList(record.added_paper_ids)}` : ""}
-          ${record.skipped_reason ? `<div class="biomed-muted">${escapeHtml(record.skipped_reason)}</div>` : ""}
-        </div>
-      `).join("")}
-      ${bundle.duplicate_paper_ids.length ? `<div class="biomed-label">Duplicates</div>${renderList(bundle.duplicate_paper_ids)}` : ""}
-    </div>
-  `;
-}
-
 function renderEvidencePacket(packet: EvidencePacketSummary | null | undefined): string {
   if (!packet) return '<div class="biomed-muted">No evidence packet recorded.</div>';
   return `
@@ -1625,21 +1564,6 @@ async function loadWorkflowTemplates(container: HTMLElement): Promise<void> {
   }
 }
 
-function renderWorkflowTemplateRun(envelope: ReleaseToolEnvelope<SavedToolChainTemplateRunResult>): string {
-  if (!envelope.ok) return renderReleaseError(envelope);
-  const result = envelope.result;
-  return `
-    <div class="biomed-answer-meta">
-      ${pill("template")}
-      ${pill(result.template.name)}
-      ${pill(result.template.source)}
-      <code>${escapeHtml(envelope.ids.run_id || result.audited_answer.answer_result.run_id)}</code>
-    </div>
-    ${renderAuditedAnswer(result.audited_answer)}
-    ${result.provenance ? `<div class="biomed-label">Template Provenance</div>${renderProvenanceResult(result.provenance)}` : ""}
-  `;
-}
-
 async function hydrateRetrievalBlocks(container: HTMLElement): Promise<void> {
   const blocks = Array.from(container.querySelectorAll<HTMLElement>("[data-biomed-retrieval-id]"));
   await Promise.all(blocks.map(async (block) => {
@@ -1895,41 +1819,6 @@ function renderTraceResult(payload: TracePayload): string {
         </div>
       `).join("") || '<div class="biomed-muted">No trace steps recorded.</div>'}
     </div>
-  `;
-}
-
-function renderAuditedAnswer(result: AuditedAnswerResult): string {
-  return `
-    <div class="biomed-answer-meta">
-      <code>${escapeHtml(result.answer_result.run_id)}</code>
-      ${pill(result.answer_result.uncertainty_level)}
-      ${pill(result.final_action)}
-      ${result.answer_result.synthesis_mode ? pill(result.answer_result.synthesis_mode) : ""}
-    </div>
-    <div class="biomed-label">Retrieval Provenance</div>
-    ${renderManifest(result.answer_result.retrieval_manifest)}
-    <div class="biomed-label">Retrieval Bundle</div>
-    ${renderRetrievalBundle(result.answer_result.retrieval_bundle)}
-    <div class="biomed-label">Evidence Packet</div>
-    ${renderEvidencePacket(result.answer_result.evidence_packet)}
-    <div class="biomed-label">Final Answer</div>
-    <div class="biomed-answer">${renderMarkdown(result.final_answer)}</div>
-    ${renderBoundaryNotice(result.answer_result)}
-    <div class="biomed-label">Audit</div>
-    ${renderAuditResult(result.audit)}
-    <div class="biomed-label">Advisory Verifier</div>
-    ${renderAdvisoryVerifier(result.advisory_verifier)}
-    <div class="biomed-label">Trace Summary</div>
-    ${renderTraceResult({
-      run_id: result.answer_result.run_id,
-      answer_run: result.answer_result,
-      trace: result.trace,
-      revision: result.revision,
-      latest_citation_audit: result.audit,
-      latest_advisory_verifier: result.advisory_verifier,
-      step_telemetry: undefined,
-      memory: result.answer_result.project_context_trace || {},
-    })}
   `;
 }
 
@@ -3422,48 +3311,196 @@ function renderWatch(container: HTMLElement): void {
 
 function renderAudit(container: HTMLElement): void {
   container.innerHTML += `
-    <div class="biomed-section">
-      <div class="biomed-title">Citation & Evidence Audit</div>
-      <div class="biomed-form">
-        <div class="biomed-row">
-          <input id="biomed-audit-run-id" placeholder="answer run id" />
-          <button id="biomed-audit-run-btn">Run Audit</button>
+    <div class="biomed-audit-workspace">
+      <aside class="biomed-audit-rail">
+        <div>
+          <div class="biomed-label">Audit</div>
+          <h2>Citation review</h2>
+          <p>Run or inspect claim-level citation audit, then jump to trace, packet, or provenance for the same answer run.</p>
         </div>
-      </div>
-      <div id="biomed-audit-result" class="biomed-result"></div>
-      <div class="biomed-label">Recent Audits</div>
-      <div id="biomed-audit-list" class="biomed-result"></div>
+        <label class="biomed-field">
+          <span>Run ID</span>
+          <input id="biomed-audit-run-id" placeholder="answer run id" />
+        </label>
+        <div class="biomed-review-rail-actions">
+          <button id="biomed-audit-run-btn">Run Audit</button>
+          <button id="biomed-audit-trace-btn">Trace</button>
+        </div>
+        <div class="biomed-review-rail-actions">
+          <button id="biomed-audit-packet-btn">Packet</button>
+          <button id="biomed-audit-provenance-btn">Provenance</button>
+        </div>
+        <div class="biomed-label">Recent Runs</div>
+        <div id="biomed-audit-recent-runs" class="biomed-review-run-list"></div>
+      </aside>
+      <main id="biomed-audit-result" class="biomed-audit-main">
+        <div class="biomed-empty-state">
+          <div class="biomed-label">No audit selected</div>
+          <h2>Select a recent run</h2>
+          <p>The audit view loads citation precision, support rate, overclaim risk, claim verdicts, and logic-audit artifacts when present.</p>
+        </div>
+      </main>
+      <aside id="biomed-audit-inspector" class="biomed-audit-inspector">
+        <div class="biomed-review-inspector-empty">
+          <div class="biomed-label">Run Artifacts</div>
+          <h3>Trace, packet, provenance</h3>
+          <p>Use the selected run to inspect supporting release artifacts without leaving the audit workflow.</p>
+        </div>
+      </aside>
     </div>
   `;
-  container.querySelector<HTMLButtonElement>("#biomed-audit-run-btn")?.addEventListener("click", async () => {
+
+  const selectedRunId = (): string => (
+    container.querySelector<HTMLInputElement>("#biomed-audit-run-id")?.value.trim() || ""
+  );
+
+  const setSelectedRun = (runId: string): void => {
+    const input = container.querySelector<HTMLInputElement>("#biomed-audit-run-id");
+    if (input) input.value = runId;
+  };
+
+  const loadAudit = async (runId: string, runAudit = false): Promise<void> => {
     const target = container.querySelector<HTMLElement>("#biomed-audit-result");
-    const runId = container.querySelector<HTMLInputElement>("#biomed-audit-run-id")?.value || "";
     if (!target || !runId) return;
-    target.textContent = "Running citation audit...";
+    setSelectedRun(runId);
+    target.innerHTML = renderLoading(runAudit ? "Running citation audit..." : "Loading citation audit...");
     try {
-      const audit = await api<CitationAuditResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/audit`, { method: "POST" });
-      target.innerHTML = renderAuditResult(audit);
+      const audit = runAudit
+        ? await api<CitationAuditResult>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/audit`, { method: "POST" })
+        : (await api<AuditRunPayload>(`/api/biomed/audit/${encodeURIComponent(runId)}`)).latest_citation_audit;
+      if (!audit) {
+        target.innerHTML = `
+          <div class="biomed-empty-state">
+            <div class="biomed-label">No citation audit</div>
+            <h2>${escapeHtml(runId)}</h2>
+            <p>This run has no saved audit yet. Run Audit will create the citation audit and logic-audit artifact for this answer run.</p>
+          </div>
+        `;
+        return;
+      }
+      target.innerHTML = `
+        <section class="biomed-run-hero">
+          <div class="biomed-run-kicker">
+            ${pill(audit.recommended_action)}
+            ${pill(`support ${Math.round(audit.claim_support_rate * 100)}%`)}
+            ${pill(`precision ${Math.round(audit.citation_precision * 100)}%`)}
+          </div>
+          <div class="biomed-run-title">${escapeHtml(runId)}</div>
+          <div class="biomed-run-stats">
+            <span>${audit.claim_audits.length} claims</span>
+            <span>${audit.failed_claims.length} failed</span>
+            <span>${Math.round(audit.unsupported_claim_rate * 100)}% unsupported</span>
+            <span>${Math.round(audit.overclaim_rate * 100)}% overclaim</span>
+          </div>
+        </section>
+        ${renderAuditResult(audit)}
+      `;
       await loadAuditList(container);
     } catch (error) {
       target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
+  };
+
+  const loadInspector = async (label: string, loader: () => Promise<string>): Promise<void> => {
+    const target = container.querySelector<HTMLElement>("#biomed-audit-inspector");
+    if (!target) return;
+    target.innerHTML = renderLoading(label);
+    try {
+      target.innerHTML = await loader();
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  };
+
+  container.querySelector<HTMLButtonElement>("#biomed-audit-run-btn")?.addEventListener("click", async () => {
+    await loadAudit(selectedRunId(), true);
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-audit-trace-btn")?.addEventListener("click", async () => {
+    const runId = selectedRunId();
+    if (!runId) return;
+    await loadInspector("Loading trace...", async () => {
+      const trace = await api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`);
+      return renderTraceResult(trace);
+    });
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-audit-packet-btn")?.addEventListener("click", async () => {
+    const runId = selectedRunId();
+    if (!runId) return;
+    await loadInspector("Building evidence packet...", async () => {
+      const envelope = await api<ReleaseToolEnvelope<EvidencePacketBuildResult>>("/api/biomed/evidence/packet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: runId, max_evidence_items: 12, selection_strategy: "submodular_greedy" }),
+      });
+      return renderPacketBuildResult(envelope);
+    });
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-audit-provenance-btn")?.addEventListener("click", async () => {
+    const runId = selectedRunId();
+    if (!runId) return;
+    await loadInspector("Loading provenance graph...", async () => {
+      const envelope = await api<ReleaseToolEnvelope<ProvenanceGraphResult>>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/provenance`);
+      return renderProvenanceResult(envelope);
+    });
   });
   void loadAuditList(container);
+  void loadAuditRecentRuns(container, loadAudit);
 }
 
 async function loadAuditList(container: HTMLElement): Promise<void> {
-  const target = container.querySelector<HTMLElement>("#biomed-audit-list");
+  const target = container.querySelector<HTMLElement>("#biomed-audit-inspector");
   if (!target) return;
   try {
     const data = await api<{ items: { audit_id: string; run_id?: string | null; recommended_action: string; metrics?: Record<string, unknown>; created_at: string }[] }>("/api/biomed/audits");
-    target.innerHTML = data.items.map((item) => `
-      <div class="biomed-decision">
-        <div>${pill(item.recommended_action)} <code>${escapeHtml(item.audit_id)}</code></div>
-        <div class="biomed-watch-meta">
-          run ${escapeHtml(item.run_id || "-")} · ${escapeHtml(item.created_at || "")}
-        </div>
+    const rows = data.items.slice(0, 5).map((item) => `
+      <button class="biomed-run-link" data-audit-history-run-id="${escapeHtml(item.run_id || "")}">
+        <span>${escapeHtml(item.run_id || item.audit_id)}</span>
+        <code>${escapeHtml(item.recommended_action)} · ${escapeHtml(item.created_at || "")}</code>
+      </button>
+    `).join("");
+    target.innerHTML = `
+      <div class="biomed-label">Recent Audits</div>
+      <div class="biomed-review-run-list">
+        ${rows || '<div class="biomed-muted">No audits yet.</div>'}
       </div>
-    `).join("") || '<div class="biomed-muted">No audits yet.</div>';
+    `;
+    target.querySelectorAll<HTMLButtonElement>("[data-audit-history-run-id]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const runId = button.dataset.auditHistoryRunId || "";
+        const input = container.querySelector<HTMLInputElement>("#biomed-audit-run-id");
+        if (input && runId) input.value = runId;
+      });
+    });
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function loadAuditRecentRuns(
+  container: HTMLElement,
+  onSelect: (runId: string, runAudit?: boolean) => Promise<void>,
+): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-audit-recent-runs");
+  if (!target) return;
+  target.innerHTML = '<div class="biomed-muted">Loading recent runs...</div>';
+  try {
+    const data = await api<{ items: AnswerRunListItem[] }>("/api/biomed/answer-runs?page_size=8");
+    target.innerHTML = data.items.map((item) => `
+      <button class="biomed-run-link" data-audit-run-id="${escapeHtml(item.run_id)}">
+        <span>${escapeHtml(item.question || item.run_id)}</span>
+        <code>${escapeHtml(item.created_at || item.run_id)}</code>
+      </button>
+    `).join("") || '<div class="biomed-muted">No runs yet.</div>';
+    target.querySelectorAll<HTMLButtonElement>("[data-audit-run-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const runId = button.dataset.auditRunId || "";
+        await onSelect(runId, false);
+      });
+    });
+    const firstRunId = data.items[0]?.run_id || "";
+    if (firstRunId) {
+      await onSelect(firstRunId, false);
+    }
   } catch (error) {
     target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
   }
@@ -3471,83 +3508,189 @@ async function loadAuditList(container: HTMLElement): Promise<void> {
 
 function renderTrace(container: HTMLElement): void {
   container.innerHTML += `
-    <div class="biomed-section">
-      <div class="biomed-title">Answer Trace</div>
-      <div class="biomed-form">
-        <div class="biomed-row">
+    <div class="biomed-trace-workspace">
+      <aside class="biomed-trace-rail">
+        <div>
+          <div class="biomed-label">Trace</div>
+          <h2>Run exports</h2>
+          <p>Open a saved answer run, inspect tool steps, then build packet, provenance, or one-way Obsidian export artifacts.</p>
+        </div>
+        <label class="biomed-field">
+          <span>Run ID</span>
           <input id="biomed-trace-run-id" placeholder="answer run id" />
+        </label>
+        <div class="biomed-review-rail-actions">
           <button id="biomed-trace-load-btn">Load Trace</button>
           <button id="biomed-packet-build-btn">Build Packet</button>
-          <button id="biomed-provenance-load-btn">Provenance</button>
         </div>
-        <div class="biomed-row">
-          <input id="biomed-obsidian-dir" placeholder="workspace-relative Obsidian export dir" value="obsidian-export" />
-          <label class="biomed-check"><input id="biomed-obsidian-enabled" type="checkbox" /> enable one-way export</label>
+        <div class="biomed-review-rail-actions">
+          <button id="biomed-provenance-load-btn">Provenance</button>
           <button id="biomed-obsidian-export-btn">Export Packet</button>
         </div>
-      </div>
-      <div id="biomed-trace-result" class="biomed-result"></div>
-      <div id="biomed-release-tool-result" class="biomed-result"></div>
+        <label class="biomed-field">
+          <span>Obsidian Export Dir</span>
+          <input id="biomed-obsidian-dir" placeholder="workspace-relative export dir" value="obsidian-export" />
+        </label>
+        <label class="biomed-check">
+          <input id="biomed-obsidian-enabled" type="checkbox" />
+          <span>Enable one-way export</span>
+        </label>
+        <div class="biomed-label">Recent Runs</div>
+        <div id="biomed-trace-recent-runs" class="biomed-review-run-list"></div>
+      </aside>
+      <main id="biomed-trace-result" class="biomed-trace-main">
+        <div class="biomed-empty-state">
+          <div class="biomed-label">No run selected</div>
+          <h2>Select a recent run</h2>
+          <p>The trace view loads tool-chain steps, memory effects, budget snapshots, telemetry, audit state, and answer revision details.</p>
+        </div>
+      </main>
+      <aside id="biomed-release-tool-result" class="biomed-trace-inspector">
+        <div class="biomed-review-inspector-empty">
+          <div class="biomed-label">Release Artifacts</div>
+          <h3>Packet, provenance, export</h3>
+          <p>Use a selected run to build or inspect release artifacts. Obsidian export remains disabled unless explicitly enabled.</p>
+        </div>
+      </aside>
     </div>
   `;
-  container.querySelector<HTMLButtonElement>("#biomed-trace-load-btn")?.addEventListener("click", async () => {
+
+  let currentTrace: TracePayload | null = null;
+
+  const selectedRunId = (): string => (
+    container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value.trim() || currentTrace?.run_id || ""
+  );
+
+  const setSelectedRun = (runId: string): void => {
+    const input = container.querySelector<HTMLInputElement>("#biomed-trace-run-id");
+    if (input) input.value = runId;
+  };
+
+  const renderTraceSummary = (trace: TracePayload): string => {
+    const answer = trace.answer_run;
+    const audit = trace.latest_citation_audit;
+    const revision = trace.revision;
+    return `
+      <section class="biomed-run-hero">
+        <div class="biomed-run-kicker">
+          ${pill(revision?.revision_action || "trace")}
+          ${pill(answer.uncertainty_level)}
+          ${answer.synthesis_mode ? pill(answer.synthesis_mode) : ""}
+          ${answer.retrieval_manifest?.source ? pill(answer.retrieval_manifest.source) : ""}
+        </div>
+        <div class="biomed-run-title">${escapeHtml(trace.run_id)}</div>
+        <div class="biomed-run-stats">
+          <span>${trace.trace.length} steps</span>
+          <span>${answer.evidence_summary.length} evidence items</span>
+          <span>${answer.citations.length} citations</span>
+          <span>${audit ? audit.recommended_action : "audit pending"}</span>
+        </div>
+      </section>
+      ${renderTraceResult(trace)}
+    `;
+  };
+
+  const loadTrace = async (runId: string): Promise<void> => {
     const target = container.querySelector<HTMLElement>("#biomed-trace-result");
-    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
+    const artifactTarget = container.querySelector<HTMLElement>("#biomed-release-tool-result");
     if (!target || !runId) return;
-    target.textContent = "Loading trace...";
+    setSelectedRun(runId);
+    target.innerHTML = renderLoading("Loading answer trace...");
+    if (artifactTarget) {
+      artifactTarget.innerHTML = `
+        <div class="biomed-review-inspector-empty">
+          <div class="biomed-label">Release Artifacts</div>
+          <h3>${escapeHtml(runId)}</h3>
+          <p>Build packet, load provenance, or export one-way Obsidian notes for this run.</p>
+        </div>
+      `;
+    }
     try {
       const trace = await api<TracePayload>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`);
-      target.innerHTML = renderTraceResult(trace);
+      currentTrace = trace;
+      target.innerHTML = renderTraceSummary(trace);
     } catch (error) {
       target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
+  };
+
+  const loadReleaseArtifact = async (label: string, loader: () => Promise<string>): Promise<void> => {
+    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
+    if (!target) return;
+    target.innerHTML = renderLoading(label);
+    try {
+      target.innerHTML = await loader();
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  };
+
+  container.querySelector<HTMLButtonElement>("#biomed-trace-load-btn")?.addEventListener("click", async () => {
+    await loadTrace(selectedRunId());
   });
   container.querySelector<HTMLButtonElement>("#biomed-packet-build-btn")?.addEventListener("click", async () => {
-    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
-    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
-    if (!target || !runId) return;
-    target.textContent = "Building evidence packet...";
-    try {
+    const runId = selectedRunId();
+    if (!runId) return;
+    await loadReleaseArtifact("Building evidence packet...", async () => {
       const envelope = await api<ReleaseToolEnvelope<EvidencePacketBuildResult>>("/api/biomed/evidence/packet", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ run_id: runId, max_evidence_items: 12, selection_strategy: "submodular_greedy" }),
       });
-      target.innerHTML = renderPacketBuildResult(envelope);
-    } catch (error) {
-      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
-    }
+      return renderPacketBuildResult(envelope);
+    });
   });
   container.querySelector<HTMLButtonElement>("#biomed-provenance-load-btn")?.addEventListener("click", async () => {
-    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
-    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
-    if (!target || !runId) return;
-    target.textContent = "Loading provenance graph...";
-    try {
+    const runId = selectedRunId();
+    if (!runId) return;
+    await loadReleaseArtifact("Loading provenance graph...", async () => {
       const envelope = await api<ReleaseToolEnvelope<ProvenanceGraphResult>>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/provenance`);
-      target.innerHTML = renderProvenanceResult(envelope);
-    } catch (error) {
-      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
-    }
+      return renderProvenanceResult(envelope);
+    });
   });
   container.querySelector<HTMLButtonElement>("#biomed-obsidian-export-btn")?.addEventListener("click", async () => {
-    const target = container.querySelector<HTMLElement>("#biomed-release-tool-result");
-    const runId = container.querySelector<HTMLInputElement>("#biomed-trace-run-id")?.value || "";
-    const exportDir = container.querySelector<HTMLInputElement>("#biomed-obsidian-dir")?.value || "";
+    const runId = selectedRunId();
+    const exportDir = container.querySelector<HTMLInputElement>("#biomed-obsidian-dir")?.value.trim() || "";
     const enabled = Boolean(container.querySelector<HTMLInputElement>("#biomed-obsidian-enabled")?.checked);
-    if (!target || !runId) return;
-    target.textContent = "Exporting one-way Obsidian note...";
-    try {
+    if (!runId) return;
+    await loadReleaseArtifact("Exporting one-way Obsidian note...", async () => {
       const envelope = await api<ReleaseToolEnvelope<ObsidianExportResult>>("/api/biomed/export/obsidian/evidence-packet", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ run_id: runId, export_dir: exportDir, enabled }),
       });
-      target.innerHTML = renderObsidianExportResult(envelope);
-    } catch (error) {
-      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
-    }
+      return renderObsidianExportResult(envelope);
+    });
   });
+  void loadTraceRecentRuns(container, loadTrace);
+}
+
+async function loadTraceRecentRuns(
+  container: HTMLElement,
+  onSelect: (runId: string) => Promise<void>,
+): Promise<void> {
+  const target = container.querySelector<HTMLElement>("#biomed-trace-recent-runs");
+  if (!target) return;
+  target.innerHTML = '<div class="biomed-muted">Loading recent runs...</div>';
+  try {
+    const data = await api<{ items: AnswerRunListItem[] }>("/api/biomed/answer-runs?page_size=8");
+    target.innerHTML = data.items.map((item) => `
+      <button class="biomed-run-link" data-trace-run-id="${escapeHtml(item.run_id)}">
+        <span>${escapeHtml(item.question || item.run_id)}</span>
+        <code>${escapeHtml(item.created_at || item.run_id)}</code>
+      </button>
+    `).join("") || '<div class="biomed-muted">No runs yet.</div>';
+    target.querySelectorAll<HTMLButtonElement>("[data-trace-run-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const runId = button.dataset.traceRunId || "";
+        await onSelect(runId);
+      });
+    });
+    const firstRunId = data.items[0]?.run_id || "";
+    if (firstRunId) await onSelect(firstRunId);
+  } catch (error) {
+    target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+  }
 }
 
 function csv(value: string): string[] {

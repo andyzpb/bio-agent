@@ -10,15 +10,19 @@ from typing import Any
 
 import pytest
 
-from agent.lifecycle.types import PreToolCtx, PromptRenderCtx
+from agent.lifecycle.types import BeforeTurnCtx, PreToolCtx, PromptRenderCtx
 from agent.plugins.config import PluginConfig
 from agent.plugins.context import PluginContext, PluginKVStore
 from agent.plugins.manager import PluginManager
 from agent.plugins.registry import plugin_registry
+from agent.tool_hooks.base import ToolHook
 from agent.tool_hooks.executor import ToolExecutor
-from agent.tool_hooks.types import ToolExecutionRequest
+from agent.tool_hooks.types import HookContext, HookOutcome, ToolExecutionRequest
 from agent.tools.registry import ToolRegistry
+from agent.lifecycle.types import TurnState
 from bus.event_bus import EventBus
+from bus.events import InboundMessage
+from plugins.biomed_evidence.guardrails import clinical_refusal
 from plugins.biomed_evidence.plugin import BiomedEvidencePlugin
 from plugins.biomed_evidence.schemas import BiomedProjectCreateRequest
 
@@ -52,6 +56,32 @@ async def _make_plugin(
     )
     await plugin.initialize()
     return plugin, bus
+
+
+class _BiomedGuardHook(ToolHook):
+    name = "biomed"
+    event = "pre_tool_use"
+
+    def __init__(self, plugin: BiomedEvidencePlugin) -> None:
+        self._plugin = plugin
+
+    def matches(self, _ctx: HookContext) -> bool:
+        return True
+
+    async def run(self, ctx: HookContext) -> HookOutcome:
+        outcome = await self._plugin.guard_biomedical_tool(
+            PreToolCtx(
+                session_key=ctx.request.session_key,
+                channel=ctx.request.channel,
+                chat_id=ctx.request.chat_id,
+                tool_name=ctx.request.tool_name,
+                arguments=dict(ctx.current_arguments),
+                call_id=ctx.request.call_id,
+                source=ctx.request.source,
+                request_text=ctx.request.request_text,
+            )
+        )
+        return outcome or HookOutcome()
 
 
 @pytest.mark.asyncio
@@ -159,6 +189,112 @@ async def test_biomed_pre_tool_guard_denies_live_pubmed_when_config_disabled(
     assert outcome is not None
     assert outcome.decision == "deny"
     assert "live PubMed tool calls are disabled" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_biomed_before_turn_clinical_guard_aborts_before_context_prepare(
+    tmp_path: Path,
+) -> None:
+    plugin, bus = await _make_plugin(tmp_path)
+    try:
+        module = plugin.before_turn_modules()[0]
+        frame = SimpleNamespace(
+            input=TurnState(
+                msg=InboundMessage(
+                    channel="dashboard",
+                    sender="user",
+                    chat_id="default",
+                    content="What dose should my mother take for Alzheimer disease?",
+                ),
+                session_key="dashboard:default",
+                dispatch_outbound=True,
+            ),
+            slots={"session:session": SimpleNamespace(messages=["old"])},
+        )
+        await module.run(frame)
+        ctx = frame.slots["session:ctx"]
+    finally:
+        await plugin.terminate()
+        await bus.aclose()
+
+    assert isinstance(ctx, BeforeTurnCtx)
+    assert ctx.abort is True
+    assert ctx.abort_reply == clinical_refusal()
+    assert ctx.retrieved_memory_block == ""
+    assert ctx.history_messages == ()
+    assert ctx.extra_metadata["clinical_boundary_before_memory"] is True
+    assert (
+        ctx.extra_metadata["biomed_evidence_clinical_boundary"][
+            "before_context_prepare"
+        ]
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_biomed_dashboard_chat_sensitive_tool_requires_confirmation_guard(
+    tmp_path: Path,
+) -> None:
+    plugin, bus = await _make_plugin(tmp_path)
+    try:
+        outcome = await plugin.guard_biomedical_tool(
+            PreToolCtx(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                tool_name="record_run_review_decision",
+                arguments={
+                    "run_id": "run-1",
+                    "decision": "supported",
+                },
+                source="passive",
+                request_text="Please save this review decision.",
+            )
+        )
+    finally:
+        await plugin.terminate()
+        await bus.aclose()
+
+    assert outcome is not None
+    assert outcome.decision == "deny"
+    assert "biomed_evidence_confirmation_required" in outcome.reason
+    assert "requires_confirmation=true" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_biomed_sensitive_chat_tool_executor_denies_without_invoker(
+    tmp_path: Path,
+) -> None:
+    plugin, bus = await _make_plugin(tmp_path)
+    invoked = False
+    try:
+        executor = ToolExecutor([_BiomedGuardHook(plugin)])
+
+        async def _invoker(_name: str, _args: dict[str, Any]) -> str:
+            nonlocal invoked
+            invoked = True
+            return "ran"
+
+        result = await executor.execute(
+            ToolExecutionRequest(
+                call_id="call-1",
+                tool_name="export_project_to_obsidian",
+                arguments={"project_id": "project-1"},
+                source="passive",
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+            ),
+            _invoker,
+        )
+    finally:
+        await plugin.terminate()
+        await bus.aclose()
+
+    assert invoked is False
+    assert result.status == "denied"
+    assert "export_project_to_obsidian" in result.output
+    assert "requires_confirmation=true" in result.output
 
 
 @pytest.mark.asyncio

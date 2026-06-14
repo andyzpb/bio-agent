@@ -98,6 +98,9 @@ def test_release_tool_contract_registry_and_source_policy() -> None:
     review_contract = get_release_tool_metadata("get_run_evidence_review")
     assert review_contract.risk_level == "read_only"
     assert review_contract.side_effects == ["read_storage"]
+    review_decision_contract = get_release_tool_metadata("record_run_review_decision")
+    assert review_decision_contract.risk_level == "writes_storage"
+    assert review_decision_contract.requires_confirmation is True
 
     blocked = release_source_policy_error(
         tool_name="search_literature",
@@ -150,6 +153,7 @@ def test_release_tool_contracts_api(tmp_path: Path) -> None:
     tools = {item["tool_name"]: item for item in payload["tools"]}
     assert tools["run_multi_pass_literature_search"]["source_policy"] == "live_opt_in"
     assert tools["export_evidence_packet_to_obsidian"]["requires_confirmation"] is True
+    assert tools["record_run_review_decision"]["requires_confirmation"] is True
     assert tools["export_evidence_graph_json"]["risk_level"] == "read_only"
     assert tools["export_evidence_graph_json"]["side_effects"] == ["read_storage"]
     assert tools["get_run_evidence_review"]["risk_level"] == "read_only"

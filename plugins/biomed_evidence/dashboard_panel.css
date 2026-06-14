@@ -1286,15 +1286,30 @@
 
 .biomed-review-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 980px);
-  justify-content: center;
-  gap: 14px;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(300px, 360px);
+  align-items: start;
+  gap: 16px;
+  min-height: calc(100vh - 170px);
+}
+
+.biomed-audit-workspace,
+.biomed-trace-workspace {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(300px, 360px);
+  align-items: start;
+  gap: 16px;
   min-height: calc(100vh - 170px);
 }
 
 .biomed-review-rail,
 .biomed-review-main,
 .biomed-review-inspector,
+.biomed-audit-rail,
+.biomed-audit-main,
+.biomed-audit-inspector,
+.biomed-trace-rail,
+.biomed-trace-main,
+.biomed-trace-inspector,
 .biomed-review-answer,
 .biomed-empty-state,
 .biomed-review-inspector-empty {
@@ -1304,23 +1319,35 @@
 }
 
 .biomed-review-rail,
-.biomed-review-inspector {
-  position: static;
+.biomed-review-inspector,
+.biomed-audit-rail,
+.biomed-audit-inspector,
+.biomed-trace-rail,
+.biomed-trace-inspector {
+  position: sticky;
+  top: 16px;
   align-self: start;
-  max-height: none;
-  overflow: visible;
+  max-height: calc(100vh - 190px);
+  overflow: auto;
 }
 
 .biomed-review-rail {
-  display: grid;
-  grid-template-columns: minmax(190px, 1fr) minmax(180px, 240px) minmax(150px, auto) minmax(220px, 320px);
-  gap: 10px;
-  align-items: end;
-  padding: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+}
+
+.biomed-audit-rail,
+.biomed-trace-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
 }
 
 .biomed-review-rail > div:first-child {
-  display: none;
+  display: block;
 }
 
 .biomed-review-rail h2,
@@ -1344,11 +1371,11 @@
 }
 
 .biomed-review-rail > div:first-child p {
-  display: none;
+  display: block;
 }
 
 .biomed-review-rail > .biomed-label {
-  display: none;
+  display: block;
 }
 
 .biomed-review-rail-actions {
@@ -1359,13 +1386,11 @@
 }
 
 .biomed-review-run-list {
-  grid-column: 1 / -1;
   display: flex;
-  flex-direction: row;
+  flex-direction: column;
   gap: 8px;
   min-height: 0;
-  overflow-x: auto;
-  padding-bottom: 2px;
+  overflow: visible;
 }
 
 .biomed-review-run-list .biomed-watch-row {
@@ -1374,13 +1399,22 @@
 }
 
 .biomed-review-run-list .biomed-run-link {
-  flex: 0 0 280px;
-  width: 280px;
+  flex: 0 0 auto;
+  width: 100%;
   max-width: 100%;
   min-width: 0;
 }
 
 .biomed-review-main {
+  min-width: 0;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.biomed-audit-main,
+.biomed-trace-main {
   min-width: 0;
   padding: 16px;
   display: flex;
@@ -1421,10 +1455,13 @@
 .biomed-review-inspector {
   min-width: 0;
   padding: 14px;
-  display: none;
+  display: block;
 }
 
-.biomed-review-inspector:not(:empty):not(:has(.biomed-review-inspector-empty)) {
+.biomed-audit-inspector,
+.biomed-trace-inspector {
+  min-width: 0;
+  padding: 14px;
   display: block;
 }
 
@@ -1564,7 +1601,19 @@
     grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
   }
 
+  .biomed-audit-workspace,
+  .biomed-trace-workspace {
+    grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
+  }
+
   .biomed-review-inspector {
+    grid-column: 1 / -1;
+    position: static;
+    max-height: none;
+  }
+
+  .biomed-audit-inspector,
+  .biomed-trace-inspector {
     grid-column: 1 / -1;
     position: static;
     max-height: none;
@@ -1655,7 +1704,20 @@
     min-height: 0;
   }
 
+  .biomed-audit-workspace,
+  .biomed-trace-workspace {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+
   .biomed-review-rail {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+    padding: 12px;
+  }
+
+  .biomed-audit-rail,
+  .biomed-trace-rail {
     grid-template-columns: 1fr;
     align-items: stretch;
     padding: 12px;
@@ -1682,6 +1744,12 @@
   }
 
   .biomed-review-inspector {
+    position: static;
+    max-height: none;
+  }
+
+  .biomed-audit-inspector,
+  .biomed-trace-inspector {
     position: static;
     max-height: none;
   }
