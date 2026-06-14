@@ -6,10 +6,24 @@ import sqlite3
 import threading
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient as _RawTestClient
 
-from bootstrap.dashboard_api import create_dashboard_app as _create_dashboard_app
+from bootstrap.dashboard_api import (
+    DashboardChatMultiplexer,
+    _sse_payload,
+    create_dashboard_app as _create_dashboard_app,
+)
+from agent.lifecycle.types import AfterStepCtx
 from plugins.default_memory.engine import DefaultMemoryEngine
+from bus.event_bus import EventBus
+from bus.events import OutboundMessage
+from bus.events_lifecycle import (
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+)
+from bus.queue import MessageBus
 from memory2.store import MemoryStore2
 from proactive_v2.state import ProactiveStateStore
 from session.store import SessionStore
@@ -132,6 +146,16 @@ class _ManualMemoryOptimizer:
                 raise self.error
         finally:
             self._running = False
+
+
+class _FakeBus(MessageBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inbound_items = []
+
+    async def publish_inbound(self, msg):
+        self.inbound_items.append(msg)
+        await super().publish_inbound(msg)
 
 
 def _seed_workspace(tmp_path) -> None:
@@ -382,6 +406,328 @@ def test_list_sessions_with_filters(tmp_path) -> None:
         )
         assert messages_resp.status_code == 200
         assert messages_resp.json()["items"][0]["seq"] == 0
+
+
+def test_dashboard_chat_status_disabled_without_full_runtime(tmp_path) -> None:
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        status = client.get("/api/dashboard/chat/status")
+        post = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "hello"},
+        )
+
+    assert status.status_code == 200
+    assert status.json()["enabled"] is False
+    assert "full runtime" in status.json()["reason"]
+    assert post.status_code == 503
+
+
+def test_dashboard_chat_status_reports_session_cursor_when_enabled(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        status = client.get(
+            "/api/dashboard/chat/status",
+            params={"session_key": "dashboard:default"},
+        )
+
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["enabled"] is True
+    assert payload["session_key"] == "dashboard:default"
+    assert payload["latest_seq"] == 0
+    assert payload["active"] is False
+    assert payload["replay_limit"] >= 100
+
+
+def test_dashboard_chat_status_requires_event_bus(tmp_path) -> None:
+    bus = _FakeBus()
+    with TestClient(create_dashboard_app(tmp_path, message_bus=bus)) as client:
+        status = client.get("/api/dashboard/chat/status")
+        post = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "hello"},
+        )
+
+    assert status.status_code == 200
+    assert status.json()["enabled"] is False
+    assert post.status_code == 503
+    assert bus.inbound_items == []
+
+
+def test_dashboard_chat_post_publishes_inbound_to_runtime_bus(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        resp = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "hello from dashboard"},
+        )
+
+    assert resp.status_code == 202
+    assert resp.json()["accepted"] is True
+    assert resp.json()["session_key"] == "dashboard:default"
+    assert len(bus.inbound_items) == 1
+    item = bus.inbound_items[0]
+    assert item.channel == "dashboard"
+    assert item.sender == "dashboard-user"
+    assert item.chat_id == "default"
+    assert item.content == "hello from dashboard"
+    assert item.session_key == "dashboard:default"
+    assert item.metadata["source"] == "dashboard_chat"
+
+
+def test_dashboard_chat_post_accepts_custom_dashboard_session(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        resp = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "hello", "session_key": "dashboard:project-alpha"},
+        )
+
+    assert resp.status_code == 202
+    assert resp.json()["session_key"] == "dashboard:project-alpha"
+    assert resp.json()["chat_id"] == "project-alpha"
+    assert bus.inbound_items[0].session_key == "dashboard:project-alpha"
+
+
+def test_dashboard_chat_validates_payload(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        empty = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "   "},
+        )
+        wrong_session = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "hello", "session_key": "telegram:100"},
+        )
+        too_long = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "x" * 16001},
+        )
+
+    assert empty.status_code == 400
+    assert wrong_session.status_code == 400
+    assert too_long.status_code == 400
+    assert bus.inbound_items == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_multiplexer_fans_out_by_session() -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    first = await mux.subscribe("dashboard:default")
+    second = await mux.subscribe("dashboard:other")
+    try:
+        await mux._on_outbound(
+            OutboundMessage(
+                channel="dashboard",
+                chat_id="default",
+                content="hello back",
+            )
+        )
+        event, payload = await asyncio.wait_for(first.get(), timeout=1.0)
+    finally:
+        await mux.unsubscribe("dashboard:default", first)
+        await mux.unsubscribe("dashboard:other", second)
+
+    assert event == "assistant_message"
+    assert payload["content"] == "hello back"
+    assert payload["session_key"] == "dashboard:default"
+    assert second.empty()
+
+
+def test_dashboard_chat_stream_connected_event_payload() -> None:
+    payload = _sse_payload(
+        "connected",
+        {"event": "connected", "session_key": "dashboard:default"},
+    )
+
+    assert payload.startswith("event: connected\ndata: ")
+    assert '"session_key":"dashboard:default"' in payload
+    assert payload.endswith("\n\n")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_multiplexer_replays_events_after_cursor() -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    await mux.publish_user_message_accepted(
+        session_key="dashboard:default",
+        content="first",
+    )
+    await mux.publish_user_message_accepted(
+        session_key="dashboard:default",
+        content="second",
+    )
+
+    queue = await mux.subscribe("dashboard:default", since_seq=1)
+    try:
+        event, payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert event == "user_message_accepted"
+    assert payload["seq"] == 2
+    assert payload["content_preview"] == "second"
+    assert await mux.latest_seq("dashboard:default") == 2
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_multiplexer_keeps_replay_after_done() -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    await mux.publish_user_message_accepted(
+        session_key="dashboard:default",
+        content="first",
+    )
+    assert await mux.is_active("dashboard:default") is True
+    await mux._on_outbound(
+        OutboundMessage(
+            channel="dashboard",
+            chat_id="default",
+            content="final",
+        )
+    )
+    assert await mux.is_active("dashboard:default") is False
+
+    queue = await mux.subscribe("dashboard:default", since_seq=1)
+    try:
+        event, payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert event == "assistant_message"
+    assert payload["content"] == "final"
+    assert payload["seq"] == 2
+
+
+def test_dashboard_chat_history_redacts_sensitive_fields(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.create_session(key="dashboard:default")
+    store.insert_message(
+        "dashboard:default",
+        role="assistant",
+        content="safe answer",
+        ts="2026-04-19T10:02:00+08:00",
+        seq=0,
+        tool_chain=[{"raw_prompt": "do not leak"}],
+        extra={"api_key": "secret", "nested": {"authorization": "Bearer abc123456"}},
+    )
+    store.close()
+
+    with TestClient(create_dashboard_app(tmp_path)) as client:
+        resp = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": "dashboard:default"},
+        )
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["content"] == "safe answer"
+    assert item["tool_chain"] is None
+    assert item["extra"]["api_key"] == "[redacted]"
+    assert item["extra"]["nested"]["authorization"] == "[redacted]"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_multiplexer_maps_lifecycle_events_and_redacts() -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    queue = await mux.subscribe("dashboard:default")
+    try:
+        await mux._on_stream_delta(
+            StreamDeltaReady(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+            )
+        )
+        assert queue.empty()
+
+        await mux._on_stream_delta(
+            StreamDeltaReady(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                content_delta="hello",
+            )
+        )
+        delta_event, delta_payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        await mux._on_tool_started(
+            ToolCallStarted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="search_literature",
+                arguments={"query": "microglia", "api_key": "secret"},
+            )
+        )
+        tool_event, tool_payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        await mux._on_after_step(
+            AfterStepCtx(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                context_tokens_estimate=100,
+                tools_called=("search_literature",),
+                partial_reply="working",
+                tools_used_so_far=("search_literature",),
+                tool_chain_partial=(),
+                partial_thinking=None,
+                has_more=False,
+            )
+        )
+        step_event, step_payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        await mux._on_tool_completed(
+            ToolCallCompleted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-2",
+                tool_name="record_run_review_decision",
+                arguments={"api_key": "secret"},
+                final_arguments={"decision": "supported", "token": "secret"},
+                status="success",
+                result_preview="completed with token=abc123456 redacted",
+            )
+        )
+        completed_event, completed_payload = await asyncio.wait_for(
+            queue.get(),
+            timeout=1.0,
+        )
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert delta_event == "assistant_delta"
+    assert delta_payload["kind"] == "assistant"
+    assert delta_payload["content_delta"] == "hello"
+    assert tool_event == "tool_started"
+    assert tool_payload["kind"] == "tool"
+    assert tool_payload["arguments"]["api_key"] == "[redacted]"
+    assert step_event == "step"
+    assert step_payload["kind"] == "system"
+    assert step_payload["has_more"] is False
+    assert completed_event == "tool_completed"
+    assert completed_payload["kind"] == "tool"
+    assert completed_payload["status"] == "success"
+    assert completed_payload["arguments"]["api_key"] == "[redacted]"
+    assert completed_payload["final_arguments"]["token"] == "[redacted]"
+    assert "[redacted]" in completed_payload["detail"]
 
 
 def test_update_and_delete_session(tmp_path) -> None:

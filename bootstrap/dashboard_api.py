@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path, PureWindowsPath
 import importlib.util
@@ -19,12 +20,22 @@ from typing import Any, Protocol, cast
 import subprocess
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from agent.lifecycle.types import AfterStepCtx
 from agent.memory import MemoryStore
+from bus.event_bus import EventBus
+from bus.events import InboundMessage, OutboundMessage
+from bus.events_lifecycle import (
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+    TurnStarted,
+)
+from bus.queue import MessageBus
 from proactive_v2.memory_optimizer import MemoryOptimizerBusy
 from proactive_v2.state import ProactiveStateStore
 from core.common.timekit import utcnow
@@ -34,6 +45,47 @@ from session.store import SessionStore
 logger = logging.getLogger(__name__)
 
 _DASHBOARD_ACCESS_PREFIXES = ("/api/dashboard", "/assets", "/plugins/")
+_DASHBOARD_CHAT_CHANNEL = "dashboard"
+_DASHBOARD_CHAT_DEFAULT_SESSION = "dashboard:default"
+_DASHBOARD_CHAT_MAX_CONTENT_CHARS = 16000
+_DASHBOARD_CHAT_MAX_SESSION_CHARS = 160
+_DASHBOARD_CHAT_DISABLED_REASON = (
+    "Dashboard Chat requires the full runtime. Start with python main.py, "
+    "not python main.py dashboard."
+)
+_DASHBOARD_CHAT_REDACTED = "[redacted]"
+_DASHBOARD_CHAT_SENSITIVE_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "id_token",
+    "idtoken",
+    "token",
+    "secret",
+    "password",
+    "client_secret",
+    "clientsecret",
+    "raw_prompt",
+    "prompt",
+    "raw_provider_response",
+    "provider_response",
+}
+_DASHBOARD_CHAT_SECRET_PATTERNS = (
+    re.compile(
+        r"\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|authorization|secret|client[_-]?secret|password)\s*[:=]\s*[^,\s;]+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
+)
+_DASHBOARD_CHAT_MAX_STRING_FIELD_CHARS = 4000
+_DASHBOARD_CHAT_MAX_COLLECTION_ITEMS = 24
+_DASHBOARD_CHAT_MAX_SANITIZE_DEPTH = 6
+_DASHBOARD_CHAT_REPLAY_LIMIT = 400
 
 
 def _is_plugin_disabled(plugin_dir: Path) -> bool:
@@ -123,6 +175,11 @@ class ProactiveDeletePayload(BaseModel):
     item_ids: list[str] | None = None
 
 
+class ChatMessagePayload(BaseModel):
+    content: str
+    session_key: str | None = None
+
+
 class ManualConsolidator(Protocol):
     async def trigger_memory_consolidation(
         self,
@@ -138,6 +195,397 @@ class ManualMemoryOptimizer(Protocol):
     def is_running(self) -> bool: ...
 
     async def optimize(self) -> None: ...
+
+
+def _validate_dashboard_chat_session(session_key: str | None) -> str:
+    key = str(session_key or _DASHBOARD_CHAT_DEFAULT_SESSION).strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="session_key 不能为空")
+    if len(key) > _DASHBOARD_CHAT_MAX_SESSION_CHARS:
+        raise HTTPException(status_code=400, detail="session_key 过长")
+    if not key.startswith(f"{_DASHBOARD_CHAT_CHANNEL}:"):
+        raise HTTPException(
+            status_code=400,
+            detail="session_key 必须以 dashboard: 开头",
+        )
+    if any(ch in key for ch in "\r\n\t"):
+        raise HTTPException(status_code=400, detail="session_key 含非法字符")
+    return key
+
+
+def _validate_dashboard_chat_content(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    if len(text) > _DASHBOARD_CHAT_MAX_CONTENT_CHARS:
+        raise HTTPException(status_code=400, detail="content 过长")
+    return text
+
+
+def _dashboard_chat_id(session_key: str) -> str:
+    if ":" not in session_key:
+        return session_key
+    return session_key.split(":", 1)[1] or "default"
+
+
+def _sse_payload(event: str, data: dict[str, Any]) -> str:
+    # One data line avoids browser-specific multiline reconstruction edge cases.
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _redact_dashboard_chat_string(value: str) -> str:
+    redacted = value
+    for pattern in _DASHBOARD_CHAT_SECRET_PATTERNS:
+        redacted = pattern.sub(_DASHBOARD_CHAT_REDACTED, redacted)
+    if len(redacted) > _DASHBOARD_CHAT_MAX_STRING_FIELD_CHARS:
+        return redacted[:_DASHBOARD_CHAT_MAX_STRING_FIELD_CHARS].rstrip() + "..."
+    return redacted
+
+
+def _sanitize_dashboard_chat_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > _DASHBOARD_CHAT_MAX_SANITIZE_DEPTH:
+        return "[max-depth]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:_DASHBOARD_CHAT_MAX_COLLECTION_ITEMS]:
+            str_key = str(key)
+            normalized_key = str_key.lower().replace("-", "_")
+            if normalized_key in _DASHBOARD_CHAT_SENSITIVE_KEYS:
+                result[str_key] = _DASHBOARD_CHAT_REDACTED
+            else:
+                result[str_key] = _sanitize_dashboard_chat_value(
+                    item,
+                    depth=depth + 1,
+                )
+        if len(value) > _DASHBOARD_CHAT_MAX_COLLECTION_ITEMS:
+            result["_truncated"] = len(value) - _DASHBOARD_CHAT_MAX_COLLECTION_ITEMS
+        return result
+    if isinstance(value, (list, tuple)):
+        items = [
+            _sanitize_dashboard_chat_value(item, depth=depth + 1)
+            for item in list(value)[:_DASHBOARD_CHAT_MAX_COLLECTION_ITEMS]
+        ]
+        if len(value) > _DASHBOARD_CHAT_MAX_COLLECTION_ITEMS:
+            items.append({
+                "_truncated": len(value) - _DASHBOARD_CHAT_MAX_COLLECTION_ITEMS
+            })
+        return items
+    if isinstance(value, str):
+        return _redact_dashboard_chat_string(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _redact_dashboard_chat_string(str(value))
+
+
+def _dashboard_chat_history_item(row: dict[str, Any]) -> dict[str, Any]:
+    reserved = {
+        "id",
+        "session_key",
+        "seq",
+        "role",
+        "content",
+        "timestamp",
+        "ts",
+        "tool_chain",
+        "extra",
+    }
+    extra = dict(row.get("extra") or {}) if isinstance(row.get("extra"), dict) else {}
+    for key, value in row.items():
+        if key not in reserved:
+            extra[key] = value
+    return {
+        "id": row.get("id"),
+        "session_key": row.get("session_key"),
+        "seq": row.get("seq"),
+        "role": row.get("role"),
+        "content": row.get("content"),
+        "tool_chain": None,
+        "extra": _sanitize_dashboard_chat_value(extra),
+        "ts": row.get("ts") or row.get("timestamp"),
+    }
+
+
+class DashboardChatMultiplexer:
+    """Fan out dashboard-channel agent events to active SSE clients."""
+
+    def __init__(
+        self,
+        *,
+        bus: MessageBus | None,
+        event_bus: EventBus | None,
+    ) -> None:
+        self._bus = bus
+        self._event_bus = event_bus
+        self._queues: dict[str, set[asyncio.Queue[tuple[str, dict[str, Any]]]]] = {}
+        self._seq_by_session: dict[str, int] = {}
+        self._history_by_session: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        self._active_sessions: set[str] = set()
+        self._lock = asyncio.Lock()
+        self._started = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._bus is not None and self._event_bus is not None
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        if self._bus is not None:
+            self._bus.subscribe_outbound(_DASHBOARD_CHAT_CHANNEL, self._on_outbound)
+        if self._event_bus is not None:
+            self._event_bus.on(TurnStarted, self._on_turn_started)
+            self._event_bus.on(StreamDeltaReady, self._on_stream_delta)
+            self._event_bus.on(ToolCallStarted, self._on_tool_started)
+            self._event_bus.on(ToolCallCompleted, self._on_tool_completed)
+            self._event_bus.on(AfterStepCtx, self._on_after_step)
+
+    async def subscribe(
+        self,
+        session_key: str,
+        *,
+        since_seq: int | None = None,
+    ) -> asyncio.Queue[tuple[str, dict[str, Any]]]:
+        queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(
+            maxsize=_DASHBOARD_CHAT_REPLAY_LIMIT + 200
+        )
+        async with self._lock:
+            self._queues.setdefault(session_key, set()).add(queue)
+            replay = []
+            if since_seq is not None:
+                replay = [
+                    (event, dict(payload))
+                    for event, payload in self._history_by_session.get(session_key, [])
+                    if int(payload.get("seq") or 0) > since_seq
+                ]
+            for event, payload in replay:
+                queue.put_nowait((event, payload))
+        return queue
+
+    async def unsubscribe(
+        self,
+        session_key: str,
+        queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+    ) -> None:
+        async with self._lock:
+            queues = self._queues.get(session_key)
+            if queues is None:
+                return
+            queues.discard(queue)
+            if not queues:
+                self._queues.pop(session_key, None)
+
+    async def publish_user_message_accepted(
+        self,
+        *,
+        session_key: str,
+        content: str,
+    ) -> None:
+        await self._publish(
+            session_key,
+            "user_message_accepted",
+            {
+                "session_key": session_key,
+                "kind": "system",
+                "label": "Message accepted",
+                "content_preview": _preview_text(content, 240),
+                "detail": _preview_text(content, 240),
+            },
+        )
+
+    async def publish_error(
+        self,
+        *,
+        session_key: str,
+        message: str,
+    ) -> None:
+        await self._publish(
+            session_key,
+            "error",
+            {
+                "session_key": session_key,
+                "kind": "error",
+                "label": "Error",
+                "message": _redact_dashboard_chat_string(message),
+                "detail": _redact_dashboard_chat_string(message),
+            },
+        )
+
+    async def _on_outbound(self, msg: OutboundMessage) -> None:
+        if msg.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        session_key = _session_key_from_outbound(msg)
+        await self._publish(
+            session_key,
+            "assistant_message",
+            {
+                "session_key": session_key,
+                "chat_id": msg.chat_id,
+                "content": msg.content,
+                "thinking": msg.thinking,
+                "media": list(msg.media or []),
+                "kind": "assistant",
+                "label": "Assistant",
+                "metadata": _sanitize_dashboard_chat_value(dict(msg.metadata or {})),
+            },
+        )
+        await self._publish(
+            session_key,
+            "done",
+            {
+                "session_key": session_key,
+                "chat_id": msg.chat_id,
+                "kind": "system",
+                "label": "Done",
+            },
+        )
+
+    async def _on_turn_started(self, event: TurnStarted) -> None:
+        if event.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        await self._publish(
+            event.session_key,
+            "turn_started",
+            {
+                "session_key": event.session_key,
+                "kind": "system",
+                "label": "Agent started",
+                "detail": _preview_text(event.content, 240),
+            },
+        )
+
+    async def _on_stream_delta(self, event: StreamDeltaReady) -> None:
+        if event.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        if not event.content_delta and not event.thinking_delta:
+            return
+        await self._publish(
+            event.session_key,
+            "assistant_delta",
+            {
+                "session_key": event.session_key,
+                "content_delta": event.content_delta,
+                "thinking_delta": event.thinking_delta,
+                "kind": "assistant",
+                "label": "Assistant streaming",
+            },
+        )
+
+    async def _on_tool_started(self, event: ToolCallStarted) -> None:
+        if event.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        await self._publish(
+            event.session_key,
+            "tool_started",
+            {
+                "session_key": event.session_key,
+                "kind": "tool",
+                "label": f"Tool started: {event.tool_name}",
+                "tool_name": event.tool_name,
+                "iteration": event.iteration,
+                "call_id": event.call_id,
+                "arguments": _sanitize_dashboard_chat_value(dict(event.arguments)),
+            },
+        )
+
+    async def _on_tool_completed(self, event: ToolCallCompleted) -> None:
+        if event.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        await self._publish(
+            event.session_key,
+            "tool_completed",
+            {
+                "session_key": event.session_key,
+                "kind": "tool",
+                "label": f"Tool completed: {event.tool_name}",
+                "tool_name": event.tool_name,
+                "iteration": event.iteration,
+                "call_id": event.call_id,
+                "status": event.status,
+                "detail": _preview_text(
+                    _redact_dashboard_chat_string(event.result_preview),
+                    360,
+                ),
+                "arguments": _sanitize_dashboard_chat_value(dict(event.arguments)),
+                "final_arguments": _sanitize_dashboard_chat_value(
+                    dict(event.final_arguments)
+                ),
+            },
+        )
+
+    async def _on_after_step(self, event: AfterStepCtx) -> None:
+        if event.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        if event.tools_called:
+            label = "Tools called: " + ", ".join(event.tools_called)
+            detail = _preview_text(event.partial_reply, 240)
+        else:
+            label = "Assistant response ready"
+            detail = _preview_text(event.partial_reply, 240)
+        await self._publish(
+            event.session_key,
+            "step",
+            {
+                "session_key": event.session_key,
+                "kind": "system",
+                "label": label,
+                "detail": detail,
+                "iteration": event.iteration,
+                "has_more": event.has_more,
+                "tools_used_so_far": list(event.tools_used_so_far),
+            },
+        )
+
+    async def _publish(
+        self,
+        session_key: str,
+        event: str,
+        payload: dict[str, Any],
+    ) -> None:
+        async with self._lock:
+            seq = self._seq_by_session.get(session_key, 0) + 1
+            self._seq_by_session[session_key] = seq
+            payload = {"event": event, "seq": seq, **payload}
+            if event in {"user_message_accepted", "turn_started"}:
+                self._active_sessions.add(session_key)
+            history = self._history_by_session.setdefault(session_key, [])
+            history.append((event, dict(payload)))
+            if len(history) > _DASHBOARD_CHAT_REPLAY_LIMIT:
+                del history[: len(history) - _DASHBOARD_CHAT_REPLAY_LIMIT]
+            queues = list(self._queues.get(session_key, set()))
+            if event in {"done", "error"}:
+                self._active_sessions.discard(session_key)
+        if not queues:
+            return
+        for queue in queues:
+            try:
+                queue.put_nowait((event, payload))
+            except asyncio.QueueFull:
+                try:
+                    _ = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait((event, payload))
+                except asyncio.QueueFull:
+                    logger.warning("dashboard chat SSE queue full: %s", session_key)
+
+    async def latest_seq(self, session_key: str) -> int:
+        async with self._lock:
+            return self._seq_by_session.get(session_key, 0)
+
+    async def is_active(self, session_key: str) -> bool:
+        async with self._lock:
+            return session_key in self._active_sessions
+
+
+def _session_key_from_outbound(msg: OutboundMessage) -> str:
+    raw = str((msg.metadata or {}).get("session_key_override") or "").strip()
+    if raw.startswith(f"{_DASHBOARD_CHAT_CHANNEL}:"):
+        return raw
+    chat_id = str(msg.chat_id or "default").strip() or "default"
+    return f"{_DASHBOARD_CHAT_CHANNEL}:{chat_id}"
 
 
 class ProactiveDashboardReader:
@@ -730,6 +1178,8 @@ def create_dashboard_app(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    message_bus: MessageBus | None = None,
+    event_bus: EventBus | None = None,
 ) -> FastAPI:
     workspace.mkdir(parents=True, exist_ok=True)
     store = SessionStore(workspace / "sessions.db")
@@ -741,6 +1191,7 @@ def create_dashboard_app(
     project_root = Path(__file__).resolve().parent.parent
     plugins_root = project_root / "plugins"
     static_dir = project_root / "static" / "dashboard"
+    chat_mux = DashboardChatMultiplexer(bus=message_bus, event_bus=event_bus)
 
     def get_proactive_reader() -> ProactiveDashboardReader:
         nonlocal proactive_reader
@@ -751,6 +1202,7 @@ def create_dashboard_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        chat_mux.start()
         compile_task = asyncio.create_task(_compile_pending_plugins_async())
         try:
             yield
@@ -770,6 +1222,7 @@ def create_dashboard_app(
     app = FastAPI(title="Akashic Dashboard API", lifespan=lifespan)
     app.state.memory_admin = memory_admin
     app.state.memory_store = memory_store or MemoryStore(workspace)
+    app.state.dashboard_chat = chat_mux
     app.mount("/assets", StaticFiles(directory=static_dir), name="dashboard-assets")
 
     # Compile TypeScript plugin panels and mount plugin routes
@@ -818,6 +1271,134 @@ def create_dashboard_app(
             if panels:
                 result.append({"id": plugin_dir.name, "panels": panels})
         return result
+
+    @app.get("/api/dashboard/chat/status")
+    async def get_chat_status(
+        session_key: str = _DASHBOARD_CHAT_DEFAULT_SESSION,
+    ) -> dict[str, Any]:
+        clean_session_key = _validate_dashboard_chat_session(session_key)
+        return {
+            "enabled": chat_mux.enabled,
+            "reason": "" if chat_mux.enabled else _DASHBOARD_CHAT_DISABLED_REASON,
+            "default_session_key": _DASHBOARD_CHAT_DEFAULT_SESSION,
+            "streaming": chat_mux.enabled,
+            "session_key": clean_session_key,
+            "latest_seq": await chat_mux.latest_seq(clean_session_key),
+            "active": await chat_mux.is_active(clean_session_key),
+            "replay_limit": _DASHBOARD_CHAT_REPLAY_LIMIT,
+        }
+
+    @app.get("/api/dashboard/chat/history")
+    def get_chat_history(
+        session_key: str = _DASHBOARD_CHAT_DEFAULT_SESSION,
+        page_size: int = 80,
+    ) -> dict[str, Any]:
+        clean_session_key = _validate_dashboard_chat_session(session_key)
+        items, total = store.list_messages_for_dashboard(
+            session_key=clean_session_key,
+            page=1,
+            page_size=max(1, min(page_size, 200)),
+            sort_by="seq",
+            sort_order="asc",
+        )
+        return {
+            "items": [_dashboard_chat_history_item(item) for item in items],
+            "total": total,
+            "page": 1,
+            "page_size": max(1, min(page_size, 200)),
+            "session_key": clean_session_key,
+        }
+
+    @app.post("/api/dashboard/chat/messages", status_code=202)
+    async def post_chat_message(payload: ChatMessagePayload) -> dict[str, Any]:
+        if not chat_mux.enabled or message_bus is None:
+            raise HTTPException(
+                status_code=503,
+                detail=_DASHBOARD_CHAT_DISABLED_REASON,
+            )
+        session_key = _validate_dashboard_chat_session(payload.session_key)
+        content = _validate_dashboard_chat_content(payload.content)
+        chat_id = _dashboard_chat_id(session_key)
+        inbound = InboundMessage(
+            channel=_DASHBOARD_CHAT_CHANNEL,
+            sender="dashboard-user",
+            chat_id=chat_id,
+            content=content,
+            metadata={
+                "session_key_override": session_key,
+                "source": "dashboard_chat",
+            },
+        )
+        try:
+            await message_bus.publish_inbound(inbound)
+            await chat_mux.publish_user_message_accepted(
+                session_key=session_key,
+                content=content,
+            )
+        except Exception as exc:
+            await chat_mux.publish_error(session_key=session_key, message=str(exc))
+            raise
+        return {
+            "accepted": True,
+            "session_key": session_key,
+            "chat_id": chat_id,
+        }
+
+    @app.get("/api/dashboard/chat/stream")
+    async def stream_chat_events(
+        request: Request,
+        session_key: str = _DASHBOARD_CHAT_DEFAULT_SESSION,
+        since_seq: int | None = Query(default=None, ge=0),
+    ) -> StreamingResponse:
+        if not chat_mux.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail=_DASHBOARD_CHAT_DISABLED_REASON,
+            )
+        clean_session_key = _validate_dashboard_chat_session(session_key)
+
+        async def event_stream() -> AsyncIterator[str]:
+            queue = await chat_mux.subscribe(
+                clean_session_key,
+                since_seq=since_seq,
+            )
+            try:
+                yield _sse_payload(
+                    "connected",
+                    {
+                        "event": "connected",
+                        "seq": await chat_mux.latest_seq(clean_session_key),
+                        "session_key": clean_session_key,
+                        "kind": "system",
+                        "label": "Connected",
+                        "latest_seq": await chat_mux.latest_seq(clean_session_key),
+                        "replay_from_seq": since_seq,
+                    },
+                )
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event, data = await asyncio.wait_for(
+                            queue.get(),
+                            timeout=15.0,
+                        )
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    yield _sse_payload(event, data)
+            finally:
+                await chat_mux.unsubscribe(clean_session_key, queue)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/plugins/{plugin_id}/{panel_name}.js")
     def get_plugin_panel_js(plugin_id: str, panel_name: str) -> FileResponse:
@@ -1389,6 +1970,8 @@ def run_dashboard_api(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    message_bus: MessageBus | None = None,
+    event_bus: EventBus | None = None,
 ) -> None:
     server = uvicorn.Server(
         _build_dashboard_uvicorn_config(
@@ -1399,6 +1982,8 @@ def run_dashboard_api(
             manual_memory_optimizer=manual_memory_optimizer,
             memory_admin=memory_admin,
             memory_store=memory_store,
+            message_bus=message_bus,
+            event_bus=event_bus,
         )
     )
     server.run()
@@ -1413,6 +1998,8 @@ def _build_dashboard_uvicorn_config(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    message_bus: MessageBus | None = None,
+    event_bus: EventBus | None = None,
 ) -> uvicorn.Config:
     config = uvicorn.Config(
         create_dashboard_app(
@@ -1421,6 +2008,8 @@ def _build_dashboard_uvicorn_config(
             manual_memory_optimizer=manual_memory_optimizer,
             memory_admin=memory_admin,
             memory_store=memory_store,
+            message_bus=message_bus,
+            event_bus=event_bus,
         ),
         host=host,
         port=port,
@@ -1439,6 +2028,8 @@ def build_dashboard_server(
     manual_memory_optimizer: ManualMemoryOptimizer | None = None,
     memory_admin: MemoryAdminApi,
     memory_store: MemoryStore | None = None,
+    message_bus: MessageBus | None = None,
+    event_bus: EventBus | None = None,
 ) -> uvicorn.Server:
     config = _build_dashboard_uvicorn_config(
         workspace=workspace,
@@ -1448,5 +2039,7 @@ def build_dashboard_server(
         manual_memory_optimizer=manual_memory_optimizer,
         memory_admin=memory_admin,
         memory_store=memory_store,
+        message_bus=message_bus,
+        event_bus=event_bus,
     )
     return uvicorn.Server(config)
