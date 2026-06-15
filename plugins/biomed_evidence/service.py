@@ -5102,8 +5102,8 @@ def _deterministic_query_plan(
         f"{refute_seed} mechanism evidence",
     ]
     refute_queries = [
-        f"{refute_seed} contradictory evidence",
-        f"{refute_seed} negative results limitations",
+        f"{refute_seed} conflicting evidence",
+        f"{refute_seed} review limitations",
     ]
     subquestions = _deterministic_retrieval_subquestions(
         question=request.question,
@@ -5891,11 +5891,11 @@ def _followup_query_for_gap(
 ) -> str:
     base = query_plan.primary_query or row.query
     if row.retrieval_intent == "refute":
-        suffix = "conflicting evidence negative results null findings"
+        suffix = "conflicting evidence heterogeneous findings null results"
     elif row.retrieval_intent == "mechanism":
         suffix = "mechanism pathway biological process"
     elif row.retrieval_intent == "limitation":
-        suffix = "limitations study design cohort model system"
+        suffix = "review limitations study design cohort methods"
     elif row.retrieval_intent == "recent":
         suffix = "recent evidence"
     elif row.retrieval_intent == "background":
@@ -6348,6 +6348,7 @@ def _llm_synthesis_payload(
             "Use bracket paper-id citations like [MOCK-PMID-1001] on every biomedical claim.",
             "Do not include uncited future-work, clinical, dosing, diagnosis, treatment, or patient-specific advice.",
             "Mention uncertainty and limitations only when supported by supplied evidence.",
+            "If refute or limitation searches return no papers, describe that as a retrieval limitation and do not claim a PubMed indexing gap unless explicitly supported by the supplied retrieval metadata.",
             "Do not include the research-use disclaimer in final_answer; it is displayed separately in UI and metadata.",
             "Return JSON with final_answer, uncertainty_level, and optional added_limitations.",
         ],
@@ -8010,6 +8011,7 @@ def _llm_revision_payload(
             "Prefer concise bullets; place citation labels in the same sentence as the claim they support.",
             "Do not provide diagnosis, treatment, dosing, prognosis, or patient-specific advice.",
             "If evidence is insufficient, say so.",
+            "If refute or limitation searches returned no papers, state that the review is retrieval-limited rather than asserting a PubMed indexing gap unless the retrieval metadata explicitly supports that claim.",
             "Return JSON with final_answer, changed_claims, removed_claims, softened_claims, added_limitations, and uncertainty_level.",
         ],
         "acceptance_gate": (

@@ -11,6 +11,7 @@ import re
 import sqlite3
 import sys
 import threading
+import secrets
 import os
 import shutil
 from datetime import timedelta
@@ -31,6 +32,7 @@ from bus.event_bus import EventBus
 from bus.events import InboundMessage, OutboundMessage
 from bus.events_lifecycle import (
     StreamDeltaReady,
+    ToolCallApprovalRequired,
     ToolCallCompleted,
     ToolCallStarted,
     TurnStarted,
@@ -86,6 +88,7 @@ _DASHBOARD_CHAT_MAX_STRING_FIELD_CHARS = 4000
 _DASHBOARD_CHAT_MAX_COLLECTION_ITEMS = 24
 _DASHBOARD_CHAT_MAX_SANITIZE_DEPTH = 6
 _DASHBOARD_CHAT_REPLAY_LIMIT = 400
+_DASHBOARD_CHAT_APPROVALS_META_KEY = "pending_approvals"
 
 
 def _is_plugin_disabled(plugin_dir: Path) -> bool:
@@ -180,6 +183,14 @@ class ChatMessagePayload(BaseModel):
     session_key: str | None = None
 
 
+class ChatSessionCreatePayload(BaseModel):
+    title: str | None = None
+
+
+class ChatApprovalDecisionPayload(BaseModel):
+    decision: str = "approve"
+
+
 class ManualConsolidator(Protocol):
     async def trigger_memory_consolidation(
         self,
@@ -226,6 +237,93 @@ def _dashboard_chat_id(session_key: str) -> str:
     if ":" not in session_key:
         return session_key
     return session_key.split(":", 1)[1] or "default"
+
+
+def _dashboard_chat_title_from_prompt(content: str) -> str:
+    text = re.sub(r"```.*?```", " ", str(content or ""), flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[*_>#|~-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .,:;!?")
+    text = re.sub(
+        r"^(please\s+help\s+me|please|pls|can you|could you|would you|help me|help|帮我|请帮我|请你|麻烦你)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;!?")
+    if not text:
+        return "Untitled chat"
+    if len(text) <= 48:
+        return text
+    clipped = text[:49]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.strip(" .,:;!?") or text[:48].strip() or "Untitled chat"
+
+
+def _dashboard_chat_placeholder_metadata(title: str | None = None) -> dict[str, Any]:
+    clean_title = str(title or "").strip()[:80] or "New chat"
+    return {
+        "title": clean_title,
+        "title_source": "placeholder",
+        "created_from": "dashboard_chat",
+    }
+
+
+def _dashboard_chat_pending_approvals(meta: dict[str, Any] | None) -> dict[str, Any]:
+    raw = dict(meta or {}).get(_DASHBOARD_CHAT_APPROVALS_META_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): value for key, value in raw.items() if isinstance(value, dict)}
+
+
+def _store_dashboard_chat_pending_approval(
+    store: SessionStore,
+    *,
+    session_key: str,
+    approval: dict[str, Any],
+) -> None:
+    approval_id = str(approval.get("approval_id") or "").strip()
+    if not approval_id:
+        return
+    meta = store.get_session_meta(session_key)
+    metadata = dict((meta or {}).get("metadata") or {})
+    pending = _dashboard_chat_pending_approvals(metadata)
+    pending[approval_id] = {
+        **approval,
+        "status": "pending",
+        "created_at": approval.get("created_at") or utcnow().isoformat(),
+    }
+    metadata[_DASHBOARD_CHAT_APPROVALS_META_KEY] = pending
+    store.update_session(session_key, metadata=metadata)
+
+
+def _ensure_dashboard_chat_session_title(
+    store: SessionStore,
+    session_key: str,
+    content: str,
+) -> None:
+    meta = store.get_session_meta(session_key)
+    if meta is None:
+        store.create_session(
+            key=session_key,
+            metadata=_dashboard_chat_placeholder_metadata(),
+        )
+        meta = store.get_session_meta(session_key)
+    metadata = dict((meta or {}).get("metadata") or {})
+    title = str(metadata.get("title") or "").strip()
+    title_source = str(metadata.get("title_source") or "").strip()
+    if title_source not in {"", "placeholder"} and title:
+        return
+    metadata.update(
+        {
+            "title": _dashboard_chat_title_from_prompt(content),
+            "title_source": "auto_first_user",
+            "created_from": metadata.get("created_from") or "dashboard_chat",
+        }
+    )
+    store.update_session(session_key, metadata=metadata)
 
 
 def _sse_payload(event: str, data: dict[str, Any]) -> str:
@@ -314,9 +412,11 @@ class DashboardChatMultiplexer:
         *,
         bus: MessageBus | None,
         event_bus: EventBus | None,
+        store: SessionStore | None = None,
     ) -> None:
         self._bus = bus
         self._event_bus = event_bus
+        self._store = store
         self._queues: dict[str, set[asyncio.Queue[tuple[str, dict[str, Any]]]]] = {}
         self._seq_by_session: dict[str, int] = {}
         self._history_by_session: dict[str, list[tuple[str, dict[str, Any]]]] = {}
@@ -339,6 +439,7 @@ class DashboardChatMultiplexer:
             self._event_bus.on(StreamDeltaReady, self._on_stream_delta)
             self._event_bus.on(ToolCallStarted, self._on_tool_started)
             self._event_bus.on(ToolCallCompleted, self._on_tool_completed)
+            self._event_bus.on(ToolCallApprovalRequired, self._on_tool_approval_required)
             self._event_bus.on(AfterStepCtx, self._on_after_step)
 
     async def subscribe(
@@ -510,6 +611,55 @@ class DashboardChatMultiplexer:
                 "arguments": _sanitize_dashboard_chat_value(dict(event.arguments)),
                 "final_arguments": _sanitize_dashboard_chat_value(
                     dict(event.final_arguments)
+                ),
+            },
+        )
+
+    async def _on_tool_approval_required(
+        self,
+        event: ToolCallApprovalRequired,
+    ) -> None:
+        if event.channel != _DASHBOARD_CHAT_CHANNEL:
+            return
+        approval_id = str(event.confirmation.get("approval_id") or "").strip()
+        if self._store is not None and approval_id:
+            _store_dashboard_chat_pending_approval(
+                self._store,
+                session_key=event.session_key,
+                approval={
+                    "approval_id": approval_id,
+                    "tool_name": event.tool_name,
+                    "call_id": event.call_id,
+                    "iteration": event.iteration,
+                    "arguments": event.arguments,
+                    "final_arguments": event.final_arguments,
+                    "reason": event.reason,
+                    "confirmation": event.confirmation,
+                    "created_at": utcnow().isoformat(),
+                },
+            )
+        await self._publish(
+            event.session_key,
+            "tool_approval_required",
+            {
+                "session_key": event.session_key,
+                "kind": "approval",
+                "label": f"Approval required: {event.tool_name}",
+                "approval_id": approval_id,
+                "tool_name": event.tool_name,
+                "iteration": event.iteration,
+                "call_id": event.call_id,
+                "status": "pending",
+                "detail": _preview_text(
+                    _redact_dashboard_chat_string(event.reason),
+                    360,
+                ),
+                "arguments": _sanitize_dashboard_chat_value(dict(event.arguments)),
+                "final_arguments": _sanitize_dashboard_chat_value(
+                    dict(event.final_arguments)
+                ),
+                "confirmation": _sanitize_dashboard_chat_value(
+                    dict(event.confirmation or {})
                 ),
             },
         )
@@ -1180,6 +1330,7 @@ def create_dashboard_app(
     memory_store: MemoryStore | None = None,
     message_bus: MessageBus | None = None,
     event_bus: EventBus | None = None,
+    tool_registry: Any | None = None,
     biomed_revision_provider: Any | None = None,
     biomed_revision_model: str = "",
 ) -> FastAPI:
@@ -1193,7 +1344,11 @@ def create_dashboard_app(
     project_root = Path(__file__).resolve().parent.parent
     plugins_root = project_root / "plugins"
     static_dir = project_root / "static" / "dashboard"
-    chat_mux = DashboardChatMultiplexer(bus=message_bus, event_bus=event_bus)
+    chat_mux = DashboardChatMultiplexer(
+        bus=message_bus,
+        event_bus=event_bus,
+        store=store,
+    )
 
     def get_proactive_reader() -> ProactiveDashboardReader:
         nonlocal proactive_reader
@@ -1292,12 +1447,25 @@ def create_dashboard_app(
             "replay_limit": _DASHBOARD_CHAT_REPLAY_LIMIT,
         }
 
+    @app.post("/api/dashboard/chat/sessions", status_code=201)
+    def create_chat_session(payload: ChatSessionCreatePayload | None = None) -> dict[str, Any]:
+        if not chat_mux.enabled:
+            raise HTTPException(status_code=503, detail=_DASHBOARD_CHAT_DISABLED_REASON)
+        suffix = secrets.token_hex(4)
+        session_key = f"{_DASHBOARD_CHAT_CHANNEL}:{suffix}"
+        metadata = _dashboard_chat_placeholder_metadata(payload.title if payload is not None else None)
+        meta = store.create_session(key=session_key, metadata=metadata)
+        meta["message_count"] = store.count_messages(session_key)
+        return meta
+
     @app.get("/api/dashboard/chat/history")
     def get_chat_history(
         session_key: str = _DASHBOARD_CHAT_DEFAULT_SESSION,
         page_size: int = 80,
     ) -> dict[str, Any]:
         clean_session_key = _validate_dashboard_chat_session(session_key)
+        meta = store.get_session_meta(clean_session_key)
+        metadata = dict((meta or {}).get("metadata") or {})
         items, total = store.list_messages_for_dashboard(
             session_key=clean_session_key,
             page=1,
@@ -1311,6 +1479,9 @@ def create_dashboard_app(
             "page": 1,
             "page_size": max(1, min(page_size, 200)),
             "session_key": clean_session_key,
+            "pending_approvals": list(
+                _dashboard_chat_pending_approvals(metadata).values()
+            ),
         }
 
     @app.post("/api/dashboard/chat/messages", status_code=202)
@@ -1323,6 +1494,7 @@ def create_dashboard_app(
         session_key = _validate_dashboard_chat_session(payload.session_key)
         content = _validate_dashboard_chat_content(payload.content)
         chat_id = _dashboard_chat_id(session_key)
+        _ensure_dashboard_chat_session_title(store, session_key, content)
         inbound = InboundMessage(
             channel=_DASHBOARD_CHAT_CHANNEL,
             sender="dashboard-user",
@@ -1346,6 +1518,109 @@ def create_dashboard_app(
             "accepted": True,
             "session_key": session_key,
             "chat_id": chat_id,
+        }
+
+    @app.post("/api/dashboard/chat/approvals/{approval_id}")
+    async def decide_chat_approval(
+        approval_id: str,
+        payload: ChatApprovalDecisionPayload | None = None,
+        session_key: str = _DASHBOARD_CHAT_DEFAULT_SESSION,
+    ) -> dict[str, Any]:
+        clean_session_key = _validate_dashboard_chat_session(session_key)
+        clean_approval_id = str(approval_id or "").strip()
+        if not clean_approval_id:
+            raise HTTPException(status_code=400, detail="approval_id is required")
+        meta = store.get_session_meta(clean_session_key)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        metadata = dict(meta.get("metadata") or {})
+        pending = _dashboard_chat_pending_approvals(metadata)
+        approval = dict(pending.get(clean_approval_id) or {})
+        if not approval:
+            raise HTTPException(status_code=404, detail="approval not found")
+        if str(approval.get("status") or "pending") != "pending":
+            raise HTTPException(status_code=409, detail="approval already handled")
+        decision = str((payload.decision if payload is not None else "approve") or "").lower()
+        if decision not in {"approve", "reject"}:
+            raise HTTPException(status_code=400, detail="decision must be approve or reject")
+        if decision == "reject":
+            approval["status"] = "rejected"
+            approval["resolved_at"] = utcnow().isoformat()
+            pending[clean_approval_id] = approval
+            metadata[_DASHBOARD_CHAT_APPROVALS_META_KEY] = pending
+            store.update_session(clean_session_key, metadata=metadata)
+            await chat_mux.publish_error(
+                session_key=clean_session_key,
+                message=f"Approval rejected: {approval.get('tool_name')}",
+            )
+            return {
+                "approved": False,
+                "approval_id": clean_approval_id,
+                "status": "rejected",
+            }
+        if tool_registry is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Tool execution is unavailable in this dashboard runtime.",
+            )
+        tool_name = str(approval.get("tool_name") or "").strip()
+        final_arguments = approval.get("final_arguments")
+        if not tool_name or not isinstance(final_arguments, dict):
+            raise HTTPException(status_code=409, detail="approval payload is invalid")
+        try:
+            result = await tool_registry.execute(tool_name, dict(final_arguments))
+        except Exception as exc:
+            approval["status"] = "failed"
+            approval["resolved_at"] = utcnow().isoformat()
+            approval["error"] = str(exc)
+            pending[clean_approval_id] = approval
+            metadata[_DASHBOARD_CHAT_APPROVALS_META_KEY] = pending
+            store.update_session(clean_session_key, metadata=metadata)
+            await chat_mux.publish_error(
+                session_key=clean_session_key,
+                message=f"Approved tool failed: {tool_name}: {exc}",
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        text = str(result)
+        approval["status"] = "approved"
+        approval["resolved_at"] = utcnow().isoformat()
+        approval["result_preview"] = _preview_text(
+            _redact_dashboard_chat_string(text),
+            1200,
+        )
+        pending[clean_approval_id] = approval
+        metadata[_DASHBOARD_CHAT_APPROVALS_META_KEY] = pending
+        store.update_session(clean_session_key, metadata=metadata)
+        seq = store.next_seq(clean_session_key)
+        row = store.insert_message(
+            clean_session_key,
+            role="assistant",
+            content=(
+                f"Approved action completed: {tool_name}\n\n"
+                f"{approval['result_preview']}"
+            ),
+            ts=utcnow().isoformat(),
+            seq=seq,
+            extra={
+                "approval_id": clean_approval_id,
+                "tool_name": tool_name,
+                "source": "dashboard_chat_approval",
+            },
+        )
+        await chat_mux._on_outbound(
+            OutboundMessage(
+                channel=_DASHBOARD_CHAT_CHANNEL,
+                chat_id=_dashboard_chat_id(clean_session_key),
+                content=str(row["content"]),
+                metadata={"session_key_override": clean_session_key},
+            )
+        )
+        return {
+            "approved": True,
+            "approval_id": clean_approval_id,
+            "status": "approved",
+            "tool_name": tool_name,
+            "result_preview": approval["result_preview"],
         }
 
     @app.get("/api/dashboard/chat/stream")
@@ -2008,6 +2283,7 @@ def _build_dashboard_uvicorn_config(
     memory_store: MemoryStore | None = None,
     message_bus: MessageBus | None = None,
     event_bus: EventBus | None = None,
+    tool_registry: Any | None = None,
     biomed_revision_provider: Any | None = None,
     biomed_revision_model: str = "",
 ) -> uvicorn.Config:
@@ -2020,6 +2296,7 @@ def _build_dashboard_uvicorn_config(
             memory_store=memory_store,
             message_bus=message_bus,
             event_bus=event_bus,
+            tool_registry=tool_registry,
             biomed_revision_provider=biomed_revision_provider,
             biomed_revision_model=biomed_revision_model,
         ),
@@ -2042,6 +2319,7 @@ def build_dashboard_server(
     memory_store: MemoryStore | None = None,
     message_bus: MessageBus | None = None,
     event_bus: EventBus | None = None,
+    tool_registry: Any | None = None,
     biomed_revision_provider: Any | None = None,
     biomed_revision_model: str = "",
 ) -> uvicorn.Server:
@@ -2055,6 +2333,7 @@ def build_dashboard_server(
         memory_store=memory_store,
         message_bus=message_bus,
         event_bus=event_bus,
+        tool_registry=tool_registry,
         biomed_revision_provider=biomed_revision_provider,
         biomed_revision_model=biomed_revision_model,
     )

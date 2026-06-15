@@ -147,6 +147,7 @@ class AppRuntime:
                 memory_store=self.memory_runtime.markdown.store,
                 message_bus=self.bus,
                 event_bus=event_bus,
+                tool_registry=self.tools,
                 biomed_revision_provider=self.light_provider or self.provider,
                 biomed_revision_model=getattr(
                     self.config,

@@ -20,6 +20,7 @@ from bus.event_bus import EventBus
 from bus.events import OutboundMessage
 from bus.events_lifecycle import (
     StreamDeltaReady,
+    ToolCallApprovalRequired,
     ToolCallCompleted,
     ToolCallStarted,
 )
@@ -110,6 +111,15 @@ class _ManualConsolidator:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class _FakeToolRegistry:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    async def execute(self, name: str, args: dict):
+        self.calls.append((name, dict(args)))
+        return {"ok": True, "name": name, "args": dict(args)}
 
 
 class _ManualMemoryOptimizer:
@@ -481,6 +491,79 @@ def test_dashboard_chat_post_publishes_inbound_to_runtime_bus(tmp_path) -> None:
     assert item.metadata["source"] == "dashboard_chat"
 
 
+def test_dashboard_chat_create_session_returns_friendly_placeholder(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        resp = client.post("/api/dashboard/chat/sessions", json={})
+
+    assert resp.status_code == 201
+    payload = resp.json()
+    assert payload["key"].startswith("dashboard:")
+    assert payload["message_count"] == 0
+    assert payload["metadata"] == {
+        "title": "New chat",
+        "title_source": "placeholder",
+        "created_from": "dashboard_chat",
+    }
+
+
+def test_dashboard_chat_first_message_updates_placeholder_title(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        resp = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "content": "Please help me review microglia activation in Alzheimer disease progression",
+                "session_key": session_key,
+            },
+        )
+        session = client.get(f"/api/dashboard/sessions/{session_key}")
+
+    assert resp.status_code == 202
+    assert session.status_code == 200
+    metadata = session.json()["metadata"]
+    assert metadata["title"] == "review microglia activation in Alzheimer disease"
+    assert metadata["title_source"] == "auto_first_user"
+
+
+def test_dashboard_chat_first_message_does_not_overwrite_user_title(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={"title": "Custom title"})
+        session_key = create.json()["key"]
+        patch = client.patch(
+            f"/api/dashboard/sessions/{session_key}",
+            json={
+                "metadata": {
+                    "title": "User title",
+                    "title_source": "user",
+                    "created_from": "dashboard_chat",
+                }
+            },
+        )
+        resp = client.post(
+            "/api/dashboard/chat/messages",
+            json={"content": "rename me from this prompt", "session_key": session_key},
+        )
+        session = client.get(f"/api/dashboard/sessions/{session_key}")
+
+    assert patch.status_code == 200
+    assert resp.status_code == 202
+    assert session.json()["metadata"]["title"] == "User title"
+    assert session.json()["metadata"]["title_source"] == "user"
+
+
 def test_dashboard_chat_post_accepts_custom_dashboard_session(tmp_path) -> None:
     bus = _FakeBus()
     event_bus = EventBus()
@@ -521,6 +604,89 @@ def test_dashboard_chat_validates_payload(tmp_path) -> None:
     assert wrong_session.status_code == 400
     assert too_long.status_code == 400
     assert bus.inbound_items == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_approval_event_persists_to_history(tmp_path) -> None:
+    mux_store = SessionStore(tmp_path / "sessions.db")
+    mux_store.create_session(key="dashboard:default", metadata={})
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None, store=mux_store)
+    try:
+        await mux._on_tool_approval_required(
+            ToolCallApprovalRequired(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="record_run_review_decision",
+                arguments={"run_id": "run-1"},
+                final_arguments={"run_id": "run-1", "decision": "accept"},
+                reason="requires confirmation",
+                confirmation={"approval_id": "approval-1"},
+            )
+        )
+        meta = mux_store.get_session_meta("dashboard:default")
+    finally:
+        mux_store.close()
+
+    pending = meta["metadata"]["pending_approvals"]
+    assert pending["approval-1"]["status"] == "pending"
+    assert pending["approval-1"]["tool_name"] == "record_run_review_decision"
+
+
+def test_dashboard_chat_approval_endpoint_executes_confirmed_tool(tmp_path) -> None:
+    registry = _FakeToolRegistry()
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=registry,
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.update_session(
+                session_key,
+                metadata={
+                    "title": "Approval test",
+                    "pending_approvals": {
+                        "approval-1": {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "tool_name": "record_run_review_decision",
+                            "final_arguments": {
+                                "run_id": "run-1",
+                                "decision": "accept",
+                            },
+                        }
+                    },
+                },
+            )
+        finally:
+            session.close()
+        response = client.post(
+            "/api/dashboard/chat/approvals/approval-1",
+            params={"session_key": session_key},
+            json={"decision": "approve"},
+        )
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "approved"
+    assert registry.calls == [
+        (
+            "record_run_review_decision",
+            {"run_id": "run-1", "decision": "accept"},
+        )
+    ]
+    assert history.json()["items"]
+    assert "Approved action completed" in history.json()["items"][-1]["content"]
 
 
 @pytest.mark.asyncio

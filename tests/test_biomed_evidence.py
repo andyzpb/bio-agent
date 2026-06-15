@@ -323,6 +323,36 @@ async def test_answer_with_planner_executes_support_refute_bundle(
 
 
 @pytest.mark.asyncio
+async def test_deterministic_planner_uses_broader_refute_limitation_queries(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question=(
+                    "What evidence links microglial activation to "
+                    "Alzheimer disease progression?"
+                ),
+                source="pubmed",
+                max_results=10,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.query_plan is not None
+    assert [query.lower() for query in result.query_plan.refute_queries] == [
+        "microglial activation alzheimer disease progression conflicting evidence",
+        "microglial activation alzheimer disease progression review limitations",
+    ]
+    assert all(
+        "negative results limitations" not in query
+        for query in result.query_plan.refute_queries
+    )
+
+
+@pytest.mark.asyncio
 async def test_mock_search_fetch_extract_and_storage_idempotency(
     tmp_path: Path,
 ) -> None:

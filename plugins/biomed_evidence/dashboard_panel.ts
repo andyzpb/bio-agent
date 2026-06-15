@@ -899,6 +899,135 @@ interface DashboardChatMessage {
   ts: string;
 }
 
+interface DashboardChatSseMessage {
+  event: string;
+  seq?: number;
+  session_key?: string;
+  kind?: string;
+  label?: string;
+  detail?: string;
+  content?: string;
+  content_delta?: string;
+  thinking_delta?: string;
+  thinking?: string;
+  tool_name?: string;
+  call_id?: string;
+  arguments?: unknown;
+  final_arguments?: unknown;
+  status?: string;
+  iteration?: number;
+  has_more?: boolean;
+  latest_seq?: number;
+  replay_from_seq?: number | null;
+  message?: string;
+  content_preview?: string;
+}
+
+interface BiomedChatLiveNotice {
+  kind: "system";
+  seq: number;
+  summary: string;
+  detail?: string;
+}
+
+function biomedChatProgressSummary(event: string, data: DashboardChatSseMessage): string {
+  const toolName = String(data.tool_name || "");
+  const label = String(data.label || "");
+  const detail = String(data.detail || data.message || "");
+  if (event === "user_message_accepted") {
+    return "Message received";
+  }
+  if (event === "turn_started") {
+    return "Agent started the biomedical review";
+  }
+  if (event === "assistant_delta") {
+    return "Writing the response";
+  }
+  if (event === "tool_started") {
+    return biomedToolProgressSummary(toolName, "started");
+  }
+  if (event === "tool_completed") {
+    return biomedToolProgressSummary(toolName, String(data.status || "completed"));
+  }
+  if (event === "step") {
+    return biomedStepProgressSummary(label || detail);
+  }
+  if (event === "error") {
+    return detail || "Something went wrong";
+  }
+  return label || detail || "Review workflow is progressing";
+}
+
+function biomedToolProgressSummary(toolName: string, status: string): string {
+  const done = status === "success" || status === "completed" || status === "done";
+  const prefix = done ? "Completed" : "Running";
+  const normalized = toolName.toLowerCase();
+  if (normalized.includes("workflow") || normalized.includes("tool_chain")) {
+    return `${prefix} the evidence review workflow`;
+  }
+  if (normalized.includes("template")) {
+    return `${prefix} the selected review template`;
+  }
+  if (normalized.includes("plan_biomedical_search") || normalized.includes("plan")) {
+    return `${prefix} biomedical search planning`;
+  }
+  if (normalized.includes("search_literature") || normalized.includes("pubmed") || normalized.includes("literature")) {
+    return `${prefix} PubMed literature retrieval`;
+  }
+  if (normalized.includes("extract")) {
+    return `${prefix} evidence extraction`;
+  }
+  if (normalized.includes("audit") || normalized.includes("verify")) {
+    return `${prefix} citation and claim checks`;
+  }
+  if (normalized.includes("provenance") || normalized.includes("evidence_packet")) {
+    return `${prefix} evidence packaging`;
+  }
+  if (toolName) {
+    return `${prefix} ${biomedHumanizeToolName(toolName)}`;
+  }
+  return done ? "Step completed" : "Working on the biomedical review";
+}
+
+function biomedStepProgressSummary(value: string): string {
+  const normalized = value.toLowerCase();
+  if (normalized.includes("assistant response ready")) {
+    return "Drafting the final response";
+  }
+  if (normalized.includes("tools called")) {
+    return "Review workflow is progressing";
+  }
+  if (normalized.includes("accepted")) {
+    return "Request accepted";
+  }
+  if (normalized.includes("started")) {
+    return "Agent started the biomedical review";
+  }
+  return value || "Review workflow is progressing";
+}
+
+function biomedHumanizeToolName(value: string): string {
+  return value
+    .replace(/^mcp__[^.]+\./, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function compactBiomedChatDetail(event: string, data: DashboardChatSseMessage): string | undefined {
+  const details: Record<string, unknown> = { event };
+  for (const key of ["tool_name", "status", "iteration", "call_id", "detail", "label", "arguments", "final_arguments", "has_more"]) {
+    const value = data[key as keyof DashboardChatSseMessage];
+    if (value !== undefined && value !== "") {
+      details[key] = value;
+    }
+  }
+  if (Object.keys(details).length <= 1) return undefined;
+  const serialized = JSON.stringify(details, null, 2);
+  return serialized.length > 1400 ? `${serialized.slice(0, 1400)}\n...` : serialized;
+}
+
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
   const value = dispatch?.filters["_view"];
   if (value === "chat" || value === "runs" || value === "queue" || value === "library" || value === "settings") {
@@ -2546,6 +2675,46 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
     container.querySelector<HTMLInputElement>("#biomed-chat-session")?.value.trim()
     || "dashboard:biomed"
   );
+  const chatState = {
+    events: [] as DashboardChatMessage[],
+    latestSeq: 0,
+    streamSeq: 0,
+    streamedContent: "",
+    streamAbort: null as AbortController | null,
+    optimisticEvents: [] as DashboardChatMessage[],
+    liveNotices: [] as BiomedChatLiveNotice[],
+  };
+  const renderAssistantMarkdown = (content: string): string => renderMarkdown(content || "");
+  const renderChatEvent = (event: DashboardChatMessage | BiomedChatLiveNotice): string => {
+    if ("role" in event && event.role === "assistant") {
+      return `
+        <div class="biomed-chat-message is-agent">
+          <div class="biomed-chat-bubble">
+            <div class="biomed-watch-meta">assistant · #${event.seq}</div>
+            <div>${renderAssistantMarkdown(event.content || "")}</div>
+          </div>
+        </div>
+      `;
+    }
+    if ("kind" in event && event.kind === "system") {
+      return `
+        <div class="biomed-chat-system">
+          <span class="biomed-watch-meta">progress · #${event.seq}</span>
+          <span>${escapeHtml(event.summary)}</span>
+          ${event.detail ? `<details><summary>Technical details</summary><pre>${escapeHtml(event.detail)}</pre></details>` : ""}
+        </div>
+      `;
+    }
+    const message = event as DashboardChatMessage;
+    return `
+      <div class="biomed-chat-message is-user">
+        <div class="biomed-chat-bubble">
+          <div class="biomed-watch-meta">user · #${message.seq}</div>
+          <div>${escapeHtml(message.content)}</div>
+        </div>
+      </div>
+    `;
+  };
   const renderHistory = (messages: DashboardChatMessage[]): string => (
     messages.map((message) => `
       <div class="biomed-chat-message ${message.role === "user" ? "is-user" : "is-agent"}">
@@ -2556,20 +2725,178 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
       </div>
     `).join("") || '<div class="biomed-muted">No messages in this session.</div>'
   );
-  const loadHistory = async (): Promise<void> => {
+  const syncHistory = async (): Promise<void> => {
     const target = container.querySelector<HTMLElement>("#biomed-chat-history");
     if (!target) return;
-    target.innerHTML = renderLoading("Loading chat history...");
     try {
       const params = new URLSearchParams();
       params.set("session_key", sessionKey());
       params.set("page_size", "80");
-      const data = await api<{ items: DashboardChatMessage[] }>(`/api/dashboard/chat/history?${params.toString()}`);
-      target.innerHTML = renderHistory(data.items || []);
+      const data = await api<{ items: DashboardChatMessage[]; session_key?: string }>(`/api/dashboard/chat/history?${params.toString()}`);
+      const history = data.items || [];
+      chatState.optimisticEvents = chatState.optimisticEvents.filter((item) => (
+        !history.some((row) => (
+          row.role === item.role
+          && row.content === item.content
+          && (row.seq === item.seq || row.seq >= item.seq)
+        ))
+      ));
+      chatState.events = [...history, ...chatState.optimisticEvents];
+      chatState.latestSeq = Math.max(
+        chatState.latestSeq,
+        ...chatState.events.map((item) => item.seq).filter((seq) => Number.isFinite(seq)) as number[],
+      );
+      if (target.querySelector(".biomed-chat-message.is-agent.is-pending")) {
+        return;
+      }
+      target.innerHTML = `${renderHistory(chatState.events)}${chatState.liveNotices.map(renderChatEvent).join("")}`;
       target.scrollTo({ top: target.scrollHeight });
     } catch (error) {
       target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     }
+  };
+  const appendLiveNotice = (notice: BiomedChatLiveNotice): void => {
+    const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+    if (!target) return;
+    chatState.liveNotices = [...chatState.liveNotices.filter((item) => item.seq !== notice.seq), notice].slice(-80);
+    target.insertAdjacentHTML("beforeend", renderChatEvent(notice));
+    target.scrollTo({ top: target.scrollHeight });
+  };
+  const presentLiveEvent = (event: string, data: DashboardChatSseMessage): BiomedChatLiveNotice => {
+    const seq = typeof data.seq === "number" ? data.seq : Number(data.seq || chatState.latestSeq || 0);
+    return {
+      kind: "system",
+      seq: Number.isFinite(seq) && seq > 0 ? seq : chatState.latestSeq,
+      summary: biomedChatProgressSummary(event, data),
+      detail: compactBiomedChatDetail(event, data),
+    };
+  };
+  const applyLivePayload = (event: string, data: DashboardChatSseMessage): void => {
+    const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+    if (!target) return;
+    const seq = typeof data.seq === "number" ? data.seq : Number(data.seq || 0);
+    if (Number.isFinite(seq) && seq > chatState.streamSeq) {
+      chatState.streamSeq = seq;
+    }
+    if (event === "user_message_accepted") {
+      appendLiveNotice(presentLiveEvent(event, data));
+      return;
+    }
+    if (event === "turn_started") {
+      appendLiveNotice(presentLiveEvent(event, data));
+      return;
+    }
+    if (event === "assistant_delta") {
+      const content = String(data.content_delta || data.thinking_delta || "");
+      if (!content) return;
+      chatState.streamedContent += content;
+      const bubble = target.querySelector<HTMLElement>(".biomed-chat-message.is-agent.is-pending .biomed-chat-markdown");
+      if (bubble?.parentElement) {
+        bubble.innerHTML = renderAssistantMarkdown(chatState.streamedContent);
+        target.scrollTo({ top: target.scrollHeight });
+        return;
+      }
+      target.insertAdjacentHTML("beforeend", `
+        <div class="biomed-chat-message is-agent is-pending">
+          <div class="biomed-chat-bubble">
+            <div class="biomed-watch-meta">assistant · #${seq || chatState.latestSeq}</div>
+            <div class="biomed-chat-markdown">${renderAssistantMarkdown(chatState.streamedContent)}</div>
+          </div>
+        </div>
+      `);
+      target.scrollTo({ top: target.scrollHeight });
+      return;
+    }
+    if (event === "assistant_message") {
+      const content = String(data.content || "");
+      const pending = target.querySelector<HTMLElement>(".biomed-chat-message.is-agent.is-pending");
+      if (pending) {
+        pending.outerHTML = renderChatEvent({ id: "", session_key: String(data.session_key || sessionKey()), seq: seq || chatState.latestSeq, role: "assistant", content, ts: new Date().toISOString() });
+      } else {
+        target.insertAdjacentHTML("beforeend", renderChatEvent({ id: "", session_key: String(data.session_key || sessionKey()), seq: seq || chatState.latestSeq, role: "assistant", content, ts: new Date().toISOString() }));
+      }
+      chatState.streamedContent = "";
+      target.scrollTo({ top: target.scrollHeight });
+      return;
+    }
+    if (event === "tool_started" || event === "tool_completed" || event === "step") {
+      appendLiveNotice(presentLiveEvent(event, data));
+      return;
+    }
+    if (event === "error") {
+      target.insertAdjacentHTML("beforeend", `<div class="biomed-error">${escapeHtml(String(data.detail || data.message || "Error"))}</div>`);
+      target.scrollTo({ top: target.scrollHeight });
+    }
+  };
+  const startLiveStream = async (sinceSeq?: number): Promise<void> => {
+    chatState.streamAbort?.abort();
+    const controller = new AbortController();
+    chatState.streamAbort = controller;
+    try {
+      const params = new URLSearchParams();
+      params.set("session_key", sessionKey());
+      if (typeof sinceSeq === "number" && sinceSeq > 0) {
+        params.set("since_seq", String(sinceSeq));
+      }
+      const response = await fetch(`/api/dashboard/chat/stream?${params.toString()}`, {
+        headers: { Accept: "text/event-stream" },
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) return;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() || "";
+        for (const chunk of chunks) {
+          let event = "";
+          const dataLines: string[] = [];
+          for (const line of chunk.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+          }
+          if (!event || !dataLines.length) continue;
+          if (event === "connected") {
+            const payload = JSON.parse(dataLines.join("\n")) as DashboardChatSseMessage;
+            const latest = Number(payload.latest_seq || payload.seq || 0);
+            if (Number.isFinite(latest) && latest > chatState.streamSeq) {
+              chatState.streamSeq = latest;
+            }
+            continue;
+          }
+          const payload = JSON.parse(dataLines.join("\n")) as DashboardChatSseMessage;
+          applyLivePayload(event, payload);
+        }
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+      if (target) {
+        target.insertAdjacentHTML("beforeend", `<div class="biomed-error">${escapeHtml(String(error))}</div>`);
+      }
+    }
+  };
+  const ensureLiveStream = (): void => {
+    if (!chatState.streamAbort || chatState.streamAbort.signal.aborted) {
+      void startLiveStream(chatState.streamSeq);
+    }
+  };
+  const refreshHistoryAndStream = async (): Promise<void> => {
+    await syncHistory();
+    ensureLiveStream();
+  };
+  const loadHistory = async (): Promise<void> => {
+    const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+    if (!target) return;
+    chatState.streamSeq = 0;
+    chatState.streamedContent = "";
+    chatState.liveNotices = [];
+    target.innerHTML = renderLoading("Loading chat history...");
+    await refreshHistoryAndStream();
   };
 
   container.querySelector<HTMLButtonElement>("#biomed-chat-load")?.addEventListener("click", () => {
@@ -2588,16 +2915,35 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
     const content = input?.value.trim() || "";
     if (!content) return;
     if (send) send.disabled = true;
+    const nextSeq = chatState.latestSeq + 1;
+    const optimistic: DashboardChatMessage = {
+      id: `local-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      session_key: sessionKey(),
+      seq: nextSeq,
+      role: "user",
+      content,
+      ts: new Date().toISOString(),
+    };
     try {
+      ensureLiveStream();
+      chatState.optimisticEvents = [...chatState.optimisticEvents, optimistic];
+      chatState.events = [...chatState.events, optimistic];
+      chatState.latestSeq = nextSeq;
+      const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+      if (target) {
+        target.insertAdjacentHTML("beforeend", renderChatEvent(optimistic));
+        target.scrollTo({ top: target.scrollHeight });
+      }
       await api("/api/dashboard/chat/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_key: sessionKey(), content }),
       });
       if (input) input.value = "";
-      await loadHistory();
-      window.setTimeout(() => void loadHistory(), 1400);
+      window.setTimeout(() => void syncHistory(), 1400);
     } catch (error) {
+      chatState.optimisticEvents = chatState.optimisticEvents.filter((item) => item.id !== optimistic.id);
+      chatState.events = chatState.events.filter((item) => item.id !== optimistic.id);
       const target = container.querySelector<HTMLElement>("#biomed-chat-history");
       if (target) target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
     } finally {
@@ -2744,6 +3090,7 @@ function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
   }
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- legacy renderer kept for fallback/debug workbench routes.
 function renderAdvanced(container: HTMLElement): void {
   container.innerHTML = `
     <div class="biomed-advanced-workspace">
@@ -3207,6 +3554,7 @@ function workspaceAnswerPayload(container: HTMLElement, audited: boolean): Recor
   };
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- legacy renderer kept for fallback/debug workbench routes.
 function renderReview(container: HTMLElement): void {
   container.innerHTML = `
     <div class="biomed-review-workspace">

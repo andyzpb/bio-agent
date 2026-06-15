@@ -106,3 +106,17 @@ class ToolCallCompleted:
     final_arguments: dict[str, Any]
     status: str
     result_preview: str
+
+
+@dataclass(frozen=True)
+class ToolCallApprovalRequired:
+    session_key: str
+    channel: str
+    chat_id: str
+    iteration: int
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    final_arguments: dict[str, Any]
+    reason: str
+    confirmation: dict[str, Any] = field(default_factory=_empty_metadata)

@@ -1,4 +1,20 @@
+import DOMPurify from "dompurify";
+import MarkdownIt from "markdown-it";
 import type { ProactiveTick } from "./types";
+
+const markdown = new MarkdownIt({
+  html: false,
+  linkify: true,
+  typographer: true,
+  breaks: false,
+});
+
+const defaultLinkOpen = markdown.renderer.rules.link_open;
+markdown.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx].attrSet("target", "_blank");
+  tokens[idx].attrSet("rel", "noopener noreferrer");
+  return defaultLinkOpen ? defaultLinkOpen(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options);
+};
 
 export function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -33,7 +49,10 @@ export function renderMarkdown(text: unknown): string {
   if (!raw) {
     return '<span class="detail-subtext">empty</span>';
   }
-  return `<span class="pre-wrap">${escapeHtml(raw).replaceAll("\n", "<br>")}</span>`;
+  const html = markdown.render(raw);
+  return `<div class="markdown-content">${DOMPurify.sanitize(html, {
+    ADD_ATTR: ["target", "rel"],
+  })}</div>`;
 }
 
 export function formatSessionKeyForTable(key: unknown): string {
@@ -133,5 +152,3 @@ export function proactiveTickPreview(item: ProactiveTick): string {
   }
   return parts.join(" · ");
 }
-
-

@@ -1156,6 +1156,10 @@
   justify-content: flex-start;
 }
 
+.biomed-chat-message.is-pending .biomed-chat-bubble {
+  border-color: color-mix(in srgb, var(--line, #deded8) 72%, var(--accent, #171717) 28%);
+}
+
 .biomed-chat-bubble {
   max-width: min(760px, 88%);
   min-width: 0;
@@ -1166,6 +1170,178 @@
   color: var(--text, #171717);
   line-height: 1.52;
   overflow-wrap: anywhere;
+}
+
+.biomed-chat-system {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-soft, #6c6a64);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.biomed-chat-system > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.biomed-chat-system details {
+  flex-basis: 100%;
+}
+
+.biomed-chat-system summary {
+  cursor: pointer;
+  color: var(--text-soft, #6c6a64);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.biomed-chat-system pre {
+  max-width: min(760px, 100%);
+  margin: 8px 0 0;
+  padding: 9px 10px;
+  overflow-x: auto;
+  border: 1px solid var(--line, #deded8);
+  border-radius: 8px;
+  background: rgba(23, 23, 23, 0.04);
+  color: var(--text-soft, #6c6a64);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+.biomed-chat-bubble .markdown-content,
+.biomed-answer .markdown-content {
+  display: block;
+  line-height: 1.58;
+  overflow-wrap: anywhere;
+}
+
+.biomed-chat-bubble .markdown-content > *:first-child,
+.biomed-answer .markdown-content > *:first-child {
+  margin-top: 0;
+}
+
+.biomed-chat-bubble .markdown-content > *:last-child,
+.biomed-answer .markdown-content > *:last-child {
+  margin-bottom: 0;
+}
+
+.biomed-chat-bubble .markdown-content p,
+.biomed-answer .markdown-content p {
+  margin: 0 0 0.72em;
+}
+
+.biomed-chat-bubble .markdown-content h1,
+.biomed-chat-bubble .markdown-content h2,
+.biomed-chat-bubble .markdown-content h3,
+.biomed-chat-bubble .markdown-content h4,
+.biomed-chat-bubble .markdown-content h5,
+.biomed-chat-bubble .markdown-content h6,
+.biomed-answer .markdown-content h1,
+.biomed-answer .markdown-content h2,
+.biomed-answer .markdown-content h3,
+.biomed-answer .markdown-content h4,
+.biomed-answer .markdown-content h5,
+.biomed-answer .markdown-content h6 {
+  margin: 0.95em 0 0.38em;
+  color: var(--text, #171717);
+  font-size: 1em;
+  font-weight: 760;
+  line-height: 1.28;
+}
+
+.biomed-chat-bubble .markdown-content ul,
+.biomed-chat-bubble .markdown-content ol,
+.biomed-answer .markdown-content ul,
+.biomed-answer .markdown-content ol {
+  margin: 0.45em 0 0.85em;
+  padding-left: 1.35em;
+}
+
+.biomed-chat-bubble .markdown-content li + li,
+.biomed-answer .markdown-content li + li {
+  margin-top: 0.24em;
+}
+
+.biomed-chat-bubble .markdown-content code,
+.biomed-answer .markdown-content code {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.92em;
+  padding: 0.08em 0.28em;
+  border: 1px solid var(--line, #deded8);
+  border-radius: 4px;
+  background: rgba(23, 23, 23, 0.045);
+}
+
+.biomed-chat-bubble .markdown-content pre,
+.biomed-answer .markdown-content pre {
+  margin: 0.7em 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid var(--line, #deded8);
+  border-radius: 8px;
+  background: rgba(23, 23, 23, 0.045);
+}
+
+.biomed-chat-bubble .markdown-content pre code,
+.biomed-answer .markdown-content pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  white-space: pre;
+}
+
+.biomed-chat-bubble .markdown-content table,
+.biomed-answer .markdown-content table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 0.75em 0 1em;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.94em;
+}
+
+.biomed-chat-bubble .markdown-content th,
+.biomed-chat-bubble .markdown-content td,
+.biomed-answer .markdown-content th,
+.biomed-answer .markdown-content td {
+  min-width: 96px;
+  padding: 7px 9px;
+  border: 1px solid var(--line, #deded8);
+  text-align: left;
+  vertical-align: top;
+}
+
+.biomed-chat-bubble .markdown-content th,
+.biomed-answer .markdown-content th {
+  background: rgba(23, 23, 23, 0.045);
+  color: var(--text, #171717);
+  font-weight: 760;
+}
+
+.biomed-chat-bubble .markdown-content tr:nth-child(even) td,
+.biomed-answer .markdown-content tr:nth-child(even) td {
+  background: rgba(23, 23, 23, 0.018);
+}
+
+.biomed-chat-bubble .markdown-content blockquote,
+.biomed-answer .markdown-content blockquote {
+  margin: 0.7em 0;
+  padding: 0.1em 0 0.1em 0.9em;
+  border-left: 3px solid var(--line-strong, #a8a8a2);
+  color: var(--text-soft, #6c6a64);
+}
+
+.biomed-chat-bubble .markdown-content a,
+.biomed-answer .markdown-content a {
+  color: var(--accent, #171717);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .biomed-chat-message.is-user .biomed-chat-bubble {

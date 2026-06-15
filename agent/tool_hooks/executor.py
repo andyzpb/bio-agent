@@ -51,7 +51,7 @@ class ToolExecutor:
 
         try:
             # pre_hook 是唯一允许改输入/直接 deny 的阶段。
-            denied_reason, current_arguments = await self._run_pre_hooks(
+            denied_reason, current_arguments, confirmation = await self._run_pre_hooks(
                 request=request,
                 current_arguments=current_arguments,
                 extra_messages=extra_messages,
@@ -67,6 +67,16 @@ class ToolExecutor:
                 post_hook_trace=post_trace,
             )
         final_arguments = dict(current_arguments)
+        if confirmation:
+            return ToolExecutionResult(
+                status="approval_required",
+                output=denied_reason or "Tool call requires confirmation.",
+                final_arguments=final_arguments,
+                extra_messages=extra_messages,
+                pre_hook_trace=pre_trace,
+                post_hook_trace=post_trace,
+                confirmation=confirmation,
+            )
         if denied_reason:
             return ToolExecutionResult(
                 status="denied",
@@ -151,7 +161,7 @@ class ToolExecutor:
         extra_messages: list[str] = []
         pre_trace: list[HookTraceItem] = []
         try:
-            denied_reason, current_arguments = await self._run_pre_hooks(
+            denied_reason, current_arguments, confirmation = await self._run_pre_hooks(
                 request=request,
                 current_arguments=current_arguments,
                 extra_messages=extra_messages,
@@ -164,6 +174,15 @@ class ToolExecutor:
                 final_arguments=dict(current_arguments),
                 extra_messages=extra_messages,
                 pre_hook_trace=pre_trace,
+            )
+        if confirmation:
+            return ToolExecutionResult(
+                status="approval_required",
+                output=denied_reason or "Tool call requires confirmation.",
+                final_arguments=dict(current_arguments),
+                extra_messages=extra_messages,
+                pre_hook_trace=pre_trace,
+                confirmation=confirmation,
             )
         if denied_reason:
             return ToolExecutionResult(
@@ -188,7 +207,7 @@ class ToolExecutor:
         current_arguments: dict[str, Any],
         extra_messages: list[str],
         traces: list[HookTraceItem],
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         for hook in self._hooks:
             if hook.event != "pre_tool_use":
                 continue
@@ -230,8 +249,10 @@ class ToolExecutor:
             )
             if outcome.decision == "deny":
                 reason = outcome.reason.strip() or "工具调用被拦截"
-                return reason, current_arguments
-        return "", current_arguments
+                if outcome.requires_confirmation:
+                    return reason, current_arguments, dict(outcome.confirmation or {})
+                return reason, current_arguments, {}
+        return "", current_arguments, {}
 
     async def _run_post_hooks(
         self,

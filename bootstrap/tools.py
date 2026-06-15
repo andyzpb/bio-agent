@@ -502,6 +502,9 @@ def build_core_runtime(
         workspace=workspace,
         session_manager=session_manager,
         memory_engine=memory_runtime.engine,
+        llm_services=loop_deps.llm_services,
+        llm_model=config.model,
+        light_model=config.light_model,
         plugin_configs=config.plugins,
     )
 

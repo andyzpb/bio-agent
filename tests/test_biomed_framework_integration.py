@@ -27,6 +27,12 @@ from plugins.biomed_evidence.plugin import BiomedEvidencePlugin
 from plugins.biomed_evidence.schemas import BiomedProjectCreateRequest
 
 
+class _FakeLLMServices:
+    def __init__(self) -> None:
+        self.provider = object()
+        self.light_provider = object()
+
+
 @pytest.fixture(autouse=True)
 def _clean_plugin_registry() -> Generator[None, None, None]:
     plugin_registry._handlers._handlers.clear()
@@ -53,6 +59,9 @@ async def _make_plugin(
         kv_store=PluginKVStore(tmp_path / ".kv.json"),
         config=PluginConfig(config or {}),
         workspace=tmp_path,
+        llm=_FakeLLMServices(),
+        llm_model="main-model",
+        light_model="light-model",
     )
     await plugin.initialize()
     return plugin, bus
@@ -164,6 +173,18 @@ async def test_biomed_pre_tool_guard_applies_config_defaults_caps_and_kv(
 
 
 @pytest.mark.asyncio
+async def test_biomed_plugin_initialize_receives_llm_provider(tmp_path: Path) -> None:
+    plugin, bus = await _make_plugin(tmp_path)
+    try:
+        service = getattr(plugin, "_service")
+        assert getattr(service, "revision_provider", None) is not None
+        assert getattr(service, "revision_model", "") == "light-model"
+    finally:
+        await plugin.terminate()
+        await bus.aclose()
+
+
+@pytest.mark.asyncio
 async def test_biomed_pre_tool_guard_denies_live_pubmed_when_config_disabled(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +210,43 @@ async def test_biomed_pre_tool_guard_denies_live_pubmed_when_config_disabled(
     assert outcome is not None
     assert outcome.decision == "deny"
     assert "live PubMed tool calls are disabled" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_biomed_pre_tool_guard_reads_live_config_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, bus = await _make_plugin(
+        tmp_path,
+        config={"allow_live_pubmed_tools": False},
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[plugins.biomed_evidence]
+allow_live_pubmed_tools = true
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AKASHIC_CONFIG", str(config_path))
+    try:
+        outcome = await plugin.guard_biomedical_tool(
+            PreToolCtx(
+                session_key="test",
+                channel="cli",
+                chat_id="local",
+                tool_name="search_biomedical_literature",
+                arguments={"query": "microglia Alzheimer", "source": "pubmed"},
+                source="passive",
+            )
+        )
+    finally:
+        await plugin.terminate()
+        await bus.aclose()
+
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -262,7 +320,7 @@ async def test_biomed_dashboard_chat_sensitive_tool_requires_confirmation_guard(
 
 
 @pytest.mark.asyncio
-async def test_biomed_sensitive_chat_tool_executor_denies_without_invoker(
+async def test_biomed_sensitive_chat_tool_executor_requires_confirmation(
     tmp_path: Path,
 ) -> None:
     plugin, bus = await _make_plugin(tmp_path)
@@ -278,8 +336,8 @@ async def test_biomed_sensitive_chat_tool_executor_denies_without_invoker(
         result = await executor.execute(
             ToolExecutionRequest(
                 call_id="call-1",
-                tool_name="export_project_to_obsidian",
-                arguments={"project_id": "project-1"},
+                tool_name="record_run_review_decision",
+                arguments={"run_id": "run-1", "decision": "supported"},
                 source="passive",
                 session_key="dashboard:default",
                 channel="dashboard",
@@ -292,9 +350,36 @@ async def test_biomed_sensitive_chat_tool_executor_denies_without_invoker(
         await bus.aclose()
 
     assert invoked is False
-    assert result.status == "denied"
-    assert "export_project_to_obsidian" in result.output
+    assert result.status == "approval_required"
+    assert "record_run_review_decision" in result.output
     assert "requires_confirmation=true" in result.output
+
+
+@pytest.mark.asyncio
+async def test_biomed_sensitive_chat_tool_requires_approval_status(
+    tmp_path: Path,
+) -> None:
+    plugin, bus = await _make_plugin(tmp_path)
+    try:
+        outcome = await plugin.guard_biomedical_tool(
+            PreToolCtx(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                tool_name="record_run_review_decision",
+                arguments={"run_id": "run-1", "decision": "supported"},
+                source="passive",
+                request_text="Save this review decision.",
+            )
+        )
+    finally:
+        await plugin.terminate()
+        await bus.aclose()
+
+    assert outcome is not None
+    assert outcome.decision == "deny"
+    assert outcome.requires_confirmation is True
+    assert "requires_confirmation=true" in outcome.reason
 
 
 @pytest.mark.asyncio

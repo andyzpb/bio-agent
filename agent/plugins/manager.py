@@ -55,6 +55,9 @@ class PluginManager:
         workspace: Path | None = None,
         session_manager: Any = None,
         memory_engine: Any = None,
+        llm_services: Any = None,
+        llm_model: str = "",
+        light_model: str = "",
         plugin_configs: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._dirs = plugin_dirs
@@ -63,6 +66,9 @@ class PluginManager:
         self._workspace = workspace
         self._session_manager = session_manager
         self._memory_engine = memory_engine
+        self._llm_services = llm_services
+        self._llm_model = llm_model
+        self._light_model = light_model
         self._plugin_configs = plugin_configs or {}
         self._loaded: set[str] = set()
         self._channels: list[Channel] = []
@@ -207,6 +213,9 @@ class PluginManager:
             workspace=self._workspace,
             session_manager=self._session_manager,
             memory_engine=self._memory_engine,
+            llm=self._llm_services,
+            llm_model=self._llm_model,
+            light_model=self._light_model,
         )
         plugin_registry.register_instance(mp, instance)
         self._bind_handlers(instance, mp)

@@ -42,6 +42,13 @@ export interface ChatStatus {
   replay_limit?: number;
 }
 
+export interface ChatSessionMetadata {
+  title?: string;
+  title_source?: string;
+  created_from?: string;
+  [key: string]: unknown;
+}
+
 export interface ChatEventRow {
   id: string;
   session_key: string;
@@ -59,14 +66,38 @@ export interface ChatEventRow {
   call_id?: string;
   arguments?: unknown;
   final_arguments?: unknown;
+  approval_id?: string;
+  confirmation?: unknown;
   status?: string;
   iteration?: number;
   has_more?: boolean;
   final?: boolean;
+  summary?: string;
+  technical_detail?: string;
+  raw?: unknown;
   source?: "history" | "live" | "local";
   pending?: boolean;
   ts?: string;
   created_at: string;
+}
+
+export interface ChatTurn {
+  session_key: string;
+  user?: ChatEventRow | null;
+  assistant?: ChatEventRow | null;
+  thinking?: ChatThinkingState | null;
+  approval?: ChatEventRow | null;
+  error?: ChatEventRow | null;
+}
+
+export interface ChatThinkingState {
+  status: "idle" | "running" | "done" | "error";
+  summary: string;
+  steps: string[];
+  technicalDetail?: string;
+  startedAt?: string;
+  updatedAt?: string;
+  expanded?: boolean;
 }
 
 export interface ProactiveOverview {

@@ -91,6 +91,47 @@ def test_tool_executor_denied_is_not_error() -> None:
     assert result.output == "blocked"
 
 
+def test_tool_executor_can_return_approval_required_without_invoking_tool() -> None:
+    hook = _SpyHook(
+        name="approve",
+        event="pre_tool_use",
+        outcome=HookOutcome(
+            decision="deny",
+            reason="needs confirmation",
+            requires_confirmation=True,
+            confirmation={"tool_name": "dummy", "risk_level": "writes_storage"},
+        ),
+    )
+    invoked = False
+    executor = ToolExecutor([hook])
+
+    async def _should_not_run(
+        _tool_name: str,
+        _arguments: dict[str, Any],
+    ) -> Any:
+        nonlocal invoked
+        invoked = True
+        return "ran"
+
+    result = asyncio.run(
+        executor.execute(
+            ToolExecutionRequest(
+                call_id="c1",
+                tool_name="dummy",
+                arguments={"x": 1},
+                source="passive",
+            ),
+            _should_not_run,
+        )
+    )
+
+    assert invoked is False
+    assert result.status == "approval_required"
+    assert result.output == "needs confirmation"
+    assert result.final_arguments == {"x": 1}
+    assert result.confirmation["risk_level"] == "writes_storage"
+
+
 def test_tool_executor_post_hook_only_adds_extra_message() -> None:
     hook = _SpyHook(
         name="post",

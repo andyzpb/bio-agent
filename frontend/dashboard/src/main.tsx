@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { ChevronDown, Copy, Info, LoaderCircle, Plus, Search, Trash2 } from "lucide-react";
 import { api, asPageResult, pageCount } from "./api";
 import {
   encodePath,
@@ -19,7 +20,10 @@ import { PluginDetail, PluginMain } from "./PluginDetail";
 import type {
   DashboardColumn,
   ChatEventRow,
+  ChatSessionMetadata,
   ChatStatus,
+  ChatThinkingState,
+  ChatTurn,
   MessageRow,
   PageResult,
   PluginBatchAction,
@@ -146,9 +150,13 @@ function App(): React.ReactElement {
   const [chatSending, setChatSending] = useState(false);
   const [chatConnected, setChatConnected] = useState(false);
   const [chatLiveEvent, setChatLiveEvent] = useState<string>("");
+  const [chatDeleteTarget, setChatDeleteTarget] = useState<SessionRow | null>(null);
+  const [creatingChat, setCreatingChat] = useState(false);
+  const [deletingChatKey, setDeletingChatKey] = useState<string | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
   const chatStreamRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const chatSeqRef = useRef<Record<string, number>>({});
+  const chatEventsRef = useRef<ChatEventRow[]>([]);
   const [hiddenPlugins, setHiddenPlugins] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
@@ -160,8 +168,20 @@ function App(): React.ReactElement {
   const currentPluginLayout = currentPlugin?.layout ?? "table";
   const isChatView = viewMode === "chat";
   const dashboardSessions = useMemo(() => sessions.filter((session) => session.key.startsWith("dashboard:")), [sessions]);
+  const activeChatSession = useMemo(
+    () => dashboardSessions.find((session) => session.key === chatSessionKey) ?? null,
+    [chatSessionKey, dashboardSessions],
+  );
+  const currentChatEvents = useMemo(
+    () => chatEvents.filter((event) => event.session_key === chatSessionKey),
+    [chatEvents, chatSessionKey],
+  );
 
   const channels = useMemo(() => Array.from(new Set(sessions.map((session) => session.key.split(":")[0]).filter(Boolean))), [sessions]);
+
+  useEffect(() => {
+    chatEventsRef.current = chatEvents;
+  }, [chatEvents]);
 
   const run = useCallback(async (work: () => Promise<void>) => {
     try {
@@ -212,12 +232,27 @@ function App(): React.ReactElement {
     const params = new URLSearchParams();
     params.set("session_key", sessionKey);
     params.set("page_size", "120");
-    const payload = await api<PageResult<MessageRow> & { session_key?: string }>(`/api/dashboard/chat/history?${params.toString()}`);
+    const payload = await api<PageResult<MessageRow> & { session_key?: string; pending_approvals?: unknown[] }>(`/api/dashboard/chat/history?${params.toString()}`);
     const history = chatHistoryToEvents(payload.items ?? []);
-    setChatEvents((current) => [
-      ...history,
-      ...current.filter((event) => event.session_key === sessionKey && event.source !== "history"),
-    ]);
+    const approvals = Array.isArray(payload.pending_approvals)
+      ? payload.pending_approvals.map((item, index) => normalizeChatEvent(
+          {
+            event: "tool_approval_required",
+            kind: "approval",
+            label: "Approval required",
+            seq: -(index + 1),
+            session_key: sessionKey,
+            ...((item && typeof item === "object") ? item as Record<string, unknown> : {}),
+          },
+          sessionKey,
+          new Date().toISOString(),
+        ))
+      : [];
+    setChatEvents((current) => {
+      const otherSessions = current.filter((event) => event.session_key !== sessionKey);
+      const liveForSession = current.filter((event) => event.session_key === sessionKey && event.source !== "history");
+      return [...otherSessions, ...history, ...approvals, ...liveForSession];
+    });
   }, []);
 
   const appendChatEvent = useCallback((event: Partial<ChatEventRow> & { event: string }): void => {
@@ -235,23 +270,36 @@ function App(): React.ReactElement {
     setChatLiveEvent("");
     const params = new URLSearchParams();
     params.set("session_key", sessionKey);
-    const sinceSeq = getStoredChatSeq(sessionKey);
+    const sinceSeq = latestChatEventSeq(chatEventsRef.current, sessionKey);
     chatSeqRef.current[sessionKey] = sinceSeq;
     if (sinceSeq > 0) params.set("since_seq", String(sinceSeq));
-    const response = await fetch(`/api/dashboard/chat/stream?${params.toString()}`, {
-      signal: controller.signal,
-      headers: { Accept: "text/event-stream" },
-    });
+    let response: Response;
+    try {
+      response = await fetch(`/api/dashboard/chat/stream?${params.toString()}`, {
+        signal: controller.signal,
+        headers: { Accept: "text/event-stream" },
+      });
+    } catch (error) {
+      if (isAbortError(error)) return;
+      throw errorWithCause(chatNetworkErrorMessage(error), error);
+    }
     if (!response.ok || !response.body) {
       const payload = await response.json().catch(() => ({})) as { detail?: string };
-      throw new Error(payload.detail || `请求失败: ${response.status}`);
+      throw new Error(payload.detail || `Request failed: ${response.status}`);
     }
     const reader = response.body.getReader();
     chatStreamRef.current = reader;
     const decoder = new TextDecoder();
     let buffer = "";
     while (true) {
-      const { done, value } = await reader.read();
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        if (isAbortError(error)) return;
+        throw error;
+      }
+      const { done, value } = result;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const chunks = buffer.split("\n\n");
@@ -292,6 +340,7 @@ function App(): React.ReactElement {
         method: "POST",
         body: JSON.stringify({ content, session_key: chatSessionKey }),
       });
+      void loadSessions();
     } catch (exc) {
       setChatSending(false);
       appendChatEvent({
@@ -302,7 +351,74 @@ function App(): React.ReactElement {
         session_key: chatSessionKey,
       });
     }
-  }, [appendChatEvent, chatInput, chatSending, chatSessionKey]);
+  }, [appendChatEvent, chatInput, chatSending, chatSessionKey, loadSessions]);
+
+  const createChatSession = useCallback(async (): Promise<void> => {
+    if (creatingChat) return;
+    setCreatingChat(true);
+    try {
+      const session = await api<SessionRow>("/api/dashboard/chat/sessions", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setSessions((current) => [session, ...current.filter((item) => item.key !== session.key)]);
+      setChatSessionKey(session.key);
+      setChatLiveEvent("");
+      setChatInput("");
+      setViewMode("chat");
+      setNavOpen((current) => ({ ...current, chat: true }));
+      void loadChatStatus();
+      void loadChatHistory(session.key);
+    } finally {
+      setCreatingChat(false);
+    }
+  }, [creatingChat, loadChatHistory, loadChatStatus]);
+
+  const deleteChatSession = useCallback(async (session: SessionRow): Promise<void> => {
+    if (deletingChatKey) return;
+    setDeletingChatKey(session.key);
+    try {
+      await api(`/api/dashboard/sessions/${encodePath(session.key)}`, { method: "DELETE" });
+      setChatEvents((current) => current.filter((event) => event.session_key !== session.key));
+      setSessions((current) => current.filter((item) => item.key !== session.key));
+      setChatDeleteTarget(null);
+      if (chatSessionKey === session.key) {
+        const nextSession = dashboardSessions
+          .filter((item) => item.key !== session.key)
+          .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))[0];
+        if (nextSession) {
+          setChatSessionKey(nextSession.key);
+          setChatLiveEvent("");
+          void loadChatHistory(nextSession.key);
+        } else {
+          await createChatSession();
+        }
+      }
+      void loadSessions();
+    } finally {
+      setDeletingChatKey(null);
+    }
+  }, [chatSessionKey, createChatSession, dashboardSessions, deletingChatKey, loadChatHistory, loadSessions]);
+
+  const decideChatApproval = useCallback(async (approvalId: string, decision: "approve" | "reject"): Promise<void> => {
+    if (!approvalId) return;
+    try {
+      await api(`/api/dashboard/chat/approvals/${encodeURIComponent(approvalId)}?session_key=${encodeURIComponent(chatSessionKey)}`, {
+        method: "POST",
+        body: JSON.stringify({ decision }),
+      });
+      await loadChatHistory(chatSessionKey);
+      void loadSessions();
+    } catch (exc) {
+      appendChatEvent({
+        event: "error",
+        kind: "error",
+        label: "Approval failed",
+        detail: exc instanceof Error ? exc.message : String(exc),
+        session_key: chatSessionKey,
+      });
+    }
+  }, [appendChatEvent, chatSessionKey, loadChatHistory, loadSessions]);
 
   const loadProactivePanel = useCallback(async () => {
     const params = new URLSearchParams();
@@ -469,7 +585,7 @@ function App(): React.ReactElement {
       return;
     }
     void startChatStream(chatSessionKey).catch((exc) => {
-      if (exc instanceof DOMException && exc.name === "AbortError") return;
+      if (isAbortError(exc)) return;
       setError(exc instanceof Error ? exc.message : String(exc));
     });
     return () => {
@@ -586,7 +702,7 @@ function App(): React.ReactElement {
           </div>
           <div className="filters-stack">
             <label className="search search-small">
-              <span>⌕</span>
+              <Search size={14} aria-hidden="true" />
               <input type="text" placeholder="过滤 session" value={sessionSearch} onChange={(event) => setSessionSearch(event.target.value.trim())} />
             </label>
             <select value={sessionChannel} onChange={(event) => setSessionChannel(event.target.value)}>
@@ -596,28 +712,41 @@ function App(): React.ReactElement {
           </div>
           <nav className="explorer-nav">
             <NavGroup label="Chat" count={dashboardSessions.length} active={viewMode === "chat"} open={!!navOpen.chat} onToggle={() => toggleNav("chat")}>
-              <button className={`all-messages-row ${viewMode === "chat" && chatSessionKey === "dashboard:default" ? "active" : ""}`} type="button" onClick={() => {
-                setChatSessionKey("dashboard:default");
-                selectView("chat");
-              }}>
-                <span>dashboard:default</span><strong>{chatStatus?.enabled ? "on" : "off"}</strong>
+              <button className="new-chat-button" type="button" disabled={creatingChat || !chatStatus?.enabled} onClick={() => void run(createChatSession)}>
+                <Plus size={15} aria-hidden="true" />
+                <span>{creatingChat ? "Creating..." : "New Chat"}</span>
               </button>
-              <div className="session-list">
-                {dashboardSessions.filter((session) => session.key !== "dashboard:default").map((session) => (
-                  <button key={session.key} className={`session-item ${chatSessionKey === session.key ? "active" : ""}`} type="button" onClick={() => {
-                    setChatSessionKey(session.key);
-                    setChatEvents([]);
-                    setChatLiveEvent("");
-                    selectView("chat");
-                  }}>
-                    <div className="nav-item-row">
-                      <span className="nav-type-dot memory-type-profile" />
-                      <span className="nav-item-name mono">{formatSessionKeyForTable(session.key)}</span>
-                      <span className="nav-item-count">{session.message_count}</span>
+              <div className="session-list chat-session-list">
+                {dashboardSessions.length ? dashboardSessions.map((session) => {
+                  const isRunning = chatSending && chatSessionKey === session.key;
+                  return (
+                    <div key={session.key} className={`chat-session-row ${chatSessionKey === session.key ? "active" : ""}`}>
+                      <button className="chat-session-main" type="button" onClick={() => {
+                        setChatSessionKey(session.key);
+                        setChatLiveEvent("");
+                        selectView("chat");
+                      }}>
+                        <div className="nav-item-row">
+                          <span className="nav-item-name">{chatSessionTitle(session)}</span>
+                          <span className="nav-item-count">{session.message_count}</span>
+                        </div>
+                        <div className="nav-item-desc">{chatSessionSubtitle(session)}</div>
+                      </button>
+                      <button
+                        className="chat-session-delete icon-btn"
+                        type="button"
+                        title={isRunning ? "Chat is running" : "Delete chat"}
+                        aria-label={`Delete ${chatSessionTitle(session)}`}
+                        disabled={isRunning || deletingChatKey === session.key}
+                        onClick={() => setChatDeleteTarget(session)}
+                      >
+                        <Trash2 size={14} aria-hidden="true" />
+                      </button>
                     </div>
-                    <div className="nav-item-desc">{relativeTime(session.updated_at)}</div>
-                  </button>
-                ))}
+                  );
+                }) : (
+                  <div className="chat-nav-empty">No chats yet.</div>
+                )}
               </div>
             </NavGroup>
             <NavGroup label="Sessions" count={totalMessages || totalSessionMessages(sessions)} active={viewMode === "sessions"} open={!!navOpen.sessions} onToggle={() => toggleNav("sessions")}>
@@ -707,19 +836,17 @@ function App(): React.ReactElement {
         {isChatView ? (
           <ChatPane
             status={chatStatus}
-            sessionKey={chatSessionKey}
-            setSessionKey={(value) => {
-              setChatSessionKey(value);
-              setChatEvents([]);
-              setChatLiveEvent("");
-            }}
+            session={activeChatSession}
             connected={chatConnected}
-            events={chatEvents}
+            events={currentChatEvents}
             input={chatInput}
             setInput={setChatInput}
             sending={chatSending}
             liveEvent={chatLiveEvent}
+            onCreateChat={() => void run(createChatSession)}
+            onDeleteChat={() => activeChatSession && setChatDeleteTarget(activeChatSession)}
             onSend={() => void run(sendChatMessage)}
+            onApproval={(approvalId, decision) => void run(() => decideChatApproval(approvalId, decision))}
             onOpenSession={() => {
               setActiveSessionKey(chatSessionKey);
               setActiveSession(sessions.find((session) => session.key === chatSessionKey) ?? null);
@@ -831,7 +958,30 @@ function App(): React.ReactElement {
           </>
         )}
       </main>
-      {error && <div className="modal-backdrop" onClick={() => setError(null)}><div className="modal"><div className="modal-title">请求失败</div><p>{error}</p><div className="modal-actions"><button className="primary" type="button" onClick={() => setError(null)}>关闭</button></div></div></div>}
+      {error && <div className="modal-backdrop" onClick={() => setError(null)}><div className="modal"><div className="modal-title">Request failed</div><p>{error}</p><div className="modal-actions"><button className="primary" type="button" onClick={() => setError(null)}>Close</button></div></div></div>}
+      {chatDeleteTarget && (
+        <div className="modal-backdrop" onClick={() => setChatDeleteTarget(null)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-title">Delete this chat?</div>
+            <p className="modal-sub">This cannot be undone.</p>
+            <div className="delete-chat-preview">
+              <strong>{chatSessionTitle(chatDeleteTarget)}</strong>
+              <span>{chatSessionSubtitle(chatDeleteTarget)}</span>
+            </div>
+            <div className="modal-actions">
+              <button className="ghost" type="button" onClick={() => setChatDeleteTarget(null)}>Cancel</button>
+              <button
+                className="danger-ghost"
+                type="button"
+                disabled={deletingChatKey === chatDeleteTarget.key}
+                onClick={() => void run(async () => deleteChatSession(chatDeleteTarget))}
+              >
+                {deletingChatKey === chatDeleteTarget.key ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -904,65 +1054,89 @@ function PluginTopbarAction(props: {
 
 function ChatPane(props: {
   status: ChatStatus | null;
-  sessionKey: string;
-  setSessionKey(value: string): void;
+  session: SessionRow | null;
   connected: boolean;
   events: ChatEventRow[];
   input: string;
   setInput(value: string): void;
   sending: boolean;
   liveEvent: string;
+  onCreateChat(): void;
+  onDeleteChat(): void;
   onSend(): void;
+  onApproval(approvalId: string, decision: "approve" | "reject"): void;
   onOpenSession(): void;
 }): React.ReactElement {
   const disabled = !props.status?.enabled;
   const streamRef = useRef<HTMLDivElement>(null);
-  const latestContentKey = props.events
-    .map((event) => `${event.id}:${event.content ?? ""}:${event.detail ?? ""}`)
-    .join("|");
+  const turns = useMemo(() => deriveChatTurns(props.events), [props.events]);
+  const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
+  const activeThinkingKey = props.session?.key ?? props.status?.session_key ?? "dashboard:default";
+  const currentThinkingExpanded = expandedThinking[activeThinkingKey] ?? false;
+  const latestContentKey = useMemo(
+    () => props.events.map((event) => `${event.id}:${event.content ?? ""}:${event.detail ?? ""}:${event.pending ? "1" : "0"}`).join("|"),
+    [props.events],
+  );
 
   useEffect(() => {
     if (disabled) return;
     const el = streamRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    el.scrollTo({ top: el.scrollHeight, behavior: props.sending || props.liveEvent ? "smooth" : "auto" });
   }, [disabled, latestContentKey, props.liveEvent, props.sending]);
 
   return (
     <section className="chat-pane">
       <header className="chat-head">
         <div>
-          <div className="chat-title">Dashboard Chat</div>
+          <div className="chat-title">{chatSessionTitle(props.session)}</div>
           <div className="chat-subtitle">
             <span className={`chat-dot ${props.connected && !disabled ? "on" : ""}`} />
-            <code>{props.sessionKey}</code>
+            <span>{disabled ? "Disconnected" : props.sending ? "Running" : "Connected"}</span>
+            {props.session?.key && <code>{props.session.key}</code>}
           </div>
         </div>
         <div className="chat-head-actions">
-          <label className="chat-session-input">
-            <span>session</span>
-            <input
-              type="text"
-              value={props.sessionKey}
-              onChange={(event) => props.setSessionKey(event.target.value.trim() || "dashboard:default")}
-              disabled={props.sending}
-            />
-          </label>
-          <button className="ghost" type="button" onClick={props.onOpenSession}>查看 session</button>
+          <button className="ghost" type="button" onClick={props.onCreateChat} disabled={disabled}>
+            <Plus size={14} aria-hidden="true" />
+            <span>New Chat</span>
+          </button>
+          <button className="ghost" type="button" onClick={props.onDeleteChat} disabled={disabled || props.sending || !props.session}>
+            <Trash2 size={14} aria-hidden="true" />
+            <span>Delete</span>
+          </button>
+          {props.session?.key && (
+            <button className="ghost" type="button" title="Copy session key" onClick={() => void copySessionKey(props.session!.key)}>
+              <Copy size={14} aria-hidden="true" />
+              <span>Copy key</span>
+            </button>
+          )}
+          <button className="ghost" type="button" onClick={props.onOpenSession} disabled={!props.session}>
+            <Info size={14} aria-hidden="true" />
+            <span>Session details</span>
+          </button>
         </div>
       </header>
       {disabled ? (
         <div className="chat-disabled">
-          <div className="detail-empty-title">完整 runtime 未启用</div>
+          <div className="detail-empty-title">Full runtime is not enabled</div>
           <div className="detail-empty-text">{props.status?.reason || "Dashboard Chat requires python main.py."}</div>
         </div>
       ) : (
         <>
           <div className="chat-stream" ref={streamRef}>
-            {props.events.length ? props.events.map((event) => <ChatEventItem
-              key={event.id}
-              event={event}
-            />) : (
+            {turns.length ? turns.map((turn, index) => (
+              <ChatTurnItem
+                key={`${turn.session_key}-${turn.user?.id ?? turn.assistant?.id ?? turn.thinking?.updatedAt ?? index}`}
+                turn={turn}
+                expanded={currentThinkingExpanded}
+                onToggleThinking={() => setExpandedThinking((current) => ({
+                  ...current,
+                  [activeThinkingKey]: !currentThinkingExpanded,
+                }))}
+                onApproval={props.onApproval}
+              />
+            )) : (
               <div className="chat-empty">
                 <div className="chat-empty-kicker">Agent Console</div>
                 <div className="chat-empty-title">Start a session with the agent.</div>
@@ -979,9 +1153,9 @@ function ChatPane(props: {
               </div>
             )}
             {props.sending && (
-              <div className="chat-event chat-event-running">
-                <span className="status-pill">running</span>
-                <span>{props.liveEvent || "等待 agent 回复"}</span>
+              <div className="chat-running-row">
+                <span className="status-pill"><LoaderCircle size={12} aria-hidden="true" /></span>
+                <span>{props.liveEvent || "Working on the response"}</span>
               </div>
             )}
           </div>
@@ -999,7 +1173,7 @@ function ChatPane(props: {
               disabled={props.sending}
             />
             <button className="primary" type="submit" disabled={props.sending || !props.input.trim()}>
-              {props.sending ? "发送中" : "发送"}
+              {props.sending ? "Sending" : "Send"}
             </button>
           </form>
         </>
@@ -1008,28 +1182,108 @@ function ChatPane(props: {
   );
 }
 
-function ChatEventItem(props: {
-  event: ChatEventRow;
+function ChatTurnItem(props: {
+  turn: ChatTurn;
+  expanded: boolean;
+  onToggleThinking(): void;
+  onApproval(approvalId: string, decision: "approve" | "reject"): void;
 }): React.ReactElement {
-  const event = props.event;
-  if (event.kind === "user") {
-    return <div className="chat-message user"><div className="chat-bubble">{event.content || event.detail}</div></div>;
-  }
-  if (event.kind === "assistant" && (event.content || event.detail || event.pending)) {
-    const content = event.content || event.detail || "";
-    return <div className={`chat-message assistant${event.pending ? " pending" : ""}`}><div className="chat-bubble" dangerouslySetInnerHTML={{ __html: renderMarkdown(content || " ") }} /></div>;
-  }
-  if (event.event === "error") {
-    return <div className="chat-event error"><span className="status-pill proactive-result-busy">error</span><span>{event.detail}</span></div>;
-  }
-  if (event.event === "user_message_accepted") {
-    return <div className="chat-event"><span className="status-pill">accepted</span><span>{event.detail || "Message accepted"}</span></div>;
-  }
-  if (event.kind === "tool") {
-    const status = event.status || (event.event === "tool_started" ? "started" : "tool");
-    return <div className="chat-event chat-tool-event"><span className="status-pill">{status}</span><span>{event.tool_name || event.label}</span>{event.detail && <small>{event.detail}</small>}</div>;
-  }
-  return <div className="chat-event"><span className="status-pill">{event.kind}</span><span>{event.label}</span>{event.detail && <small>{event.detail}</small>}</div>;
+  return (
+    <div className="chat-turn">
+      {props.turn.user && (
+        <div className="chat-message user">
+          <div className="chat-bubble">{props.turn.user.content || props.turn.user.detail}</div>
+        </div>
+      )}
+      {props.turn.thinking && props.turn.thinking.status !== "idle" && (
+        <ThinkingPanel state={props.turn.thinking} expanded={props.expanded} onToggle={props.onToggleThinking} />
+      )}
+      {props.turn.assistant && (props.turn.assistant.content || props.turn.assistant.detail || props.turn.assistant.pending) && (
+        <div className={`chat-message assistant${props.turn.assistant.pending ? " pending" : ""}`}>
+          <div className="chat-bubble" dangerouslySetInnerHTML={{ __html: renderMarkdown(props.turn.assistant.content || props.turn.assistant.detail || " ") }} />
+        </div>
+      )}
+      {props.turn.approval && (
+        <ApprovalCard event={props.turn.approval} onDecision={props.onApproval} />
+      )}
+      {props.turn.error && (
+        <div className="chat-error-card">
+          <span className="status-pill proactive-result-busy">error</span>
+          <span>{props.turn.error.summary || props.turn.error.detail}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ApprovalCard(props: {
+  event: ChatEventRow;
+  onDecision(approvalId: string, decision: "approve" | "reject"): void;
+}): React.ReactElement {
+  const approvalId = props.event.approval_id || "";
+  const toolName = props.event.tool_name || "tool";
+  const pending = (props.event.status || "pending") === "pending";
+  return (
+    <div className="approval-card">
+      <div className="approval-card-body">
+        <span className="status-pill proactive-result-busy">approval</span>
+        <div>
+          <strong>Confirm action</strong>
+          <p>{toolName} requires confirmation before it can run.</p>
+          {props.event.detail && <small>{props.event.detail}</small>}
+        </div>
+      </div>
+      <div className="approval-card-actions">
+        <button type="button" className="ghost" disabled={!pending || !approvalId} onClick={() => props.onDecision(approvalId, "reject")}>Reject</button>
+        <button type="button" className="primary compact" disabled={!pending || !approvalId} onClick={() => props.onDecision(approvalId, "approve")}>Approve</button>
+      </div>
+    </div>
+  );
+}
+
+function ThinkingPanel(props: {
+  state: ChatThinkingState;
+  expanded: boolean;
+  onToggle(): void;
+}): React.ReactElement {
+  const statusLabel = props.state.status === "done"
+    ? "Completed"
+    : props.state.status === "error"
+      ? "Failed"
+      : "Working";
+  return (
+    <div className={`thinking-panel ${props.expanded ? "expanded" : "collapsed"}`}>
+      <button type="button" className="thinking-panel-head" onClick={props.onToggle}>
+        <div className="thinking-panel-summary">
+          <LoaderCircle size={13} aria-hidden="true" className={props.state.status === "running" ? "spin" : ""} />
+          <span>{statusLabel}</span>
+          <strong>{props.state.summary || "Review workflow is progressing"}</strong>
+        </div>
+        <div className="thinking-panel-meta">
+          {props.state.steps.length > 0 && <span>{props.state.steps.length} steps</span>}
+          <ChevronDown size={13} aria-hidden="true" className={props.expanded ? "open" : ""} />
+        </div>
+      </button>
+      {props.expanded && (
+        <div className="thinking-panel-body">
+          {props.state.steps.length ? props.state.steps.map((step, index) => (
+            <div key={`${step}-${index}`} className="thinking-step">
+              <span className="status-pill">step {index + 1}</span>
+              <span>{step}</span>
+            </div>
+          )) : (
+            <div className="muted-text">No internal steps were captured.</div>
+          )}
+          {props.state.technicalDetail && (
+            <details className="thinking-detail">
+              <summary>Technical details</summary>
+              <pre>{props.state.technicalDetail}</pre>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function TopbarFilters(props: {
@@ -1309,6 +1563,97 @@ function chatHistoryToEvents(items: MessageRow[]): ChatEventRow[] {
   return events;
 }
 
+function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
+  const turns: ChatTurn[] = [];
+  for (const event of events) {
+    let current = turns[turns.length - 1];
+    if (event.event === "error") {
+      if (!current) {
+        current = { session_key: event.session_key };
+        turns.push(current);
+      }
+      current.error = event;
+      continue;
+    }
+    if (event.kind === "user") {
+      current = { session_key: event.session_key, user: event };
+      turns.push(current);
+      continue;
+    }
+    if (!current) {
+      current = { session_key: event.session_key };
+      turns.push(current);
+    }
+    if (event.event === "done") {
+      current.thinking = {
+        status: "done",
+        summary: "Completed",
+        steps: current.thinking?.steps ?? [],
+        technicalDetail: current.thinking?.technicalDetail,
+        startedAt: current.thinking?.startedAt,
+        updatedAt: event.ts ?? current.thinking?.updatedAt,
+        expanded: current.thinking?.expanded,
+      };
+      continue;
+    }
+    if (event.kind === "assistant") {
+      current.assistant = event;
+      if (event.source !== "history" || current.thinking) {
+        current.thinking = {
+          status: event.final ? "done" : "running",
+          summary: event.pending ? "Writing the response" : "Drafting the response",
+          steps: current.thinking?.steps ?? [],
+          technicalDetail: current.thinking?.technicalDetail,
+          startedAt: current.thinking?.startedAt,
+          updatedAt: event.ts ?? current.thinking?.updatedAt,
+          expanded: current.thinking?.expanded,
+        };
+      }
+      continue;
+    }
+    if (event.event === "tool_approval_required" || event.kind === "approval") {
+      current.approval = event;
+      current.thinking = {
+        status: "done",
+        summary: "Waiting for confirmation",
+        steps: current.thinking?.steps ?? [],
+        technicalDetail: current.thinking?.technicalDetail,
+        startedAt: current.thinking?.startedAt ?? event.ts,
+        updatedAt: event.ts ?? current.thinking?.updatedAt,
+        expanded: current.thinking?.expanded,
+      };
+      continue;
+    }
+    if (event.event === "assistant_message" || event.event === "turn_started") {
+      current.thinking = {
+        status: "running",
+        summary: event.summary || event.label || "Working",
+        steps: current.thinking?.steps ?? [],
+        technicalDetail: event.technical_detail ?? current.thinking?.technicalDetail,
+        startedAt: event.ts ?? current.thinking?.startedAt,
+        updatedAt: event.ts ?? current.thinking?.updatedAt,
+        expanded: current.thinking?.expanded,
+      };
+      continue;
+    }
+    if (event.kind === "tool" || event.kind === "system") {
+      const currentSteps = current.thinking?.steps ?? [];
+      const nextStep = event.event === "tool_completed" ? "" : event.summary || event.label || event.detail || event.event;
+      current.thinking = {
+        status: "running",
+        summary: event.summary || event.label || event.detail || "Working",
+        steps: nextStep && currentSteps[currentSteps.length - 1] !== nextStep ? [...currentSteps, nextStep] : currentSteps,
+        technicalDetail: event.technical_detail ?? current.thinking?.technicalDetail,
+        startedAt: current.thinking?.startedAt ?? event.ts,
+        updatedAt: event.ts ?? current.thinking?.updatedAt,
+        expanded: current.thinking?.expanded,
+      };
+      continue;
+    }
+  }
+  return turns;
+}
+
 function normalizeChatEvent(
   event: Partial<ChatEventRow> & { event: string },
   fallbackSessionKey: string,
@@ -1334,6 +1679,8 @@ function normalizeChatEvent(
     call_id: event.call_id,
     arguments: event.arguments,
     final_arguments: event.final_arguments,
+    approval_id: event.approval_id,
+    confirmation: event.confirmation,
     status: event.status,
     iteration: event.iteration,
     has_more: event.has_more,
@@ -1343,6 +1690,26 @@ function normalizeChatEvent(
     ts: event.ts,
     created_at: createdAt,
   };
+}
+
+function chatSessionTitle(session: SessionRow | null | undefined): string {
+  const title = session ? String((session.metadata as ChatSessionMetadata | null | undefined)?.title ?? "").trim() : "";
+  if (title) return title;
+  return session?.key ? formatSessionKeyForTable(session.key) : "New chat";
+}
+
+function chatSessionSubtitle(session: SessionRow | null | undefined): string {
+  if (!session) return "Conversation";
+  const count = session.message_count || 0;
+  return `${relativeTime(session.updated_at)} · ${count} message${count === 1 ? "" : "s"}`;
+}
+
+async function copySessionKey(value: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    return;
+  }
 }
 
 function mergeChatEvent(current: ChatEventRow[], next: ChatEventRow): ChatEventRow[] {
@@ -1453,6 +1820,129 @@ function updateStoredChatSeq(sessionKey: string, data: Record<string, unknown>, 
   }
 }
 
+function latestChatEventSeq(events: ChatEventRow[], sessionKey: string): number {
+  return Math.max(
+    0,
+    ...events
+      .filter((event) => event.session_key === sessionKey && event.source !== "history")
+      .map((event) => typeof event.seq === "number" ? event.seq : 0)
+      .filter((value) => Number.isFinite(value)),
+  );
+}
+
+function presentChatEvent(event: string, data: Record<string, unknown>): {
+  summary: string;
+  technicalDetail?: string;
+} {
+  const toolName = typeof data.tool_name === "string" ? data.tool_name : "";
+  const label = String(data.label ?? "");
+  const detail = String(data.detail ?? data.message ?? "");
+  let summary = label || detail || event;
+  if (event === "user_message_accepted") {
+    summary = "Message received";
+  } else if (event === "turn_started") {
+    summary = "Agent started the review";
+  } else if (event === "tool_started") {
+    summary = toolProgressSummary(toolName, "started");
+  } else if (event === "tool_completed") {
+    summary = toolProgressSummary(toolName, String(data.status ?? "completed"));
+  } else if (event === "step") {
+    summary = stepProgressSummary(label || detail);
+  } else if (event === "error") {
+    summary = detail || "Something went wrong";
+  }
+  return {
+    summary,
+    technicalDetail: compactChatTechnicalDetail(event, data),
+  };
+}
+
+function toolProgressSummary(toolName: string, status: string): string {
+  const done = status === "success" || status === "completed" || status === "done";
+  const prefix = done ? "Completed" : "Running";
+  const normalized = toolName.toLowerCase();
+  if (normalized.includes("workflow") || normalized.includes("tool_chain")) {
+    return `${prefix} the evidence review workflow`;
+  }
+  if (normalized.includes("plan_biomedical_search") || normalized.includes("plan")) {
+    return `${prefix} search planning`;
+  }
+  if (normalized.includes("search_literature") || normalized.includes("pubmed") || normalized.includes("literature")) {
+    return `${prefix} literature retrieval`;
+  }
+  if (normalized.includes("extract")) {
+    return `${prefix} evidence extraction`;
+  }
+  if (normalized.includes("audit") || normalized.includes("verify")) {
+    return `${prefix} citation and claim checks`;
+  }
+  if (normalized.includes("provenance") || normalized.includes("evidence_packet")) {
+    return `${prefix} evidence packaging`;
+  }
+  if (toolName) {
+    return `${prefix} ${humanizeToolName(toolName)}`;
+  }
+  return done ? "Step completed" : "Working on the request";
+}
+
+function stepProgressSummary(value: string): string {
+  const normalized = value.toLowerCase();
+  if (normalized.includes("assistant response ready")) {
+    return "Drafting the response";
+  }
+  if (normalized.includes("tools called")) {
+    return "Review workflow is progressing";
+  }
+  if (normalized.includes("accepted")) {
+    return "Request accepted";
+  }
+  if (normalized.includes("started")) {
+    return "Agent started the review";
+  }
+  return value || "Review workflow is progressing";
+}
+
+function humanizeToolName(value: string): string {
+  return value
+    .replace(/^mcp__[^.]+\./, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function compactChatTechnicalDetail(event: string, data: Record<string, unknown>): string | undefined {
+  const details: Record<string, unknown> = { event };
+  for (const key of ["tool_name", "status", "iteration", "call_id", "detail", "label", "arguments", "final_arguments", "has_more"]) {
+    if (data[key] !== undefined && data[key] !== "") {
+      details[key] = data[key];
+    }
+  }
+  if (Object.keys(details).length <= 1) return undefined;
+  const serialized = JSON.stringify(details, null, 2);
+  return serialized.length > 1400 ? `${serialized.slice(0, 1400)}\n...` : serialized;
+}
+
+function chatNetworkErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (message.toLowerCase().includes("failed to fetch")) {
+    return "Dashboard backend is unreachable. Check that the full runtime is running at the current address, then retry.";
+  }
+  return message || "Dashboard backend is unreachable. Check the runtime and retry.";
+}
+
+function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /abort|aborted/i.test(message);
+}
+
+function errorWithCause(message: string, cause: unknown): Error {
+  const error = new Error(message) as Error & { cause?: unknown };
+  error.cause = cause;
+  return error;
+}
+
 function handleChatSsePayload(
   event: string,
   data: Record<string, unknown>,
@@ -1466,16 +1956,9 @@ function handleChatSsePayload(
     return;
   }
   const seq = readChatSeq(data);
+  const presentation = presentChatEvent(event, data);
   if (event === "user_message_accepted") {
-    ctx.appendChatEvent({
-      event,
-      seq,
-      kind: "system",
-      label: "Message accepted",
-      detail: String(data.detail ?? data.content_preview ?? "Message accepted"),
-      session_key: String(data.session_key ?? ""),
-      source: "live",
-    });
+    ctx.setChatLiveEvent("Message received");
     return;
   }
   if (event === "turn_started") {
@@ -1485,10 +1968,13 @@ function handleChatSsePayload(
       kind: "system",
       label: String(data.label ?? "Agent started"),
       detail: String(data.detail ?? ""),
+      summary: presentation.summary,
+      technical_detail: presentation.technicalDetail,
+      raw: data,
       session_key: String(data.session_key ?? ""),
       source: "live",
     });
-    ctx.setChatLiveEvent(String(data.label ?? data.detail ?? "Agent started"));
+    ctx.setChatLiveEvent(presentation.summary);
     return;
   }
   if (event === "assistant_delta") {
@@ -1504,7 +1990,7 @@ function handleChatSsePayload(
       pending: true,
       source: "live",
     });
-    ctx.setChatLiveEvent(String(data.content_delta ?? data.thinking_delta ?? "Assistant streaming"));
+    ctx.setChatLiveEvent("Writing the response");
     return;
   }
   if (event === "assistant_message") {
@@ -1532,6 +2018,9 @@ function handleChatSsePayload(
       kind: "tool",
       label: String(data.label ?? data.tool_name ?? "Tool started"),
       detail: String(data.tool_name ?? ""),
+      summary: presentation.summary,
+      technical_detail: presentation.technicalDetail,
+      raw: data,
       session_key: String(data.session_key ?? ""),
       tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
       call_id: typeof data.call_id === "string" ? data.call_id : undefined,
@@ -1539,7 +2028,7 @@ function handleChatSsePayload(
       iteration: typeof data.iteration === "number" ? data.iteration : undefined,
       source: "live",
     });
-    ctx.setChatLiveEvent(String(data.label ?? data.tool_name ?? "Tool started"));
+    ctx.setChatLiveEvent(presentation.summary);
     return;
   }
   if (event === "tool_completed") {
@@ -1549,6 +2038,9 @@ function handleChatSsePayload(
       kind: "tool",
       label: String(data.label ?? data.tool_name ?? "Tool completed"),
       detail: String(data.detail ?? ""),
+      summary: presentation.summary,
+      technical_detail: presentation.technicalDetail,
+      raw: data,
       session_key: String(data.session_key ?? ""),
       tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
       call_id: typeof data.call_id === "string" ? data.call_id : undefined,
@@ -1558,7 +2050,7 @@ function handleChatSsePayload(
       iteration: typeof data.iteration === "number" ? data.iteration : undefined,
       source: "live",
     });
-    ctx.setChatLiveEvent(String(data.label ?? data.tool_name ?? "Tool completed"));
+    ctx.setChatLiveEvent(presentation.summary);
     return;
   }
   if (event === "step") {
@@ -1568,18 +2060,30 @@ function handleChatSsePayload(
       kind: "system",
       label: String(data.label ?? "Assistant response ready"),
       detail: String(data.detail ?? ""),
+      summary: presentation.summary,
+      technical_detail: presentation.technicalDetail,
+      raw: data,
       session_key: String(data.session_key ?? ""),
       iteration: typeof data.iteration === "number" ? data.iteration : undefined,
       has_more: typeof data.has_more === "boolean" ? data.has_more : undefined,
       source: "live",
     });
-    ctx.setChatLiveEvent(String(data.label ?? data.kind ?? "running"));
+    ctx.setChatLiveEvent(presentation.summary);
     if (data.has_more === false) {
       ctx.setChatSending(false);
     }
     return;
   }
   if (event === "done") {
+    ctx.appendChatEvent({
+      event,
+      seq,
+      kind: "system",
+      label: "Completed",
+      summary: "Completed",
+      session_key: String(data.session_key ?? ""),
+      source: "live",
+    });
     ctx.setChatSending(false);
     ctx.setChatLiveEvent("");
     return;
@@ -1591,6 +2095,9 @@ function handleChatSsePayload(
       kind: "error",
       label: String(data.label ?? "Error"),
       detail: String(data.detail ?? data.message ?? "Error"),
+      summary: presentation.summary,
+      technical_detail: presentation.technicalDetail,
+      raw: data,
       session_key: String(data.session_key ?? ""),
       source: "live",
     });
@@ -1604,6 +2111,9 @@ function handleChatSsePayload(
     kind: String(data.kind ?? "system"),
     label: String(data.label ?? event),
     detail: String(data.detail ?? data.content_delta ?? data.message ?? ""),
+    summary: presentation.summary,
+    technical_detail: presentation.technicalDetail,
+    raw: data,
     content_delta: typeof data.content_delta === "string" ? data.content_delta : undefined,
     thinking_delta: typeof data.thinking_delta === "string" ? data.thinking_delta : undefined,
     tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,

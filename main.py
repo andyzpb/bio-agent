@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 from contextlib import suppress
@@ -98,6 +99,7 @@ async def serve(
     config_path: str = "config.toml",
     workspace: Path | None = None,
 ) -> None:
+    os.environ["AKASHIC_CONFIG"] = str(Path(config_path).resolve())
     config = Config.load(config_path)
     runtime = build_app_runtime(
         config,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from agent.turns.outbound import OutboundDispatch, OutboundPort
 from bus.event_bus import EventBus
 from bus.events import InboundMessage, OutboundMessage
 from bus.events_lifecycle import (
+    ToolCallApprovalRequired,
     ToolCallCompleted,
     ToolCallStarted,
 )
@@ -1270,6 +1272,106 @@ class DefaultReasoner(Reasoner):
                         # hook 只负责拦截与记录，不替代 registry。
                         self._tools.execute,
                     )
+                    if exec_result.status == "approval_required":
+                        approval_id = str(
+                            exec_result.confirmation.get("approval_id") or ""
+                        ).strip()
+                        if not approval_id:
+                            seed = (
+                                f"{tool_event_session_key}:"
+                                f"{iteration + 1}:"
+                                f"{tool_call.id}:"
+                                f"{tool_call.name}"
+                            )
+                            approval_id = hashlib.sha256(
+                                seed.encode("utf-8")
+                            ).hexdigest()[:16]
+                        confirmation = {
+                            **dict(exec_result.confirmation or {}),
+                            "approval_id": approval_id,
+                            "session_key": tool_event_session_key,
+                            "chat_id": tool_event_chat_id,
+                            "channel": tool_event_channel,
+                        }
+                        if self._event_bus is not None:
+                            await self._event_bus.observe(
+                                ToolCallApprovalRequired(
+                                    session_key=tool_event_session_key,
+                                    channel=tool_event_channel,
+                                    chat_id=tool_event_chat_id,
+                                    iteration=iteration + 1,
+                                    call_id=tool_call.id,
+                                    tool_name=tool_call.name,
+                                    arguments=dict(tool_call.arguments),
+                                    final_arguments=exec_result.final_arguments,
+                                    reason=str(exec_result.output),
+                                    confirmation=confirmation,
+                                )
+                            )
+                        result = (
+                            "This action requires confirmation in Dashboard Chat. "
+                            f"Approval ID: {approval_id}"
+                        )
+                        append_tool_result(
+                            messages,
+                            tool_call_id=tool_call.id,
+                            content=result,
+                            tool_name=tool_call.name,
+                        )
+                        await self._observe_tool_call_completed(
+                            session_key=tool_event_session_key,
+                            channel=tool_event_channel,
+                            chat_id=tool_event_chat_id,
+                            iteration=iteration + 1,
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            final_arguments=exec_result.final_arguments,
+                            status="approval_required",
+                            result_preview=support.log_preview(result),
+                        )
+                        iter_calls.append(
+                            {
+                                "call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "status": "approval_required",
+                                "arguments": tool_call.arguments,
+                                "final_arguments": exec_result.final_arguments,
+                                "confirmation": confirmation,
+                                "pre_hook_trace": [
+                                    {
+                                        "hook_name": item.hook_name,
+                                        "event": item.event,
+                                        "matched": item.matched,
+                                        "decision": item.decision,
+                                        "reason": item.reason,
+                                        "extra_message": item.extra_message,
+                                    }
+                                    for item in exec_result.pre_hook_trace
+                                ],
+                                "result": result,
+                            }
+                        )
+                        tool_chain.append({"text": response.content, "calls": iter_calls})
+                        summary = await self._summarize_incomplete_progress(
+                            messages,
+                            reason="approval_required",
+                            iteration=iteration + 1,
+                            tools_used=tools_used,
+                        )
+                        return self._build_result(
+                            reply=summary,
+                            tools_used=tools_used,
+                            tool_chain=tool_chain,
+                            visible_names=visible_names,
+                            thinking=None,
+                            streamed=False,
+                            react_input_samples=react_input_samples,
+                            cache_prompt_tokens=react_cache_prompt_tokens,
+                            cache_hit_tokens=react_cache_hit_tokens,
+                            cache_seen=react_cache_seen,
+                            tools_unlocked=tools_unlocked,
+                        )
                     if exec_result.status == "success":
                         tools_used.append(tool_call.name)
                     result = exec_result.output

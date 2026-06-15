@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import tomllib
 from typing import Any, Literal, cast
 
 from agent.lifecycle.types import BeforeTurnCtx, PreToolCtx, PromptRenderCtx
@@ -253,7 +255,23 @@ class BiomedEvidencePlugin(Plugin):
 
     async def initialize(self) -> None:
         workspace = self.context.workspace or (Path.home() / ".akashic" / "workspace")
-        self._service = BiomedEvidenceService(workspace)
+        llm = getattr(self.context, "llm", None)
+        revision_provider = None
+        revision_model = ""
+        if llm is not None:
+            revision_provider = getattr(llm, "light_provider", None) or getattr(
+                llm, "provider", None
+            )
+            revision_model = str(
+                getattr(self.context, "light_model", "")
+                or getattr(self.context, "llm_model", "")
+                or ""
+            )
+        self._service = BiomedEvidenceService(
+            workspace,
+            revision_provider=revision_provider,
+            revision_model=revision_model,
+        )
 
     async def terminate(self) -> None:
         service = getattr(self, "_service", None)
@@ -285,12 +303,6 @@ class BiomedEvidencePlugin(Plugin):
                     "for a clinical or patient-specific request."
                 ),
             )
-        sensitive_action_outcome = self._deny_chat_sensitive_action_without_approval(
-            event
-        )
-        if sensitive_action_outcome is not None:
-            return sensitive_action_outcome
-
         messages: list[str] = []
         project_error = self._validate_or_apply_project(event.tool_name, args, messages)
         if project_error:
@@ -302,6 +314,20 @@ class BiomedEvidencePlugin(Plugin):
         self._apply_search_defaults(event.tool_name, args, messages)
         self._apply_default_llm_flags(event.tool_name, args, messages)
         self._remember_tool_preferences(args)
+        sensitive_action_outcome = self._deny_chat_sensitive_action_without_approval(
+            event
+        )
+        if sensitive_action_outcome is not None:
+            sensitive_action_outcome.updated_input = args
+            if messages:
+                reason = "; ".join(messages)
+                sensitive_action_outcome.reason = (
+                    f"{sensitive_action_outcome.reason}; {reason}"
+                )
+                sensitive_action_outcome.extra_message = (
+                    f"{sensitive_action_outcome.extra_message} {reason}"
+                )
+            return sensitive_action_outcome
         reason = "; ".join(messages)
         if args != event.arguments:
             return HookOutcome(
@@ -324,16 +350,23 @@ class BiomedEvidencePlugin(Plugin):
         metadata = get_release_tool_metadata(event.tool_name)
         return HookOutcome(
             decision="deny",
+            requires_confirmation=True,
+            confirmation={
+                "plugin_id": self.name,
+                "tool_name": event.tool_name,
+                "risk_level": metadata.risk_level,
+                "side_effects": list(metadata.side_effects),
+                "source_policy": metadata.source_policy,
+                "reason": "Sensitive Biomedical Evidence action requires confirmation.",
+            },
             reason=(
                 "biomed_evidence_confirmation_required: "
                 f"{event.tool_name} is marked requires_confirmation=true "
-                "and Dashboard Chat does not yet provide a durable approval "
-                "resume flow for sensitive Biomedical Evidence actions."
+                "and must be confirmed before execution."
             ),
             extra_message=(
-                "Sensitive Biomedical Evidence action was not executed. Use the "
-                "Biomedical Evidence workspace or a future framework approval flow "
-                f"to confirm this {metadata.risk_level} action."
+                "Sensitive Biomedical Evidence action is waiting for confirmation "
+                f"before executing this {metadata.risk_level} action."
             ),
         )
 
@@ -2442,10 +2475,7 @@ def _cap_int_arg(
 
 
 def _config_bool(plugin: BiomedEvidencePlugin, key: str, default: bool) -> bool:
-    config = getattr(plugin.context, "config", None)
-    if config is None:
-        return default
-    value = config.get(key, default)
+    value = _config_value(plugin, key, default)
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -2454,24 +2484,55 @@ def _config_bool(plugin: BiomedEvidencePlugin, key: str, default: bool) -> bool:
 
 
 def _config_int(plugin: BiomedEvidencePlugin, key: str, default: int) -> int:
-    config = getattr(plugin.context, "config", None)
-    if config is None:
-        return default
     try:
-        return int(config.get(key, default))
+        return int(_config_value(plugin, key, default))
     except (TypeError, ValueError):
         return default
 
 
 def _config_str(plugin: BiomedEvidencePlugin, key: str, default: str) -> str:
-    config = getattr(plugin.context, "config", None)
-    if config is None:
-        return default
-    value = config.get(key, default)
+    value = _config_value(plugin, key, default)
     if value is None:
         return default
     cleaned = str(value).strip()
     return cleaned or default
+
+
+def _config_value(plugin: BiomedEvidencePlugin, key: str, default: Any) -> Any:
+    config = getattr(plugin.context, "config", None)
+    value = default if config is None else config.get(key, default)
+    live_value = _live_plugin_config_value(plugin, key)
+    return value if live_value is _MISSING else live_value
+
+
+_MISSING = object()
+
+
+def _live_plugin_config_value(plugin: BiomedEvidencePlugin, key: str) -> Any:
+    config_path = _live_plugin_config_path(plugin)
+    if config_path is None or not config_path.exists():
+        return _MISSING
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return _MISSING
+    plugins = data.get("plugins")
+    if not isinstance(plugins, dict):
+        return _MISSING
+    section = plugins.get(plugin.name)
+    if not isinstance(section, dict) or key not in section:
+        return _MISSING
+    return section[key]
+
+
+def _live_plugin_config_path(plugin: BiomedEvidencePlugin) -> Path | None:
+    env_path = os.environ.get("AKASHIC_CONFIG")
+    if env_path:
+        return Path(env_path)
+    workspace = getattr(plugin.context, "workspace", None)
+    if workspace is not None:
+        return Path(workspace) / "config.toml"
+    return None
 
 
 def _clean_str(value: object) -> str:
