@@ -1,6 +1,7 @@
 # Akashic Biomedical Evidence Agent
 
 Read more about the design: https://andyzpb.github.io/blog/biomedical-evidence-agent/
+Detailed manual: https://andyzpb.github.io/blog/bio-agent-deployment-guide/
 
 Akashic is a plugin-based AI agent framework with memory, tools, background
 workflows, channel integrations, and a FastAPI dashboard. This repository shows
