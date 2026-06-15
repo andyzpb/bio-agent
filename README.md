@@ -8,9 +8,10 @@ how that framework can power a **research-only biomedical evidence agent**:
 search papers, extract evidence, audit claims, and make every answer
 inspectable.
 
-Current biomedical baseline: **Release 1.7: Graph Snapshot Lifecycle**, with
-generic Dashboard Chat, plugin-side Biomed workspace polish, and run-centric
-Trace/Audit/Export/Review workspaces.
+Current biomedical baseline: **Release 2.0: Full-Text Evidence Review**, with
+deterministic full-text/PDF ingestion, Research Watch graph drift, Argument
+Graph v2, generic Dashboard Chat, and run-centric Trace/Audit/Export/Review
+workspaces.
 
 ## Highlights
 
@@ -24,10 +25,19 @@ Trace/Audit/Export/Review workspaces.
   Evidence Graph snapshots, stale snapshots are detected from newer audits,
   snapshot diffs are inspectable, and risky graph states are captured in the
   project review queue.
+- **Full-text evidence locators**: known papers can store deterministic
+  full-text/PDF parser output as document sections, source hashes, and
+  section/page/character-offset locators. Parser output is not evidence until
+  extracted `EvidenceItem` records pass through packet, audit, graph,
+  provenance, and review contracts.
+- **Release 2.0 reviewer signals**: Research Watch graph drift compares paper,
+  claim, method, limitation, entity, and support-shift changes across
+  snapshots; Argument Graph v2 links support/attack/qualifier relationships
+  back to Evidence Graph node IDs. Both are advisory QA context, not evidence.
 - **Codex-style Biomed workspace**: the plugin is organized around Chat, Runs,
   Review Queue, Library, and Settings. Runs are the main inspector surface for
   review, diff, trace, evidence packet, audit, logic, argument, math, and
-  provenance artifacts.
+  provenance artifacts; Library includes Watch drift and full-text inspection.
 - **Framework-native Dashboard Chat**: chat runs through the shared `dashboard`
   channel, agent loop, session history, event stream, and tool hooks; biomedical
   policy stays in the plugin. Dashboard chat replies default to English unless
@@ -39,7 +49,7 @@ Trace/Audit/Export/Review workspaces.
   are exposed as structured tools.
 - **Works offline by default**: demos and evals use deterministic mock
   literature data. Live PubMed and DeepSeek/OpenAI-compatible LLM calls are
-  opt-in.
+  opt-in and covered by release smoke artifacts.
 
 ## Dashboard
 
@@ -64,6 +74,10 @@ What recent evidence links microglial activation to Alzheimer's disease progress
 Patient-specific clinical requests are refused by design. Dashboard Chat is a
 generic framework channel, with sensitive biomedical write/export/review tools
 blocked until durable approval and resume support exists.
+
+Release 2.0 live smoke was validated with live PubMed plus DeepSeek
+`deepseek-v4-flash`: `27/27` checks passed, including audited answer, trace,
+evidence packet, provenance graph, and clinical guardrail checks.
 
 ## Quickstart
 
