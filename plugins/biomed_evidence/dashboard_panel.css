@@ -778,6 +778,16 @@
   overflow: hidden;
 }
 
+.biomed-chat-workspace {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  height: 100%;
+  max-height: calc(100vh - 52px);
+  min-height: 680px;
+  background: var(--paper-strong, #fff);
+  overflow: hidden;
+}
+
 .biomed-agent-rail {
   background: #f1f3f3;
   color: var(--text, #171717);
@@ -1068,9 +1078,29 @@
   color: #fff;
 }
 
+.biomed-primary-button {
+  border: 1px solid var(--text, #171717);
+  background: var(--text, #171717);
+  color: #fff;
+  border-radius: 7px;
+  padding: 8px 12px;
+  font-weight: 720;
+  cursor: pointer;
+}
+
 .biomed-primary-actions .biomed-primary-button:hover {
   background: #2b2b29;
   border-color: #2b2b29;
+}
+
+.biomed-primary-button:hover {
+  background: #2b2b29;
+  border-color: #2b2b29;
+}
+
+.biomed-primary-button:disabled {
+  cursor: default;
+  opacity: 0.58;
 }
 
 .biomed-agent-output {
@@ -1093,6 +1123,81 @@
   border-radius: 8px;
   padding: 18px;
   background: rgba(255, 255, 255, 0.55);
+}
+
+.biomed-chat-main {
+  min-width: 0;
+  min-height: 0;
+  background: var(--paper, #f7f7f4);
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.biomed-chat-history {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.biomed-chat-message {
+  display: flex;
+  min-width: 0;
+}
+
+.biomed-chat-message.is-user {
+  justify-content: flex-end;
+}
+
+.biomed-chat-message.is-agent {
+  justify-content: flex-start;
+}
+
+.biomed-chat-bubble {
+  max-width: min(760px, 88%);
+  min-width: 0;
+  border: 1px solid var(--line, #deded8);
+  border-radius: 8px;
+  padding: 11px 13px;
+  background: var(--paper-strong, #fff);
+  color: var(--text, #171717);
+  line-height: 1.52;
+  overflow-wrap: anywhere;
+}
+
+.biomed-chat-message.is-user .biomed-chat-bubble {
+  background: #171717;
+  border-color: #171717;
+  color: #fff;
+}
+
+.biomed-chat-message.is-user .biomed-watch-meta {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.biomed-chat-composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--line, #deded8);
+  background: var(--paper-strong, #fff);
+}
+
+.biomed-chat-composer textarea {
+  min-width: 0;
+  resize: vertical;
+  min-height: 78px;
+  max-height: 220px;
+  border: 1px solid var(--line, #deded8);
+  border-radius: 8px;
+  background: #fbfbfa;
+  color: var(--text, #171717);
+  padding: 10px;
+  line-height: 1.45;
 }
 
 .biomed-empty-title {
@@ -1597,6 +1702,10 @@
     grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
   }
 
+  .biomed-chat-workspace {
+    grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
+  }
+
   .biomed-review-workspace {
     grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
   }
@@ -1670,6 +1779,14 @@
     overflow: visible;
   }
 
+  .biomed-chat-workspace {
+    grid-template-columns: 1fr;
+    height: auto;
+    max-height: none;
+    min-height: 0;
+    overflow: visible;
+  }
+
   .biomed-agent-rail {
     background: #f1f3f3;
     overflow: visible;
@@ -1685,6 +1802,14 @@
 
   .biomed-agent-main {
     min-height: 620px;
+  }
+
+  .biomed-chat-main {
+    min-height: 620px;
+  }
+
+  .biomed-chat-composer {
+    grid-template-columns: 1fr;
   }
 
   .biomed-command-row {

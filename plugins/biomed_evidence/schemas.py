@@ -34,6 +34,8 @@ ProjectReviewItemType = Literal[
     "advisory_disagreement",
     "conflicting_evidence",
     "needs_expert_review",
+    "graph_validation_issue",
+    "snapshot_stale",
 ]
 ProjectEvidenceBriefFormat = Literal["markdown", "json"]
 RunReviewDecisionValue = Literal[
@@ -1492,6 +1494,10 @@ class EvidenceGraphSnapshotMetadata(BaseModel):
     source_ids: dict[str, Any] = Field(default_factory=dict)
     created_at: str | None = None
     snapshot_required: bool = False
+    stale: bool = False
+    stale_reasons: list[str] = Field(default_factory=list)
+    latest_audit_id: str | None = None
+    previous_snapshot_id: str | None = None
 
 
 class EvidenceGraphSnapshotRecord(EvidenceGraphSnapshotMetadata):

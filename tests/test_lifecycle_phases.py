@@ -1102,6 +1102,73 @@ async def test_prompt_render_chain_appends_bottom_section(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prompt_render_dashboard_chat_defaults_to_english(tmp_path):
+    memory = SimpleNamespace(
+        read_self=lambda: "",
+        read_profile=lambda: "",
+        read_recent_context=lambda: "",
+        get_memory_context=lambda: "",
+    )
+    context = ContextBuilder(tmp_path, memory=cast(Any, memory))
+    phase = Phase(
+        default_prompt_render_modules(EventBus(), context),
+        frame_factory=PromptRenderFrame,
+    )
+
+    result = await phase.run(
+        PromptRenderInput(
+            session_key="dashboard:default",
+            channel="dashboard",
+            chat_id="default",
+            content="hello",
+            media=None,
+            timestamp=_now,
+            history=[],
+            skill_names=None,
+            retrieved_memory_block="",
+            disabled_sections=set(),
+            turn_injection_prompt="",
+        )
+    )
+
+    assert "Dashboard Chat Defaults" in str(result.messages[0]["content"])
+    assert "respond in English by default" in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_render_english_default_is_dashboard_only(tmp_path):
+    memory = SimpleNamespace(
+        read_self=lambda: "",
+        read_profile=lambda: "",
+        read_recent_context=lambda: "",
+        get_memory_context=lambda: "",
+    )
+    context = ContextBuilder(tmp_path, memory=cast(Any, memory))
+    phase = Phase(
+        default_prompt_render_modules(EventBus(), context),
+        frame_factory=PromptRenderFrame,
+    )
+
+    result = await phase.run(
+        PromptRenderInput(
+            session_key="telegram:123",
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            media=None,
+            timestamp=_now,
+            history=[],
+            skill_names=None,
+            retrieved_memory_block="",
+            disabled_sections=set(),
+            turn_injection_prompt="",
+        )
+    )
+
+    assert "Dashboard Chat Defaults" not in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
 async def test_prompt_render_chain_respects_disabled_sections(tmp_path):
     class BottomModule:
         slot = "test.prompt.bottom"

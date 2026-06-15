@@ -8,8 +8,9 @@ how that framework can power a **research-only biomedical evidence agent**:
 search papers, extract evidence, audit claims, and make every answer
 inspectable.
 
-Current biomedical baseline: **Release 1.6: Review Decision Loop**, with
-generic Dashboard Chat and run-centric Trace/Audit/Export workspaces.
+Current biomedical baseline: **Release 1.7: Graph Snapshot Lifecycle**, with
+generic Dashboard Chat, plugin-side Biomed workspace polish, and run-centric
+Trace/Audit/Export/Review workspaces.
 
 ## Highlights
 
@@ -19,9 +20,18 @@ generic Dashboard Chat and run-centric Trace/Audit/Export workspaces.
 - **Reviewable claims**: Evidence Graph v1 and Run Evidence Review turn each
   answer run into claim cards with support/refute/limitation links, reviewer
   decisions, trace, provenance, and graph hash.
+- **Immutable graph snapshots**: answer runs can be backfilled into persisted
+  Evidence Graph snapshots, stale snapshots are detected from newer audits,
+  snapshot diffs are inspectable, and risky graph states are captured in the
+  project review queue.
+- **Codex-style Biomed workspace**: the plugin is organized around Chat, Runs,
+  Review Queue, Library, and Settings. Runs are the main inspector surface for
+  review, diff, trace, evidence packet, audit, logic, argument, math, and
+  provenance artifacts.
 - **Framework-native Dashboard Chat**: chat runs through the shared `dashboard`
   channel, agent loop, session history, event stream, and tool hooks; biomedical
-  policy stays in the plugin.
+  policy stays in the plugin. Dashboard chat replies default to English unless
+  the user asks for another language.
 - **Research-only safety**: clinical or patient-specific prompts are refused
   before memory, retrieval, LLM calls, export, or provenance work.
 - **Toolized workflow**: retrieval, batch extraction, gap analysis, packet
@@ -40,8 +50,10 @@ uv run python main.py dashboard
 ```
 
 Open `http://127.0.0.1:2236` and select **Biomedical Evidence**. The panel is
-review-first: ask a question, inspect the answer run, review claim support,
-trace the evidence packet, and export redacted provenance when needed.
+organized as Chat, Runs, Review Queue, Library, and Settings. Use Runs as the
+main workbench: create or open an answer run, inspect review/snapshot status,
+compare graph snapshots, trace the evidence packet, audit claim support, and
+export redacted provenance when needed.
 
 Try:
 

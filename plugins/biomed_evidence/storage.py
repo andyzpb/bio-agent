@@ -414,6 +414,42 @@ class BiomedStorage:
             ).fetchone()
         return _evidence_graph_snapshot_from_row(row)
 
+    def list_evidence_graph_snapshots(
+        self,
+        run_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[EvidenceGraphSnapshotRecord], int]:
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM biomed_evidence_graph_snapshots
+                    WHERE run_id=?
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                """
+                SELECT snapshot_id, run_id, audit_id, schema_version, graph_id,
+                       graph_json, graph_hash, validation_json, source_ids_json,
+                       created_at
+                FROM biomed_evidence_graph_snapshots
+                WHERE run_id=?
+                ORDER BY created_at DESC, snapshot_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (run_id, _safe_size(page_size), _offset(page, page_size)),
+            ).fetchall()
+        return [
+            snapshot
+            for snapshot in (_evidence_graph_snapshot_from_row(row) for row in rows)
+            if snapshot is not None
+        ], total
+
     def save_run_review_decision(
         self,
         decision: RunReviewDecision,

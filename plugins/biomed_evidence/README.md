@@ -300,7 +300,20 @@ Legacy runs without snapshots can be backfilled with:
 
 ```text
 POST /api/biomed/answer-runs/{run_id}/evidence-review/snapshot
+POST /api/biomed/evidence-graph/snapshots/backfill
 ```
+
+Snapshot rows are immutable. Review responses derive `snapshot.stale` when a
+newer citation audit exists than the latest persisted graph snapshot. Snapshot
+diffs are available at:
+
+```text
+GET /api/biomed/answer-runs/{run_id}/evidence-review/snapshot-diff
+```
+
+Invalid or stale graph situations are captured in the project review queue only
+when the answer run has a valid `project_id`. Runs without project scope keep
+the warning run-local.
 
 Review access and decision loop:
 
@@ -327,22 +340,16 @@ uv run python main.py dashboard
 
 Open `http://127.0.0.1:2236` and choose `Biomedical Evidence`.
 
-The panel is review-first and uses a Codex-style workspace shell:
+The panel uses a quieter Codex-style workspace shell:
 
-- Review: default entry point for answer-run evidence QA. It loads recent runs,
-  snapshot status, graph validation, claim cards, support reasons, evidence
-  cards, paper IDs, audit action, and links to trace/provenance/export.
-- Run: template-first workflow runner for citation-grounded biomedical research
-  answers, optional LLM stages, support/refute retrieval, and project context.
-- Projects: create project workspaces, record saved/rejected/needs-review paper
-  decisions, record project claims, inspect review queue items, and generate
-  evidence briefs.
-- Watch: create, update, check, and review research-watch topics, snapshots,
-  and push/skip decisions.
-- Advanced: raw evidence browser, typed Evidence Graph v1 explorer, run-centric
-  citation/logic Audit, run-centric Trace/Export, related/directed path lookup,
-  and redacted JSON export.
-- Boundary: research-only operating boundary, clinical refusal behavior,
+- Chat: framework Dashboard Chat session access from the biomed workspace.
+- Runs: template-first workflow runner and main run inspector. Review,
+  snapshot diff, trace, evidence packet, audit, logic, argument, math, and
+  provenance views live in the selected run inspector.
+- Review Queue: project workspaces, saved/rejected/needs-review paper
+  decisions, project claims, queue items, and evidence briefs.
+- Library: project context, Research Watch, evidence records, and graph lookup.
+- Settings: research-only operating boundary, clinical refusal behavior,
   memory-as-context policy, and retrieval limitations.
 
 Trace/Export and Audit now start from recent answer runs. Reviewers can load a

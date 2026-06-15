@@ -532,6 +532,28 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "validation": snapshot.validation,
         }
 
+    @app.post("/api/biomed/evidence-graph/snapshots/backfill")
+    def backfill_evidence_graph_snapshots(limit: int = 100) -> dict[str, Any]:
+        return service.backfill_evidence_graph_snapshots(limit=limit)
+
+    @app.get("/api/biomed/answer-runs/{run_id}/evidence-review/snapshot-diff")
+    def get_answer_evidence_review_snapshot_diff(
+        run_id: str,
+        base_snapshot_id: str = "",
+        compare_snapshot_id: str = "",
+    ) -> dict[str, Any]:
+        result = service.get_evidence_graph_snapshot_diff(
+            run_id,
+            base_snapshot_id=base_snapshot_id,
+            compare_snapshot_id=compare_snapshot_id,
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return result
+
     @app.get("/api/biomed/answer-runs/{run_id}/evidence-review/decisions")
     def list_answer_evidence_review_decisions(
         run_id: str,

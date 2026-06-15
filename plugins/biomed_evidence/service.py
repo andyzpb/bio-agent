@@ -3275,6 +3275,62 @@ class BiomedEvidenceService:
                 )
             )
 
+    def _capture_snapshot_review_queue(
+        self,
+        *,
+        run: AnswerWithEvidenceResult,
+        snapshot: EvidenceGraphSnapshotMetadata,
+        validation: dict[str, Any],
+        summary: RunEvidenceReviewSummary,
+    ) -> None:
+        if not run.project_id or self.storage.get_project(run.project_id) is None:
+            return
+        if summary.clinical_refusal:
+            return
+        now = _now_iso()
+        if snapshot.stale:
+            self.storage.upsert_project_review_item(
+                ProjectReviewQueueItem(
+                    item_id=f"biomed-proj-review-{uuid.uuid4().hex[:12]}",
+                    project_id=run.project_id,
+                    item_type="snapshot_stale",
+                    title=f"Stale evidence graph snapshot for {run.run_id}",
+                    reason="; ".join(snapshot.stale_reasons)
+                    or "Latest evidence graph snapshot is stale.",
+                    risk_level="medium",
+                    run_id=run.run_id,
+                    evidence_id=None,
+                    audit_id=snapshot.latest_audit_id or snapshot.audit_id,
+                    verifier_id=None,
+                    created_at=now,
+                )
+            )
+        issues = list(validation.get("errors") or []) + list(
+            validation.get("warnings") or []
+        )
+        for issue in issues[:10]:
+            if isinstance(issue, dict):
+                code = str(issue.get("code") or "graph_validation_issue")
+                message = str(issue.get("message") or code)
+            else:
+                code = "graph_validation_issue"
+                message = str(issue)
+            self.storage.upsert_project_review_item(
+                ProjectReviewQueueItem(
+                    item_id=f"biomed-proj-review-{uuid.uuid4().hex[:12]}",
+                    project_id=run.project_id,
+                    item_type="graph_validation_issue",
+                    title=code,
+                    reason=message,
+                    risk_level="high" if validation.get("ok") is False else "medium",
+                    run_id=run.run_id,
+                    evidence_id=None,
+                    audit_id=snapshot.audit_id,
+                    verifier_id=None,
+                    created_at=now,
+                )
+            )
+
     async def _llm_advisory_verifier_or_fallback(
         self,
         *,
@@ -3879,6 +3935,89 @@ class BiomedEvidenceService:
     ) -> EvidenceGraphSnapshotRecord | None:
         return self.storage.get_latest_evidence_graph_snapshot(run_id.strip())
 
+    def backfill_evidence_graph_snapshots(
+        self,
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        page_size = max(1, min(limit, 500))
+        runs, _ = self.storage.list_answer_runs(page=1, page_size=page_size)
+        created: list[str] = []
+        skipped: list[str] = []
+        errors: list[dict[str, str]] = []
+        for item in runs:
+            run_id = str(item.get("run_id") or "").strip()
+            if not run_id:
+                continue
+            if self.storage.get_latest_evidence_graph_snapshot(run_id) is not None:
+                skipped.append(run_id)
+                continue
+            try:
+                snapshot = self.create_evidence_graph_snapshot(run_id)
+            except Exception as exc:
+                errors.append({"run_id": run_id, "error": str(exc)})
+                continue
+            if snapshot is None:
+                errors.append({"run_id": run_id, "error": "answer run not found"})
+            else:
+                if not snapshot.snapshot_id:
+                    errors.append({"run_id": run_id, "error": "snapshot id missing"})
+                    continue
+                created.append(snapshot.snapshot_id)
+        return {
+            "created_count": len(created),
+            "skipped_count": len(skipped),
+            "error_count": len(errors),
+            "created_snapshot_ids": created,
+            "skipped_run_ids": skipped,
+            "errors": errors,
+        }
+
+    def get_evidence_graph_snapshot_diff(
+        self,
+        run_id: str,
+        *,
+        base_snapshot_id: str = "",
+        compare_snapshot_id: str = "",
+    ) -> dict[str, Any] | None:
+        clean_run_id = run_id.strip()
+        if self.storage.get_answer_run(clean_run_id) is None:
+            return None
+        if base_snapshot_id and compare_snapshot_id:
+            base = self.storage.get_evidence_graph_snapshot(base_snapshot_id.strip())
+            compare = self.storage.get_evidence_graph_snapshot(
+                compare_snapshot_id.strip()
+            )
+        else:
+            snapshots, _ = self.storage.list_evidence_graph_snapshots(
+                clean_run_id,
+                page=1,
+                page_size=2,
+            )
+            compare = snapshots[0] if snapshots else None
+            base = snapshots[1] if len(snapshots) > 1 else None
+        if base is None or compare is None:
+            return {
+                "run_id": clean_run_id,
+                "available": False,
+                "reason": "At least two snapshots are required for a diff.",
+                "base_snapshot_id": base.snapshot_id if base is not None else None,
+                "compare_snapshot_id": (
+                    compare.snapshot_id if compare is not None else None
+                ),
+                "changes": {},
+            }
+        if base.run_id != clean_run_id or compare.run_id != clean_run_id:
+            return {
+                "run_id": clean_run_id,
+                "available": False,
+                "reason": "Snapshot ids must belong to the requested run.",
+                "base_snapshot_id": base.snapshot_id,
+                "compare_snapshot_id": compare.snapshot_id,
+                "changes": {},
+            }
+        return _snapshot_diff(base, compare)
+
     def get_run_evidence_review(
         self,
         run_id: str,
@@ -3891,11 +4030,23 @@ class BiomedEvidenceService:
             return None
         audit = self.storage.get_latest_citation_audit_for_run(clean_run_id)
         snapshot_record = self.storage.get_latest_evidence_graph_snapshot(clean_run_id)
+        snapshots, _ = self.storage.list_evidence_graph_snapshots(
+            clean_run_id,
+            page=1,
+            page_size=2,
+        )
+        previous_snapshot = snapshots[1] if len(snapshots) > 1 else None
         warnings: list[str] = []
         if snapshot_record is not None:
             graph_json = snapshot_record.graph
             validation_json = snapshot_record.validation
-            snapshot_meta = _snapshot_metadata(snapshot_record)
+            snapshot_meta = _snapshot_metadata(
+                snapshot_record,
+                latest_audit=audit,
+                previous_snapshot=previous_snapshot,
+            )
+            if snapshot_meta.stale:
+                warnings.extend(snapshot_meta.stale_reasons)
         else:
             graph = self.get_graph_v1(run_id=clean_run_id, validate=True)
             if graph is None:
@@ -3914,6 +4065,7 @@ class BiomedEvidenceService:
                 source_ids=_evidence_graph_source_ids(graph_json),
                 created_at=None,
                 snapshot_required=True,
+                latest_audit_id=audit.audit_id if audit is not None else None,
             )
             warnings.append(
                 "No persisted evidence graph snapshot exists; review was derived "
@@ -3941,6 +4093,12 @@ class BiomedEvidenceService:
             validation=validation_json,
             audit=audit,
             latest_decisions=latest_decisions,
+        )
+        self._capture_snapshot_review_queue(
+            run=run,
+            snapshot=snapshot_meta,
+            validation=validation_json,
+            summary=summary,
         )
         return RunEvidenceReview(
             schema_version=EVIDENCE_REVIEW_SCHEMA_VERSION,
@@ -8189,7 +8347,26 @@ def _add_source_id(
 
 def _snapshot_metadata(
     snapshot: EvidenceGraphSnapshotRecord,
+    *,
+    latest_audit: CitationAuditResult | None = None,
+    previous_snapshot: EvidenceGraphSnapshotRecord | None = None,
 ) -> EvidenceGraphSnapshotMetadata:
+    stale_reasons: list[str] = []
+    if (
+        latest_audit is not None
+        and snapshot.audit_id != latest_audit.audit_id
+    ):
+        stale_reasons.append(
+            "A newer citation audit exists than the persisted evidence graph snapshot."
+        )
+    elif (
+        latest_audit is not None
+        and snapshot.created_at
+        and latest_audit.created_at > snapshot.created_at
+    ):
+        stale_reasons.append(
+            "The latest citation audit was created after the persisted snapshot."
+        )
     return EvidenceGraphSnapshotMetadata(
         status=snapshot.status,
         snapshot_id=snapshot.snapshot_id,
@@ -8201,7 +8378,102 @@ def _snapshot_metadata(
         source_ids=snapshot.source_ids,
         created_at=snapshot.created_at,
         snapshot_required=False,
+        stale=bool(stale_reasons),
+        stale_reasons=stale_reasons,
+        latest_audit_id=latest_audit.audit_id if latest_audit is not None else None,
+        previous_snapshot_id=(
+            previous_snapshot.snapshot_id if previous_snapshot is not None else None
+        ),
     )
+
+
+def _snapshot_diff(
+    base: EvidenceGraphSnapshotRecord,
+    compare: EvidenceGraphSnapshotRecord,
+) -> dict[str, Any]:
+    base_claims = _snapshot_claims(base.graph)
+    compare_claims = _snapshot_claims(compare.graph)
+    base_evidence = _snapshot_node_ids(base.graph, "EvidenceSpan")
+    compare_evidence = _snapshot_node_ids(compare.graph, "EvidenceSpan")
+    base_papers = _snapshot_node_ids(base.graph, "Paper")
+    compare_papers = _snapshot_node_ids(compare.graph, "Paper")
+    base_validation = _validation_issue_codes(base.validation)
+    compare_validation = _validation_issue_codes(compare.validation)
+    changed_claims = []
+    for claim_id in sorted(set(base_claims) & set(compare_claims)):
+        if base_claims[claim_id] != compare_claims[claim_id]:
+            changed_claims.append(
+                {
+                    "claim_node_id": claim_id,
+                    "before": base_claims[claim_id],
+                    "after": compare_claims[claim_id],
+                }
+            )
+    return {
+        "run_id": compare.run_id,
+        "available": True,
+        "base_snapshot_id": base.snapshot_id,
+        "compare_snapshot_id": compare.snapshot_id,
+        "base_audit_id": base.audit_id,
+        "compare_audit_id": compare.audit_id,
+        "changes": {
+            "claims_added": sorted(set(compare_claims) - set(base_claims)),
+            "claims_removed": sorted(set(base_claims) - set(compare_claims)),
+            "claims_changed": changed_claims,
+            "evidence_added": sorted(compare_evidence - base_evidence),
+            "evidence_removed": sorted(base_evidence - compare_evidence),
+            "papers_added": sorted(compare_papers - base_papers),
+            "papers_removed": sorted(base_papers - compare_papers),
+            "validation_added": sorted(compare_validation - base_validation),
+            "validation_removed": sorted(base_validation - compare_validation),
+        },
+    }
+
+
+def _snapshot_node_ids(graph: dict[str, Any], node_type: str) -> set[str]:
+    return {
+        str(node.get("id"))
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+        and str(node.get("type") or "") == node_type
+        and node.get("id")
+    }
+
+
+def _snapshot_claims(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    evidence_by_claim: dict[str, set[str]] = {}
+    for edge in graph.get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if source.startswith("evidence:") and target.startswith("claim:"):
+            evidence_by_claim.setdefault(target, set()).add(source)
+    claims: dict[str, dict[str, Any]] = {}
+    for node in graph.get("nodes", []):
+        if not isinstance(node, dict) or str(node.get("type") or "") != "Claim":
+            continue
+        node_id = str(node.get("id") or "")
+        if not node_id:
+            continue
+        properties = cast(dict[str, Any], node.get("properties") or {})
+        claims[node_id] = {
+            "label": str(node.get("label") or properties.get("claim_text") or ""),
+            "support_status": properties.get("support_status"),
+            "evidence_ids": sorted(evidence_by_claim.get(node_id, set())),
+        }
+    return claims
+
+
+def _validation_issue_codes(validation: dict[str, Any]) -> set[str]:
+    codes: set[str] = set()
+    for key in ("errors", "warnings"):
+        for item in validation.get(key) or []:
+            if isinstance(item, dict):
+                codes.add(str(item.get("code") or item.get("message") or item))
+            else:
+                codes.add(str(item))
+    return codes
 
 
 def _review_claims_from_graph(

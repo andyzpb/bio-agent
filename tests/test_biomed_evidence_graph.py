@@ -20,6 +20,7 @@ from plugins.biomed_evidence.graph.schema import (
 )
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
+    BiomedProjectCreateRequest,
     BiomedicalEntity,
     Citation,
     CitationAuditRequest,
@@ -27,6 +28,63 @@ from plugins.biomed_evidence.schemas import (
     RetrievalManifest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
+
+
+def _snapshot_evidence(
+    *,
+    evidence_id: str = "ev-snapshot-1",
+    paper_id: str = "PMID:42",
+    claim: str = "Microglial activation is associated with disease progression.",
+) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id=evidence_id,
+        paper_id=paper_id,
+        claim=claim,
+        finding="The abstract reports microglial activation in progression.",
+        evidence_direction="supports",
+        entities=[
+            BiomedicalEntity(
+                name="microglial activation",
+                entity_type="cell_type",
+            )
+        ],
+        methods=["single-cell RNA-seq"],
+        limitations=["Abstract-only extraction."],
+        confidence="medium",
+        evidence_span="The abstract reports microglial activation in progression.",
+    )
+
+
+def _snapshot_answer_run(
+    *,
+    run_id: str = "run-snapshot",
+    project_id: str | None = None,
+    evidence: list[EvidenceItem] | None = None,
+) -> AnswerWithEvidenceResult:
+    active_evidence = evidence or [_snapshot_evidence()]
+    citations = [
+        Citation(
+            paper_id=item.paper_id,
+            title=f"Paper {item.paper_id}",
+            source="mock",
+            cited_claim=item.claim,
+        )
+        for item in active_evidence
+    ]
+    return AnswerWithEvidenceResult(
+        run_id=run_id,
+        project_id=project_id,
+        retrieval_id=f"ret-{run_id}",
+        answer=(
+            "Microglial activation is associated with disease progression "
+            "[PMID:42]."
+        ),
+        citations=citations,
+        evidence_summary=active_evidence,
+        limitations=["Abstract-only extraction."],
+        uncertainty_level="medium",
+        disclaimer="Research support only.",
+    )
 
 
 def test_graph_ids_are_stable_and_normalized() -> None:
@@ -521,5 +579,192 @@ def test_snapshot_storage_contract_is_deterministic_and_immutable(tmp_path) -> N
             first.snapshot_id,
             audited_snapshot.snapshot_id,
         ]
+    finally:
+        service.close()
+
+
+def test_snapshot_backfill_is_idempotent_for_legacy_runs(tmp_path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    run = _snapshot_answer_run(run_id="run-backfill")
+    try:
+        service.storage.save_answer_run(run, question="Backfill this run")
+
+        first = service.backfill_evidence_graph_snapshots()
+        second = service.backfill_evidence_graph_snapshots()
+
+        snapshots, total = service.storage.list_evidence_graph_snapshots(run.run_id)
+        assert first["created_count"] == 1
+        assert first["created_snapshot_ids"] == [snapshots[0].snapshot_id]
+        assert second["created_count"] == 0
+        assert second["skipped_run_ids"] == [run.run_id]
+        assert total == 1
+    finally:
+        service.close()
+
+
+def test_snapshot_stale_state_is_derived_from_newer_audit(tmp_path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    project = service.create_project(
+        BiomedProjectCreateRequest(
+            name="Snapshot lifecycle",
+            research_question="How should snapshots be reviewed?",
+        )
+    )
+    run = _snapshot_answer_run(run_id="run-stale", project_id=project.project_id)
+    try:
+        service.storage.save_answer_run(run, question="Review stale state")
+        snapshot = service.create_evidence_graph_snapshot(run.run_id)
+        assert snapshot is not None
+        assert snapshot.audit_id is None
+
+        audit = service.audit_answer(
+            CitationAuditRequest(
+                answer=run.answer,
+                citations=run.citations,
+                evidence_items=run.evidence_summary,
+                run_id=run.run_id,
+                retrieval_id=run.retrieval_id,
+                observed_uncertainty=run.uncertainty_level,
+            )
+        )
+        review = service.get_run_evidence_review(run.run_id)
+        assert review is not None
+        assert review.snapshot.snapshot_id == snapshot.snapshot_id
+        assert review.snapshot.stale is True
+        assert review.snapshot.latest_audit_id == audit.audit_id
+        assert "newer citation audit" in " ".join(review.snapshot.stale_reasons)
+
+        queue_items, total = service.storage.list_project_review_queue(
+            project.project_id
+        )
+        assert total == 1
+        assert queue_items[0].item_type == "snapshot_stale"
+
+        service.get_run_evidence_review(run.run_id)
+        _, total_after_reload = service.storage.list_project_review_queue(
+            project.project_id
+        )
+        assert total_after_reload == 1
+    finally:
+        service.close()
+
+
+def test_snapshot_diff_reports_added_evidence_and_papers(tmp_path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    run = _snapshot_answer_run(run_id="run-diff")
+    try:
+        service.storage.save_answer_run(run, question="Diff this run")
+        base = service.create_evidence_graph_snapshot(run.run_id)
+        assert base is not None
+
+        expanded_run = run.model_copy(
+            update={
+                "citations": [
+                    *run.citations,
+                    Citation(
+                        paper_id="PMID:84",
+                        title="Paper PMID:84",
+                        source="mock",
+                        cited_claim=run.evidence_summary[0].claim,
+                    ),
+                ],
+                "evidence_summary": [
+                    *run.evidence_summary,
+                    _snapshot_evidence(
+                        evidence_id="ev-snapshot-2",
+                        paper_id="PMID:84",
+                        claim=run.evidence_summary[0].claim,
+                    ),
+                ],
+            }
+        )
+        service.storage.save_answer_run(expanded_run, question="Diff this run")
+        compare = service.create_evidence_graph_snapshot(run.run_id, force=True)
+        assert compare is not None
+        assert compare.snapshot_id != base.snapshot_id
+
+        diff = service.get_evidence_graph_snapshot_diff(run.run_id)
+
+        assert diff is not None
+        assert diff["available"] is True
+        assert diff["base_snapshot_id"] == base.snapshot_id
+        assert diff["compare_snapshot_id"] == compare.snapshot_id
+        assert "evidence:ev-snapshot-2" in diff["changes"]["evidence_added"]
+        assert "paper:PMID:84" in diff["changes"]["papers_added"]
+    finally:
+        service.close()
+
+
+def test_snapshot_review_queue_requires_project_scope(tmp_path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    project = service.create_project(
+        BiomedProjectCreateRequest(
+            name="Project scope",
+            research_question="Queue scope",
+        )
+    )
+    run = _snapshot_answer_run(run_id="run-no-project")
+    try:
+        service.storage.save_answer_run(run, question="No project queue")
+        assert service.create_evidence_graph_snapshot(run.run_id) is not None
+        service.audit_answer(
+            CitationAuditRequest(
+                answer=run.answer,
+                citations=run.citations,
+                evidence_items=run.evidence_summary,
+                run_id=run.run_id,
+                retrieval_id=run.retrieval_id,
+                observed_uncertainty=run.uncertainty_level,
+            )
+        )
+
+        review = service.get_run_evidence_review(run.run_id)
+        queue_items, total = service.storage.list_project_review_queue(
+            project.project_id
+        )
+
+        assert review is not None
+        assert review.snapshot.stale is True
+        assert queue_items == []
+        assert total == 0
+    finally:
+        service.close()
+
+
+def test_clinical_refusal_review_does_not_capture_graph_queue_items(tmp_path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    project = service.create_project(
+        BiomedProjectCreateRequest(
+            name="Clinical boundary",
+            research_question="Boundary",
+        )
+    )
+    run = AnswerWithEvidenceResult(
+        run_id="run-clinical-queue",
+        project_id=project.project_id,
+        answer=(
+            "This system is intended for biomedical research support only.\n\n"
+            "I cannot help diagnose a patient or recommend treatment."
+        ),
+        citations=[],
+        evidence_summary=[],
+        conflicting_evidence=[],
+        limitations=["Clinical boundary."],
+        uncertainty_level="high",
+        disclaimer="Research support only.",
+    )
+    try:
+        service.storage.save_answer_run(run, question="Should I change treatment?")
+        assert service.create_evidence_graph_snapshot(run.run_id) is not None
+
+        review = service.get_run_evidence_review(run.run_id)
+        queue_items, total = service.storage.list_project_review_queue(
+            project.project_id
+        )
+
+        assert review is not None
+        assert review.summary.clinical_refusal is True
+        assert queue_items == []
+        assert total == 0
     finally:
         service.close()

@@ -33,6 +33,12 @@ _RESULT_SLOT = "prompt:result"
 _SECTION_TOP_PREFIX = "prompt:section_top:"
 _SECTION_BOTTOM_PREFIX = "prompt:section_bottom:"
 _EXTRA_HINT_PREFIX = "prompt:extra_hint:"
+_DASHBOARD_CHAT_SECTION = "dashboard_chat_defaults"
+_DASHBOARD_CHAT_DEFAULTS = (
+    "# Dashboard Chat Defaults\n\n"
+    "For Dashboard Chat turns, respond in English by default. If the user "
+    "explicitly asks for another language, use the requested language."
+)
 
 
 class _BuildPromptRenderCtxModule:
@@ -133,6 +139,25 @@ class _CollectPromptExportSlotsModule:
         return frame
 
 
+class _DashboardChatDefaultsModule:
+    slot = "prompt_render.dashboard_chat_defaults"
+    requires = ("prompt_render.collect_exports", _CTX_SLOT)
+    produces = (_CTX_SLOT,)
+
+    async def run(self, frame: PromptRenderFrame) -> PromptRenderFrame:
+        ctx = cast(PromptRenderCtx, frame.slots[_CTX_SLOT])
+        if ctx.channel != "dashboard":
+            return frame
+        ctx.system_sections_bottom.append(
+            PromptSectionRender(
+                name=_DASHBOARD_CHAT_SECTION,
+                content=_DASHBOARD_CHAT_DEFAULTS,
+                is_static=True,
+            )
+        )
+        return frame
+
+
 class _ReturnPromptRenderResultModule:
     slot = "prompt_render.return"
     requires = ("prompt_render.render", _RESULT_SLOT)
@@ -151,6 +176,7 @@ def default_prompt_render_modules(
         _BuildPromptRenderCtxModule(),
         _EmitPromptRenderCtxModule(bus),
         _CollectPromptExportSlotsModule(),
+        _DashboardChatDefaultsModule(),
         _RenderPromptModule(context),
         _ReturnPromptRenderResultModule(),
     ]

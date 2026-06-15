@@ -269,7 +269,12 @@ aggregates:
 
 Legacy runs can still be reviewed. If no persisted snapshot exists, the review
 endpoint returns a derived review with `snapshot.status=missing`; the dashboard
-then calls the snapshot backfill route and reloads the review.
+then calls the run snapshot route and reloads the review. Release 1.7 also adds
+bulk legacy backfill, immutable snapshot diffs, and derived stale-state
+detection when a newer citation audit exists than the latest persisted
+snapshot. Stale or invalid graph states are captured as project review queue
+items only for answer runs with a valid `project_id`; unscoped runs keep the
+warning on the run review.
 
 Review validation is a UI and evaluation gate. It surfaces structural evidence
 failures to reviewers and release metrics, but it does not convert graph

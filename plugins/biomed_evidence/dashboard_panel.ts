@@ -1,16 +1,16 @@
 /// <reference path="../../types/akashic-dashboard.d.ts" />
 
-type BiomedView = "ask" | "projects" | "evidence" | "graph" | "review" | "watch" | "audit" | "trace" | "responsible" | "advanced";
+type BiomedView = "chat" | "runs" | "queue" | "library" | "settings";
+type LegacyBiomedView = "ask" | "projects" | "evidence" | "graph" | "review" | "watch" | "audit" | "trace" | "responsible" | "advanced";
 
 let biomedWorkflowTemplates: SavedToolChainTemplate[] = [];
 
 const BIOMED_VIEW_ITEMS: { id: BiomedView; label: string; description: string }[] = [
-  { id: "review", label: "Review", description: "evidence QA" },
-  { id: "ask", label: "Run", description: "workflow" },
-  { id: "projects", label: "Projects", description: "memory" },
-  { id: "watch", label: "Watch", description: "monitoring" },
-  { id: "advanced", label: "Advanced", description: "graph · audit · trace" },
-  { id: "responsible", label: "Boundary", description: "policy" },
+  { id: "chat", label: "Chat", description: "agent console" },
+  { id: "runs", label: "Runs", description: "workspace" },
+  { id: "queue", label: "Review Queue", description: "triage" },
+  { id: "library", label: "Library", description: "papers · watch" },
+  { id: "settings", label: "Settings", description: "boundary" },
 ];
 
 interface EvidenceRow {
@@ -672,6 +672,21 @@ interface EvidenceGraphSnapshotMetadata {
   source_ids: Record<string, unknown>;
   created_at?: string | null;
   snapshot_required: boolean;
+  stale?: boolean;
+  stale_reasons?: string[];
+  latest_audit_id?: string | null;
+  previous_snapshot_id?: string | null;
+}
+
+interface EvidenceGraphSnapshotDiff {
+  run_id: string;
+  available: boolean;
+  reason?: string;
+  base_snapshot_id?: string | null;
+  compare_snapshot_id?: string | null;
+  base_audit_id?: string | null;
+  compare_audit_id?: string | null;
+  changes: Record<string, unknown>;
 }
 
 interface RunEvidenceReviewSummary {
@@ -807,23 +822,27 @@ interface ProjectEvidenceBrief {
   created_at: string;
 }
 
+interface DashboardChatMessage {
+  id: string;
+  session_key: string;
+  seq: number;
+  role: string;
+  content: string;
+  ts: string;
+}
+
 function viewFromDispatch(dispatch?: PluginDispatch): BiomedView {
   const value = dispatch?.filters["_view"];
-  if (
-    value === "ask"
-    || value === "projects"
-    || value === "graph"
-    || value === "review"
-    || value === "watch"
-    || value === "audit"
-    || value === "trace"
-    || value === "responsible"
-    || value === "evidence"
-    || value === "advanced"
-  ) {
+  if (value === "chat" || value === "runs" || value === "queue" || value === "library" || value === "settings") {
     return value;
   }
-  return "review";
+  const legacy = value as LegacyBiomedView | undefined;
+  if (legacy === "ask") return "chat";
+  if (legacy === "projects" || legacy === "review") return "queue";
+  if (legacy === "evidence" || legacy === "graph" || legacy === "watch" || legacy === "advanced") return "library";
+  if (legacy === "audit" || legacy === "trace") return "runs";
+  if (legacy === "responsible") return "settings";
+  return "chat";
 }
 
 function pill(value: string): string {
@@ -1899,6 +1918,8 @@ function renderWorkspaceRunSummary(context: WorkspaceRunContext): string {
 function renderInspectorTabs(active: string): string {
   const tabs = [
     ["overview", "Overview"],
+    ["review", "Review"],
+    ["diff", "Diff"],
     ["trace", "Trace"],
     ["evidence", "Evidence"],
     ["audit", "Audit"],
@@ -1934,6 +1955,72 @@ function renderLogicFactsPanel(audit: CitationAuditResult | null): string {
       ${renderLogicAudit(item.logic_audit)}
     </div>
   `).join("");
+}
+
+function renderInspectorEvidenceReview(review: RunEvidenceReview): string {
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Snapshot Review</div>
+      <div class="biomed-mini-grid">
+        <div><span>Snapshot</span><strong>${escapeHtml(review.snapshot.status)}</strong></div>
+        <div><span>Stale</span><strong>${review.snapshot.stale ? "yes" : "no"}</strong></div>
+        <div><span>Claims</span><strong>${review.summary.total_claims}</strong></div>
+        <div><span>Needs Review</span><strong>${review.claims.filter((claim) => claim.review_action !== "accept").length}</strong></div>
+        <div><span>Validation</span><strong>${review.summary.validation_ok ? "valid" : "invalid"}</strong></div>
+        <div><span>Audit</span><strong>${escapeHtml(review.summary.recommended_audit_action || "pending")}</strong></div>
+      </div>
+      ${review.snapshot.graph_hash ? `<div class="biomed-watch-meta">graph hash ${compactCode(review.snapshot.graph_hash)}</div>` : ""}
+      ${review.snapshot.previous_snapshot_id ? `<div class="biomed-watch-meta">previous snapshot ${compactCode(review.snapshot.previous_snapshot_id)}</div>` : ""}
+      ${review.snapshot.stale_reasons?.length ? `<div class="biomed-label">Stale Reasons</div>${renderList(review.snapshot.stale_reasons)}` : ""}
+      ${review.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(review.warnings)}` : ""}
+      ${renderGraphValidation(review.validation)}
+      <div class="biomed-label">Claims</div>
+      ${review.claims.map((claim) => `
+        <article class="biomed-review-claim-card ${claim.review_action !== "accept" ? "is-failed" : ""}">
+          <div class="biomed-review-claim-head">
+            ${pill(claim.review_action)}
+            ${pill(claim.support_status)}
+            ${claim.audit_verdict ? pill(claim.audit_verdict) : ""}
+          </div>
+          <h3>${escapeHtml(claim.claim_text)}</h3>
+          <div class="biomed-watch-meta">${claim.paper_ids.map(escapeHtml).join(" · ") || "no papers"}</div>
+          ${claim.support_status_reason ? `<p>${escapeHtml(claim.support_status_reason)}</p>` : ""}
+        </article>
+      `).join("") || '<div class="biomed-muted">No claims in this review.</div>'}
+    </div>
+  `;
+}
+
+function renderSnapshotDiff(diff: EvidenceGraphSnapshotDiff): string {
+  if (!diff.available) {
+    return `
+      <div class="biomed-inspector-stack">
+        <div class="biomed-label">Snapshot Diff</div>
+        <div class="biomed-muted">${escapeHtml(diff.reason || "No snapshot diff is available.")}</div>
+      </div>
+    `;
+  }
+  const entries = Object.entries(diff.changes || {});
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Snapshot Diff</div>
+      <div class="biomed-mini-grid">
+        <div><span>Base</span><strong>${escapeHtml(compactCode(diff.base_snapshot_id || "-"))}</strong></div>
+        <div><span>Compare</span><strong>${escapeHtml(compactCode(diff.compare_snapshot_id || "-"))}</strong></div>
+        <div><span>Base Audit</span><strong>${escapeHtml(compactCode(diff.base_audit_id || "-"))}</strong></div>
+        <div><span>Compare Audit</span><strong>${escapeHtml(compactCode(diff.compare_audit_id || "-"))}</strong></div>
+      </div>
+      ${entries.map(([key, value]) => {
+        const items = Array.isArray(value) ? value : [];
+        return `
+          <div class="biomed-audit-row">
+            <div class="biomed-audit-row-head">${pill(key)}<strong>${items.length}</strong></div>
+            ${items.length ? renderList(items.map((item) => typeof item === "string" ? item : JSON.stringify(item))) : '<div class="biomed-muted">No changes.</div>'}
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
 }
 
 async function loadWorkspaceTrace(runId: string): Promise<TracePayload> {
@@ -2016,6 +2103,12 @@ async function loadInspectorTab(
   try {
     if (tab === "overview") {
       content.innerHTML = renderInspectorOverview(context);
+    } else if (tab === "review") {
+      const review = await api<RunEvidenceReview>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`);
+      content.innerHTML = renderInspectorEvidenceReview(review);
+    } else if (tab === "diff") {
+      const diff = await api<EvidenceGraphSnapshotDiff>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/snapshot-diff`);
+      content.innerHTML = renderSnapshotDiff(diff);
     } else if (tab === "trace") {
       const trace = context.trace || await loadWorkspaceTrace(runId);
       context.trace = trace;
@@ -2322,30 +2415,163 @@ function renderBiomedWorkbenchPage(
   if (body) renderBody(body);
 }
 
+function renderBiomedChatWorkspace(container: HTMLElement): void {
+  container.innerHTML = `
+    <div class="biomed-chat-workspace">
+      <aside class="biomed-agent-rail">
+        <div class="biomed-agent-brand">
+          <div class="biomed-agent-mark">BE</div>
+          <div>
+            <div class="biomed-agent-title">Biomedical Evidence Agent</div>
+            <div class="biomed-agent-subtitle">Research-only chat context</div>
+          </div>
+        </div>
+        <div class="biomed-rail-section">
+          <div class="biomed-label">Session</div>
+          <input id="biomed-chat-session" class="biomed-rail-input" value="dashboard:biomed" />
+          <div class="biomed-rail-actions">
+            <button id="biomed-chat-load">Load</button>
+          </div>
+        </div>
+        <div class="biomed-rail-section">
+          <div class="biomed-label">Prompts</div>
+          <button class="biomed-run-link" data-biomed-chat-prompt="Summarize the current biomedical evidence workspace."><span>Workspace summary</span></button>
+          <button class="biomed-run-link" data-biomed-chat-prompt="What evidence-backed biomedical run should I inspect next?"><span>Next run to inspect</span></button>
+          <button class="biomed-run-link" data-biomed-chat-prompt="List unresolved biomedical review queue risks."><span>Queue risks</span></button>
+        </div>
+      </aside>
+      <main class="biomed-chat-main">
+        <div id="biomed-chat-history" class="biomed-chat-history">
+          <div class="biomed-empty-state">
+            <div class="biomed-empty-title">No messages loaded.</div>
+            <div class="biomed-empty-copy">Session history appears here after loading or sending a message.</div>
+          </div>
+        </div>
+        <form id="biomed-chat-form" class="biomed-chat-composer">
+          <textarea id="biomed-chat-input" rows="4" placeholder="Ask the agent about this biomedical workspace..."></textarea>
+          <button id="biomed-chat-send" class="biomed-primary-button" type="submit">Send</button>
+        </form>
+      </main>
+    </div>
+  `;
+
+  const sessionKey = (): string => (
+    container.querySelector<HTMLInputElement>("#biomed-chat-session")?.value.trim()
+    || "dashboard:biomed"
+  );
+  const renderHistory = (messages: DashboardChatMessage[]): string => (
+    messages.map((message) => `
+      <div class="biomed-chat-message ${message.role === "user" ? "is-user" : "is-agent"}">
+        <div class="biomed-chat-bubble">
+          <div class="biomed-watch-meta">${escapeHtml(message.role)} · #${message.seq}</div>
+          <div>${message.role === "assistant" ? renderMarkdown(message.content || "") : escapeHtml(message.content || "")}</div>
+        </div>
+      </div>
+    `).join("") || '<div class="biomed-muted">No messages in this session.</div>'
+  );
+  const loadHistory = async (): Promise<void> => {
+    const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+    if (!target) return;
+    target.innerHTML = renderLoading("Loading chat history...");
+    try {
+      const params = new URLSearchParams();
+      params.set("session_key", sessionKey());
+      params.set("page_size", "80");
+      const data = await api<{ items: DashboardChatMessage[] }>(`/api/dashboard/chat/history?${params.toString()}`);
+      target.innerHTML = renderHistory(data.items || []);
+      target.scrollTo({ top: target.scrollHeight });
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  };
+
+  container.querySelector<HTMLButtonElement>("#biomed-chat-load")?.addEventListener("click", () => {
+    void loadHistory();
+  });
+  container.querySelectorAll<HTMLButtonElement>("[data-biomed-chat-prompt]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const input = container.querySelector<HTMLTextAreaElement>("#biomed-chat-input");
+      if (input) input.value = button.dataset.biomedChatPrompt || "";
+    });
+  });
+  container.querySelector<HTMLFormElement>("#biomed-chat-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = container.querySelector<HTMLTextAreaElement>("#biomed-chat-input");
+    const send = container.querySelector<HTMLButtonElement>("#biomed-chat-send");
+    const content = input?.value.trim() || "";
+    if (!content) return;
+    if (send) send.disabled = true;
+    try {
+      await api("/api/dashboard/chat/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_key: sessionKey(), content }),
+      });
+      if (input) input.value = "";
+      await loadHistory();
+      window.setTimeout(() => void loadHistory(), 1400);
+    } catch (error) {
+      const target = container.querySelector<HTMLElement>("#biomed-chat-history");
+      if (target) target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    } finally {
+      if (send) send.disabled = false;
+    }
+  });
+  void loadHistory();
+}
+
+function renderLibrary(container: HTMLElement): void {
+  container.innerHTML = `
+    <div class="biomed-advanced-workspace">
+      <div class="biomed-advanced-switcher">
+        <button class="is-active" data-biomed-library="projects">Projects</button>
+        <button data-biomed-library="watch">Watch</button>
+        <button data-biomed-library="evidence">Evidence</button>
+        <button data-biomed-library="graph">Graph</button>
+      </div>
+      <div id="biomed-library-body"></div>
+    </div>
+  `;
+  const body = container.querySelector<HTMLElement>("#biomed-library-body");
+  const renderMode = (mode: string): void => {
+    container.querySelectorAll<HTMLButtonElement>("[data-biomed-library]").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.biomedLibrary === mode);
+    });
+    if (!body) return;
+    if (mode === "watch") {
+      renderWatch(body);
+    } else if (mode === "evidence") {
+      renderEvidenceBrowser(body);
+    } else if (mode === "graph") {
+      renderGraph(body);
+    } else {
+      renderProjects(body);
+    }
+  };
+  container.querySelectorAll<HTMLButtonElement>("[data-biomed-library]").forEach((button) => {
+    button.addEventListener("click", () => renderMode(button.dataset.biomedLibrary || "projects"));
+  });
+  renderMode("projects");
+}
+
 function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
   root.innerHTML = "";
-  if (view === "ask") {
+  if (view === "chat") {
+    renderBiomedChatWorkspace(root);
+    return;
+  }
+  if (view === "runs") {
     renderAskWorkspace(root);
     return;
   }
-  if (view === "graph") {
-    renderBiomedWorkbenchPage(root, "Evidence graph", "Inspect paper, entity, and claim relationships for a topic.", renderGraph);
-  } else if (view === "review") {
-    renderBiomedWorkbenchPage(root, "Run evidence review", "Review answer-run claims, evidence cards, validation, and snapshot status.", renderReview);
-  } else if (view === "advanced") {
-    renderBiomedWorkbenchPage(root, "Advanced tools", "Inspect raw graph, citation audit, trace, provenance, and evidence records.", renderAdvanced);
-  } else if (view === "projects") {
-    renderBiomedWorkbenchPage(root, "Projects", "Keep research context, saved papers, claims, and reviewer queues organized.", renderProjects);
-  } else if (view === "watch") {
-    renderBiomedWorkbenchPage(root, "Research watch", "Track topics and record source-backed relevance decisions.", renderWatch);
-  } else if (view === "audit") {
-    renderBiomedWorkbenchPage(root, "Citation and evidence audit", "Re-run claim-level checks against saved answer runs.", renderAudit);
-  } else if (view === "trace") {
-    renderBiomedWorkbenchPage(root, "Trace and exports", "Inspect tool-chain steps, provenance, packets, and one-way Obsidian exports.", renderTrace);
-  } else if (view === "responsible") {
+  if (view === "queue") {
+    renderBiomedWorkbenchPage(root, "Review Queue", "Triage project-scoped graph, audit, verifier, and reviewer risks.", renderProjects);
+  } else if (view === "library") {
+    renderBiomedWorkbenchPage(root, "Library", "Manage project context, research watch topics, evidence records, and graph lookup.", renderLibrary);
+  } else if (view === "settings") {
     renderBiomedWorkbenchPage(root, "Responsible AI boundary", "Review the research-only safety contract enforced before tool execution.", renderResponsible);
   } else {
-    renderBiomedWorkbenchPage(root, "Evidence browser", "Browse retrieved evidence items from the current biomedical store.", renderEvidenceBrowser);
+    renderBiomedChatWorkspace(root);
   }
 }
 
@@ -3729,7 +3955,7 @@ function attachDetailTabs(
 ): void {
   root.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
     button.addEventListener("click", () => {
-      const view = (button.dataset.biomedView || "ask") as BiomedView;
+      const view = (button.dataset.biomedView || "chat") as BiomedView;
       dispatch?.setFilter("_view", view);
       renderBiomedDetail(root, item, view, dispatch);
     });
@@ -3743,32 +3969,24 @@ function renderBiomedDetail(
   dispatch?: PluginDispatch,
 ): void {
   root.innerHTML = renderTabs(view);
-  if (item && view === "evidence") {
+  if (item && view === "library") {
     root.innerHTML += renderEvidenceDetail(item as unknown as EvidenceRow);
     attachDetailTabs(root, item, dispatch);
     void hydrateRetrievalBlocks(root);
     return;
   }
-  if (view === "graph") {
-    renderGraph(root);
-  } else if (view === "advanced") {
-    renderAdvanced(root);
-  } else if (view === "review") {
-    renderReview(root);
-  } else if (view === "projects") {
-    renderProjects(root);
-  } else if (view === "watch") {
-    renderWatch(root);
-  } else if (view === "audit") {
-    renderAudit(root);
-  } else if (view === "trace") {
-    renderTrace(root);
-  } else if (view === "responsible") {
-    renderResponsible(root);
-  } else if (view === "evidence") {
-    root.innerHTML += '<div class="biomed-section"><div class="biomed-title">Evidence Browser</div><div class="biomed-muted">Select an evidence row to inspect entities, methods, and limitations.</div></div>';
-  } else {
+  if (view === "chat") {
+    renderBiomedChatWorkspace(root);
+  } else if (view === "runs") {
     renderAskWorkspace(root);
+  } else if (view === "queue") {
+    renderProjects(root);
+  } else if (view === "library") {
+    renderLibrary(root);
+  } else if (view === "settings") {
+    renderResponsible(root);
+  } else {
+    renderBiomedChatWorkspace(root);
   }
   attachDetailTabs(root, item, dispatch);
 }
@@ -3834,7 +4052,7 @@ window.AkashicDashboard.registerPlugin({
     `;
     container.querySelectorAll<HTMLButtonElement>("[data-biomed-view]").forEach((button) => {
       button.addEventListener("click", () => {
-        dispatch.setFilter("_view", button.dataset.biomedView || "ask");
+        dispatch.setFilter("_view", button.dataset.biomedView || "chat");
         dispatch.activate();
       });
     });
