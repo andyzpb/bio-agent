@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class LLMConfig:
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-pro"
     light_model: str = ""
     max_iterations: int = 10
     max_tokens: int = 8192

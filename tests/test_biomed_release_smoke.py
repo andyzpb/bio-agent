@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from eval.biomed_evidence.run_release_smoke import (
     ReleaseSmokeRunner,
@@ -18,14 +19,14 @@ def test_release_smoke_runner_writes_artifact_bundle(tmp_path: Path) -> None:
         base_url="http://dashboard.test",
         transport=httpx.MockTransport(_dashboard_handler),
     )
-    ollama_client = httpx.Client(
-        base_url="http://ollama.test/v1",
-        transport=httpx.MockTransport(_ollama_handler),
+    deepseek_client = httpx.Client(
+        base_url="https://deepseek.test/v1",
+        transport=httpx.MockTransport(_deepseek_handler),
     )
     runner = ReleaseSmokeRunner(
         SmokeConfig(output_dir=tmp_path, source="pubmed"),
         dashboard_client=dashboard_client,
-        ollama_client=ollama_client,
+        deepseek_client=deepseek_client,
     )
 
     try:
@@ -45,6 +46,30 @@ def test_release_smoke_runner_writes_artifact_bundle(tmp_path: Path) -> None:
     assert all(item["passed"] for item in persisted_summary["checks"])
 
 
+def test_release_smoke_reports_missing_deepseek_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    dashboard_client = httpx.Client(
+        base_url="http://dashboard.test",
+        transport=httpx.MockTransport(_dashboard_handler),
+    )
+    runner = ReleaseSmokeRunner(
+        SmokeConfig(output_dir=tmp_path, source="pubmed"),
+        dashboard_client=dashboard_client,
+    )
+
+    try:
+        summary = runner.run()
+    finally:
+        runner.close()
+
+    assert summary["status"] == "failed"
+    assert summary["failure"]["category"] == "llm_unavailable"
+    assert summary["failure"]["step"] == "deepseek_auth"
+
+
 def test_release_smoke_redacts_secret_keys_and_query_values() -> None:
     payload = {
         "headers": {"Authorization": "Bearer secret", "x-api-key": "abc"},
@@ -60,9 +85,9 @@ def test_release_smoke_redacts_secret_keys_and_query_values() -> None:
     assert redacted["nested"][0]["token"] == "<redacted>"
 
 
-def _ollama_handler(request: httpx.Request) -> httpx.Response:
+def _deepseek_handler(request: httpx.Request) -> httpx.Response:
     if request.url.path == "/v1/models":
-        return httpx.Response(200, json={"data": [{"id": "gpt-oss:120b-cloud"}]})
+        return httpx.Response(200, json={"data": [{"id": "deepseek-v4-pro"}]})
     if request.url.path == "/v1/chat/completions":
         return httpx.Response(
             200,
@@ -207,18 +232,18 @@ def _audited_answer_payload() -> dict[str, Any]:
             "retrieval_bundle": {"records": [{"retrieval_id": "retrieval-smoke"}]},
             "query_plan": {
                 "planner_mode": "llm",
-                "llm_model": "gpt-oss:120b-cloud",
+                "llm_model": "deepseek-v4-pro",
             },
             "synthesis_mode": "llm",
-            "synthesis_model": "gpt-oss:120b-cloud",
+            "synthesis_model": "deepseek-v4-pro",
         },
         "advisory_verifier": {
             "verifier_mode": "llm",
-            "llm_model": "gpt-oss:120b-cloud",
+            "llm_model": "deepseek-v4-pro",
         },
         "revision": {
             "revision_mode": "llm",
-            "llm_model": "gpt-oss:120b-cloud",
+            "llm_model": "deepseek-v4-pro",
         },
         "trace": [{"step": "audit", "status": "completed"}],
     }

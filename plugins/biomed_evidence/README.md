@@ -480,10 +480,10 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/answer/audited" \
   }'
 ```
 
-For local Ollama Pro testing, configure the OpenAI-compatible base URL and run
-the same smoke with `gpt-oss:120b-cloud`. V2.5 should expose `logic_audit`,
-symbolic fact exports, parser mode/model/prompt provenance, and explainable
-fallback warnings if the provider-backed logic parser is unavailable or returns
-schema-invalid frames. Framework pre-tool behavior is covered by
+For local DeepSeek testing, set `DEEPSEEK_API_KEY` and run the same smoke with
+`deepseek-v4-pro`. V2.5 should expose `logic_audit`, symbolic fact exports,
+parser mode/model/prompt provenance, and explainable fallback warnings if the
+provider-backed logic parser is unavailable or returns schema-invalid frames.
+Framework pre-tool behavior is covered by
 `tests/test_biomed_framework_integration.py`; dashboard/API routes keep their
 existing explicit request flags.

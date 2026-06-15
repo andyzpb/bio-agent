@@ -7,7 +7,7 @@ SubAgent — 通用子 Agent
 用法示例：
     agent = SubAgent(
         provider=provider,
-        model="deepseek-chat",
+        model="deepseek-v4-pro",
         tools=[WebSearchTool(), WebFetchTool()],
         system_prompt="你是后台研究助手...",
     )

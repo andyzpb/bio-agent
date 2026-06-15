@@ -137,7 +137,7 @@ async def test_provider_chat_and_retry_paths(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr("agent.provider.AsyncOpenAI", lambda **_: fake)
     result = await LLMProvider(api_key="k", provider_name="deepseek").chat(
-        [], [], "deepseek-v4-flash", 1
+        [], [], "deepseek-v4-pro", 1
     )
     assert result.cache_prompt_tokens == 40
     assert result.cache_hit_tokens == 12

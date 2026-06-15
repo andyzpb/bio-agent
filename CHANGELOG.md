@@ -129,7 +129,7 @@ toolized evidence workflow on top of the Akashic plugin framework.
   agent handoff docs to describe the tool chain, safety boundary, release
   gates, and post-release hardening path.
 - Kept `mock` as the deterministic default source while preserving opt-in live
-  PubMed and Ollama/OpenAI-compatible smoke paths.
+  PubMed and DeepSeek/OpenAI-compatible smoke paths.
 
 ### Safety
 

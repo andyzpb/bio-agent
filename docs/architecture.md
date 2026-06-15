@@ -407,21 +407,21 @@ Evidence Graph JSON export, and release smoke artifacts.
 ## Release Smoke
 
 Release 1.1 adds a repeatable dashboard-level smoke runner for the live PubMed
-and Ollama path:
+and DeepSeek path:
 
 ```bash
 .venv/bin/python -m eval.biomed_evidence.run_release_smoke \
   --source pubmed \
-  --ollama-model gpt-oss:120b-cloud \
+  --deepseek-model deepseek-v4-pro \
   --output-dir /tmp/biomed_release_smoke
 ```
 
 The runner captures artifacts for:
 
-- Ollama model/chat connectivity;
+- DeepSeek model/chat connectivity;
 - dashboard plugin and release tool-contract readiness;
 - live PubMed readiness and controlled `search_literature`;
-- PubMed + Ollama `answer/audited`;
+- PubMed + DeepSeek `answer/audited`;
 - persisted trace, evidence packet, retrieval manifest, and provenance graph;
 - clinical guardrail regression.
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -14,8 +15,9 @@ import httpx
 
 SCHEMA_VERSION = "biomed-release-smoke-v1"
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:2236"
-DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/v1"
-DEFAULT_MODEL = "gpt-oss:120b-cloud"
+DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com/v1"
+DEFAULT_DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_QUERY = "microglia Alzheimer disease progression"
 DEFAULT_QUESTION = (
     "What recent evidence links microglial activation to Alzheimer disease progression?"
@@ -55,8 +57,9 @@ SECRET_QUERY_RE = re.compile(
 @dataclass(frozen=True)
 class SmokeConfig:
     dashboard_url: str = DEFAULT_DASHBOARD_URL
-    ollama_url: str = DEFAULT_OLLAMA_URL
-    ollama_model: str = DEFAULT_MODEL
+    deepseek_url: str = DEFAULT_DEEPSEEK_URL
+    deepseek_model: str = DEFAULT_MODEL
+    deepseek_api_key_env: str = DEFAULT_DEEPSEEK_API_KEY_ENV
     output_dir: Path = Path("/tmp/biomed_release_smoke")
     source: str = "pubmed"
     max_papers: int = 3
@@ -64,7 +67,7 @@ class SmokeConfig:
     question: str = DEFAULT_QUESTION
     clinical_question: str = DEFAULT_CLINICAL_QUESTION
     timeout_seconds: float = 360.0
-    skip_ollama: bool = False
+    skip_deepseek: bool = False
     require_llm_planner: bool = True
 
 
@@ -106,7 +109,7 @@ class ReleaseSmokeRunner:
         config: SmokeConfig,
         *,
         dashboard_client: httpx.Client | None = None,
-        ollama_client: httpx.Client | None = None,
+        deepseek_client: httpx.Client | None = None,
     ) -> None:
         self.config = config
         timeout = httpx.Timeout(config.timeout_seconds)
@@ -114,12 +117,14 @@ class ReleaseSmokeRunner:
             base_url=config.dashboard_url.rstrip("/"),
             timeout=timeout,
         )
-        self.ollama_client = ollama_client or httpx.Client(
-            base_url=config.ollama_url.rstrip("/"),
+        self.deepseek_client = deepseek_client or httpx.Client(
+            base_url=config.deepseek_url.rstrip("/"),
             timeout=timeout,
+            headers=_deepseek_headers(config.deepseek_api_key_env),
         )
         self._owns_dashboard_client = dashboard_client is None
-        self._owns_ollama_client = ollama_client is None
+        self._owns_deepseek_client = deepseek_client is None
+        self._deepseek_client_injected = deepseek_client is not None
         self.output_dir = config.output_dir
         self.artifacts: list[SmokeArtifact] = []
         self.checks: list[SmokeCheck] = []
@@ -130,16 +135,16 @@ class ReleaseSmokeRunner:
     def close(self) -> None:
         if self._owns_dashboard_client:
             self.dashboard_client.close()
-        if self._owns_ollama_client:
-            self.ollama_client.close()
+        if self._owns_deepseek_client:
+            self.deepseek_client.close()
 
     def run(self) -> dict[str, Any]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         status = "passed"
         failure: dict[str, Any] | None = None
         try:
-            if not self.config.skip_ollama:
-                self._check_ollama()
+            if not self.config.skip_deepseek:
+                self._check_deepseek()
             self._check_dashboard()
             self._check_literature_readiness()
             search_payload = self._check_literature_search()
@@ -194,23 +199,32 @@ class ReleaseSmokeRunner:
         self._write_report(summary)
         return summary
 
-    def _check_ollama(self) -> None:
-        models = self._ollama_json("GET", "/models", artifact_name="ollama_models")
+    def _check_deepseek(self) -> None:
+        if not self._deepseek_client_injected and not os.getenv(
+            self.config.deepseek_api_key_env
+        ):
+            self._fail(
+                "llm_unavailable",
+                f"Set {self.config.deepseek_api_key_env} before running DeepSeek smoke.",
+                step="deepseek_auth",
+                detail={"api_key_env": self.config.deepseek_api_key_env},
+            )
+        models = self._deepseek_json("GET", "/models", artifact_name="deepseek_models")
         model_names = [
             str(item.get("id") or item.get("name") or "")
             for item in _list_at(models, ["data"])
             if isinstance(item, dict)
         ]
-        if self.config.ollama_model not in model_names:
+        if self.config.deepseek_model not in model_names:
             self.warnings.append(
-                f"{self.config.ollama_model} was not listed by /models; "
+                f"{self.config.deepseek_model} was not listed by /models; "
                 "chat completion remains the source of truth."
             )
 
-        response = self.ollama_client.post(
+        response = self.deepseek_client.post(
             "/chat/completions",
             json={
-                "model": self.config.ollama_model,
+                "model": self.config.deepseek_model,
                 "messages": [
                     {
                         "role": "system",
@@ -226,10 +240,10 @@ class ReleaseSmokeRunner:
         content = _string_at(payload, ["choices", 0, "message", "content"])
         usage = _dict_at(payload, ["usage"])
         self._write_json(
-            "ollama_chat",
+            "deepseek_chat",
             {
                 "status_code": response.status_code,
-                "model": self.config.ollama_model,
+                "model": self.config.deepseek_model,
                 "content": content,
                 "finish_reason": _string_at(payload, ["choices", 0, "finish_reason"]),
                 "usage": usage,
@@ -238,14 +252,14 @@ class ReleaseSmokeRunner:
         if response.status_code >= 400 or not content:
             self._fail(
                 "llm_unavailable",
-                "Ollama chat completion returned no usable content.",
-                step="ollama_chat",
+                "DeepSeek chat completion returned no usable content.",
+                step="deepseek_chat",
                 detail={"status_code": response.status_code},
             )
         self._record_check(
-            "ollama_chat_non_empty",
+            "deepseek_chat_non_empty",
             True,
-            detail={"model": self.config.ollama_model},
+            detail={"model": self.config.deepseek_model},
         )
 
     def _check_dashboard(self) -> None:
@@ -667,7 +681,7 @@ class ReleaseSmokeRunner:
             )
         return payload
 
-    def _ollama_json(
+    def _deepseek_json(
         self,
         method: str,
         path: str,
@@ -676,11 +690,11 @@ class ReleaseSmokeRunner:
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
-            response = self.ollama_client.request(method, path, json=json_body)
+            response = self.deepseek_client.request(method, path, json=json_body)
         except httpx.TransportError as exc:
             self._fail(
                 "llm_unavailable",
-                f"Ollama request failed: {exc}",
+                f"DeepSeek request failed: {exc}",
                 step=artifact_name,
             )
         payload = _response_payload(response)
@@ -690,7 +704,7 @@ class ReleaseSmokeRunner:
         if response.status_code >= 400:
             self._fail(
                 "llm_unavailable",
-                f"Ollama endpoint {path} returned HTTP {response.status_code}.",
+                f"DeepSeek endpoint {path} returned HTTP {response.status_code}.",
                 step=artifact_name,
                 detail={"status_code": response.status_code, "payload": payload},
             )
@@ -773,7 +787,7 @@ class ReleaseSmokeRunner:
             f"- Status: `{summary.get('status')}`",
             f"- Source: `{self.config.source}`",
             f"- Dashboard: `{self.config.dashboard_url}`",
-            f"- Ollama model: `{self.config.ollama_model}`",
+            f"- DeepSeek model: `{self.config.deepseek_model}`",
             f"- Started: `{summary.get('started_at')}`",
             f"- Finished: `{summary.get('finished_at')}`",
         ]
@@ -823,12 +837,13 @@ class ReleaseSmokeRunner:
                 "finished_at": _now_iso(),
                 "config": {
                     "dashboard_url": self.config.dashboard_url,
-                    "ollama_url": self.config.ollama_url,
-                    "ollama_model": self.config.ollama_model,
+                    "deepseek_url": self.config.deepseek_url,
+                    "deepseek_model": self.config.deepseek_model,
+                    "deepseek_api_key_env": self.config.deepseek_api_key_env,
                     "source": self.config.source,
                     "max_papers": self.config.max_papers,
                     "query": self.config.query,
-                    "skip_ollama": self.config.skip_ollama,
+                    "skip_deepseek": self.config.skip_deepseek,
                     "require_llm_planner": self.config.require_llm_planner,
                 },
                 "ids": self.ids,
@@ -875,6 +890,13 @@ def _response_payload(response: httpx.Response) -> dict[str, Any] | list[Any]:
     if isinstance(redacted, (dict, list)):
         return redacted
     return {"value": redacted}
+
+
+def _deepseek_headers(api_key_env: str) -> dict[str, str]:
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
 
 
 def _now_iso() -> str:
@@ -931,8 +953,13 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the Release 1.1 biomedical live smoke and artifact capture."
     )
     parser.add_argument("--dashboard-url", default=DEFAULT_DASHBOARD_URL)
-    parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
-    parser.add_argument("--ollama-model", default=DEFAULT_MODEL)
+    parser.add_argument("--deepseek-url", default=DEFAULT_DEEPSEEK_URL)
+    parser.add_argument("--deepseek-model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--deepseek-api-key-env",
+        default=DEFAULT_DEEPSEEK_API_KEY_ENV,
+        help="Environment variable containing the DeepSeek API key.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/biomed_release_smoke"))
     parser.add_argument("--source", choices=["mock", "pubmed"], default="pubmed")
     parser.add_argument("--max-papers", type=int, default=3)
@@ -941,9 +968,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--clinical-question", default=DEFAULT_CLINICAL_QUESTION)
     parser.add_argument("--timeout-seconds", type=float, default=360.0)
     parser.add_argument(
-        "--skip-ollama",
+        "--skip-deepseek",
         action="store_true",
-        help="Skip direct Ollama connectivity checks. The audited answer can still use LLM flags.",
+        help="Skip direct DeepSeek connectivity checks. The audited answer can still use LLM flags.",
     )
     parser.add_argument(
         "--allow-planner-fallback",
@@ -957,8 +984,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = SmokeConfig(
         dashboard_url=str(args.dashboard_url),
-        ollama_url=str(args.ollama_url),
-        ollama_model=str(args.ollama_model),
+        deepseek_url=str(args.deepseek_url),
+        deepseek_model=str(args.deepseek_model),
+        deepseek_api_key_env=str(args.deepseek_api_key_env),
         output_dir=args.output_dir,
         source=str(args.source),
         max_papers=max(1, int(args.max_papers)),
@@ -966,7 +994,7 @@ def main(argv: list[str] | None = None) -> int:
         question=str(args.question),
         clinical_question=str(args.clinical_question),
         timeout_seconds=float(args.timeout_seconds),
-        skip_ollama=bool(args.skip_ollama),
+        skip_deepseek=bool(args.skip_deepseek),
         require_llm_planner=not bool(args.allow_planner_fallback),
     )
     runner = ReleaseSmokeRunner(config)

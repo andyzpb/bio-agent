@@ -7,9 +7,9 @@
 provider = "deepseek"
 
 [llm.main]
-# 主模型，必填。推荐 deepseek-v4-flash（agent 能力强、价格低）。
-model = "deepseek-v4-flash"
-api_key = "sk-..."
+# 主模型，必填。默认使用 DeepSeek。
+model = "deepseek-v4-pro"
+api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 enable_thinking = true
 multimodal = false
@@ -17,9 +17,9 @@ multimodal = false
 [llm.fast]
 # 轻量模型，用于 memory gate / query rewrite / HyDE。
 # 不填则退回主模型，但延迟会稍高。
-model = "qwen-flash"
-api_key = "sk-..."
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+model = "deepseek-v4-pro"
+api_key = "${DEEPSEEK_API_KEY}"
+base_url = "https://api.deepseek.com/v1"
 
 [llm.vl]
 # 视觉模型，仅在 llm.main.multimodal = false 时需要。

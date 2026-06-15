@@ -24,9 +24,9 @@ provider = "deepseek"        # or "qwen" / "openai" — cosmetic label only
 
 # ── Main model: agent reasoning during QA ───────────────────
 # One full tool-use turn per question. A mid-tier model is fine.
-# Suggestions: deepseek-chat, qwen-plus, gpt-4o-mini
+# Suggestions: deepseek-v4-pro, qwen-plus, gpt-4o-mini
 [llm.main]
-model     = "deepseek-chat"
+model     = "deepseek-v4-pro"
 api_key   = "${BENCH_API_KEY}"
 base_url  = "https://api.deepseek.com/v1"
 
@@ -34,9 +34,9 @@ base_url  = "https://api.deepseek.com/v1"
 # Called ~10-30 times per instance during ingest consolidation,
 # and 2-4 times per QA call (HyDE hypotheses, query rewrite,
 # sufficiency check). Must be fast and cheap.
-# Suggestions: deepseek-chat (same), qwen-turbo, gpt-4o-mini
+# Suggestions: deepseek-v4-pro (same), qwen-turbo, gpt-4o-mini
 [llm.fast]
-model     = "deepseek-chat"
+model     = "deepseek-v4-pro"
 api_key   = "${BENCH_API_KEY}"
 base_url  = "https://api.deepseek.com/v1"
 

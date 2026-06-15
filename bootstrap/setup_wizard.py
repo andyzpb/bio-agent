@@ -18,6 +18,10 @@ from typing import cast
 import click
 from plugins.default_memory.config import render_default_memory_config
 
+DEFAULT_LLM_PROVIDER = "deepseek"
+DEFAULT_LLM_MODEL = "deepseek-v4-pro"
+DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
+
 
 def _empty_str_list() -> list[str]:
     return []
@@ -247,11 +251,19 @@ def _collect_answers() -> WizardAnswers:
 def _phase_main_llm(a: WizardAnswers) -> None:
     _section_header("1/4", "主模型")
 
-    a.model = click.prompt("模型名")
-    a.base_url = click.prompt("base_url（OpenAI 兼容格式）")
-    a.api_key = _secret_prompt("API key")
-    a.provider = "openai"
-    a.enable_thinking = click.confirm("开启 thinking 模式？", default=False)
+    a.provider = click.prompt(
+        "provider",
+        default=DEFAULT_LLM_PROVIDER,
+        show_default=True,
+    )
+    a.model = click.prompt("模型名", default=DEFAULT_LLM_MODEL, show_default=True)
+    a.base_url = click.prompt(
+        "base_url（OpenAI 兼容格式）",
+        default=DEFAULT_LLM_BASE_URL,
+        show_default=True,
+    )
+    a.api_key = _secret_prompt("API key（可填 ${DEEPSEEK_API_KEY}）")
+    a.enable_thinking = click.confirm("开启 thinking 模式？", default=True)
     a.multimodal = click.confirm("主模型原生支持图片输入？", default=False)
 
     if not a.multimodal:

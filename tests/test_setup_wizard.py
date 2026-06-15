@@ -7,7 +7,32 @@ import types
 
 import pytest
 
-from bootstrap.setup_wizard import _async_fetch_qqbot_openid
+from bootstrap.setup_wizard import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_PROVIDER,
+    WizardAnswers,
+    _async_fetch_qqbot_openid,
+    _render_llm,
+)
+
+
+def test_setup_wizard_renders_deepseek_defaults() -> None:
+    rendered = _render_llm(
+        WizardAnswers(
+            provider=DEFAULT_LLM_PROVIDER,
+            model=DEFAULT_LLM_MODEL,
+            api_key="${DEEPSEEK_API_KEY}",
+            base_url=DEFAULT_LLM_BASE_URL,
+            enable_thinking=True,
+        )
+    )
+
+    assert 'provider = "deepseek"' in rendered
+    assert 'model = "deepseek-v4-pro"' in rendered
+    assert 'api_key = "${DEEPSEEK_API_KEY}"' in rendered
+    assert 'base_url = "https://api.deepseek.com/v1"' in rendered
+    assert "enable_thinking = true" in rendered
 
 
 @pytest.mark.asyncio

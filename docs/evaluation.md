@@ -117,23 +117,23 @@ tests.
 ## Release 1.1 Live Smoke
 
 Release 1.1 adds a repeatable dashboard-level smoke runner for the live PubMed
-and Ollama path:
+and DeepSeek path:
 
 ```bash
 .venv/bin/python -m eval.biomed_evidence.run_release_smoke \
   --source pubmed \
-  --ollama-model gpt-oss:120b-cloud \
+  --deepseek-model deepseek-v4-pro \
   --output-dir /tmp/biomed_release_smoke
 ```
 
 The runner assumes the dashboard is already running, usually through Docker
-when `config.toml` points to `http://host.docker.internal:11434/v1`. It writes
-redacted artifacts for:
+or `uv run python main.py dashboard`, with `DEEPSEEK_API_KEY` set in the local
+environment. It writes redacted artifacts for:
 
-- Ollama model/chat connectivity;
+- DeepSeek model/chat connectivity;
 - dashboard plugin and release tool-contract readiness;
 - live PubMed readiness and controlled `search_literature`;
-- PubMed + Ollama `answer/audited`;
+- PubMed + DeepSeek `answer/audited`;
 - persisted trace, evidence packet, retrieval manifest, and provenance graph;
 - clinical guardrail regression.
 
@@ -142,7 +142,7 @@ Exit codes are intentionally distinct:
 - `0`: smoke passed.
 - `1`: code/schema regression.
 - `2`: external PubMed/source instability.
-- `3`: Ollama or LLM path unavailable.
+- `3`: DeepSeek or LLM path unavailable.
 - `4`: policy or clinical guardrail failure.
 - `5`: dashboard unavailable.
 

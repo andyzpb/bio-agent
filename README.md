@@ -28,7 +28,7 @@ generic Dashboard Chat and run-centric Trace/Audit/Export workspaces.
   building, trace lookup, provenance export, Obsidian export, and release smoke
   are exposed as structured tools.
 - **Works offline by default**: demos and evals use deterministic mock
-  literature data. Live PubMed and OpenAI-compatible/Ollama LLM providers are
+  literature data. Live PubMed and DeepSeek/OpenAI-compatible LLM calls are
   opt-in.
 
 ## Dashboard
