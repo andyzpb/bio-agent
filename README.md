@@ -100,3 +100,8 @@ docker compose up -d --build
 ## License
 
 Licensed under the [Apache License 2.0](./LICENSE).
+
+> **License Note:** This project is a fork of
+> [kachofugetsu09/akashic-agent](https://github.com/kachofugetsu09/akashic-agent),
+> which is licensed under the MIT License. This fork has been relicensed under
+> Apache 2.0 in accordance with MIT's permissive terms.
