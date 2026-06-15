@@ -20,6 +20,8 @@ from plugins.biomed_evidence.schemas import (
     ConflictAuditResult,
     EvidenceGraphSnapshotRecord,
     EvidenceItem,
+    FullTextDocument,
+    FullTextSection,
     ProjectClaimRecord,
     ProjectEvidenceBrief,
     ProjectPaperDecision,
@@ -149,8 +151,10 @@ class BiomedStorage:
                     evidence_direction, methods_json, datasets_json, limitations_json,
                     confidence, evidence_span, retrieval_intent,
                     extraction_mode, extractor_model, extractor_prompt_hash,
-                    requires_expert_review, retrieval_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    requires_expert_review, retrieval_id, source_scope,
+                    document_id, section_id, section_label, page_number,
+                    char_start, char_end, source_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(paper_id, claim_hash) DO UPDATE SET
                     source=excluded.source,
                     claim=excluded.claim,
@@ -167,6 +171,14 @@ class BiomedStorage:
                     extractor_prompt_hash=excluded.extractor_prompt_hash,
                     requires_expert_review=excluded.requires_expert_review,
                     retrieval_id=COALESCE(excluded.retrieval_id, biomed_evidence.retrieval_id),
+                    source_scope=excluded.source_scope,
+                    document_id=excluded.document_id,
+                    section_id=excluded.section_id,
+                    section_label=excluded.section_label,
+                    page_number=excluded.page_number,
+                    char_start=excluded.char_start,
+                    char_end=excluded.char_end,
+                    source_hash=excluded.source_hash,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -188,6 +200,14 @@ class BiomedStorage:
                     item.extractor_prompt_hash,
                     1 if item.requires_expert_review else 0,
                     retrieval_id,
+                    item.source_scope,
+                    item.document_id,
+                    item.section_id,
+                    item.section_label,
+                    item.page_number,
+                    item.char_start,
+                    item.char_end,
+                    item.source_hash,
                     now,
                     now,
                 ),
@@ -213,6 +233,115 @@ class BiomedStorage:
                     (evidence_id, entity_id),
                 )
             self._db.commit()
+
+    def upsert_full_text_document(
+        self,
+        document: FullTextDocument,
+        sections: list[FullTextSection],
+    ) -> FullTextDocument:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_full_text_documents(
+                    document_id, paper_id, source, content_type, title,
+                    source_filename, source_hash, byte_size, section_count,
+                    parser, parser_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    paper_id=excluded.paper_id,
+                    source=excluded.source,
+                    content_type=excluded.content_type,
+                    title=excluded.title,
+                    source_filename=excluded.source_filename,
+                    source_hash=excluded.source_hash,
+                    byte_size=excluded.byte_size,
+                    section_count=excluded.section_count,
+                    parser=excluded.parser,
+                    parser_version=excluded.parser_version,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    document.document_id,
+                    document.paper_id,
+                    document.source,
+                    document.content_type,
+                    document.title,
+                    document.source_filename,
+                    document.source_hash,
+                    document.byte_size,
+                    document.section_count,
+                    document.parser,
+                    document.parser_version,
+                    document.created_at,
+                    document.updated_at,
+                ),
+            )
+            self._db.execute(
+                "DELETE FROM biomed_full_text_sections WHERE document_id=?",
+                (document.document_id,),
+            )
+            for section in sections:
+                self._db.execute(
+                    """
+                    INSERT INTO biomed_full_text_sections(
+                        section_id, document_id, paper_id, label, text, ordinal,
+                        page_start, page_end, source_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        section.section_id,
+                        section.document_id,
+                        section.paper_id,
+                        section.label,
+                        section.text,
+                        section.ordinal,
+                        section.page_start,
+                        section.page_end,
+                        section.source_hash,
+                        section.created_at,
+                    ),
+                )
+            self._db.commit()
+        return document
+
+    def get_full_text_document(
+        self, paper_id: str, *, source: str = ""
+    ) -> tuple[FullTextDocument, list[FullTextSection]] | None:
+        where = "paper_id=?"
+        params: tuple[Any, ...] = (paper_id,)
+        if source:
+            where += " AND source=?"
+            params = (paper_id, source)
+        with self._lock:
+            row = self._db.execute(
+                f"""
+                SELECT * FROM biomed_full_text_documents
+                WHERE {where}
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            document = _full_text_document_from_row(row)
+            section_rows = self._db.execute(
+                """
+                SELECT * FROM biomed_full_text_sections
+                WHERE document_id=?
+                ORDER BY ordinal ASC, section_id ASC
+                """,
+                (document.document_id,),
+            ).fetchall()
+        return document, [_full_text_section_from_row(item) for item in section_rows]
+
+    def get_full_text_section(self, section_id: str) -> FullTextSection | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM biomed_full_text_sections WHERE section_id=?",
+                (section_id,),
+            ).fetchone()
+        return _full_text_section_from_row(row) if row is not None else None
 
     def list_evidence(
         self,
@@ -1534,6 +1663,26 @@ class BiomedStorage:
             )
             self._db.commit()
 
+    def list_watch_snapshots(
+        self,
+        watch_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[WatchSnapshot]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT snapshot_id, watch_id, retrieval_id, paper_ids_json,
+                       new_paper_ids_json, created_at
+                FROM biomed_watch_snapshots
+                WHERE watch_id=?
+                ORDER BY created_at DESC, snapshot_id DESC
+                LIMIT ?
+                """,
+                (watch_id, max(1, min(limit, 200))),
+            ).fetchall()
+        return [_watch_snapshot_from_row(row) for row in rows]
+
     def list_watch_decisions(
         self,
         *,
@@ -1596,6 +1745,18 @@ class BiomedStorage:
                 else None
             ),
             requires_expert_review=bool(row["requires_expert_review"]),
+            source_scope=(
+                row["source_scope"] if "source_scope" in row.keys() else "abstract"
+            ),
+            document_id=row["document_id"] if "document_id" in row.keys() else None,
+            section_id=row["section_id"] if "section_id" in row.keys() else None,
+            section_label=(
+                row["section_label"] if "section_label" in row.keys() else None
+            ),
+            page_number=row["page_number"] if "page_number" in row.keys() else None,
+            char_start=row["char_start"] if "char_start" in row.keys() else None,
+            char_end=row["char_end"] if "char_end" in row.keys() else None,
+            source_hash=row["source_hash"] if "source_hash" in row.keys() else None,
         )
 
     def _evidence_row_to_dict(self, row: sqlite3.Row) -> dict[str, object]:
@@ -1709,6 +1870,34 @@ class BiomedStorage:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(source, paper_id)
             );
+            CREATE TABLE IF NOT EXISTS biomed_full_text_documents(
+                document_id TEXT PRIMARY KEY,
+                paper_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                title TEXT,
+                source_filename TEXT,
+                source_hash TEXT NOT NULL,
+                byte_size INTEGER NOT NULL DEFAULT 0,
+                section_count INTEGER NOT NULL DEFAULT 0,
+                parser TEXT NOT NULL DEFAULT 'deterministic',
+                parser_version TEXT NOT NULL DEFAULT '1',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS biomed_full_text_sections(
+                section_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                paper_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                text TEXT NOT NULL,
+                ordinal INTEGER NOT NULL DEFAULT 0,
+                page_start INTEGER,
+                page_end INTEGER,
+                source_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES biomed_full_text_documents(document_id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS biomed_entities(
                 entity_id TEXT PRIMARY KEY,
                 entity_key TEXT NOT NULL UNIQUE,
@@ -1735,6 +1924,14 @@ class BiomedStorage:
                 extractor_prompt_hash TEXT,
                 requires_expert_review INTEGER NOT NULL DEFAULT 1,
                 retrieval_id TEXT,
+                source_scope TEXT NOT NULL DEFAULT 'abstract',
+                document_id TEXT,
+                section_id TEXT,
+                section_label TEXT,
+                page_number INTEGER,
+                char_start INTEGER,
+                char_end INTEGER,
+                source_hash TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(paper_id, claim_hash)
@@ -2018,6 +2215,16 @@ class BiomedStorage:
         )
         self._ensure_column("biomed_evidence", "extractor_model", "TEXT")
         self._ensure_column("biomed_evidence", "extractor_prompt_hash", "TEXT")
+        self._ensure_column(
+            "biomed_evidence", "source_scope", "TEXT NOT NULL DEFAULT 'abstract'"
+        )
+        self._ensure_column("biomed_evidence", "document_id", "TEXT")
+        self._ensure_column("biomed_evidence", "section_id", "TEXT")
+        self._ensure_column("biomed_evidence", "section_label", "TEXT")
+        self._ensure_column("biomed_evidence", "page_number", "INTEGER")
+        self._ensure_column("biomed_evidence", "char_start", "INTEGER")
+        self._ensure_column("biomed_evidence", "char_end", "INTEGER")
+        self._ensure_column("biomed_evidence", "source_hash", "TEXT")
         self._ensure_column("biomed_watch_decisions", "retrieval_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "snapshot_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "dedupe_reason", "TEXT")
@@ -2058,6 +2265,39 @@ def _paper_from_row(row: sqlite3.Row) -> BiomedicalPaper:
         url=row["url"],
         mesh_terms=_json_list(row["mesh_terms_json"]),
         keywords=_json_list(row["keywords_json"]),
+    )
+
+
+def _full_text_document_from_row(row: sqlite3.Row) -> FullTextDocument:
+    return FullTextDocument(
+        document_id=str(row["document_id"]),
+        paper_id=str(row["paper_id"]),
+        source=row["source"],
+        content_type=row["content_type"],
+        title=row["title"],
+        source_filename=row["source_filename"],
+        source_hash=str(row["source_hash"]),
+        byte_size=int(row["byte_size"] or 0),
+        section_count=int(row["section_count"] or 0),
+        parser=str(row["parser"] or "deterministic"),
+        parser_version=str(row["parser_version"] or "1"),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _full_text_section_from_row(row: sqlite3.Row) -> FullTextSection:
+    return FullTextSection(
+        section_id=str(row["section_id"]),
+        document_id=str(row["document_id"]),
+        paper_id=str(row["paper_id"]),
+        label=str(row["label"]),
+        text=str(row["text"]),
+        ordinal=int(row["ordinal"] or 0),
+        page_start=row["page_start"],
+        page_end=row["page_end"],
+        source_hash=str(row["source_hash"]),
+        created_at=str(row["created_at"]),
     )
 
 
@@ -2201,6 +2441,17 @@ def _watch_from_row(row: sqlite3.Row) -> WatchTopic:
         updated_at=str(row["updated_at"]),
         last_checked_at=row["last_checked_at"],
         next_check_at=row["next_check_at"],
+    )
+
+
+def _watch_snapshot_from_row(row: sqlite3.Row) -> WatchSnapshot:
+    return WatchSnapshot(
+        snapshot_id=str(row["snapshot_id"]),
+        watch_id=str(row["watch_id"]),
+        retrieval_id=str(row["retrieval_id"]),
+        paper_ids=[str(item) for item in _json_list(row["paper_ids_json"])],
+        new_paper_ids=[str(item) for item in _json_list(row["new_paper_ids_json"])],
+        created_at=str(row["created_at"]),
     )
 
 

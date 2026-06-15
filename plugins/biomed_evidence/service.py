@@ -98,6 +98,10 @@ from plugins.biomed_evidence.schemas import (
     EvidenceItem,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    FullTextDocument,
+    FullTextIngestionRequest,
+    FullTextIngestionResult,
+    FullTextSection,
     GapSearchDecision,
     GenerateProjectEvidenceBriefRequest,
     GraphEdge,
@@ -149,6 +153,8 @@ from plugins.biomed_evidence.schemas import (
     SearchBiomedicalLiteratureResult,
     WatchCheckResult,
     WatchDecisionDetail,
+    WatchDriftChange,
+    WatchGraphDriftResult,
     WatchSnapshot,
     WatchTopic,
     WatchTopicCreateRequest,
@@ -1908,6 +1914,143 @@ class BiomedEvidenceService:
         if paper is not None:
             self.storage.upsert_paper(paper)
         return paper
+
+    def ingest_full_text(
+        self, request: FullTextIngestionRequest
+    ) -> FullTextIngestionResult:
+        paper = self.storage.get_paper(request.paper_id, source=request.source)
+        if paper is None:
+            return FullTextIngestionResult(
+                ok=False,
+                errors=[f"unknown paper_id: {request.paper_id}"],
+            )
+        existing = self.storage.get_full_text_document(
+            request.paper_id,
+            source=request.source,
+        )
+        if existing is not None and not request.overwrite:
+            document, sections = existing
+            return FullTextIngestionResult(
+                ok=True,
+                document=document,
+                sections=sections,
+                warnings=[
+                    "Existing full-text document returned; set overwrite=true to replace it."
+                ],
+            )
+        normalized = _normalize_full_text_content(
+            request.content,
+            content_type=request.content_type,
+        )
+        if not normalized.strip():
+            return FullTextIngestionResult(
+                ok=False,
+                errors=["full-text content is empty after normalization"],
+            )
+        now = _now_iso()
+        source_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        document_id = _full_text_document_id(
+            paper_id=request.paper_id,
+            source=request.source,
+            source_hash=source_hash,
+        )
+        sections = _full_text_sections(
+            document_id=document_id,
+            paper_id=request.paper_id,
+            content=normalized,
+            created_at=now,
+        )
+        document = FullTextDocument(
+            document_id=document_id,
+            paper_id=request.paper_id,
+            source=request.source,
+            content_type=request.content_type,
+            title=request.title or paper.title,
+            source_filename=request.source_filename,
+            source_hash=source_hash,
+            byte_size=len(request.content.encode("utf-8")),
+            section_count=len(sections),
+            created_at=now,
+            updated_at=now,
+        )
+        self.storage.upsert_full_text_document(document, sections)
+        return FullTextIngestionResult(ok=True, document=document, sections=sections)
+
+    def get_full_text_document(
+        self, paper_id: str, *, source: str = "mock"
+    ) -> FullTextIngestionResult | None:
+        result = self.storage.get_full_text_document(paper_id, source=source)
+        if result is None:
+            return None
+        document, sections = result
+        return FullTextIngestionResult(
+            ok=True,
+            document=document,
+            sections=sections,
+        )
+
+    def extract_full_text_evidence(
+        self,
+        *,
+        paper_id: str,
+        source: str = "mock",
+        research_question: str | None = None,
+    ) -> EvidenceExtractionResult | None:
+        paper = self.storage.get_paper(paper_id, source=source)
+        stored = self.storage.get_full_text_document(paper_id, source=source)
+        if paper is None or stored is None:
+            return None
+        document, sections = stored
+        evidence: list[EvidenceItem] = []
+        for section in sections:
+            section_paper = paper.model_copy(
+                update={
+                    "source": "pubmed",
+                    "abstract": section.text,
+                    "title": f"{paper.title} ({section.label})",
+                }
+            )
+            extracted = self.extractor.extract(
+                section_paper,
+                research_question=research_question,
+            )
+            for item in extracted.evidence:
+                span = item.evidence_span or item.finding
+                start = section.text.find(span) if span else -1
+                if start < 0:
+                    start = 0
+                end = start + len(span) if span else None
+                evidence.append(
+                    item.model_copy(
+                        update={
+                            "evidence_id": _full_text_evidence_id(
+                                section.section_id,
+                                item.evidence_span or item.finding,
+                            ),
+                            "paper_id": paper.paper_id,
+                            "source_scope": (
+                                "pdf"
+                                if document.content_type == "application/pdf"
+                                else "full_text"
+                            ),
+                            "document_id": document.document_id,
+                            "section_id": section.section_id,
+                            "section_label": section.label,
+                            "page_number": section.page_start,
+                            "char_start": start,
+                            "char_end": end,
+                            "source_hash": section.source_hash,
+                            "extraction_mode": "deterministic",
+                        }
+                    )
+                )
+        for item in evidence:
+            self.storage.upsert_evidence(item, paper_source=paper.source)
+        return EvidenceExtractionResult(
+            paper_id=paper.paper_id,
+            evidence=evidence,
+            reason=None if evidence else "No full-text evidence could be extracted.",
+        )
 
     def extract_evidence(
         self,
@@ -4421,6 +4564,78 @@ class BiomedEvidenceService:
             page=page,
             page_size=page_size,
         )
+
+    def get_watch_graph_drift(
+        self,
+        watch_id: str,
+        *,
+        base_snapshot_id: str = "",
+        compare_snapshot_id: str = "",
+    ) -> WatchGraphDriftResult:
+        watch = self.storage.get_watch(watch_id)
+        if watch is None:
+            return WatchGraphDriftResult(
+                watch_id=watch_id,
+                status="watch_not_found",
+                warnings=["watch topic not found"],
+            )
+        snapshots = self.storage.list_watch_snapshots(watch_id, limit=100)
+        if base_snapshot_id or compare_snapshot_id:
+            by_id = {item.snapshot_id: item for item in snapshots}
+            base = by_id.get(base_snapshot_id)
+            compare = by_id.get(compare_snapshot_id)
+        else:
+            compare = snapshots[0] if snapshots else None
+            base = snapshots[1] if len(snapshots) > 1 else None
+        if base is None or compare is None:
+            return WatchGraphDriftResult(
+                watch_id=watch_id,
+                base_snapshot_id=base.snapshot_id if base else None,
+                compare_snapshot_id=compare.snapshot_id if compare else None,
+                status="insufficient_snapshots",
+                warnings=["At least two Watch snapshots are required for drift."],
+            )
+        changes = _watch_drift_changes(
+            base_snapshot=base,
+            compare_snapshot=compare,
+            base_profile=self._watch_snapshot_profile(base),
+            compare_profile=self._watch_snapshot_profile(compare),
+        )
+        summary: dict[str, int] = {}
+        for change in changes:
+            summary[change.change_type] = summary.get(change.change_type, 0) + 1
+        return WatchGraphDriftResult(
+            watch_id=watch_id,
+            base_snapshot_id=base.snapshot_id,
+            compare_snapshot_id=compare.snapshot_id,
+            change_count=len(changes),
+            changes=changes,
+            summary=summary,
+        )
+
+    def _watch_snapshot_profile(self, snapshot: WatchSnapshot) -> dict[str, Any]:
+        evidence: list[EvidenceItem] = []
+        for paper_id in snapshot.paper_ids:
+            evidence.extend(self.storage.get_evidence_for_paper(paper_id))
+        return {
+            "papers": set(snapshot.paper_ids),
+            "claims": {item.claim: item for item in evidence},
+            "methods": {
+                method: item
+                for item in evidence
+                for method in item.methods
+            },
+            "limitations": {
+                limitation: item
+                for item in evidence
+                for limitation in item.limitations
+            },
+            "entities": {
+                entity.name: item
+                for item in evidence
+                for entity in item.entities
+            },
+        }
 
     def get_answer_run(self, run_id: str) -> AnswerWithEvidenceResult | None:
         return self.storage.get_answer_run(run_id)
@@ -8723,12 +8938,208 @@ def _decision_id(watch_id: str, paper_id: str) -> str:
     return f"wd-{digest}"
 
 
+def _watch_drift_changes(
+    *,
+    base_snapshot: WatchSnapshot,
+    compare_snapshot: WatchSnapshot,
+    base_profile: dict[str, Any],
+    compare_profile: dict[str, Any],
+) -> list[WatchDriftChange]:
+    changes: list[WatchDriftChange] = []
+    changes.extend(
+        _set_drift_changes(
+            "paper_added",
+            "paper_removed",
+            base_profile["papers"],
+            compare_profile["papers"],
+        )
+    )
+    feature_specs = [
+        ("claim_added", "claim_removed", "claims"),
+        ("method_added", "method_removed", "methods"),
+        ("limitation_added", "limitation_removed", "limitations"),
+        ("entity_added", "entity_removed", "entities"),
+    ]
+    for added_type, removed_type, key in feature_specs:
+        base_items: dict[str, EvidenceItem] = base_profile[key]
+        compare_items: dict[str, EvidenceItem] = compare_profile[key]
+        for label in sorted(set(compare_items) - set(base_items)):
+            item = compare_items[label]
+            changes.append(
+                WatchDriftChange(
+                    change_type=added_type,  # type: ignore[arg-type]
+                    item_id=_drift_item_id(compare_snapshot.snapshot_id, added_type, label),
+                    label=label,
+                    after=_evidence_drift_context(item),
+                    evidence_ids=[item.evidence_id],
+                    paper_ids=[item.paper_id],
+                )
+            )
+        for label in sorted(set(base_items) - set(compare_items)):
+            item = base_items[label]
+            changes.append(
+                WatchDriftChange(
+                    change_type=removed_type,  # type: ignore[arg-type]
+                    item_id=_drift_item_id(base_snapshot.snapshot_id, removed_type, label),
+                    label=label,
+                    before=_evidence_drift_context(item),
+                    evidence_ids=[item.evidence_id],
+                    paper_ids=[item.paper_id],
+                )
+            )
+    for label in sorted(set(base_profile["claims"]) & set(compare_profile["claims"])):
+        before = base_profile["claims"][label]
+        after = compare_profile["claims"][label]
+        if before.evidence_direction != after.evidence_direction:
+            changes.append(
+                WatchDriftChange(
+                    change_type="support_shift",
+                    item_id=_drift_item_id(compare_snapshot.snapshot_id, "support_shift", label),
+                    label=label,
+                    before=_evidence_drift_context(before),
+                    after=_evidence_drift_context(after),
+                    evidence_ids=[before.evidence_id, after.evidence_id],
+                    paper_ids=_unique_str([before.paper_id, after.paper_id]),
+                )
+            )
+    return changes
+
+
+def _set_drift_changes(
+    added_type: str,
+    removed_type: str,
+    base: set[str],
+    compare: set[str],
+) -> list[WatchDriftChange]:
+    changes: list[WatchDriftChange] = []
+    for value in sorted(compare - base):
+        changes.append(
+            WatchDriftChange(
+                change_type=added_type,  # type: ignore[arg-type]
+                item_id=_drift_item_id("paper", added_type, value),
+                label=value,
+                paper_ids=[value],
+            )
+        )
+    for value in sorted(base - compare):
+        changes.append(
+            WatchDriftChange(
+                change_type=removed_type,  # type: ignore[arg-type]
+                item_id=_drift_item_id("paper", removed_type, value),
+                label=value,
+                paper_ids=[value],
+            )
+        )
+    return changes
+
+
+def _evidence_drift_context(item: EvidenceItem) -> dict[str, Any]:
+    return {
+        "evidence_id": item.evidence_id,
+        "paper_id": item.paper_id,
+        "direction": item.evidence_direction,
+        "confidence": item.confidence,
+        "methods": item.methods,
+        "limitations": item.limitations,
+        "entities": [entity.name for entity in item.entities],
+    }
+
+
+def _drift_item_id(scope: str, change_type: str, label: str) -> str:
+    digest = hashlib.sha256(f"{scope}:{change_type}:{label}".encode("utf-8")).hexdigest()[:16]
+    return f"drift-{digest}"
+
+
 def _next_check(now_iso: str, schedule: str) -> str | None:
     if schedule == "manual":
         return None
     now = datetime.fromisoformat(now_iso)
     delta = timedelta(days=7 if schedule == "weekly" else 1)
     return (now + delta).isoformat()
+
+
+def _normalize_full_text_content(content: str, *, content_type: str) -> str:
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    if content_type == "application/pdf":
+        text = re.sub(r"%PDF-\d\.\d", "", text)
+        text = text.replace("\x00", " ")
+        text = re.sub(r"\b(endobj|obj|stream|endstream|xref|trailer)\b", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _full_text_document_id(*, paper_id: str, source: str, source_hash: str) -> str:
+    digest = hashlib.sha256(
+        f"{source}:{paper_id}:{source_hash}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"fulltext-{digest}"
+
+
+def _full_text_evidence_id(section_id: str, span: str) -> str:
+    digest = hashlib.sha256(f"{section_id}:{span}".encode("utf-8")).hexdigest()[:16]
+    return f"ev-fulltext-{digest}"
+
+
+def _full_text_sections(
+    *,
+    document_id: str,
+    paper_id: str,
+    content: str,
+    created_at: str,
+) -> list[FullTextSection]:
+    chunks = _split_full_text_sections(content)
+    sections: list[FullTextSection] = []
+    page = 1
+    for index, (label, text) in enumerate(chunks):
+        section_hash = hashlib.sha256(
+            f"{document_id}:{index}:{label}:{text}".encode("utf-8")
+        ).hexdigest()
+        page_count = max(1, text.count("\f") + 1)
+        clean_text = text.replace("\f", "\n").strip()
+        sections.append(
+            FullTextSection(
+                section_id=f"fulltext-section-{section_hash[:20]}",
+                document_id=document_id,
+                paper_id=paper_id,
+                label=label,
+                text=clean_text,
+                ordinal=index,
+                page_start=page,
+                page_end=page + page_count - 1,
+                source_hash=section_hash,
+                created_at=created_at,
+            )
+        )
+        page += page_count
+    return sections
+
+
+def _split_full_text_sections(content: str) -> list[tuple[str, str]]:
+    lines = content.splitlines()
+    sections: list[tuple[str, list[str]]] = []
+    current_label = "Full text"
+    current_lines: list[str] = []
+    for line in lines:
+        heading = re.match(r"^\s{0,3}#{1,4}\s+(.+?)\s*$", line)
+        if heading:
+            if current_lines:
+                sections.append((current_label, current_lines))
+                current_lines = []
+            current_label = heading.group(1).strip()[:120] or "Full text"
+            continue
+        current_lines.append(line)
+    if current_lines:
+        sections.append((current_label, current_lines))
+    if not sections:
+        sections = [("Full text", [content])]
+    output: list[tuple[str, str]] = []
+    for label, chunk_lines in sections:
+        text = "\n".join(chunk_lines).strip()
+        if len(text) < 25:
+            continue
+        output.append((label, text))
+    return output or [("Full text", content.strip())]
 
 
 def _now_iso() -> str:

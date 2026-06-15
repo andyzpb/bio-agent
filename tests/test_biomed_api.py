@@ -515,13 +515,19 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         )
         assert argument_graph.status_code == 200
         argument_payload = argument_graph.json()
+        assert argument_payload["schema_version"] == "biomed-argument-graph-v2"
         assert argument_payload["status"] == "ok"
         assert argument_payload["advisory_only"] is True
         assert argument_payload["nodes"]
         assert argument_payload["edges"]
         assert argument_payload["claim_summaries"]
         assert any(
-            edge["edge_type"] in {"supports", "limits"}
+            node["metadata"].get("evidence_graph_node_id")
+            for node in argument_payload["nodes"]
+            if node["node_type"] in {"claim", "evidence"}
+        )
+        assert any(
+            edge["edge_type"] in {"supports", "qualifies", "limits"}
             for edge in argument_payload["edges"]
         )
 
@@ -894,6 +900,80 @@ def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
         deleted = client.delete(f"/api/biomed/watch/{watch_id}")
         assert deleted.status_code == 200
         assert deleted.json()["deleted"] is True
+
+
+def test_biomed_api_full_text_and_watch_drift(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        search = client.post(
+            "/api/biomed/literature/search",
+            json={
+                "query": "microglia Alzheimer",
+                "source": "mock",
+                "max_results": 2,
+                "store": True,
+            },
+        )
+        assert search.status_code == 200
+        paper_id = search.json()["items"][0]["paper_id"]
+
+        ingest = client.post(
+            f"/api/biomed/papers/{paper_id}/full-text",
+            json={
+                "source": "mock",
+                "content_type": "application/pdf",
+                "source_filename": "fixture.pdf",
+                "content": (
+                    "%PDF-1.7\n## Results\nMicroglial activation was associated "
+                    "with Alzheimer's disease progression in a human cohort. "
+                    "This cohort study requires validation."
+                ),
+            },
+        )
+        assert ingest.status_code == 200
+        ingest_payload = ingest.json()
+        assert ingest_payload["ok"] is True
+        assert ingest_payload["document"]["content_type"] == "application/pdf"
+        assert ingest_payload["sections"]
+
+        full_text = client.get(
+            f"/api/biomed/papers/{paper_id}/full-text",
+            params={"source": "mock"},
+        )
+        assert full_text.status_code == 200
+        assert full_text.json()["document"]["document_id"] == (
+            ingest_payload["document"]["document_id"]
+        )
+
+        evidence = client.post(
+            f"/api/biomed/papers/{paper_id}/full-text/evidence",
+            json={
+                "source": "mock",
+                "research_question": "microglial activation Alzheimer progression",
+            },
+        )
+        assert evidence.status_code == 200
+        evidence_payload = evidence.json()
+        assert evidence_payload["evidence"]
+        assert evidence_payload["evidence"][0]["source_scope"] == "pdf"
+        assert evidence_payload["evidence"][0]["section_id"]
+        assert evidence_payload["evidence"][0]["char_start"] is not None
+
+        watch = client.post(
+            "/api/biomed/watch",
+            json={"topic": "microglia Alzheimer", "schedule": "manual"},
+        )
+        assert watch.status_code == 200
+        watch_id = watch.json()["watch_id"]
+        first = client.post(f"/api/biomed/watch/{watch_id}/check")
+        assert first.status_code == 200
+        second = client.post(f"/api/biomed/watch/{watch_id}/check")
+        assert second.status_code == 200
+        drift = client.get(f"/api/biomed/watch/{watch_id}/drift")
+        assert drift.status_code == 200
+        drift_payload = drift.json()
+        assert drift_payload["schema_version"] == "biomed-watch-graph-drift-v1"
+        assert drift_payload["advisory_only"] is True
+        assert drift_payload["status"] == "ok"
 
 
 def test_biomed_workflow_templates_api(tmp_path: Path) -> None:

@@ -6,6 +6,8 @@ from collections import Counter
 from typing import Iterable
 from typing import Literal
 
+from plugins.biomed_evidence.graph.ids import claim_node_id as evidence_graph_claim_node_id
+from plugins.biomed_evidence.graph.ids import evidence_span_node_id
 from plugins.biomed_evidence.schemas import (
     AnswerRevision,
     AnswerWithEvidenceResult,
@@ -55,6 +57,9 @@ def build_argument_graph(
             label=claim.claim,
             metadata={
                 "claim_id": claim.claim_id,
+                "evidence_graph_node_id": evidence_graph_claim_node_id(
+                    claim.claim_id
+                ),
                 "verdict": claim.verdict,
                 "support_score": claim.support_score,
                 "claim_type": claim.claim_type,
@@ -100,15 +105,21 @@ def build_argument_graph(
                     node_id=evidence_node_id,
                     node_type="evidence",
                     label=_short_label(evidence.finding or evidence.claim),
-                    metadata={
-                        "evidence_id": evidence.evidence_id,
-                        "paper_id": evidence.paper_id,
-                        "direction": evidence.evidence_direction,
-                        "confidence": evidence.confidence,
-                        "retrieval_intent": evidence.retrieval_intent,
-                    },
-                ),
-            )
+                        metadata={
+                            "evidence_id": evidence.evidence_id,
+                            "evidence_graph_node_id": evidence_span_node_id(
+                                evidence.evidence_id
+                            ),
+                            "paper_id": evidence.paper_id,
+                            "direction": evidence.evidence_direction,
+                            "confidence": evidence.confidence,
+                            "retrieval_intent": evidence.retrieval_intent,
+                            "source_scope": evidence.source_scope,
+                            "document_id": evidence.document_id,
+                            "section_id": evidence.section_id,
+                        },
+                    ),
+                )
             edge_type = _argument_edge_type(claim, evidence)
             if edge_type == "attacks":
                 attack_ids.append(evidence.evidence_id)
@@ -123,6 +134,12 @@ def build_argument_graph(
                 metadata={
                     "verdict": claim.verdict,
                     "evidence_direction": evidence.evidence_direction,
+                    "claim_graph_node_id": evidence_graph_claim_node_id(
+                        claim.claim_id
+                    ),
+                    "evidence_graph_node_id": evidence_span_node_id(
+                        evidence.evidence_id
+                    ),
                 },
             )
             for limitation in evidence.limitations:
@@ -456,10 +473,14 @@ def _argument_edge_type(
     evidence: EvidenceItem,
 ) -> str:
     if (
-        claim.verdict in {"contradicted", "overclaimed"}
+        claim.verdict == "contradicted"
         or evidence.evidence_direction == "contradicts"
     ):
         return "attacks"
+    if claim.verdict in {"partial_support", "overclaimed"}:
+        return "qualifies"
+    if evidence.evidence_direction == "inconclusive":
+        return "qualifies"
     return "supports"
 
 

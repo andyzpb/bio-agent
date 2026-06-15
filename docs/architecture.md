@@ -314,6 +314,27 @@ scoring, and push/skip decision logs. Saved project memory and Watch notes do
 not become biomedical evidence unless they point back to retrieved papers and
 evidence spans.
 
+Release 2.0 adds Watch graph drift as a reviewer-facing comparison of two Watch
+snapshots and their related graph evidence. Drift can highlight new papers,
+changed claims, support/contradiction shifts, method changes, limitations, and
+paper clusters. It remains advisory QA context and never becomes biomedical
+evidence or autonomous runtime control.
+
+## Full-Text And PDF Ingestion
+
+Full-text ingestion is allowed only behind the same evidence contracts used for
+abstract-level runs. The ingestion layer stores document metadata, normalized
+sections, source hashes, and span locators such as section label, page number,
+and character offsets. Parser output is not evidence until an extractor creates
+an `EvidenceItem` that flows through evidence packet selection, citation audit,
+logic audit, Evidence Graph validation, snapshot persistence, and Run Evidence
+Review.
+
+The first implementation uses deterministic local text/PDF fixtures and does not
+make external full-text providers the default. Live literature access remains
+opt-in, and clinical or patient-specific requests are refused before retrieval,
+parsing, extraction, graph construction, or export.
+
 ## Release Tool Chain
 
 Release 1.0 turns the internal answer pipeline into independently callable,
@@ -441,5 +462,5 @@ unavailability, policy/guardrail failure, and dashboard unavailability.
 - Replacing deterministic audit with an advisory verifier.
 - Making live PubMed the default source in CI or demos.
 - Using general web search snippets as biomedical evidence.
-- Adding full-text/PDF ingestion before abstract-level provenance and audit
-  gates remain stable.
+- Letting full-text/PDF parser output bypass evidence packets, citation/logic
+  audit, graph validation, or Run Evidence Review.

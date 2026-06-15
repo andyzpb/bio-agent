@@ -27,6 +27,14 @@ interface EvidenceRow {
   limitations?: string[];
   entities?: { name: string; entity_type: string }[];
   methods?: string[];
+  source_scope?: string;
+  document_id?: string | null;
+  section_id?: string | null;
+  section_label?: string | null;
+  page_number?: number | null;
+  char_start?: number | null;
+  char_end?: number | null;
+  source_hash?: string | null;
 }
 
 interface RetrievalManifest {
@@ -197,6 +205,66 @@ interface WatchCheckResult {
     new_paper_ids: string[];
     created_at: string;
   } | null;
+}
+
+interface WatchDriftChange {
+  change_type: string;
+  item_id: string;
+  label: string;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  evidence_ids: string[];
+  paper_ids: string[];
+}
+
+interface WatchGraphDriftResult {
+  schema_version: string;
+  watch_id: string;
+  base_snapshot_id?: string | null;
+  compare_snapshot_id?: string | null;
+  status: string;
+  advisory_only: boolean;
+  change_count: number;
+  changes: WatchDriftChange[];
+  summary: Record<string, number>;
+  warnings: string[];
+}
+
+interface FullTextDocument {
+  document_id: string;
+  paper_id: string;
+  source: string;
+  content_type: string;
+  title?: string | null;
+  source_filename?: string | null;
+  source_hash: string;
+  byte_size: number;
+  section_count: number;
+  parser: string;
+  parser_version: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface FullTextSection {
+  section_id: string;
+  document_id: string;
+  paper_id: string;
+  label: string;
+  text: string;
+  ordinal: number;
+  page_start?: number | null;
+  page_end?: number | null;
+  source_hash: string;
+  created_at: string;
+}
+
+interface FullTextIngestionResult {
+  ok: boolean;
+  document?: FullTextDocument | null;
+  sections: FullTextSection[];
+  warnings: string[];
+  errors: string[];
 }
 
 interface LogicFactExport {
@@ -1176,6 +1244,7 @@ function renderReviewInspectorEmpty(): string {
 }
 
 function renderEvidenceItem(item: EvidenceRow): string {
+  const locator = renderEvidenceLocator(item);
   return `
     <div class="biomed-evidence-item">
       <div class="biomed-evidence-head">
@@ -1183,10 +1252,28 @@ function renderEvidenceItem(item: EvidenceRow): string {
         ${pill(item.confidence)}
         ${item.retrieval_intent ? pill(item.retrieval_intent) : ""}
         ${item.extraction_mode ? pill(item.extraction_mode) : ""}
+        ${item.source_scope && item.source_scope !== "abstract" ? pill(item.source_scope) : ""}
         <code>${escapeHtml(item.paper_id)}</code>
       </div>
       <div class="biomed-evidence-claim">${escapeHtml(item.claim)}</div>
       <div class="biomed-evidence-finding">${escapeHtml(item.finding)}</div>
+      ${locator}
+    </div>
+  `;
+}
+
+function renderEvidenceLocator(item: EvidenceRow): string {
+  if (!item.document_id && !item.section_id && !item.source_hash) return "";
+  const range = item.char_start !== undefined && item.char_start !== null
+    ? `${item.char_start}${item.char_end !== undefined && item.char_end !== null ? `-${item.char_end}` : ""}`
+    : "-";
+  return `
+    <div class="biomed-watch-meta">
+      locator ${escapeHtml(item.section_label || item.section_id || "-")}
+      · page ${escapeHtml(String(item.page_number ?? "-"))}
+      · chars ${escapeHtml(range)}
+      · doc ${escapeHtml(compactId(item.document_id || "-"))}
+      · hash ${escapeHtml(compactId(item.source_hash || "-"))}
     </div>
   `;
 }
@@ -2527,6 +2614,7 @@ function renderLibrary(container: HTMLElement): void {
         <button class="is-active" data-biomed-library="projects">Projects</button>
         <button data-biomed-library="watch">Watch</button>
         <button data-biomed-library="evidence">Evidence</button>
+        <button data-biomed-library="fulltext">Full Text</button>
         <button data-biomed-library="graph">Graph</button>
       </div>
       <div id="biomed-library-body"></div>
@@ -2542,6 +2630,8 @@ function renderLibrary(container: HTMLElement): void {
       renderWatch(body);
     } else if (mode === "evidence") {
       renderEvidenceBrowser(body);
+    } else if (mode === "fulltext") {
+      renderFullTextWorkspace(body);
     } else if (mode === "graph") {
       renderGraph(body);
     } else {
@@ -2552,6 +2642,85 @@ function renderLibrary(container: HTMLElement): void {
     button.addEventListener("click", () => renderMode(button.dataset.biomedLibrary || "projects"));
   });
   renderMode("projects");
+}
+
+function renderFullTextWorkspace(container: HTMLElement): void {
+  container.innerHTML = `
+    <div class="biomed-section">
+      <div class="biomed-title">Full-Text And PDF Ingestion</div>
+      <div class="biomed-subtitle">Parser output is stored as sections and locators. It becomes evidence only after extraction and downstream audit/review.</div>
+      <div class="biomed-form">
+        <div class="biomed-row">
+          <input id="biomed-fulltext-paper-id" placeholder="paper id" />
+          <select id="biomed-fulltext-source"><option value="mock">mock</option><option value="pubmed">pubmed</option></select>
+          <select id="biomed-fulltext-content-type"><option value="text/plain">text/plain</option><option value="application/pdf">application/pdf</option></select>
+        </div>
+        <input id="biomed-fulltext-filename" placeholder="source filename" />
+        <textarea id="biomed-fulltext-content" rows="9" placeholder="Paste deterministic fixture text or extracted PDF text here...">## Results
+Microglial activation was associated with Alzheimer's disease progression in a human cohort. This cohort study requires validation.</textarea>
+        <div class="biomed-row">
+          <button id="biomed-fulltext-ingest">Ingest</button>
+          <button id="biomed-fulltext-load">Load Stored</button>
+          <button id="biomed-fulltext-extract">Extract Evidence</button>
+        </div>
+      </div>
+      <div id="biomed-fulltext-result" class="biomed-result"></div>
+    </div>
+  `;
+  const paperId = (): string => container.querySelector<HTMLInputElement>("#biomed-fulltext-paper-id")?.value.trim() || "";
+  const source = (): string => container.querySelector<HTMLSelectElement>("#biomed-fulltext-source")?.value || "mock";
+  const resultNode = (): HTMLElement | null => container.querySelector<HTMLElement>("#biomed-fulltext-result");
+  container.querySelector<HTMLButtonElement>("#biomed-fulltext-ingest")?.addEventListener("click", async () => {
+    const target = resultNode();
+    if (!target || !paperId()) return;
+    target.innerHTML = renderLoading("Ingesting full text...");
+    try {
+      const result = await api<FullTextIngestionResult>(`/api/biomed/papers/${encodeURIComponent(paperId())}/full-text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paper_id: paperId(),
+          source: source(),
+          content_type: container.querySelector<HTMLSelectElement>("#biomed-fulltext-content-type")?.value || "text/plain",
+          source_filename: container.querySelector<HTMLInputElement>("#biomed-fulltext-filename")?.value || null,
+          content: container.querySelector<HTMLTextAreaElement>("#biomed-fulltext-content")?.value || "",
+          overwrite: true,
+        }),
+      });
+      target.innerHTML = renderFullTextResult(result);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-fulltext-load")?.addEventListener("click", async () => {
+    const target = resultNode();
+    if (!target || !paperId()) return;
+    target.innerHTML = renderLoading("Loading full text...");
+    try {
+      const result = await api<FullTextIngestionResult>(`/api/biomed/papers/${encodeURIComponent(paperId())}/full-text?source=${encodeURIComponent(source())}`);
+      target.innerHTML = renderFullTextResult(result);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
+  container.querySelector<HTMLButtonElement>("#biomed-fulltext-extract")?.addEventListener("click", async () => {
+    const target = resultNode();
+    if (!target || !paperId()) return;
+    target.innerHTML = renderLoading("Extracting evidence from stored full text...");
+    try {
+      const result = await api<{ evidence?: EvidenceRow[]; reason?: string | null }>(`/api/biomed/papers/${encodeURIComponent(paperId())}/full-text/evidence`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: source(),
+          research_question: container.querySelector<HTMLTextAreaElement>("#biomed-fulltext-content")?.value.slice(0, 240) || null,
+        }),
+      });
+      target.innerHTML = renderFullTextEvidenceResult(result);
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  });
 }
 
 function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
@@ -2700,6 +2869,7 @@ function renderEvidenceBrowserCard(item: EvidenceRow): string {
         ${pill(item.confidence)}
         ${item.retrieval_intent ? pill(item.retrieval_intent) : ""}
         ${item.extraction_mode ? pill(item.extraction_mode) : ""}
+        ${item.source_scope && item.source_scope !== "abstract" ? pill(item.source_scope) : ""}
       </div>
       <div class="biomed-evidence-card-title">${escapeHtml(item.claim)}</div>
       <div class="biomed-evidence-card-finding">${escapeHtml(item.finding)}</div>
@@ -2707,6 +2877,7 @@ function renderEvidenceBrowserCard(item: EvidenceRow): string {
         <code>${escapeHtml(item.paper_id)}</code>
         ${item.retrieval_id ? `<code>${escapeHtml(item.retrieval_id)}</code>` : ""}
       </div>
+      ${renderEvidenceLocator(item)}
       <div class="biomed-evidence-card-detail">
         <div>
           <span>Entities</span>
@@ -2724,6 +2895,57 @@ function renderEvidenceBrowserCard(item: EvidenceRow): string {
         </div>
       ` : ""}
     </article>
+  `;
+}
+
+function renderFullTextResult(result: FullTextIngestionResult): string {
+  if (!result.ok || !result.document) {
+    return `
+      <div class="biomed-error">
+        ${escapeHtml((result.errors || []).join("; ") || "Full-text operation failed.")}
+      </div>
+    `;
+  }
+  return `
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Document</span><code>${escapeHtml(result.document.document_id)}</code></div>
+        <div><span>Paper</span><code>${escapeHtml(result.document.paper_id)}</code></div>
+        <div><span>Type</span><strong>${escapeHtml(result.document.content_type)}</strong></div>
+        <div><span>Sections</span><strong>${result.sections.length}</strong></div>
+        <div><span>Bytes</span><strong>${result.document.byte_size}</strong></div>
+        <div><span>Parser</span><strong>${escapeHtml(result.document.parser)}</strong></div>
+      </div>
+      <div class="biomed-watch-meta">
+        source hash ${escapeHtml(compactId(result.document.source_hash))} · updated ${escapeHtml(result.document.updated_at)}
+      </div>
+      ${result.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(result.warnings)}` : ""}
+      <div class="biomed-label">Sections</div>
+      <div class="biomed-audit-table">
+        ${result.sections.map((section) => `
+          <div class="biomed-audit-row">
+            <div class="biomed-audit-row-head">
+              ${pill(section.label)}
+              <code>${escapeHtml(section.section_id)}</code>
+              <span>pages ${escapeHtml(String(section.page_start ?? "-"))}-${escapeHtml(String(section.page_end ?? "-"))}</span>
+            </div>
+            <div class="biomed-watch-meta">hash ${escapeHtml(compactId(section.source_hash))}</div>
+            <div class="biomed-evidence-finding">${escapeHtml(section.text.slice(0, 420))}${section.text.length > 420 ? "..." : ""}</div>
+          </div>
+        `).join("") || '<div class="biomed-muted">No sections stored.</div>'}
+      </div>
+    </div>
+  `;
+}
+
+function renderFullTextEvidenceResult(result: { evidence?: EvidenceRow[]; reason?: string | null }): string {
+  const evidence = result.evidence || [];
+  return `
+    <div class="biomed-section">
+      <div class="biomed-label">Extracted Full-Text Evidence</div>
+      ${result.reason ? `<div class="biomed-muted">${escapeHtml(result.reason)}</div>` : ""}
+      ${evidence.map(renderEvidenceItem).join("") || '<div class="biomed-muted">No full-text evidence extracted.</div>'}
+    </div>
   `;
 }
 
@@ -3432,7 +3654,10 @@ async function loadWatchList(container: HTMLElement): Promise<void> {
           last ${escapeHtml(watch.last_checked_at || "-")} · next ${escapeHtml(watch.next_check_at || "-")}
         </div>
       </div>
-      <button data-biomed-check="${escapeHtml(watch.watch_id)}">Check</button>
+      <div class="biomed-row">
+        <button data-biomed-check="${escapeHtml(watch.watch_id)}">Check</button>
+        <button data-biomed-drift="${escapeHtml(watch.watch_id)}">Drift</button>
+      </div>
     </div>
   `).join("");
   target.querySelectorAll<HTMLButtonElement>("[data-biomed-check]").forEach((button) => {
@@ -3447,6 +3672,24 @@ async function loadWatchList(container: HTMLElement): Promise<void> {
       }
       await loadWatchList(container);
       await loadWatchEvents(container, id);
+    });
+  });
+  target.querySelectorAll<HTMLButtonElement>("[data-biomed-drift]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.getAttribute("data-biomed-drift") || "";
+      button.disabled = true;
+      button.textContent = "Loading...";
+      const driftTarget = container.querySelector<HTMLElement>("#biomed-watch-drift-result");
+      if (driftTarget) driftTarget.innerHTML = renderLoading("Loading Watch graph drift...");
+      try {
+        const result = await api<WatchGraphDriftResult>(`/api/biomed/watch/${encodeURIComponent(id)}/drift`);
+        if (driftTarget) driftTarget.innerHTML = renderWatchDrift(result);
+      } catch (error) {
+        if (driftTarget) driftTarget.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+      } finally {
+        button.disabled = false;
+        button.textContent = "Drift";
+      }
     });
   });
 }
@@ -3497,6 +3740,48 @@ function renderWatchCheckResult(result: WatchCheckResult): string {
   `;
 }
 
+function renderWatchDrift(result: WatchGraphDriftResult): string {
+  const changesByType = result.changes.reduce<Record<string, WatchDriftChange[]>>((acc, change) => {
+    const key = change.change_type || "unknown";
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(change);
+    return acc;
+  }, {});
+  return `
+    <div class="biomed-section">
+      <div class="biomed-title">Watch Graph Drift</div>
+      <div class="biomed-provenance">
+        <div class="biomed-provenance-grid">
+          <div><span>Status</span><strong>${escapeHtml(result.status)}</strong></div>
+          <div><span>Schema</span><strong>${escapeHtml(result.schema_version)}</strong></div>
+          <div><span>Changes</span><strong>${result.change_count}</strong></div>
+          <div><span>Advisory</span><strong>${result.advisory_only ? "yes" : "no"}</strong></div>
+          <div><span>Base</span>${compactCode(result.base_snapshot_id || "-")}</div>
+          <div><span>Compare</span>${compactCode(result.compare_snapshot_id || "-")}</div>
+        </div>
+        <div class="biomed-muted">Drift is reviewer QA context. It is not biomedical evidence and does not control runtime behavior.</div>
+        ${Object.keys(result.summary || {}).length ? `<div class="biomed-label">Summary</div><pre class="biomed-json">${escapeHtml(JSON.stringify(result.summary, null, 2))}</pre>` : ""}
+        ${result.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(result.warnings)}` : ""}
+      </div>
+      <div class="biomed-audit-table">
+        ${Object.entries(changesByType).map(([type, changes]) => `
+          <div class="biomed-audit-row">
+            <div class="biomed-audit-row-head">${pill(type)} <strong>${changes.length}</strong></div>
+            ${changes.slice(0, 8).map((change) => `
+              <div class="biomed-decision">
+                <div><code>${escapeHtml(change.item_id)}</code> ${escapeHtml(change.label)}</div>
+                <div class="biomed-watch-meta">
+                  papers ${escapeHtml(change.paper_ids.join(", ") || "-")} · evidence ${escapeHtml(change.evidence_ids.join(", ") || "-")}
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        `).join("") || '<div class="biomed-muted">No graph drift changes available.</div>'}
+      </div>
+    </div>
+  `;
+}
+
 function renderWatch(container: HTMLElement): void {
   container.innerHTML += `
     <div class="biomed-section">
@@ -3514,6 +3799,7 @@ function renderWatch(container: HTMLElement): void {
       <div class="biomed-label">Topics</div>
       <div id="biomed-watch-list" class="biomed-result"></div>
       <div id="biomed-watch-check-result" class="biomed-result"></div>
+      <div id="biomed-watch-drift-result" class="biomed-result"></div>
       <div class="biomed-label">Decision Log</div>
       <div id="biomed-watch-events" class="biomed-result"></div>
     </div>

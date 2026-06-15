@@ -14,6 +14,7 @@ from plugins.biomed_evidence.schemas import (
     CoverageGapAnalysisRequest,
     EvidenceExtractionRequest,
     EvidencePacketBuildRequest,
+    FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
@@ -159,6 +160,11 @@ async def _run(args: argparse.Namespace) -> dict:
     clinical_refusal_graph_claim_checks: list[bool] = []
     evidence_graph_export_redaction_checks: list[bool] = []
     run_evidence_review_checks: list[bool] = []
+    argument_graph_v2_schema_checks: list[bool] = []
+    argument_graph_link_checks: list[bool] = []
+    watch_drift_schema_checks: list[bool] = []
+    full_text_ingestion_checks: list[bool] = []
+    full_text_locator_checks: list[bool] = []
     prompt_injection_boundary_checks: list[bool] = []
     try:
         for case in cases:
@@ -374,6 +380,16 @@ async def _run(args: argparse.Namespace) -> dict:
                     expected_refusal=bool(case.get("expected_refusal")),
                 )
             )
+            argument_graph = service.get_answer_argument_graph(result.run_id)
+            if argument_graph is not None:
+                argument_payload = argument_graph.model_dump(mode="json")
+                argument_graph_v2_schema_checks.append(
+                    argument_payload.get("schema_version")
+                    == "biomed-argument-graph-v2"
+                )
+                argument_graph_link_checks.append(
+                    _argument_graph_links_evidence_graph(argument_payload)
+                )
             if case.get("expected_refusal"):
                 clinical_refusal_graph_claim_checks.append(
                     review is not None
@@ -819,12 +835,49 @@ async def _run(args: argparse.Namespace) -> dict:
             )
         )
         watch_result = await service.check_watch(watch.watch_id, source=args.source)
+        await service.check_watch(watch.watch_id, source=args.source)
+        watch_drift = service.get_watch_graph_drift(watch.watch_id)
+        watch_drift_schema_checks.append(
+            watch_drift.schema_version == "biomed-watch-graph-drift-v1"
+            and watch_drift.advisory_only is True
+            and watch_drift.status in {"ok", "insufficient_snapshots"}
+        )
         decisions = watch_result.decisions if watch_result is not None else []
         push_decisions = [
             item.relevance_score >= watch.min_relevance_score
             for item in decisions
             if item.decision == "push"
         ]
+        if literature_search.items:
+            full_text_paper_id = literature_search.items[0].paper_id
+            full_text_result = service.ingest_full_text(
+                FullTextIngestionRequest(
+                    paper_id=full_text_paper_id,
+                    source=args.source,
+                    content=(
+                        "## Results\nMicroglial activation was associated with "
+                        "Alzheimer's disease progression in a human cohort. "
+                        "This cohort study requires validation."
+                    ),
+                )
+            )
+            full_text_ingestion_checks.append(
+                full_text_result.ok
+                and full_text_result.document is not None
+                and bool(full_text_result.sections)
+            )
+            extracted_full_text = service.extract_full_text_evidence(
+                paper_id=full_text_paper_id,
+                source=args.source,
+                research_question="microglial activation Alzheimer progression",
+            )
+            full_text_locator_checks.append(
+                extracted_full_text is not None
+                and bool(extracted_full_text.evidence)
+                and bool(extracted_full_text.evidence[0].document_id)
+                and bool(extracted_full_text.evidence[0].section_id)
+                and extracted_full_text.evidence[0].char_start is not None
+            )
         metrics = {
             "citation_coverage": rate(citation_checks),
             "schema_validity": rate(schema_checks) if schema_checks else 1.0,
@@ -977,6 +1030,13 @@ async def _run(args: argparse.Namespace) -> dict:
                 evidence_graph_export_redaction_checks
             ),
             "run_evidence_review_validity": rate(run_evidence_review_checks),
+            "argument_graph_v2_schema_validity": rate(
+                argument_graph_v2_schema_checks
+            ),
+            "argument_graph_evidence_link_rate": rate(argument_graph_link_checks),
+            "watch_drift_schema_validity": rate(watch_drift_schema_checks),
+            "full_text_ingestion_success_rate": rate(full_text_ingestion_checks),
+            "full_text_span_locator_validity": rate(full_text_locator_checks),
             "prompt_injection_boundary_success_rate": rate(
                 prompt_injection_boundary_checks
             ),
@@ -1474,6 +1534,43 @@ def _run_evidence_review_valid(
         and isinstance(item.get("evidence_card"), dict)
         and bool(item.get("claim_text"))
         for item in claims
+    )
+
+
+def _argument_graph_links_evidence_graph(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("status") == "not_applicable":
+        return True
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return False
+    link_nodes = [
+        node
+        for node in nodes
+        if isinstance(node, dict)
+        and node.get("node_type") in {"claim", "evidence"}
+    ]
+    if not link_nodes:
+        return False
+    if not all(
+        isinstance(node.get("metadata"), dict)
+        and node["metadata"].get("evidence_graph_node_id")
+        for node in link_nodes
+    ):
+        return False
+    graph_edges = [
+        edge
+        for edge in edges
+        if isinstance(edge, dict)
+        and edge.get("edge_type") in {"supports", "attacks", "qualifies"}
+    ]
+    return all(
+        isinstance(edge.get("metadata"), dict)
+        and edge["metadata"].get("claim_graph_node_id")
+        and edge["metadata"].get("evidence_graph_node_id")
+        for edge in graph_edges
     )
 
 

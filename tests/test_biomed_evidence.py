@@ -15,14 +15,19 @@ from plugins.biomed_evidence.literature_client import (
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     BiomedProjectCreateRequest,
+    BiomedicalPaper,
     EvidenceExtractionRequest,
+    EvidenceItem,
+    FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
+    RetrievalManifest,
     SearchBiomedicalLiteratureRequest,
+    WatchSnapshot,
     WatchTopicCreateRequest,
 )
 from plugins.biomed_evidence.guardrails import RESEARCH_USE_DISCLAIMER
@@ -1039,6 +1044,153 @@ async def test_watch_check_scores_and_dedupes_decisions(tmp_path: Path) -> None:
     assert total == len(decisions)
     assert all(item.retrieval_id and item.snapshot_id for item in decisions)
     assert any(item.decision == "push" for item in decisions)
+
+
+def test_full_text_ingestion_extracts_locator_backed_evidence(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        paper = BiomedicalPaper(
+            paper_id="MOCK-FULLTEXT-1",
+            source="mock",
+            title="Full text microglia study",
+            abstract="Abstract-level summary only.",
+        )
+        service.storage.upsert_paper(paper)
+        ingested = service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper.paper_id,
+                source="mock",
+                content=(
+                    "## Results\n"
+                    "Microglial activation was associated with Alzheimer's disease "
+                    "progression in a longitudinal human cohort. The cohort study "
+                    "requires validation in independent samples."
+                ),
+            )
+        )
+        extracted = service.extract_full_text_evidence(
+            paper_id=paper.paper_id,
+            source="mock",
+            research_question="microglial activation Alzheimer progression",
+        )
+        graph = service.get_graph_v1(paper_id=paper.paper_id, validate=True)
+    finally:
+        service.storage.close()
+
+    assert ingested.ok is True
+    assert ingested.document is not None
+    assert ingested.sections
+    assert extracted is not None
+    assert extracted.evidence
+    item = extracted.evidence[0]
+    assert item.source_scope == "full_text"
+    assert item.document_id == ingested.document.document_id
+    assert item.section_id == ingested.sections[0].section_id
+    assert item.section_label == "Results"
+    assert item.char_start is not None
+    assert item.char_end is not None
+    assert item.source_hash == ingested.sections[0].source_hash
+    assert graph is not None
+    evidence_nodes = [node for node in graph.nodes if node.type == "EvidenceSpan"]
+    assert any(node.properties.get("source_scope") == "full_text" for node in evidence_nodes)
+
+
+def test_watch_graph_drift_reports_paper_and_claim_changes(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        watch = service.create_watch(
+            WatchTopicCreateRequest(topic="microglia Alzheimer drift")
+        )
+        service.storage.upsert_evidence(
+            EvidenceItem(
+                evidence_id="ev-drift-base",
+                paper_id="PAPER-BASE",
+                claim="Microglial activation is associated with Alzheimer's disease.",
+                finding="Microglial activation is associated with Alzheimer's disease.",
+                evidence_direction="supports",
+                confidence="medium",
+                evidence_span="Microglial activation is associated with Alzheimer's disease.",
+            ),
+            paper_source="mock",
+        )
+        service.storage.upsert_evidence(
+            EvidenceItem(
+                evidence_id="ev-drift-compare",
+                paper_id="PAPER-COMPARE",
+                claim="Microglial activation was not associated after adjustment.",
+                finding="Microglial activation was not associated after adjustment.",
+                evidence_direction="contradicts",
+                confidence="medium",
+                evidence_span="Microglial activation was not associated after adjustment.",
+            ),
+            paper_source="mock",
+        )
+        service.storage.save_retrieval_manifest(
+            _test_retrieval_manifest(
+                "ret-base",
+                returned_paper_ids=["PAPER-BASE"],
+                started_at="2026-06-15T00:00:00+00:00",
+            )
+        )
+        service.storage.save_retrieval_manifest(
+            _test_retrieval_manifest(
+                "ret-compare",
+                returned_paper_ids=["PAPER-BASE", "PAPER-COMPARE"],
+                started_at="2026-06-15T01:00:00+00:00",
+            )
+        )
+        service.storage.save_watch_snapshot(
+            WatchSnapshot(
+                snapshot_id="watch-snapshot-base",
+                watch_id=watch.watch_id,
+                retrieval_id="ret-base",
+                paper_ids=["PAPER-BASE"],
+                new_paper_ids=["PAPER-BASE"],
+                created_at="2026-06-15T00:00:00+00:00",
+            )
+        )
+        service.storage.save_watch_snapshot(
+            WatchSnapshot(
+                snapshot_id="watch-snapshot-compare",
+                watch_id=watch.watch_id,
+                retrieval_id="ret-compare",
+                paper_ids=["PAPER-BASE", "PAPER-COMPARE"],
+                new_paper_ids=["PAPER-COMPARE"],
+                created_at="2026-06-15T01:00:00+00:00",
+            )
+        )
+        drift = service.get_watch_graph_drift(watch.watch_id)
+    finally:
+        service.storage.close()
+
+    assert drift.status == "ok"
+    assert drift.advisory_only is True
+    assert drift.base_snapshot_id == "watch-snapshot-base"
+    assert drift.compare_snapshot_id == "watch-snapshot-compare"
+    assert drift.summary["paper_added"] == 1
+    assert any(change.change_type == "claim_added" for change in drift.changes)
+
+
+def _test_retrieval_manifest(
+    retrieval_id: str,
+    *,
+    returned_paper_ids: list[str],
+    started_at: str,
+) -> RetrievalManifest:
+    return RetrievalManifest(
+        retrieval_id=retrieval_id,
+        source="mock",
+        original_query="microglia Alzheimer drift",
+        compiled_query="microglia Alzheimer drift",
+        page_size=len(returned_paper_ids),
+        pages_requested=1,
+        pages_completed=1,
+        raw_result_count=len(returned_paper_ids),
+        deduped_result_count=len(returned_paper_ids),
+        returned_paper_ids=returned_paper_ids,
+        started_at=started_at,
+        finished_at=started_at,
+    )
 
 
 def test_tool_schema_derives_literal_and_list_types() -> None:

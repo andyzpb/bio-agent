@@ -1,11 +1,27 @@
 # Changelog
 
-## Unreleased
+## Release 2.0 - 2026-06-15
+
+### Added
+
+- Release 2.0 Biomedical Evidence milestone work: deterministic full-text/PDF
+  ingestion for known papers, section/page/offset/source-hash span locators,
+  and full-text-derived evidence extraction through the existing evidence
+  store.
+- Research Watch graph drift comparing snapshots for paper, claim, method,
+  limitation, entity, and support-shift changes as advisory reviewer QA
+  context.
+- Argument Graph v2 metadata linking claim/evidence argument nodes and edges
+  back to Evidence Graph node IDs, with qualifier edges for partial or
+  overclaimed support.
+- Dashboard Library surfaces for Watch drift and full-text ingestion/inspection.
 
 ### Changed
 
 - Refreshed public documentation around Release 1.6, framework-native
   Dashboard Chat, and run-centric Trace/Audit/Export review paths.
+- Extended mock eval metrics for Argument Graph v2, Watch drift, full-text
+  ingestion, and span locator validity.
 - Kept README focused on GitHub-facing highlights while moving implementation
   detail into architecture, plugin, evaluation, deployment, and responsible-AI
   docs.
@@ -15,6 +31,11 @@
 - Documented the Dashboard Chat boundary: clinical requests still stop before
   memory/retrieval/LLM work, and sensitive biomedical write/export/review tools
   deny until framework-level durable approval and resume support exists.
+- Full-text parser output is stored as source sections and locators only; it is
+  not biomedical evidence until extracted evidence flows through packet, audit,
+  graph, provenance, and review contracts.
+- Watch drift and Argument Graph v2 remain advisory reviewer signals and cannot
+  override clinical refusal, source policy, citation audit, or logic audit.
 
 ## Release 1.6 - 2026-06-13
 

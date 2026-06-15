@@ -36,6 +36,9 @@ ProjectReviewItemType = Literal[
     "needs_expert_review",
     "graph_validation_issue",
     "snapshot_stale",
+    "watch_graph_drift",
+    "argument_conflict",
+    "argument_unlinked_evidence",
 ]
 ProjectEvidenceBriefFormat = Literal["markdown", "json"]
 RunReviewDecisionValue = Literal[
@@ -262,6 +265,7 @@ EvidencePacketAvailability = Literal[
     "stale",
     "unavailable",
 ]
+FullTextSourceScope = Literal["abstract", "full_text", "pdf", "unknown"]
 BanditAdvisoryAction = Literal[
     "stop",
     "broaden_query",
@@ -410,7 +414,7 @@ class ArgumentGraphEdge(BaseModel):
     edge_id: str
     source: str
     target: str
-    edge_type: Literal["supports", "attacks", "limits", "cites"]
+    edge_type: Literal["supports", "attacks", "qualifies", "limits", "cites"]
     weight: float = 1.0
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -432,6 +436,7 @@ class ClaimArgumentSummary(BaseModel):
 class ArgumentGraphResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: str = "biomed-argument-graph-v2"
     run_id: str
     audit_id: str | None = None
     retrieval_id: str | None = None
@@ -677,6 +682,14 @@ class EvidenceItem(BaseModel):
     extractor_model: str | None = None
     extractor_prompt_hash: str | None = None
     requires_expert_review: bool = True
+    source_scope: FullTextSourceScope = "abstract"
+    document_id: str | None = None
+    section_id: str | None = None
+    section_label: str | None = None
+    page_number: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    source_hash: str | None = None
 
 
 class Citation(BaseModel):
@@ -1139,6 +1152,74 @@ class WatchSnapshot(BaseModel):
     paper_ids: list[str] = Field(default_factory=list)
     new_paper_ids: list[str] = Field(default_factory=list)
     created_at: str
+
+
+class FullTextSpanLocator(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_scope: FullTextSourceScope = "full_text"
+    document_id: str
+    section_id: str
+    section_label: str | None = None
+    page_number: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    source_hash: str
+
+
+class FullTextSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    section_id: str
+    document_id: str
+    paper_id: str
+    label: str = "Full text"
+    text: str
+    ordinal: int = 0
+    page_start: int | None = None
+    page_end: int | None = None
+    source_hash: str
+    created_at: str
+
+
+class FullTextDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str
+    paper_id: str
+    source: BiomedicalSource = "mock"
+    content_type: Literal["text/plain", "application/pdf"] = "text/plain"
+    title: str | None = None
+    source_filename: str | None = None
+    source_hash: str
+    byte_size: int = 0
+    section_count: int = 0
+    parser: str = "deterministic"
+    parser_version: str = "1"
+    created_at: str
+    updated_at: str
+
+
+class FullTextIngestionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: str = ""
+    source: BiomedicalSource = "mock"
+    content: str
+    content_type: Literal["text/plain", "application/pdf"] = "text/plain"
+    source_filename: str | None = None
+    title: str | None = None
+    overwrite: bool = False
+
+
+class FullTextIngestionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    document: FullTextDocument | None = None
+    sections: list[FullTextSection] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class FetchBiomedicalPaperRequest(BaseModel):
@@ -1948,6 +2029,45 @@ class WatchCheckResult(BaseModel):
     checked_at: str
     retrieval_manifest: RetrievalManifest | None = None
     snapshot: WatchSnapshot | None = None
+
+
+class WatchDriftChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    change_type: Literal[
+        "paper_added",
+        "paper_removed",
+        "claim_added",
+        "claim_removed",
+        "support_shift",
+        "method_added",
+        "method_removed",
+        "limitation_added",
+        "limitation_removed",
+        "entity_added",
+        "entity_removed",
+    ]
+    item_id: str
+    label: str
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+    evidence_ids: list[str] = Field(default_factory=list)
+    paper_ids: list[str] = Field(default_factory=list)
+
+
+class WatchGraphDriftResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "biomed-watch-graph-drift-v1"
+    watch_id: str
+    base_snapshot_id: str | None = None
+    compare_snapshot_id: str | None = None
+    status: Literal["ok", "insufficient_snapshots", "watch_not_found"] = "ok"
+    advisory_only: bool = True
+    change_count: int = 0
+    changes: list[WatchDriftChange] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class GraphNode(BaseModel):

@@ -84,11 +84,18 @@ python -m eval.biomed_evidence.run_eval \
 - `clinical_refusal_graph_claim_rate`: clinical refusal run graphs contain zero biomedical Claim nodes.
 - `evidence_graph_export_redaction_rate`: graph JSON export excludes raw prompts, raw provider responses, API keys, tokens, authorization headers, and secrets.
 - `run_evidence_review_validity`: snapshot-backed Run Evidence Review returns schema-valid claim reviews for non-refusal runs and zero-claim refusal reviews for clinical refusals.
+- `argument_graph_v2_schema_validity`: Argument Graph exports use the v2 schema and remain advisory.
+- `argument_graph_evidence_link_rate`: argument claim/evidence nodes and support/attack/qualifier edges link back to Evidence Graph node IDs.
+- `watch_drift_schema_validity`: Watch graph drift returns schema-valid advisory results for repeated Watch snapshots.
+- `full_text_ingestion_success_rate`: deterministic full-text fixture ingestion stores a document and sections for a known paper.
+- `full_text_span_locator_validity`: full-text-derived evidence exposes document ID, section ID, source hash, and character offsets.
 - `prompt_injection_boundary_success_rate`: prompt-injection-like clinical requests still hit the clinical boundary.
 
 The Evidence Graph and Run Evidence Review metrics are active in the mock eval
 gate. They use persisted graph snapshots when available and check review
 contracts without requiring live PubMed or external graph infrastructure.
+Release 2.0 metrics add deterministic local full-text fixtures, Watch drift, and
+Argument Graph v2 checks without requiring external full-text providers.
 
 Dashboard Chat is covered by targeted framework/plugin tests rather than by the
 mock biomedical eval runner:
@@ -107,6 +114,14 @@ The Release 1.0 mock gate is:
 ```bash
 .venv/bin/python -m eval.biomed_evidence.run_eval \
   --output /tmp/biomed_eval_release_1_0.json
+```
+
+The current Release 2.0 milestone uses the same deterministic mock harness with
+a Release 2.0 output artifact:
+
+```bash
+.venv/bin/python -m eval.biomed_evidence.run_eval \
+  --output /tmp/biomed_eval_release_2_0.json
 ```
 
 Expected release-specific checks should be `1.0` except

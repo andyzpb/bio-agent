@@ -33,6 +33,11 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
   cards, and immutable graph snapshot metadata as a reviewer and eval gate. It
   does not turn graph structure into a new biomedical fact source, and it does
   not override deterministic citation audit.
+- Full-text/PDF ingestion stores parser output as document sections, source
+  hashes, and span locators only. Parser output is not biomedical evidence until
+  extracted `EvidenceItem` records pass through packet selection, citation
+  audit, logic audit, Evidence Graph validation, provenance, and Run Evidence
+  Review.
 
 ## Tool And Memory Boundary
 
@@ -74,6 +79,9 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
 - Evidence Graph and Provenance Graph share stable local IDs, but the former is
   the claim/evidence/source relationship graph and the latter is the execution
   lineage graph.
+- Watch graph drift compares snapshots for reviewer QA. New papers, changed
+  claims, support shifts, methods, limitations, and entity changes are advisory
+  context only and cannot assert biomedical truth.
 
 ## Advisory Math Boundary
 
@@ -84,6 +92,9 @@ The Biomedical Evidence Agent is a research support tool. It is not a clinical d
   query, but it cannot override caps or policy.
 - Step telemetry and Markov-style transition summaries are descriptive only and
   cannot assert biomedical truth.
+- Argument Graph v2 support, attack, qualifier, limitation, and citation edges
+  are advisory review signals linked back to Evidence Graph IDs. They do not
+  replace citation audit or deterministic logic audit.
 
 ## Uncertainty Policy
 

@@ -29,6 +29,7 @@ from plugins.biomed_evidence.schemas import (
     EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
@@ -241,6 +242,44 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "paper": paper.model_dump(mode="json"),
             "evidence": [item.model_dump(mode="json") for item in evidence],
         }
+
+    @app.post("/api/biomed/papers/{paper_id}/full-text")
+    def ingest_paper_full_text(
+        paper_id: str,
+        payload: FullTextIngestionRequest,
+    ) -> dict[str, Any]:
+        request = payload.model_copy(update={"paper_id": paper_id})
+        result = service.ingest_full_text(request)
+        if not result.ok:
+            raise HTTPException(status_code=400, detail=result.model_dump(mode="json"))
+        return result.model_dump(mode="json")
+
+    @app.get("/api/biomed/papers/{paper_id}/full-text")
+    def get_paper_full_text(
+        paper_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+    ) -> dict[str, Any]:
+        result = service.get_full_text_document(paper_id, source=source)
+        if result is None:
+            raise HTTPException(status_code=404, detail="full text not found")
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/papers/{paper_id}/full-text/evidence")
+    def extract_paper_full_text_evidence(
+        paper_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = service.extract_full_text_evidence(
+            paper_id=paper_id,
+            source=str(payload.get("source") or "mock"),
+            research_question=payload.get("research_question"),
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="paper or full text not found",
+            )
+        return result.model_dump(mode="json")
 
     @app.post("/api/biomed/evidence/extract")
     def extract_evidence(payload: EvidenceExtractionRequest) -> dict[str, Any]:
@@ -884,6 +923,21 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             "page": max(1, page),
             "page_size": max(1, min(page_size, 200)),
         }
+
+    @app.get("/api/biomed/watch/{watch_id}/drift")
+    def get_watch_drift(
+        watch_id: str,
+        base_snapshot_id: str = "",
+        compare_snapshot_id: str = "",
+    ) -> dict[str, Any]:
+        result = service.get_watch_graph_drift(
+            watch_id,
+            base_snapshot_id=base_snapshot_id,
+            compare_snapshot_id=compare_snapshot_id,
+        )
+        if result.status == "watch_not_found":
+            raise HTTPException(status_code=404, detail="watch topic not found")
+        return result.model_dump(mode="json")
 
     @app.post("/api/biomed/watch/{watch_id}/check")
     async def check_watch_topic(

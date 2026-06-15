@@ -330,6 +330,29 @@ same review loop to agent workflows. Reviewer notes are persisted as QA
 metadata and are never treated as biomedical evidence. Snapshot creation is
 intentionally not exposed as an agent tool in this phase.
 
+## Release 2.0 Full-Text Contract
+
+Release 2.0 extends the abstract-level workflow with deterministic full-text/PDF
+ingestion behind the same graph and review contracts:
+
+```text
+paper metadata
+  -> full-text document + sections
+  -> section/page/offset span locators
+  -> evidence extraction
+  -> evidence packet + audit
+  -> Evidence Graph snapshot + Run Evidence Review
+```
+
+PDF or full-text parser output is never treated as biomedical evidence by
+itself. It can only provide source sections and span locators for extracted
+`EvidenceItem` records. Full-text-derived evidence remains subject to citation
+audit, logic audit, graph validation, snapshot review, and expert review.
+
+Research Watch drift and Argument Graph v2 are also Release 2.0 review aids.
+They are advisory reviewer signals, not evidence, and they do not control
+runtime behavior.
+
 ## Dashboard
 
 Start the dashboard:
@@ -375,8 +398,12 @@ Common routes:
 - `POST /api/biomed/answer-runs/{run_id}/audit`
 - `GET /api/biomed/answer-runs/{run_id}/trace`
 - `GET /api/biomed/answer-runs/{run_id}/evidence-graph`
+- `GET /api/biomed/answer-runs/{run_id}/argument-graph`
 - `GET /api/biomed/answer-runs/{run_id}/evidence-review`
 - `POST /api/biomed/answer-runs/{run_id}/evidence-review/snapshot`
+- `GET /api/biomed/watch/{watch_id}/drift`
+- `POST /api/biomed/papers/{paper_id}/full-text`
+- `GET /api/biomed/papers/{paper_id}/full-text`
 - `GET /api/biomed/projects`
 - `POST /api/biomed/projects`
 - `POST /api/biomed/projects/{project_id}/papers`

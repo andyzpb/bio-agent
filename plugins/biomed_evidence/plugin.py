@@ -32,6 +32,7 @@ from plugins.biomed_evidence.schemas import (
     EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
@@ -92,6 +93,10 @@ _BIOMED_TOOL_NAMES = frozenset(
         "list_research_watch_topics",
         "update_research_watch_topic",
         "delete_research_watch_topic",
+        "get_research_watch_drift",
+        "ingest_paper_full_text",
+        "get_paper_full_text",
+        "extract_full_text_evidence",
         "get_evidence_graph",
         "get_evidence_card",
         "validate_evidence_graph",
@@ -115,6 +120,9 @@ _TOOLS_WITH_SOURCE = frozenset(
         "search_literature",
         "search_biomedical_literature",
         "fetch_biomedical_paper",
+        "ingest_paper_full_text",
+        "get_paper_full_text",
+        "extract_full_text_evidence",
         "answer_with_evidence",
         "answer_with_audit",
         "record_project_paper_decision",
@@ -202,6 +210,10 @@ _SENSITIVE_CHAT_TOOL_NAMES = frozenset(
         "watch_research_topic",
         "update_research_watch_topic",
         "delete_research_watch_topic",
+        "get_research_watch_drift",
+        "ingest_paper_full_text",
+        "get_paper_full_text",
+        "extract_full_text_evidence",
         "save_biomed_workflow_template",
         "delete_biomed_workflow_template",
         "record_run_review_decision",
@@ -548,6 +560,75 @@ class BiomedEvidencePlugin(Plugin):
         if paper is None:
             return _dump({"paper": None, "error": "paper_not_found"})
         return _dump({"paper": paper.model_dump(mode="json")})
+
+    @tool(
+        name="ingest_paper_full_text",
+        risk="read-write",
+        search_hint="ingest biomedical paper full text pdf sections span locators",
+    )
+    async def ingest_paper_full_text(
+        self,
+        event,
+        paper_id: str,
+        content: str,
+        source: Literal["pubmed", "mock"] = "mock",
+        content_type: Literal["text/plain", "application/pdf"] = "text/plain",
+        source_filename: str | None = None,
+        title: str | None = None,
+        overwrite: bool = False,
+    ) -> str:
+        """Store normalized full text/PDF sections for a known paper."""
+        result = self._service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper_id,
+                source=source,
+                content=content,
+                content_type=content_type,
+                source_filename=source_filename,
+                title=title,
+                overwrite=overwrite,
+            )
+        )
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="get_paper_full_text",
+        risk="read-only",
+        search_hint="get biomedical paper full text sections span locator source hash",
+    )
+    async def get_paper_full_text(
+        self,
+        event,
+        paper_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+    ) -> str:
+        """Return stored full-text document sections for a paper."""
+        result = self._service.get_full_text_document(paper_id, source=source)
+        if result is None:
+            return _dump({"error": "full_text_not_found", "paper_id": paper_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="extract_full_text_evidence",
+        risk="read-write",
+        search_hint="extract evidence from stored full text sections with locators",
+    )
+    async def extract_full_text_evidence(
+        self,
+        event,
+        paper_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+        research_question: str | None = None,
+    ) -> str:
+        """Extract evidence from stored full-text sections for a paper."""
+        result = self._service.extract_full_text_evidence(
+            paper_id=paper_id,
+            source=source,
+            research_question=research_question,
+        )
+        if result is None:
+            return _dump({"error": "paper_or_full_text_not_found", "paper_id": paper_id})
+        return _dump(result.model_dump(mode="json"))
 
     @tool(
         name="extract_evidence",
@@ -1690,6 +1771,26 @@ class BiomedEvidencePlugin(Plugin):
         return _dump(
             {"deleted": self._service.delete_watch(watch_id), "watch_id": watch_id}
         )
+
+    @tool(
+        name="get_research_watch_drift",
+        risk="read-only",
+        search_hint="compare research watch graph snapshots drift claims methods limitations",
+    )
+    async def get_research_watch_drift(
+        self,
+        event,
+        watch_id: str,
+        base_snapshot_id: str = "",
+        compare_snapshot_id: str = "",
+    ) -> str:
+        """Compare two research watch snapshots for graph-level drift."""
+        result = self._service.get_watch_graph_drift(
+            watch_id,
+            base_snapshot_id=base_snapshot_id,
+            compare_snapshot_id=compare_snapshot_id,
+        )
+        return _dump(result.model_dump(mode="json"))
 
     @tool(
         name="get_evidence_graph",

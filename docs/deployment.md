@@ -92,6 +92,46 @@ curl -s -X POST "http://127.0.0.1:2236/api/biomed/export/obsidian/evidence-packe
 The export is deterministic and one-way; Markdown notes are reviewer artifacts
 and are not imported as biomedical evidence.
 
+## Release 2.0 Full-Text And Drift Smoke
+
+After creating an audited answer run, inspect Argument Graph v2:
+
+```bash
+curl -s "http://127.0.0.1:2236/api/biomed/answer-runs/$RUN_ID/argument-graph" \
+  | jq '{schema_version, status, advisory_only, nodes:(.nodes|length), edges:(.edges|length)}'
+```
+
+For a known stored paper, ingest deterministic local full text and extract
+locator-backed evidence:
+
+```bash
+PAPER_ID="<stored paper id>"
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/papers/$PAPER_ID/full-text" \
+  -H "Content-Type: application/json" \
+  -d '{"source":"mock","content_type":"text/plain","content":"## Results\nMicroglial activation was associated with Alzheimer disease progression in a human cohort. This cohort study requires validation.","overwrite":true}' \
+  | jq '{ok, document:.document.document_id, sections:(.sections|length)}'
+
+curl -s -X POST "http://127.0.0.1:2236/api/biomed/papers/$PAPER_ID/full-text/evidence" \
+  -H "Content-Type: application/json" \
+  -d '{"source":"mock","research_question":"microglial activation Alzheimer progression"}' \
+  | jq '{paper_id, evidence:[.evidence[] | {evidence_id, source_scope, document_id, section_id, char_start, char_end}]}'
+```
+
+For Watch drift, create/check a Watch at least twice, then inspect the advisory
+diff:
+
+```bash
+WATCH_ID="<watch id>"
+
+curl -s "http://127.0.0.1:2236/api/biomed/watch/$WATCH_ID/drift" \
+  | jq '{schema_version, status, advisory_only, change_count, summary}'
+```
+
+Full-text sections, Watch drift, and Argument Graph v2 are reviewer context.
+They do not bypass evidence packets, citation audit, logic audit, graph
+validation, provenance, or Run Evidence Review.
+
 ## Docker
 
 ```bash
@@ -106,7 +146,7 @@ Release gates before merging:
 .venv/bin/pyright --level error
 .venv/bin/pyright --project pyrightconfig.tests.json --level error
 .venv/bin/pytest -q tests/
-.venv/bin/python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_release_1_0.json
+.venv/bin/python -m eval.biomed_evidence.run_eval --output /tmp/biomed_eval_release_2_0.json
 npm run typecheck
 npm run build
 docker compose up -d --build --force-recreate
