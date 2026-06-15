@@ -510,6 +510,234 @@ def test_dashboard_chat_create_session_returns_friendly_placeholder(tmp_path) ->
     }
 
 
+def test_dashboard_chat_commands_manifest_includes_biomed(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.get("/api/dashboard/chat/commands")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == "dashboard-chat-commands-v1"
+    command = payload["commands"][0]
+    assert command["prefix"] == "/biomed"
+    assert command["status"]["llm_provider"]["status"] == "configured"
+    workflows = {item["name"]: item for item in command["workflows"]}
+    assert workflows["audit"]["contract"]["tool_name"] == "answer_with_audit"
+    assert workflows["audit"]["contract"]["source_policy"] == "live_opt_in"
+
+
+def test_dashboard_chat_biomed_status_reports_disabled_pubmed_and_missing_llm(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        response = client.get("/api/dashboard/chat/commands/biomed/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["llm_provider"]["status"] == "missing"
+    assert payload["pubmed"]["status"] == "disabled"
+    assert payload["pubmed"]["allow_live_pubmed_tools"] is False
+    assert "allow_live_pubmed_tools" in payload["pubmed"]["message"]
+    assert "api_key" not in response.text.lower()
+
+
+def test_dashboard_chat_biomed_parse_audit_preview_expands_llm_flags(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed audit "microglia Alzheimer disease" --source mock --papers 10 --llm all --support-refute',
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["can_send"] is True
+    assert payload["action"] == "audit"
+    assert payload["tool_name"] == "answer_with_audit"
+    assert payload["arguments"]["max_papers"] == 10
+    assert payload["arguments"]["use_llm_planner"] is True
+    assert payload["arguments"]["use_llm_claim_logic"] is True
+    assert payload["arguments"]["execute_support_refute"] is True
+    assert "Run a research-only Biomedical Evidence audited answer workflow" in payload["final_prompt"]
+
+
+def test_dashboard_chat_biomed_parse_blocks_pubmed_when_disabled(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed audit "microglia Alzheimer disease" --source pubmed --papers 10',
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["can_send"] is False
+    assert payload["missing_requirements"][0]["kind"] == "pubmed"
+    assert "allow_live_pubmed_tools" in payload["missing_requirements"][0]["detail"]
+
+
+def test_dashboard_chat_biomed_enable_pubmed_updates_command_policy(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        enable = client.post(
+            "/api/dashboard/chat/messages",
+            json={"session_key": "dashboard:default", "content": "/biomed enable pubmed"},
+        )
+        status = client.get("/api/dashboard/chat/commands/biomed/status")
+        preview = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed audit "microglia Alzheimer disease" --source pubmed --papers 10',
+            },
+        )
+        history = client.get("/api/dashboard/chat/history", params={"session_key": "dashboard:default"})
+
+    assert enable.status_code == 202
+    assert enable.json()["deterministic_response"] is True
+    assert len(bus.inbound_items) == 0
+    assert status.json()["pubmed"]["status"] == "enabled"
+    assert status.json()["pubmed"]["policy_status"] == "enabled"
+    assert preview.json()["can_send"] is True
+    assert preview.json()["missing_requirements"] == []
+    assert "allow_live_pubmed_tools = true" in (tmp_path / "config.toml").read_text(encoding="utf-8")
+    assert history.json()["items"][-1]["content"].startswith("## PubMed enabled")
+
+
+def test_dashboard_chat_biomed_parse_confirmation_preview_for_write_action(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed project create "Microglia AD" --question "What links microglial activation to AD progression?"',
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["tool_name"] == "create_biomed_project"
+    assert payload["confirmation"]["required"] is True
+    assert payload["confirmation"]["risk_level"] == "writes_storage"
+
+
+def test_dashboard_chat_biomed_message_routes_command_prompt_through_bus(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed audit "microglia Alzheimer disease" --source mock --papers 10 --llm all',
+            },
+        )
+
+    assert response.status_code == 202
+    assert len(bus.inbound_items) == 1
+    inbound = bus.inbound_items[0]
+    assert inbound.channel == "dashboard"
+    assert inbound.metadata["raw_content"].startswith("/biomed audit")
+    assert inbound.metadata["command"]["action"] == "audit"
+    assert inbound.content.startswith("Run a research-only Biomedical Evidence")
+
+
+def test_dashboard_chat_biomed_help_is_deterministic(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={"session_key": "dashboard:default", "content": "/biomed help"},
+        )
+        history = client.get("/api/dashboard/chat/history", params={"session_key": "dashboard:default"})
+
+    assert response.status_code == 202
+    assert response.json()["command"]["action"] == "help"
+    assert response.json()["deterministic_response"] is True
+    assert len(bus.inbound_items) == 0
+    items = history.json()["items"]
+    assert items[-2]["role"] == "user"
+    assert items[-1]["role"] == "assistant"
+    assert items[-1]["content"].startswith("## /biomed commands")
+    assert "Biomedical Evidence is research-only" in items[-1]["content"]
+
+
 def test_dashboard_chat_first_message_updates_placeholder_title(tmp_path) -> None:
     bus = _FakeBus()
     event_bus = EventBus()

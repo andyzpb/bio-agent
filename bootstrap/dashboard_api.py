@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path, PureWindowsPath
@@ -189,6 +190,11 @@ class ChatSessionCreatePayload(BaseModel):
 
 class ChatApprovalDecisionPayload(BaseModel):
     decision: str = "approve"
+
+
+class ChatCommandParsePayload(BaseModel):
+    content: str
+    session_key: str | None = None
 
 
 class ManualConsolidator(Protocol):
@@ -1321,6 +1327,672 @@ def _preview_text(value: Any, limit: int) -> str:
     return text[:limit].rstrip() + "..."
 
 
+_BIOMED_LLM_FLAGS = (
+    "use_llm_planner",
+    "use_llm_extractor",
+    "use_llm_synthesis",
+    "use_llm_verifier",
+    "use_llm_revision",
+    "use_llm_claim_logic",
+)
+
+
+def _safe_read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _live_config_path(workspace: Path) -> Path:
+    env_path = os.environ.get("AKASHIC_CONFIG")
+    if env_path:
+        return Path(env_path)
+    return workspace / "config.toml"
+
+
+def _read_biomed_config(workspace: Path, plugin_dir: Path) -> dict[str, Any]:
+    schema = _safe_read_json(plugin_dir / "_conf_schema.json")
+    defaults = {
+        key: value.get("default")
+        for key, value in schema.items()
+        if isinstance(value, dict) and "default" in value
+    }
+    config = dict(defaults)
+    config_path = _live_config_path(workspace)
+    if not config_path.exists():
+        return config
+    try:
+        import tomllib
+
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return config
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return config
+    biomed = plugins.get("biomed_evidence")
+    if isinstance(biomed, dict):
+        config.update(biomed)
+    return config
+
+
+def _write_biomed_bool_config(workspace: Path, key: str, value: bool) -> dict[str, Any]:
+    if key != "allow_live_pubmed_tools":
+        raise ValueError("Unsupported Biomedical Evidence config key.")
+    config_path = _live_config_path(workspace)
+    section_header = "[plugins.biomed_evidence]"
+    new_line = f"{key} = {'true' if value else 'false'}"
+    if not config_path.exists():
+        config_path.write_text(f"{section_header}\n{new_line}\n", encoding="utf-8")
+        return {"path": str(config_path), "created": True, "updated": True}
+    text = config_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    section_start = -1
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        if line.strip() == section_header:
+            section_start = index
+            continue
+        if section_start >= 0 and index > section_start and re.match(r"^\s*\[[^\]]+\]\s*$", line):
+            section_end = index
+            break
+    if section_start < 0:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend([section_header, new_line])
+    else:
+        key_index = -1
+        for index in range(section_start + 1, section_end):
+            if re.match(rf"^\s*{re.escape(key)}\s*=", lines[index]):
+                key_index = index
+                break
+        if key_index >= 0:
+            lines[key_index] = new_line
+        else:
+            lines.insert(section_end, new_line)
+    suffix = "\n" if text.endswith("\n") else ""
+    if not suffix:
+        suffix = "\n"
+    config_path.write_text("\n".join(lines).rstrip() + suffix, encoding="utf-8")
+    return {"path": str(config_path), "created": False, "updated": True}
+
+
+def _bool_config(config: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _int_config(config: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(config.get(key, default))
+    except Exception:
+        return default
+
+
+def _str_config(config: dict[str, Any], key: str, default: str = "") -> str:
+    value = config.get(key, default)
+    return str(value if value is not None else default)
+
+
+def _provider_status(provider: Any | None, model: str) -> dict[str, Any]:
+    configured = provider is not None
+    return {
+        "status": "configured" if configured else "missing",
+        "model": model if configured and model else "",
+        "features": {
+            "planning": configured,
+            "extraction": configured,
+            "synthesis": configured,
+            "verifier": configured,
+            "revision": configured,
+            "claim_logic": configured,
+        },
+        "missing_effect": (
+            ""
+            if configured
+            else "LLM planning, extraction, synthesis, verifier, revision, and claim logic will use deterministic fallbacks or be unavailable."
+        ),
+    }
+
+
+def _biomed_readiness(
+    *,
+    workspace: Path,
+    plugin_dir: Path,
+    provider: Any | None,
+    model: str,
+) -> dict[str, Any]:
+    config = _read_biomed_config(workspace, plugin_dir)
+    live_pubmed = _bool_config(config, "allow_live_pubmed_tools", False)
+    return {
+        "command": "/biomed",
+        "llm_provider": _provider_status(provider, model),
+        "pubmed": {
+            "status": "enabled" if live_pubmed else "disabled",
+            "policy_status": "enabled" if live_pubmed else "disabled",
+            "network_status": "unchecked",
+            "allow_live_pubmed_tools": live_pubmed,
+            "message": (
+                "Live PubMed command execution is allowed by allow_live_pubmed_tools. Network reachability is checked when you run a live PubMed command."
+                if live_pubmed
+                else "Live PubMed command execution is blocked by allow_live_pubmed_tools=false. This policy gate is separate from raw network reachability."
+            ),
+        },
+        "source": {
+            "default_source": _str_config(config, "default_source", "mock") or "mock",
+            "live_pubmed_opt_in": live_pubmed,
+        },
+        "limits": {
+            "max_papers": _int_config(config, "max_answer_papers", 10),
+            "max_tool_steps": _int_config(config, "max_tool_steps", 20),
+            "max_llm_calls": _int_config(config, "max_llm_calls", 6),
+        },
+        "exports": {
+            "obsidian": _bool_config(config, "enable_obsidian_export", False),
+            "provenance": _bool_config(config, "enable_provenance_export", False),
+        },
+        "confirmation": {
+            "required_for": _biomed_confirmation_tools(),
+        },
+        "config_path": str(_live_config_path(workspace)),
+    }
+
+
+def _biomed_confirmation_tools() -> list[str]:
+    try:
+        from plugins.biomed_evidence.tool_contracts import list_release_tool_contracts
+    except Exception:
+        return []
+    return [
+        item.tool_name
+        for item in list_release_tool_contracts()
+        if bool(getattr(item, "requires_confirmation", False))
+    ]
+
+
+def _biomed_tool_contract_map() -> dict[str, dict[str, Any]]:
+    try:
+        from plugins.biomed_evidence.tool_contracts import list_release_tool_contracts
+    except Exception:
+        return {}
+    return {
+        item.tool_name: item.model_dump(mode="json")
+        for item in list_release_tool_contracts()
+    }
+
+
+def _biomed_workflow_templates(workspace: Path, provider: Any | None, model: str) -> list[dict[str, Any]]:
+    try:
+        from plugins.biomed_evidence.service import BiomedEvidenceService
+
+        service = BiomedEvidenceService(
+            workspace,
+            revision_provider=provider,
+            revision_model=model,
+        )
+        try:
+            payload = service.list_workflow_templates().model_dump(mode="json")
+        finally:
+            close = getattr(service, "close", None)
+            if callable(close):
+                close()
+        items = payload.get("items")
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def _chat_command_manifest(
+    *,
+    workspace: Path,
+    plugin_dir: Path,
+    provider: Any | None,
+    model: str,
+) -> dict[str, Any]:
+    contracts = _biomed_tool_contract_map()
+    readiness = _biomed_readiness(
+        workspace=workspace,
+        plugin_dir=plugin_dir,
+        provider=provider,
+        model=model,
+    )
+    templates = _biomed_workflow_templates(workspace, provider, model)
+    return {
+        "schema_version": "dashboard-chat-commands-v1",
+        "commands": [
+            {
+                "prefix": "/biomed",
+                "plugin_id": "biomed_evidence",
+                "display_name": "Biomedical Evidence",
+                "description": "Run research-only biomedical literature workflows with source policy, LLM readiness, and confirmations visible before execution.",
+                "status": readiness,
+                "examples": [
+                    "/biomed status",
+                    "/biomed enable pubmed",
+                    "/biomed check pubmed",
+                    "/biomed audit \"microglial activation Alzheimer disease progression\" --source pubmed --papers 10 --llm all --support-refute",
+                    "/biomed literature \"TREM2 microglia Alzheimer\" --source pubmed --papers 10",
+                    "/biomed review biomed-run-...",
+                    "/biomed export provenance biomed-run-...",
+                    "/biomed project create \"Microglia AD\" --question \"What links microglial activation to AD progression?\"",
+                    "/biomed watch create \"Microglia AD\" --query \"microglia Alzheimer disease progression\"",
+                ],
+                "options": {
+                    "source": ["mock", "pubmed"],
+                    "papers": {"type": "integer", "default": readiness["limits"]["max_papers"]},
+                    "llm": ["off", "all"],
+                    "support-refute": {"type": "boolean"},
+                    "project": {"type": "string"},
+                    "run_id": {"type": "string"},
+                },
+                "workflows": [
+                    {
+                        "name": "status",
+                        "label": "Provider and source status",
+                        "risk_level": "read_only",
+                        "requires_confirmation": False,
+                    },
+                    {
+                        "name": "enable pubmed",
+                        "label": "Enable live PubMed command policy",
+                        "risk_level": "configuration_write",
+                        "requires_confirmation": True,
+                    },
+                    {
+                        "name": "audit",
+                        "label": "Full evidence audit",
+                        "tool_name": "answer_with_audit",
+                        "contract": contracts.get("answer_with_audit", {}),
+                    },
+                    {
+                        "name": "literature",
+                        "label": "Literature retrieval",
+                        "tool_name": "search_literature",
+                        "contract": contracts.get("search_literature", {}),
+                    },
+                    {
+                        "name": "review",
+                        "label": "Run evidence review",
+                        "tool_name": "get_run_evidence_review",
+                        "contract": contracts.get("get_run_evidence_review", {}),
+                    },
+                    {
+                        "name": "export provenance",
+                        "label": "Provenance export",
+                        "tool_name": "export_provenance_graph",
+                        "contract": contracts.get("export_provenance_graph", {}),
+                    },
+                ],
+                "templates": templates,
+            }
+        ],
+    }
+
+
+def _parse_flags(tokens: list[str]) -> tuple[list[str], dict[str, Any]]:
+    positional: list[str] = []
+    flags: dict[str, Any] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--") or token == "--":
+            positional.append(token)
+            index += 1
+            continue
+        key = token[2:].strip().replace("-", "_")
+        next_value = tokens[index + 1] if index + 1 < len(tokens) else None
+        if next_value is None or next_value.startswith("--"):
+            flags[key] = True
+            index += 1
+            continue
+        flags[key] = next_value
+        index += 2
+    return positional, flags
+
+
+def _flag_int(flags: dict[str, Any], *keys: str, default: int) -> int:
+    for key in keys:
+        if key not in flags:
+            continue
+        try:
+            return max(1, int(flags[key]))
+        except Exception:
+            return default
+    return default
+
+
+def _flag_str(flags: dict[str, Any], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = flags.get(key)
+        if value is not None and value is not True:
+            return str(value).strip()
+    return default
+
+
+def _missing_for_source(source: str, readiness: dict[str, Any]) -> list[dict[str, str]]:
+    if source == "pubmed" and readiness["pubmed"]["status"] != "enabled":
+        return [
+            {
+                "kind": "pubmed",
+                "label": "Live PubMed disabled",
+                "detail": "Set allow_live_pubmed_tools=true in the Biomedical Evidence plugin config, then restart the full runtime.",
+            }
+        ]
+    return []
+
+
+def _missing_for_llm(flags: dict[str, Any], readiness: dict[str, Any]) -> list[dict[str, str]]:
+    if str(flags.get("llm") or "").lower() != "all":
+        return []
+    if readiness["llm_provider"]["status"] == "configured":
+        return []
+    return [
+        {
+            "kind": "llm",
+            "label": "LLM provider missing",
+            "detail": "LLM planning, extraction, synthesis, verifier, revision, and claim logic require a configured provider.",
+        }
+    ]
+
+
+def _confirmation_preview(tool_name: str, contracts: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if tool_name == "configure_biomed_pubmed_policy":
+        return {
+            "required": True,
+            "tool_name": tool_name,
+            "risk_level": "configuration_write",
+            "side_effects": ["Updates the active config.toml for the Biomedical Evidence plugin."],
+            "source_policy": "no_source",
+            "reason": "This changes Biomedical Evidence runtime policy and requires explicit confirmation.",
+        }
+    contract = contracts.get(tool_name) or {}
+    if not contract.get("requires_confirmation"):
+        return None
+    return {
+        "required": True,
+        "tool_name": tool_name,
+        "risk_level": contract.get("risk_level", "read_only"),
+        "side_effects": contract.get("side_effects", []),
+        "source_policy": contract.get("source_policy", "no_source"),
+        "reason": "This Biomedical Evidence action requires confirmation before execution.",
+    }
+
+
+def _biomed_prompt_for_preview(action: str, args: dict[str, Any]) -> str:
+    if action == "status":
+        return "Show Biomedical Evidence provider, source, confirmation, and export readiness. Keep the answer concise."
+    if action == "help":
+        return "Show available /biomed commands with one-line examples and explain research-only boundaries."
+    if action == "check_pubmed":
+        return (
+            "Check live PubMed readiness using Biomedical Evidence tools. "
+            f"Query: {args.get('query') or 'microglia Alzheimer disease'}."
+        )
+    if action == "enable_pubmed":
+        return (
+            "Enable live PubMed command execution for Biomedical Evidence by setting "
+            "allow_live_pubmed_tools=true in the active config.toml."
+        )
+    if action == "audit":
+        llm_text = " with all configured LLM-assisted stages" if args.get("llm") == "all" else ""
+        support_refute = " Execute support and refute retrieval." if args.get("execute_support_refute") else ""
+        return (
+            "Run a research-only Biomedical Evidence audited answer workflow"
+            f"{llm_text}. Question: {args.get('question')}. "
+            f"Source: {args.get('source')}. Papers: {args.get('max_papers')}.{support_refute}"
+        )
+    if action == "literature":
+        return (
+            "Run controlled Biomedical Evidence literature retrieval only. "
+            f"Query: {args.get('query')}. Source: {args.get('source')}. Papers: {args.get('max_results')}."
+        )
+    if action == "review":
+        return f"Open and summarize the Run Evidence Review for {args.get('run_id')}."
+    if action == "export_provenance":
+        return f"Export or prepare the provenance graph for Biomedical Evidence run {args.get('run_id')}."
+    if action == "project_create":
+        return (
+            "Create a Biomedical Evidence project after confirmation. "
+            f"Name: {args.get('name')}. Research question: {args.get('question')}."
+        )
+    if action == "watch_create":
+        return (
+            "Create a Biomedical Evidence research watch after confirmation. "
+            f"Topic: {args.get('topic')}. Query: {args.get('query')}."
+        )
+    return "Handle this Biomedical Evidence command."
+
+
+def _biomed_help_markdown(readiness: dict[str, Any]) -> str:
+    pubmed = readiness["pubmed"]["status"]
+    llm = readiness["llm_provider"]["status"]
+    return "\n".join(
+        [
+            "## /biomed commands",
+            "",
+            f"Status: PubMed **{pubmed}** · LLM **{llm}**",
+            "",
+            "| Command | What it does |",
+            "|---|---|",
+            "| `/biomed status` | Show provider, PubMed, export, and confirmation readiness. |",
+            "| `/biomed enable pubmed` | Enable live PubMed command execution in the active config. |",
+            "| `/biomed check pubmed` | Check whether live PubMed access is ready. |",
+            "| `/biomed audit \"question\" --source mock --papers 10` | Run a deterministic evidence audit using mock literature. |",
+            "| `/biomed audit \"question\" --source pubmed --papers 10 --llm all --support-refute` | Run a live PubMed audit with all configured LLM stages. |",
+            "| `/biomed literature \"query\" --source pubmed --papers 10` | Retrieve literature only, without answer synthesis. |",
+            "| `/biomed review <run_id>` | Open a saved Run Evidence Review. |",
+            "| `/biomed export provenance <run_id>` | Prepare provenance export when enabled. |",
+            "| `/biomed project create \"name\" --question \"...\"` | Create a project after confirmation. |",
+            "| `/biomed watch create \"topic\" --query \"...\"` | Create a research watch after confirmation. |",
+            "",
+            "Biomedical Evidence is research-only. It will not diagnose, recommend treatment, interpret private records, or answer patient-specific medical questions.",
+        ]
+    )
+
+
+def _biomed_status_markdown(readiness: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "## Biomedical Evidence status",
+            "",
+            "| Capability | Status |",
+            "|---|---|",
+            f"| LLM provider | {readiness['llm_provider']['status']} {readiness['llm_provider'].get('model') or ''} |",
+            f"| PubMed command policy | {readiness['pubmed']['policy_status']} |",
+            f"| PubMed network | {readiness['pubmed']['network_status']} |",
+            f"| Default source | {readiness['source']['default_source']} |",
+            f"| Obsidian export | {'enabled' if readiness['exports'].get('obsidian') else 'disabled'} |",
+            f"| Provenance export | {'enabled' if readiness['exports'].get('provenance') else 'disabled'} |",
+            f"| Confirmation-gated tools | {len(readiness['confirmation']['required_for'])} |",
+            "",
+            readiness["pubmed"].get("message", ""),
+            readiness["llm_provider"].get("missing_effect", ""),
+        ]
+    ).strip()
+
+
+def _biomed_pubmed_enabled_markdown(readiness: dict[str, Any], result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "## PubMed enabled",
+            "",
+            "`allow_live_pubmed_tools` is now set to `true` for Biomedical Evidence.",
+            "",
+            "| Capability | Status |",
+            "|---|---|",
+            f"| PubMed command policy | {readiness['pubmed']['policy_status']} |",
+            f"| PubMed network | {readiness['pubmed']['network_status']} |",
+            f"| Config | `{result.get('path', '')}` |",
+            "",
+            "You can now run `/biomed check pubmed` or a PubMed-backed `/biomed audit ... --source pubmed` command.",
+        ]
+    )
+
+
+def _parse_biomed_command(
+    content: str,
+    *,
+    readiness: dict[str, Any],
+    contracts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    raw = str(content or "").strip()
+    if not raw.startswith("/biomed"):
+        return {
+            "ok": False,
+            "command": "",
+            "action": "",
+            "errors": ["Command must start with /biomed."],
+            "missing_requirements": [],
+            "can_send": False,
+        }
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "command": "/biomed",
+            "action": "",
+            "errors": [f"Invalid command syntax: {exc}"],
+            "missing_requirements": [],
+            "can_send": False,
+        }
+    if not tokens or tokens[0] != "/biomed":
+        return {
+            "ok": False,
+            "command": "/biomed",
+            "action": "",
+            "errors": ["Unknown command prefix."],
+            "missing_requirements": [],
+            "can_send": False,
+        }
+    action_tokens, flags = _parse_flags(tokens[1:])
+    action = action_tokens[0].lower() if action_tokens else "help"
+    args: dict[str, Any] = {}
+    errors: list[str] = []
+    missing: list[dict[str, str]] = []
+    tool_name = ""
+    normalized_action = action
+    source = _flag_str(flags, "source", default=readiness["source"]["default_source"] or "mock")
+    if source not in {"mock", "pubmed"}:
+        errors.append("Source must be mock or pubmed.")
+    if action in {"status", "help"}:
+        normalized_action = action
+    elif action == "enable" and len(action_tokens) > 1 and action_tokens[1].lower() == "pubmed":
+        normalized_action = "enable_pubmed"
+        tool_name = "configure_biomed_pubmed_policy"
+        args = {
+            "allow_live_pubmed_tools": True,
+            "config_path": readiness.get("config_path", ""),
+        }
+    elif action == "check" and len(action_tokens) > 1 and action_tokens[1].lower() == "pubmed":
+        normalized_action = "check_pubmed"
+        tool_name = "check_literature_access"
+        args = {
+            "query": _flag_str(flags, "query", default="microglia Alzheimer disease"),
+            "source": "pubmed",
+            "max_results": _flag_int(flags, "papers", "max_results", default=3),
+        }
+        missing.extend(_missing_for_source("pubmed", readiness))
+    elif action == "audit":
+        question = action_tokens[1] if len(action_tokens) > 1 else ""
+        if not question:
+            errors.append("Audit requires a quoted question.")
+        papers = _flag_int(flags, "papers", "max_papers", default=readiness["limits"]["max_papers"])
+        llm = str(flags.get("llm") or "off").lower()
+        if llm not in {"off", "all"}:
+            errors.append("LLM must be off or all.")
+        normalized_action = "audit"
+        tool_name = "answer_with_audit"
+        args = {
+            "question": question,
+            "source": source,
+            "max_papers": papers,
+            "llm": llm,
+            "execute_support_refute": bool(flags.get("support_refute")),
+            **({flag: True for flag in _BIOMED_LLM_FLAGS} if llm == "all" else {}),
+        }
+        project_id = _flag_str(flags, "project", "project_id", default="")
+        if project_id:
+            args["project_id"] = project_id
+        missing.extend(_missing_for_source(source, readiness))
+        missing.extend(_missing_for_llm(flags, readiness))
+    elif action == "literature":
+        query = action_tokens[1] if len(action_tokens) > 1 else ""
+        if not query:
+            errors.append("Literature search requires a quoted query.")
+        normalized_action = "literature"
+        tool_name = "search_literature"
+        args = {
+            "query": query,
+            "source": source,
+            "max_results": _flag_int(flags, "papers", "max_results", default=readiness["limits"]["max_papers"]),
+        }
+        missing.extend(_missing_for_source(source, readiness))
+    elif action == "review":
+        run_id = action_tokens[1] if len(action_tokens) > 1 else ""
+        if not run_id:
+            errors.append("Review requires a run id.")
+        normalized_action = "review"
+        tool_name = "get_run_evidence_review"
+        args = {"run_id": run_id}
+    elif action == "export" and len(action_tokens) > 2 and action_tokens[1].lower() == "provenance":
+        run_id = action_tokens[2]
+        normalized_action = "export_provenance"
+        tool_name = "export_provenance_graph"
+        args = {"run_id": run_id}
+        if not readiness["exports"]["provenance"]:
+            missing.append({
+                "kind": "export",
+                "label": "Provenance export disabled",
+                "detail": "Set enable_provenance_export=true before using provenance export from chat.",
+            })
+    elif action == "project" and len(action_tokens) > 2 and action_tokens[1].lower() == "create":
+        name = action_tokens[2]
+        question = _flag_str(flags, "question", default="")
+        if not question:
+            errors.append("Project creation requires --question.")
+        normalized_action = "project_create"
+        tool_name = "create_biomed_project"
+        args = {"name": name, "research_question": question}
+    elif action == "watch" and len(action_tokens) > 2 and action_tokens[1].lower() == "create":
+        topic = action_tokens[2]
+        query = _flag_str(flags, "query", default="")
+        if not query:
+            errors.append("Watch creation requires --query.")
+        normalized_action = "watch_create"
+        tool_name = "watch_research_topic"
+        args = {"topic": topic, "query": query}
+    else:
+        errors.append("Unknown /biomed command. Try /biomed help.")
+    confirmation = _confirmation_preview(tool_name, contracts) if tool_name else None
+    final_prompt = _biomed_prompt_for_preview(normalized_action, args)
+    deterministic_response = ""
+    if normalized_action == "help":
+        deterministic_response = _biomed_help_markdown(readiness)
+    elif normalized_action == "status":
+        deterministic_response = _biomed_status_markdown(readiness)
+    return {
+        "ok": not errors,
+        "command": "/biomed",
+        "action": normalized_action,
+        "tool_name": tool_name,
+        "arguments": args,
+        "flags": flags,
+        "missing_requirements": missing,
+        "confirmation": confirmation,
+        "final_prompt": final_prompt,
+        "deterministic_response": deterministic_response,
+        "can_send": not errors and not missing,
+        "errors": errors,
+    }
+
+
 def create_dashboard_app(
     workspace: Path,
     *,
@@ -1447,6 +2119,66 @@ def create_dashboard_app(
             "replay_limit": _DASHBOARD_CHAT_REPLAY_LIMIT,
         }
 
+    @app.get("/api/dashboard/chat/commands")
+    def list_chat_commands() -> dict[str, Any]:
+        biomed_dir = plugins_root / "biomed_evidence"
+        commands = _chat_command_manifest(
+            workspace=workspace,
+            plugin_dir=biomed_dir,
+            provider=biomed_revision_provider,
+            model=biomed_revision_model,
+        )
+        commands["enabled"] = chat_mux.enabled
+        commands["reason"] = "" if chat_mux.enabled else _DASHBOARD_CHAT_DISABLED_REASON
+        return commands
+
+    @app.get("/api/dashboard/chat/commands/biomed/status")
+    def get_biomed_command_status() -> dict[str, Any]:
+        return _biomed_readiness(
+            workspace=workspace,
+            plugin_dir=plugins_root / "biomed_evidence",
+            provider=biomed_revision_provider,
+            model=biomed_revision_model,
+        )
+
+    @app.post("/api/dashboard/chat/commands/parse")
+    def parse_chat_command(payload: ChatCommandParsePayload) -> dict[str, Any]:
+        session_key = _validate_dashboard_chat_session(payload.session_key)
+        content = _validate_dashboard_chat_content(payload.content)
+        readiness = _biomed_readiness(
+            workspace=workspace,
+            plugin_dir=plugins_root / "biomed_evidence",
+            provider=biomed_revision_provider,
+            model=biomed_revision_model,
+        )
+        contracts = _biomed_tool_contract_map()
+        if content.strip().startswith("/biomed"):
+            parsed = _parse_biomed_command(
+                content,
+                readiness=readiness,
+                contracts=contracts,
+            )
+            return {
+                "session_key": session_key,
+                "kind": "biomed",
+                "readiness": readiness,
+                **parsed,
+            }
+        return {
+            "session_key": session_key,
+            "kind": "message",
+            "ok": True,
+            "command": "",
+            "action": "",
+            "tool_name": "",
+            "arguments": {},
+            "missing_requirements": [],
+            "confirmation": None,
+            "final_prompt": content,
+            "can_send": True,
+            "errors": [],
+        }
+
     @app.post("/api/dashboard/chat/sessions", status_code=201)
     def create_chat_session(payload: ChatSessionCreatePayload | None = None) -> dict[str, Any]:
         if not chat_mux.enabled:
@@ -1490,20 +2222,122 @@ def create_dashboard_app(
             raise HTTPException(
                 status_code=503,
                 detail=_DASHBOARD_CHAT_DISABLED_REASON,
-            )
+        )
         session_key = _validate_dashboard_chat_session(payload.session_key)
         content = _validate_dashboard_chat_content(payload.content)
+        effective_content = content
+        command_preview: dict[str, Any] | None = None
+        if content.startswith("/biomed"):
+            command_preview = _parse_biomed_command(
+                content,
+                readiness=_biomed_readiness(
+                    workspace=workspace,
+                    plugin_dir=plugins_root / "biomed_evidence",
+                    provider=biomed_revision_provider,
+                    model=biomed_revision_model,
+                ),
+                contracts=_biomed_tool_contract_map(),
+            )
+            if command_preview.get("errors"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="; ".join(str(item) for item in command_preview["errors"]),
+                )
+            if command_preview.get("action") == "enable_pubmed":
+                result = _write_biomed_bool_config(
+                    workspace,
+                    "allow_live_pubmed_tools",
+                    True,
+                )
+                fresh_readiness = _biomed_readiness(
+                    workspace=workspace,
+                    plugin_dir=plugins_root / "biomed_evidence",
+                    provider=biomed_revision_provider,
+                    model=biomed_revision_model,
+                )
+                command_preview["readiness"] = fresh_readiness
+                deterministic_response = _biomed_pubmed_enabled_markdown(
+                    fresh_readiness,
+                    result,
+                )
+            else:
+                deterministic_response = str(command_preview.get("deterministic_response") or "").strip()
+            if deterministic_response:
+                chat_id = _dashboard_chat_id(session_key)
+                _ensure_dashboard_chat_session_title(store, session_key, content)
+                now = utcnow().isoformat()
+                user_seq = store.next_seq(session_key)
+                store.insert_message(
+                    session_key,
+                    role="user",
+                    content=content,
+                    ts=now,
+                    seq=user_seq,
+                    extra={
+                        "command": command_preview,
+                        "source": "dashboard_chat_command",
+                    },
+                )
+                await chat_mux.publish_user_message_accepted(
+                    session_key=session_key,
+                    content=content,
+                )
+                seq = store.next_seq(session_key)
+                store.insert_message(
+                    session_key,
+                    role="assistant",
+                    content=deterministic_response,
+                    ts=utcnow().isoformat(),
+                    seq=seq,
+                    extra={
+                        "command": command_preview,
+                        "source": "dashboard_chat_command",
+                    },
+                )
+                await chat_mux._on_outbound(
+                    OutboundMessage(
+                        channel=_DASHBOARD_CHAT_CHANNEL,
+                        chat_id=chat_id,
+                        content=deterministic_response,
+                        metadata={
+                            "session_key_override": session_key,
+                            "source": "dashboard_chat_command",
+                            "command": command_preview,
+                            "command_action": command_preview.get("action"),
+                        },
+                    )
+                )
+                return {
+                    "accepted": True,
+                    "session_key": session_key,
+                    "chat_id": chat_id,
+                    "command": command_preview,
+                    "deterministic_response": True,
+                }
+            if command_preview.get("missing_requirements"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Command requirements are not satisfied.",
+                        "missing_requirements": command_preview["missing_requirements"],
+                    },
+                )
+            effective_content = str(command_preview.get("final_prompt") or content)
         chat_id = _dashboard_chat_id(session_key)
         _ensure_dashboard_chat_session_title(store, session_key, content)
+        metadata = {
+            "session_key_override": session_key,
+            "source": "dashboard_chat",
+        }
+        if command_preview:
+            metadata["command"] = command_preview
+            metadata["raw_content"] = content
         inbound = InboundMessage(
             channel=_DASHBOARD_CHAT_CHANNEL,
             sender="dashboard-user",
             chat_id=chat_id,
-            content=content,
-            metadata={
-                "session_key_override": session_key,
-                "source": "dashboard_chat",
-            },
+            content=effective_content,
+            metadata=metadata,
         )
         try:
             await message_bus.publish_inbound(inbound)

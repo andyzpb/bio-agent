@@ -74,8 +74,42 @@ What recent evidence links microglial activation to Alzheimer's disease progress
 ```
 
 Patient-specific clinical requests are refused by design. Dashboard Chat is a
-generic framework channel, with sensitive biomedical write/export/review tools
-blocked until durable approval and resume support exists.
+generic framework channel, with Biomedical Evidence policy, source readiness,
+tool contracts, and command previews surfaced before execution.
+
+### Dashboard Chat and `/biomed` commands
+
+Dashboard Chat now includes a Codex-style `/biomed` command surface for
+research-only biomedical workflows. The command layer stays framework-native:
+commands preview into the shared dashboard chat route instead of bypassing the
+agent loop, while deterministic control commands such as help, status, and
+policy updates return directly without triggering an extra LLM response.
+
+Useful commands:
+
+```text
+/biomed help
+/biomed status
+/biomed enable pubmed
+/biomed check pubmed
+/biomed audit "Evidence linking microglial activation to Alzheimer's disease progression" --source pubmed --papers 10 --llm all --support-refute
+/biomed literature "TREM2 microglia Alzheimer" --source pubmed --papers 10
+/biomed review biomed-run-...
+/biomed export provenance biomed-run-...
+```
+
+`/biomed status` separates PubMed command policy from network reachability, so
+the UI can explain whether live PubMed is disabled by configuration or simply
+unchecked. `/biomed enable pubmed` explicitly sets
+`allow_live_pubmed_tools = true` in the active Biomedical Evidence config, after
+which PubMed-backed audit and literature commands are no longer blocked by the
+policy gate. Markdown answers are rendered as normal tables, lists, and code
+blocks, while tool progress is folded into one compact work panel per assistant
+turn instead of raw log spam.
+
+![Dashboard chat live PubMed audit](./assets/biomed-chat-status-audit.png)
+
+![Dashboard chat command status and markdown table output](./assets/biomed-chat-help-pubmed-enabled.png)
 
 Release 2.0 live smoke was validated with live PubMed plus DeepSeek
 `deepseek-v4-flash`: `27/27` checks passed, including audited answer, trace,

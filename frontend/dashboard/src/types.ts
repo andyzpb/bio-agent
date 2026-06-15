@@ -42,6 +42,84 @@ export interface ChatStatus {
   replay_limit?: number;
 }
 
+export interface ChatCommandManifest {
+  schema_version: string;
+  enabled?: boolean;
+  reason?: string;
+  commands: ChatCommandPack[];
+}
+
+export interface ChatCommandPack {
+  prefix: string;
+  plugin_id: string;
+  display_name: string;
+  description: string;
+  examples: string[];
+  options: Record<string, unknown>;
+  workflows: ChatCommandWorkflow[];
+  templates?: Record<string, unknown>[];
+  status?: BiomedCommandStatus;
+}
+
+export interface ChatCommandWorkflow {
+  name: string;
+  label: string;
+  tool_name?: string;
+  contract?: Record<string, unknown>;
+  risk_level?: string;
+  requires_confirmation?: boolean;
+}
+
+export interface BiomedCommandStatus {
+  command: string;
+  llm_provider: {
+    status: "configured" | "missing" | string;
+    model?: string;
+    missing_effect?: string;
+    features?: Record<string, boolean>;
+  };
+  pubmed: {
+    status: "enabled" | "disabled" | "unreachable" | "unchecked" | string;
+    policy_status?: "enabled" | "disabled" | string;
+    network_status?: "enabled" | "disabled" | "unreachable" | "unchecked" | string;
+    allow_live_pubmed_tools?: boolean;
+    message?: string;
+  };
+  source: {
+    default_source: string;
+    live_pubmed_opt_in?: boolean;
+  };
+  limits: Record<string, number>;
+  exports: Record<string, boolean>;
+  confirmation: {
+    required_for: string[];
+  };
+  config_path?: string;
+}
+
+export interface ChatCommandRequirement {
+  kind: string;
+  label: string;
+  detail: string;
+}
+
+export interface ChatCommandPreview {
+  session_key: string;
+  kind: "biomed" | "message" | string;
+  ok: boolean;
+  command: string;
+  action: string;
+  tool_name?: string;
+  arguments: Record<string, unknown>;
+  flags?: Record<string, unknown>;
+  missing_requirements: ChatCommandRequirement[];
+  confirmation?: Record<string, unknown> | null;
+  final_prompt: string;
+  can_send: boolean;
+  errors: string[];
+  readiness?: BiomedCommandStatus;
+}
+
 export interface ChatSessionMetadata {
   title?: string;
   title_source?: string;
@@ -75,6 +153,7 @@ export interface ChatEventRow {
   summary?: string;
   technical_detail?: string;
   raw?: unknown;
+  metadata?: Record<string, unknown>;
   source?: "history" | "live" | "local";
   pending?: boolean;
   ts?: string;

@@ -20,6 +20,8 @@ import { PluginDetail, PluginMain } from "./PluginDetail";
 import type {
   DashboardColumn,
   ChatEventRow,
+  ChatCommandManifest,
+  ChatCommandPreview,
   ChatSessionMetadata,
   ChatStatus,
   ChatThinkingState,
@@ -150,6 +152,10 @@ function App(): React.ReactElement {
   const [chatSending, setChatSending] = useState(false);
   const [chatConnected, setChatConnected] = useState(false);
   const [chatLiveEvent, setChatLiveEvent] = useState<string>("");
+  const [chatCommands, setChatCommands] = useState<ChatCommandManifest | null>(null);
+  const [chatCommandPreview, setChatCommandPreview] = useState<ChatCommandPreview | null>(null);
+  const [chatCommandPreviewKey, setChatCommandPreviewKey] = useState("");
+  const [chatCommandPreviewLoading, setChatCommandPreviewLoading] = useState(false);
   const [chatDeleteTarget, setChatDeleteTarget] = useState<SessionRow | null>(null);
   const [creatingChat, setCreatingChat] = useState(false);
   const [deletingChatKey, setDeletingChatKey] = useState<string | null>(null);
@@ -157,6 +163,7 @@ function App(): React.ReactElement {
   const chatStreamRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const chatSeqRef = useRef<Record<string, number>>({});
   const chatEventsRef = useRef<ChatEventRow[]>([]);
+  const chatPreviewRef = useRef<Record<string, ChatCommandPreview | null>>({});
   const [hiddenPlugins, setHiddenPlugins] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
@@ -226,6 +233,17 @@ function App(): React.ReactElement {
 
   const loadChatStatus = useCallback(async () => {
     setChatStatus(await api<ChatStatus>("/api/dashboard/chat/status"));
+  }, []);
+
+  const loadChatCommands = useCallback(async () => {
+    setChatCommands(await api<ChatCommandManifest>("/api/dashboard/chat/commands"));
+  }, []);
+
+  const parseChatCommand = useCallback(async (content: string, sessionKey: string): Promise<ChatCommandPreview> => {
+    return api<ChatCommandPreview>("/api/dashboard/chat/commands/parse", {
+      method: "POST",
+      body: JSON.stringify({ content, session_key: sessionKey }),
+    });
   }, []);
 
   const loadChatHistory = useCallback(async (sessionKey: string) => {
@@ -324,7 +342,38 @@ function App(): React.ReactElement {
   const sendChatMessage = useCallback(async () => {
     const content = chatInput.trim();
     if (!content || chatSending) return;
+    let preview = chatCommandPreview;
+    if (content.startsWith("/")) {
+      try {
+        preview = await parseChatCommand(content, chatSessionKey);
+        setChatCommandPreview(preview);
+        setChatCommandPreviewKey(`${chatSessionKey}\n${content}`);
+        chatPreviewRef.current[chatSessionKey] = preview;
+      } catch (exc) {
+        appendChatEvent({
+          event: "error",
+          kind: "error",
+          label: "Command preview failed",
+          detail: exc instanceof Error ? exc.message : String(exc),
+          session_key: chatSessionKey,
+        });
+        return;
+      }
+      if (!preview.can_send) {
+        appendChatEvent({
+          event: "error",
+          kind: "error",
+          label: "Command requirements",
+          detail: commandPreviewProblem(preview),
+          session_key: chatSessionKey,
+        });
+        return;
+      }
+    }
     setChatInput("");
+    setChatCommandPreview(null);
+    setChatCommandPreviewKey("");
+    chatPreviewRef.current[chatSessionKey] = null;
     setChatSending(true);
     appendChatEvent({
       event: "user",
@@ -351,7 +400,7 @@ function App(): React.ReactElement {
         session_key: chatSessionKey,
       });
     }
-  }, [appendChatEvent, chatInput, chatSending, chatSessionKey, loadSessions]);
+  }, [appendChatEvent, chatCommandPreview, chatInput, chatSending, chatSessionKey, loadSessions, parseChatCommand]);
 
   const createChatSession = useCallback(async (): Promise<void> => {
     if (creatingChat) return;
@@ -507,8 +556,60 @@ function App(): React.ReactElement {
       await loadMessages();
       await loadProactiveOverview();
       await loadChatStatus();
+      await loadChatCommands();
     });
-  }, [loadChatStatus, loadMessages, loadProactiveOverview, loadSessions, run]);
+  }, [loadChatCommands, loadChatStatus, loadMessages, loadProactiveOverview, loadSessions, run]);
+
+  useEffect(() => {
+    if (!chatInput.trim().startsWith("/")) {
+      setChatCommandPreview(null);
+      setChatCommandPreviewKey("");
+      return;
+    }
+    const key = `${chatSessionKey}\n${chatInput.trim()}`;
+    if (chatCommandPreviewKey === key) return;
+    let cancelled = false;
+    setChatCommandPreviewLoading(true);
+    const timer = window.setTimeout(() => {
+      parseChatCommand(chatInput.trim(), chatSessionKey)
+        .then((preview) => {
+          if (cancelled) return;
+          setChatCommandPreview(preview);
+          setChatCommandPreviewKey(key);
+          chatPreviewRef.current[chatSessionKey] = preview;
+        })
+        .catch((exc) => {
+          if (cancelled) return;
+          setChatCommandPreview({
+            session_key: chatSessionKey,
+            kind: "biomed",
+            ok: false,
+            command: "",
+            action: "",
+            arguments: {},
+            missing_requirements: [],
+            confirmation: null,
+            final_prompt: chatInput.trim(),
+            can_send: false,
+            errors: [exc instanceof Error ? exc.message : String(exc)],
+          });
+          setChatCommandPreviewKey(key);
+        })
+        .finally(() => {
+          if (!cancelled) setChatCommandPreviewLoading(false);
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      setChatCommandPreviewLoading(false);
+    };
+  }, [chatCommandPreviewKey, chatInput, chatSessionKey, parseChatCommand]);
+
+  useEffect(() => {
+    setChatCommandPreview(chatPreviewRef.current[chatSessionKey] ?? null);
+    setChatCommandPreviewKey("");
+  }, [chatSessionKey]);
 
   useEffect(() => {
     for (const plugin of plugins) {
@@ -696,17 +797,17 @@ function App(): React.ReactElement {
             <div className="pane-kicker">Explorer</div>
             <div className="pane-title">
               {currentPlugin && currentPluginState
-                ? (currentPlugin.countTitle ? currentPlugin.countTitle(currentPluginState.total) : `${currentPluginState.total} 条记录`)
-                : `${sessions.length} 个会话`}
+                ? (currentPlugin.countTitle ? currentPlugin.countTitle(currentPluginState.total) : `${currentPluginState.total} records`)
+                : `${sessions.length} sessions`}
             </div>
           </div>
           <div className="filters-stack">
             <label className="search search-small">
               <Search size={14} aria-hidden="true" />
-              <input type="text" placeholder="过滤 session" value={sessionSearch} onChange={(event) => setSessionSearch(event.target.value.trim())} />
+              <input type="text" placeholder="Filter sessions" value={sessionSearch} onChange={(event) => setSessionSearch(event.target.value.trim())} />
             </label>
             <select value={sessionChannel} onChange={(event) => setSessionChannel(event.target.value)}>
-              <option value="">全部 channel</option>
+              <option value="">All channels</option>
               {channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}
             </select>
           </div>
@@ -757,7 +858,7 @@ function App(): React.ReactElement {
                 setMessagePage(1);
                 selectView("sessions");
               }}>
-                <span>全部消息</span><strong>{sessions.length}</strong>
+                <span>All messages</span><strong>{sessions.length}</strong>
               </button>
               <div className="session-list">
                 {sessions.map((session) => (
@@ -843,6 +944,9 @@ function App(): React.ReactElement {
             setInput={setChatInput}
             sending={chatSending}
             liveEvent={chatLiveEvent}
+            commands={chatCommands}
+            commandPreview={chatCommandPreview}
+            commandPreviewLoading={chatCommandPreviewLoading}
             onCreateChat={() => void run(createChatSession)}
             onDeleteChat={() => activeChatSession && setChatDeleteTarget(activeChatSession)}
             onSend={() => void run(sendChatMessage)}
@@ -1061,6 +1165,9 @@ function ChatPane(props: {
   setInput(value: string): void;
   sending: boolean;
   liveEvent: string;
+  commands: ChatCommandManifest | null;
+  commandPreview: ChatCommandPreview | null;
+  commandPreviewLoading: boolean;
   onCreateChat(): void;
   onDeleteChat(): void;
   onSend(): void;
@@ -1074,7 +1181,10 @@ function ChatPane(props: {
   const activeThinkingKey = props.session?.key ?? props.status?.session_key ?? "dashboard:default";
   const currentThinkingExpanded = expandedThinking[activeThinkingKey] ?? false;
   const latestContentKey = useMemo(
-    () => props.events.map((event) => `${event.id}:${event.content ?? ""}:${event.detail ?? ""}:${event.pending ? "1" : "0"}`).join("|"),
+    () => props.events
+      .filter((event) => event.kind === "user" || event.kind === "assistant" || event.event === "done")
+      .map((event) => `${event.id}:${event.content ?? ""}:${event.pending ? "1" : "0"}`)
+      .join("|"),
     [props.events],
   );
 
@@ -1082,8 +1192,8 @@ function ChatPane(props: {
     if (disabled) return;
     const el = streamRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: props.sending || props.liveEvent ? "smooth" : "auto" });
-  }, [disabled, latestContentKey, props.liveEvent, props.sending]);
+    el.scrollTo({ top: el.scrollHeight, behavior: props.sending ? "smooth" : "auto" });
+  }, [disabled, latestContentKey, props.sending]);
 
   return (
     <section className="chat-pane">
@@ -1117,6 +1227,23 @@ function ChatPane(props: {
           </button>
         </div>
       </header>
+      <div className="chat-command-strip">
+        <div className="command-mini-title">Commands</div>
+        <div className="command-mini-list">
+          {(props.commands?.commands ?? []).map((command) => (
+            <button
+              key={command.prefix}
+              className="command-mini-chip"
+              type="button"
+              onClick={() => props.setInput(command.examples?.[0] ?? `${command.prefix} `)}
+            >
+              <span>{command.prefix}</span>
+              <small>{command.display_name}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+      <CommandQuickStart setInput={props.setInput} />
       {disabled ? (
         <div className="chat-disabled">
           <div className="detail-empty-title">Full runtime is not enabled</div>
@@ -1159,27 +1286,190 @@ function ChatPane(props: {
               </div>
             )}
           </div>
-          <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); props.onSend(); }}>
-            <textarea
-              value={props.input}
-              placeholder="Send a message to the agent..."
-              onChange={(event) => props.setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  props.onSend();
-                }
-              }}
-              disabled={props.sending}
-            />
-            <button className="primary" type="submit" disabled={props.sending || !props.input.trim()}>
-              {props.sending ? "Sending" : "Send"}
-            </button>
-          </form>
+          <div className="chat-composer-shell">
+            {props.input.trim().startsWith("/") && (
+              <CommandPalette commands={props.commands} setInput={props.setInput} />
+            )}
+            {props.commandPreview && <CommandPreviewCard preview={props.commandPreview} loading={props.commandPreviewLoading} />}
+            <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); props.onSend(); }}>
+              <textarea
+                value={props.input}
+                placeholder="Type /biomed to run a Biomedical Evidence workflow..."
+                onChange={(event) => props.setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    props.onSend();
+                  }
+                }}
+                disabled={props.sending}
+              />
+              <button className="primary" type="submit" disabled={props.sending || !props.input.trim() || Boolean(props.commandPreview && !props.commandPreview.can_send)}>
+                {props.sending ? "Sending" : "Send"}
+              </button>
+            </form>
+          </div>
         </>
       )}
     </section>
   );
+}
+
+function CommandPreviewCard(props: {
+  preview: ChatCommandPreview;
+  loading: boolean;
+}): React.ReactElement {
+  const status = props.preview.can_send ? "Ready" : props.preview.errors.length ? "Needs edits" : "Needs setup";
+  const commandLabel = props.preview.command || "Command";
+  return (
+    <div className={`command-preview-card ${props.preview.can_send ? "ready" : "blocked"}`}>
+      <div className="command-preview-head">
+        <div>
+          <span className="status-pill">{props.loading ? "Checking" : status}</span>
+          <strong>{commandLabel} {props.preview.action && <span>{props.preview.action.replaceAll("_", " ")}</span>}</strong>
+        </div>
+        {props.preview.tool_name && <code>{humanizeToolName(props.preview.tool_name)}</code>}
+      </div>
+      <div className="command-requirements">
+        {props.preview.readiness && (
+          <>
+            <span className={`requirement-chip ${props.preview.readiness.pubmed.status === "enabled" ? "ok" : "warn"}`}>PubMed policy {props.preview.readiness.pubmed.status}</span>
+            <span className={`requirement-chip ${props.preview.readiness.llm_provider.status === "configured" ? "ok" : "warn"}`}>LLM {props.preview.readiness.llm_provider.status}</span>
+          </>
+        )}
+        {props.preview.confirmation && <span className="requirement-chip warn">Confirmation required</span>}
+        {!props.preview.confirmation && <span className="requirement-chip ok">No confirmation</span>}
+      </div>
+      {props.preview.missing_requirements.length > 0 && (
+        <div className="command-preview-list">
+          {props.preview.missing_requirements.map((item) => (
+            <div key={`${item.kind}-${item.label}`} className="command-preview-issue">
+              <strong>{item.label}</strong>
+              <span>{item.detail}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {props.preview.errors.length > 0 && (
+        <div className="command-preview-list">
+          {props.preview.errors.map((error) => <div key={error} className="command-preview-issue"><strong>Syntax</strong><span>{error}</span></div>)}
+        </div>
+      )}
+      {props.preview.can_send && (
+        <div className="command-final-prompt">{props.preview.final_prompt}</div>
+      )}
+    </div>
+  );
+}
+
+function CommandQuickStart(props: {
+  setInput(value: string): void;
+}): React.ReactElement {
+  const commands = biomedCommandSuggestions();
+  return (
+    <div className="command-quickstart">
+      <div className="command-quickstart-head">
+        <div>
+          <strong>Biomedical command shortcuts</strong>
+          <span>Pick one, then edit the question or run id.</span>
+        </div>
+      </div>
+      <div className="command-card-grid">
+        {commands.slice(0, 6).map((item) => (
+          <button key={item.label} type="button" className="command-card" onClick={() => props.setInput(item.command)}>
+            <span>{item.label}</span>
+            <small>{item.description}</small>
+            <code>{item.command}</code>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CommandPalette(props: {
+  commands: ChatCommandManifest | null;
+  setInput(value: string): void;
+}): React.ReactElement {
+  const suggestions = biomedCommandSuggestions();
+  const hasManifest = Boolean(props.commands?.commands?.length);
+  return (
+    <div className="command-palette">
+      <div className="command-palette-head">
+        <strong>Available commands</strong>
+        <span>{hasManifest ? "Biomedical Evidence command pack is loaded." : "Loading command pack..."}</span>
+      </div>
+      <div className="command-palette-list">
+        {suggestions.map((item) => (
+          <button key={item.label} type="button" className="command-palette-row" onClick={() => props.setInput(item.command)}>
+            <span>{item.label}</span>
+            <small>{item.description}</small>
+            <code>{item.command}</code>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function biomedCommandSuggestions(): Array<{ label: string; description: string; command: string }> {
+  return [
+    {
+      label: "Help",
+      description: "Show the concise command guide.",
+      command: "/biomed help",
+    },
+    {
+      label: "Status",
+      description: "Check LLM, PubMed, export, and confirmation readiness.",
+      command: "/biomed status",
+    },
+    {
+      label: "Enable PubMed",
+      description: "Turn on live PubMed command execution in config.toml.",
+      command: "/biomed enable pubmed",
+    },
+    {
+      label: "Check PubMed",
+      description: "Verify whether live PubMed access is ready.",
+      command: "/biomed check pubmed",
+    },
+    {
+      label: "Mock audit",
+      description: "Run a deterministic 10-paper audit without live PubMed.",
+      command: '/biomed audit "microglia Alzheimer disease progression" --source mock --papers 10',
+    },
+    {
+      label: "Live audit",
+      description: "Run PubMed + all configured LLM stages.",
+      command: '/biomed audit "microglia Alzheimer disease progression" --source pubmed --papers 10 --llm all --support-refute',
+    },
+    {
+      label: "Literature",
+      description: "Retrieve papers only, without synthesis.",
+      command: '/biomed literature "TREM2 microglia Alzheimer" --source pubmed --papers 10',
+    },
+    {
+      label: "Review run",
+      description: "Open a saved Run Evidence Review.",
+      command: "/biomed review biomed-run-...",
+    },
+    {
+      label: "Provenance",
+      description: "Prepare provenance export for a run.",
+      command: "/biomed export provenance biomed-run-...",
+    },
+    {
+      label: "Create project",
+      description: "Create a research project after confirmation.",
+      command: '/biomed project create "Microglia AD" --question "What links microglial activation to AD progression?"',
+    },
+    {
+      label: "Create watch",
+      description: "Create a literature watch after confirmation.",
+      command: '/biomed watch create "Microglia AD" --query "microglia Alzheimer disease progression"',
+    },
+  ];
 }
 
 function ChatTurnItem(props: {
@@ -1251,13 +1541,14 @@ function ThinkingPanel(props: {
     : props.state.status === "error"
       ? "Failed"
       : "Working";
+  const latestStep = props.state.steps[props.state.steps.length - 1] || props.state.summary || "Working";
   return (
     <div className={`thinking-panel ${props.expanded ? "expanded" : "collapsed"}`}>
       <button type="button" className="thinking-panel-head" onClick={props.onToggle}>
         <div className="thinking-panel-summary">
           <LoaderCircle size={13} aria-hidden="true" className={props.state.status === "running" ? "spin" : ""} />
           <span>{statusLabel}</span>
-          <strong>{props.state.summary || "Review workflow is progressing"}</strong>
+          <strong>{props.state.status === "done" ? props.state.summary : latestStep}</strong>
         </div>
         <div className="thinking-panel-meta">
           {props.state.steps.length > 0 && <span>{props.state.steps.length} steps</span>}
@@ -1557,6 +1848,7 @@ function chatHistoryToEvents(items: MessageRow[]): ChatEventRow[] {
       content: item.content,
       detail: item.content,
       seq: item.seq,
+      metadata: item.extra,
       source: "history",
     }, item.session_key, item.ts));
   }
@@ -1585,10 +1877,14 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
       turns.push(current);
     }
     if (event.event === "done") {
+      if (isLocalCommandAssistant(current.assistant)) {
+        continue;
+      }
+      const steps = current.thinking?.steps ?? [];
       current.thinking = {
         status: "done",
-        summary: "Completed",
-        steps: current.thinking?.steps ?? [],
+        summary: `Completed · ${steps.length} step${steps.length === 1 ? "" : "s"}`,
+        steps,
         technicalDetail: current.thinking?.technicalDetail,
         startedAt: current.thinking?.startedAt,
         updatedAt: event.ts ?? current.thinking?.updatedAt,
@@ -1598,11 +1894,15 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
     }
     if (event.kind === "assistant") {
       current.assistant = event;
+      if (isLocalCommandAssistant(event)) {
+        continue;
+      }
       if (event.source !== "history" || current.thinking) {
+        const steps = appendThinkingStep(current.thinking?.steps ?? [], event.pending ? "Preparing answer" : "Preparing final answer");
         current.thinking = {
           status: event.final ? "done" : "running",
-          summary: event.pending ? "Writing the response" : "Drafting the response",
-          steps: current.thinking?.steps ?? [],
+          summary: event.pending ? "Preparing answer" : "Preparing final answer",
+          steps,
           technicalDetail: current.thinking?.technicalDetail,
           startedAt: current.thinking?.startedAt,
           updatedAt: event.ts ?? current.thinking?.updatedAt,
@@ -1613,10 +1913,11 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
     }
     if (event.event === "tool_approval_required" || event.kind === "approval") {
       current.approval = event;
+      const steps = appendThinkingStep(current.thinking?.steps ?? [], "Waiting for confirmation");
       current.thinking = {
         status: "done",
         summary: "Waiting for confirmation",
-        steps: current.thinking?.steps ?? [],
+        steps,
         technicalDetail: current.thinking?.technicalDetail,
         startedAt: current.thinking?.startedAt ?? event.ts,
         updatedAt: event.ts ?? current.thinking?.updatedAt,
@@ -1625,10 +1926,12 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
       continue;
     }
     if (event.event === "assistant_message" || event.event === "turn_started") {
+      const summary = event.summary || event.label || "Working";
+      const steps = appendThinkingStep(current.thinking?.steps ?? [], humanThinkingStep(summary));
       current.thinking = {
         status: "running",
-        summary: event.summary || event.label || "Working",
-        steps: current.thinking?.steps ?? [],
+        summary: humanThinkingStep(summary),
+        steps,
         technicalDetail: event.technical_detail ?? current.thinking?.technicalDetail,
         startedAt: event.ts ?? current.thinking?.startedAt,
         updatedAt: event.ts ?? current.thinking?.updatedAt,
@@ -1638,11 +1941,13 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
     }
     if (event.kind === "tool" || event.kind === "system") {
       const currentSteps = current.thinking?.steps ?? [];
-      const nextStep = event.event === "tool_completed" ? "" : event.summary || event.label || event.detail || event.event;
+      const rawStep = event.event === "tool_completed" ? "" : event.summary || event.label || event.detail || event.event;
+      const nextStep = humanThinkingStep(rawStep);
+      const steps = appendThinkingStep(currentSteps, nextStep);
       current.thinking = {
         status: "running",
-        summary: event.summary || event.label || event.detail || "Working",
-        steps: nextStep && currentSteps[currentSteps.length - 1] !== nextStep ? [...currentSteps, nextStep] : currentSteps,
+        summary: nextStep || "Working",
+        steps,
         technicalDetail: event.technical_detail ?? current.thinking?.technicalDetail,
         startedAt: current.thinking?.startedAt ?? event.ts,
         updatedAt: event.ts ?? current.thinking?.updatedAt,
@@ -1652,6 +1957,39 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
     }
   }
   return turns;
+}
+
+function isLocalCommandAssistant(event: ChatEventRow | null | undefined): boolean {
+  const metadata = event?.metadata;
+  if (!metadata) return false;
+  const source = String(metadata.source ?? "");
+  const commandAction = String((metadata.command as Record<string, unknown> | undefined)?.action ?? metadata.command_action ?? "");
+  return source === "dashboard_chat_command" && Boolean(commandAction);
+}
+
+function appendThinkingStep(steps: string[], rawStep: string): string[] {
+  const step = humanThinkingStep(rawStep);
+  if (!step) return steps;
+  if (steps.includes(step)) return steps;
+  const next = [...steps, step];
+  return next.slice(Math.max(0, next.length - 12));
+}
+
+function humanThinkingStep(raw: unknown): string {
+  const text = String(raw ?? "").trim();
+  const normalized = text.toLowerCase();
+  if (!text) return "";
+  if (normalized.includes("provider") || normalized.includes("readiness")) return "Checking provider readiness";
+  if (normalized.includes("plan") || normalized.includes("search planning")) return "Planning retrieval";
+  if (normalized.includes("pubmed") || normalized.includes("literature") || normalized.includes("retrieval")) return "Searching literature";
+  if (normalized.includes("extract")) return "Extracting evidence";
+  if (normalized.includes("audit") || normalized.includes("verify") || normalized.includes("claim")) return "Auditing claims";
+  if (normalized.includes("packet") || normalized.includes("provenance") || normalized.includes("packaging")) return "Preparing evidence packet";
+  if (normalized.includes("confirm")) return "Waiting for confirmation";
+  if (normalized.includes("draft") || normalized.includes("answer") || normalized.includes("response") || normalized.includes("writing")) return "Preparing answer";
+  if (normalized.includes("started")) return "Starting workflow";
+  if (normalized.includes("completed")) return "Completed";
+  return text.length > 80 ? `${text.slice(0, 80).trim()}...` : text;
 }
 
 function normalizeChatEvent(
@@ -1685,6 +2023,10 @@ function normalizeChatEvent(
     iteration: event.iteration,
     has_more: event.has_more,
     final: event.final,
+    summary: event.summary,
+    technical_detail: event.technical_detail,
+    raw: event.raw,
+    metadata: (event.metadata && typeof event.metadata === "object") ? event.metadata as Record<string, unknown> : undefined,
     source: event.source,
     pending: event.pending,
     ts: event.ts,
@@ -1702,6 +2044,18 @@ function chatSessionSubtitle(session: SessionRow | null | undefined): string {
   if (!session) return "Conversation";
   const count = session.message_count || 0;
   return `${relativeTime(session.updated_at)} · ${count} message${count === 1 ? "" : "s"}`;
+}
+
+function commandPreviewProblem(preview: ChatCommandPreview): string {
+  if (preview.errors.length) {
+    return preview.errors.join("; ");
+  }
+  if (preview.missing_requirements.length) {
+    return preview.missing_requirements
+      .map((item) => `${item.label}: ${item.detail}`)
+      .join(" ");
+  }
+  return "Command is not ready to send.";
 }
 
 async function copySessionKey(value: string): Promise<void> {

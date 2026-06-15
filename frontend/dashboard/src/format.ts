@@ -84,7 +84,7 @@ export function shortTs(value: unknown): string {
 
 export function relativeTime(value: unknown): string {
   if (!value) {
-    return "未更新";
+    return "not updated";
   }
   const time = new Date(String(value)).getTime();
   if (Number.isNaN(time)) {
@@ -95,12 +95,12 @@ export function relativeTime(value: unknown): string {
   const hour = 60 * minute;
   const day = 24 * hour;
   if (diff < hour) {
-    return `${Math.max(1, Math.round(diff / minute))} 分钟前`;
+    return `${Math.max(1, Math.round(diff / minute))} min ago`;
   }
   if (diff < day) {
-    return `${Math.round(diff / hour)} 小时前`;
+    return `${Math.round(diff / hour)} hr ago`;
   }
-  return `${Math.round(diff / day)} 天前`;
+  return `${Math.round(diff / day)} days ago`;
 }
 
 export function formatNumber(value: unknown): string {
