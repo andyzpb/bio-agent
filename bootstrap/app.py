@@ -148,6 +148,7 @@ class AppRuntime:
                 message_bus=self.bus,
                 event_bus=event_bus,
                 tool_registry=self.tools,
+                tool_hooks=list(plugin_manager.tool_hooks) if plugin_manager else None,
                 biomed_revision_provider=self.light_provider or self.provider,
                 biomed_revision_model=getattr(
                     self.config,

@@ -158,6 +158,7 @@ def _register_defaults() -> None:
         "extract_evidence_batch",
         "analyze_coverage_gaps",
         "build_evidence_packet",
+        "check_research_watch_topic",
         "get_answer_trace",
         "get_evidence_packet",
         "export_provenance_graph",

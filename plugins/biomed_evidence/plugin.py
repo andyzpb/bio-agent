@@ -95,6 +95,7 @@ _BIOMED_TOOL_NAMES = frozenset(
         "list_research_watch_topics",
         "update_research_watch_topic",
         "delete_research_watch_topic",
+        "check_research_watch_topic",
         "get_research_watch_drift",
         "ingest_paper_full_text",
         "get_paper_full_text",
@@ -346,6 +347,8 @@ class BiomedEvidencePlugin(Plugin):
         if event.source != "passive" or event.channel != "dashboard":
             return None
         if event.tool_name not in _SENSITIVE_CHAT_TOOL_NAMES:
+            return None
+        if getattr(event, "approved", False) and str(getattr(event, "approval_id", "") or "").strip():
             return None
         metadata = get_release_tool_metadata(event.tool_name)
         return HookOutcome(
@@ -1804,6 +1807,28 @@ class BiomedEvidencePlugin(Plugin):
         return _dump(
             {"deleted": self._service.delete_watch(watch_id), "watch_id": watch_id}
         )
+
+    @tool(
+        name="check_research_watch_topic",
+        risk="read-only",
+        search_hint="check biomedical research watch topic new literature pushed papers",
+    )
+    async def check_research_watch_topic(
+        self,
+        event,
+        watch_id: str,
+        source: Literal["pubmed", "mock"] = "mock",
+    ) -> str:
+        """Check a biomedical research watch for new relevant literature.
+
+        Args:
+            watch_id: Watch topic id.
+            source: Literature source.
+        """
+        result = await self._service.check_watch(watch_id, source=source)
+        if result is None:
+            return _dump({"error": "watch_not_found", "watch_id": watch_id})
+        return _dump(result.model_dump(mode="json"))
 
     @tool(
         name="get_research_watch_drift",

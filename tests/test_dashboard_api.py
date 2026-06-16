@@ -119,7 +119,51 @@ class _FakeToolRegistry:
 
     async def execute(self, name: str, args: dict):
         self.calls.append((name, dict(args)))
+        if name == "watch_research_topic":
+            return {
+                "watch_id": "watch-test123",
+                "topic": args.get("topic") or "Microglia AD",
+                "description": args.get("description"),
+                "include_keywords": args.get("include_keywords") or [],
+                "exclude_keywords": [],
+                "preferred_methods": [],
+                "min_relevance_score": args.get("min_relevance_score", 0.7),
+                "schedule": args.get("schedule") or "daily",
+                "enabled": True,
+                "created_at": "2026-06-16T00:00:00+00:00",
+                "updated_at": "2026-06-16T00:00:00+00:00",
+                "last_checked_at": None,
+                "next_check_at": "2026-06-17T00:00:00+00:00",
+            }
+        if name == "delete_research_watch_topic":
+            return {"deleted": True, "watch_id": args.get("watch_id")}
         return {"ok": True, "name": name, "args": dict(args)}
+
+    def has_tool(self, name: str) -> bool:
+        return True
+
+
+class _RequireApprovedHook:
+    event = "pre_tool_use"
+    name = "require-approved"
+
+    def matches(self, ctx) -> bool:
+        return ctx.request.tool_name in {
+            "watch_research_topic",
+            "delete_research_watch_topic",
+        }
+
+    async def run(self, ctx):
+        from agent.tool_hooks.types import HookOutcome
+
+        if ctx.request.approved and ctx.request.approval_id:
+            return HookOutcome()
+        return HookOutcome(
+            decision="deny",
+            requires_confirmation=True,
+            confirmation={"approval_id": "hook-approval"},
+            reason="requires approval",
+        )
 
 
 class _ManualMemoryOptimizer:
@@ -678,6 +722,227 @@ def test_dashboard_chat_biomed_parse_confirmation_preview_for_write_action(
     assert payload["confirmation"]["risk_level"] == "writes_storage"
 
 
+def test_dashboard_chat_biomed_watch_command_creates_pending_approval(
+    tmp_path,
+) -> None:
+    registry = _FakeToolRegistry()
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            tool_registry=registry,
+        )
+    ) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "session_key": session_key,
+                "content": '/biomed watch create "Microglia AD" --query "microglia Alzheimer disease progression" --schedule weekly',
+            },
+        )
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["approval_required"] is True
+    assert payload["approval_id"]
+    pending = history.json()["pending_approvals"]
+    assert len(pending) == 1
+    assert pending[0]["approval_id"] == payload["approval_id"]
+    assert pending[0]["tool_name"] == "watch_research_topic"
+    assert pending[0]["final_arguments"]["topic"] == "Microglia AD"
+    assert pending[0]["final_arguments"]["schedule"] == "weekly"
+    assert pending[0]["final_arguments"]["include_keywords"]
+    assert registry.calls == []
+
+
+def test_dashboard_chat_biomed_watch_delete_command_creates_pending_approval(
+    tmp_path,
+) -> None:
+    registry = _FakeToolRegistry()
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            tool_registry=registry,
+        )
+    ) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "session_key": session_key,
+                "content": "/biomed watch delete watch-test123",
+            },
+        )
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["approval_required"] is True
+    pending = history.json()["pending_approvals"]
+    assert pending[0]["tool_name"] == "delete_research_watch_topic"
+    assert pending[0]["final_arguments"] == {"watch_id": "watch-test123"}
+    assert registry.calls == []
+
+
+def test_dashboard_chat_natural_language_watch_delete_routes_to_command_approval(
+    tmp_path,
+) -> None:
+    registry = _FakeToolRegistry()
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            tool_registry=registry,
+        )
+    ) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "session_key": session_key,
+                "content": "watch-test123 delete this watch job",
+            },
+        )
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    assert response.status_code == 202
+    assert response.json()["approval_required"] is True
+    pending = history.json()["pending_approvals"]
+    assert pending[0]["tool_name"] == "delete_research_watch_topic"
+    assert pending[0]["final_arguments"] == {"watch_id": "watch-test123"}
+    assert registry.calls == []
+
+
+def test_dashboard_chat_parse_natural_language_watch_delete_uses_biomed_router(
+    tmp_path,
+) -> None:
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=_FakeBus(),
+            event_bus=EventBus(),
+            tool_registry=_FakeToolRegistry(),
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": "watch-test123 delete this watch job",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "biomed"
+    assert payload["action"] == "watch_delete"
+    assert payload["tool_name"] == "delete_research_watch_topic"
+    assert payload["arguments"] == {"watch_id": "watch-test123"}
+    assert payload["confirmation"]["required"] is True
+
+
+def test_dashboard_chat_command_approval_sse_event_has_executable_id(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            tool_registry=_FakeToolRegistry(),
+        )
+    ) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "session_key": session_key,
+                "content": "/biomed watch delete watch-test123",
+            },
+        )
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    assert response.status_code == 202
+    approval_id = response.json()["approval_id"]
+    pending = history.json()["pending_approvals"]
+    assert pending[0]["approval_id"] == approval_id
+    assert pending[0]["confirmation"]["approval_id"] == approval_id
+
+
+def test_dashboard_chat_biomed_parse_review_includes_run_artifacts(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": "/biomed review biomed-run-123abc",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "review"
+    assert payload["artifacts"]["run_id"] == "biomed-run-123abc"
+    assert payload["artifacts"]["review_url"].endswith("/biomed-run-123abc/evidence-review")
+
+
+def test_dashboard_chat_biomed_parse_export_includes_artifact_urls(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=bus, event_bus=event_bus)
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": "/biomed export provenance biomed-run-123abc",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "export_provenance"
+    assert payload["artifacts"]["run_id"] == "biomed-run-123abc"
+    assert payload["artifacts"]["packet_url"].endswith("/biomed-run-123abc/evidence-review/packet")
+    assert payload["artifacts"]["trace_url"].endswith("/biomed-run-123abc/trace")
+    assert payload["artifacts"]["provenance_url"].endswith("/biomed-run-123abc/provenance")
+
+
 def test_dashboard_chat_biomed_message_routes_command_prompt_through_bus(
     tmp_path,
 ) -> None:
@@ -736,6 +1001,84 @@ def test_dashboard_chat_biomed_help_is_deterministic(tmp_path) -> None:
     assert items[-1]["role"] == "assistant"
     assert items[-1]["content"].startswith("## /biomed commands")
     assert "Biomedical Evidence is research-only" in items[-1]["content"]
+
+
+def test_dashboard_chat_biomed_status_is_deterministic(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={"session_key": "dashboard:default", "content": "/biomed status"},
+        )
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": "dashboard:default"},
+        )
+
+    assert response.status_code == 202
+    assert response.json()["command"]["action"] == "status"
+    assert response.json()["deterministic_response"] is True
+    assert len(bus.inbound_items) == 0
+    items = history.json()["items"]
+    assert items[-1]["content"].startswith("## Biomedical Evidence status")
+    assert items[-1]["extra"]["command"]["action"] == "status"
+
+
+def test_dashboard_chat_biomed_review_history_preserves_artifact_metadata(tmp_path) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/messages",
+            json={
+                "session_key": "dashboard:default",
+                "content": "/biomed review biomed-run-123abc",
+            },
+        )
+
+    assert response.status_code == 202
+    assert len(bus.inbound_items) == 1
+    command = bus.inbound_items[0].metadata["command"]
+    assert command["artifacts"]["run_id"] == "biomed-run-123abc"
+    assert command["artifacts"]["review_url"].endswith("/biomed-run-123abc/evidence-review")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_outbound_adds_artifacts_from_run_id_text(tmp_path) -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    queue = await mux.subscribe("dashboard:default")
+    try:
+        await mux._on_outbound(
+            OutboundMessage(
+                channel="dashboard",
+                chat_id="default",
+                content="Run complete: biomed-run-abc123",
+                metadata={"session_key_override": "dashboard:default"},
+            )
+        )
+        assistant_event, assistant_payload = await queue.get()
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert assistant_event == "assistant_message"
+    assert assistant_payload["metadata"]["artifacts"]["run_id"] == "biomed-run-abc123"
 
 
 def test_dashboard_chat_first_message_updates_placeholder_title(tmp_path) -> None:
@@ -863,6 +1206,77 @@ async def test_dashboard_chat_approval_event_persists_to_history(tmp_path) -> No
     assert pending["approval-1"]["tool_name"] == "record_run_review_decision"
 
 
+@pytest.mark.asyncio
+async def test_dashboard_chat_tool_completed_approval_required_persists_to_history(tmp_path) -> None:
+    mux_store = SessionStore(tmp_path / "sessions.db")
+    mux_store.create_session(key="dashboard:default", metadata={})
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None, store=mux_store)
+    try:
+        await mux._on_tool_completed(
+            ToolCallCompleted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="watch_research_topic",
+                arguments={"topic": "Microglia AD"},
+                final_arguments={"topic": "Microglia AD", "schedule": "daily"},
+                status="approval_required",
+                result_preview="This action requires confirmation in Dashboard Chat. Approval ID: approval-1",
+            )
+        )
+        meta = mux_store.get_session_meta("dashboard:default")
+    finally:
+        mux_store.close()
+
+    pending = meta["metadata"]["pending_approvals"]
+    assert pending["approval-1"]["status"] == "pending"
+    assert pending["approval-1"]["tool_name"] == "watch_research_topic"
+    assert pending["approval-1"]["final_arguments"]["schedule"] == "daily"
+
+
+def test_dashboard_chat_history_restores_approval_from_tool_completed(tmp_path) -> None:
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=_FakeToolRegistry(),
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.insert_message(
+                session_key,
+                role="assistant",
+                content="This action requires confirmation in Dashboard Chat. Approval ID: approval-1",
+                ts="2026-06-16T12:00:00+02:00",
+                seq=0,
+                extra={
+                    "status": "approval_required",
+                    "approval_id": "approval-1",
+                    "tool_name": "watch_research_topic",
+                    "call_id": "call-1",
+                    "iteration": 1,
+                    "arguments": {"topic": "Microglia AD"},
+                    "final_arguments": {"topic": "Microglia AD"},
+                    "confirmation": {"approval_id": "approval-1"},
+                },
+            )
+        finally:
+            session.close()
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    payload = history.json()
+    assert payload["pending_approvals"][0]["approval_id"] == "approval-1"
+    assert payload["pending_approvals"][0]["tool_name"] == "watch_research_topic"
+
+
 def test_dashboard_chat_approval_endpoint_executes_confirmed_tool(tmp_path) -> None:
     registry = _FakeToolRegistry()
     app = create_dashboard_app(
@@ -906,15 +1320,201 @@ def test_dashboard_chat_approval_endpoint_executes_confirmed_tool(tmp_path) -> N
         )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "approved"
-    assert registry.calls == [
-        (
-            "record_run_review_decision",
-            {"run_id": "run-1", "decision": "accept"},
+
+
+def test_dashboard_chat_approval_endpoint_marks_tool_call_approved(tmp_path) -> None:
+    registry = _FakeToolRegistry()
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=registry,
+        tool_hooks=[_RequireApprovedHook()],
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.update_session(
+                session_key,
+                metadata={
+                    "title": "Approval test",
+                    "pending_approvals": {
+                        "approval-1": {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "tool_name": "watch_research_topic",
+                            "final_arguments": {
+                                "topic": "Microglia AD",
+                                "description": "microglia Alzheimer disease progression",
+                            },
+                        }
+                    },
+                },
+            )
+        finally:
+            session.close()
+        response = client.post(
+            "/api/dashboard/chat/approvals/approval-1",
+            params={"session_key": session_key},
+            json={"decision": "approve"},
         )
-    ]
-    assert history.json()["items"]
-    assert "Approved action completed" in history.json()["items"][-1]["content"]
+
+    assert response.status_code == 200
+    assert registry.calls[0] == (
+        "watch_research_topic",
+        {
+            "topic": "Microglia AD",
+            "description": "microglia Alzheimer disease progression",
+        },
+    )
+    assert registry.calls[1][0] == "schedule"
+    assert registry.calls[1][1]["name"] == "biomed-watch:watch-test123"
+    assert registry.calls[1][1]["trigger"] == "every"
+    assert registry.calls[1][1]["when"] == "1d"
+
+
+def test_dashboard_chat_approval_response_includes_watch_artifacts_and_schedule(
+    tmp_path,
+) -> None:
+    registry = _FakeToolRegistry()
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=registry,
+        tool_hooks=[_RequireApprovedHook()],
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.update_session(
+                session_key,
+                metadata={
+                    "title": "Watch approval test",
+                    "pending_approvals": {
+                        "approval-1": {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "tool_name": "watch_research_topic",
+                            "final_arguments": {
+                                "topic": "Microglia AD",
+                                "description": "microglia Alzheimer disease progression",
+                                "schedule": "weekly",
+                            },
+                        }
+                    },
+                },
+            )
+        finally:
+            session.close()
+        response = client.post(
+            "/api/dashboard/chat/approvals/approval-1",
+            params={"session_key": session_key},
+            json={"decision": "approve"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["artifacts"]["watch_id"] == "watch-test123"
+    assert payload["framework_schedule"]["status"] == "registered"
+    assert payload["framework_schedule"]["name"] == "biomed-watch:watch-test123"
+    assert payload["framework_schedule"]["interval"] == "7d"
+
+
+def test_dashboard_chat_approval_delete_watch_cancels_framework_schedule(
+    tmp_path,
+) -> None:
+    registry = _FakeToolRegistry()
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=registry,
+        tool_hooks=[_RequireApprovedHook()],
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.update_session(
+                session_key,
+                metadata={
+                    "title": "Watch delete approval test",
+                    "pending_approvals": {
+                        "approval-1": {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "tool_name": "delete_research_watch_topic",
+                            "final_arguments": {"watch_id": "watch-test123"},
+                        }
+                    },
+                },
+            )
+        finally:
+            session.close()
+        response = client.post(
+            "/api/dashboard/chat/approvals/approval-1",
+            params={"session_key": session_key},
+            json={"decision": "approve"},
+        )
+
+    assert response.status_code == 200
+    assert registry.calls[0] == (
+        "delete_research_watch_topic",
+        {"watch_id": "watch-test123"},
+    )
+    assert registry.calls[1] == (
+        "cancel_schedule",
+        {"name": "biomed-watch:watch-test123"},
+    )
+    payload = response.json()
+    assert payload["framework_schedule"]["status"] == "requested"
+    assert payload["framework_schedule"]["name"] == "biomed-watch:watch-test123"
+
+
+def test_dashboard_chat_history_returns_pending_approval_id(tmp_path) -> None:
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=_FakeToolRegistry(),
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.update_session(
+                session_key,
+                metadata={
+                    "title": "Approval history",
+                    "pending_approvals": {
+                        "approval-1": {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "tool_name": "watch_research_topic",
+                            "confirmation": {"approval_id": "approval-1"},
+                            "final_arguments": {"topic": "Microglia AD"},
+                        }
+                    },
+                },
+            )
+        finally:
+            session.close()
+        history = client.get(
+            "/api/dashboard/chat/history",
+            params={"session_key": session_key},
+        )
+
+    assert history.status_code == 200
+    payload = history.json()
+    assert payload["pending_approvals"][0]["approval_id"] == "approval-1"
+    assert payload["pending_approvals"][0]["confirmation"]["approval_id"] == "approval-1"
 
 
 @pytest.mark.asyncio

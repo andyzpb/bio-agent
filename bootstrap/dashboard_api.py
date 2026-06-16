@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import threading
 import secrets
+import hashlib
 import os
 import shutil
 from datetime import timedelta
@@ -29,6 +30,7 @@ from pydantic import BaseModel
 
 from agent.lifecycle.types import AfterStepCtx
 from agent.memory import MemoryStore
+from agent.tool_hooks import ToolExecutionRequest, ToolExecutor
 from bus.event_bus import EventBus
 from bus.events import InboundMessage, OutboundMessage
 from bus.events_lifecycle import (
@@ -90,6 +92,8 @@ _DASHBOARD_CHAT_MAX_COLLECTION_ITEMS = 24
 _DASHBOARD_CHAT_MAX_SANITIZE_DEPTH = 6
 _DASHBOARD_CHAT_REPLAY_LIMIT = 400
 _DASHBOARD_CHAT_APPROVALS_META_KEY = "pending_approvals"
+_BIOMED_RUN_ID_RE = re.compile(r"\bbiomed-run-[A-Za-z0-9_-]+\b")
+_BIOMED_WATCH_ID_RE = re.compile(r"\bwatch-[A-Za-z0-9_-]+\b")
 
 
 def _is_plugin_disabled(plugin_dir: Path) -> bool:
@@ -305,6 +309,24 @@ def _store_dashboard_chat_pending_approval(
     store.update_session(session_key, metadata=metadata)
 
 
+def _dashboard_chat_command_approval_id(
+    session_key: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> str:
+    seed = json.dumps(
+        {
+            "session_key": session_key,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "nonce": secrets.token_hex(8),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def _ensure_dashboard_chat_session_title(
     store: SessionStore,
     session_key: str,
@@ -382,6 +404,214 @@ def _sanitize_dashboard_chat_value(value: Any, *, depth: int = 0) -> Any:
     return _redact_dashboard_chat_string(str(value))
 
 
+def _biomed_artifacts_for_run(run_id: str) -> dict[str, str]:
+    clean = str(run_id or "").strip()
+    if not clean:
+        return {}
+    return {
+        "run_id": clean,
+        "review_url": f"/api/biomed/answer-runs/{clean}/evidence-review",
+        "packet_url": f"/api/biomed/answer-runs/{clean}/evidence-review/packet",
+        "trace_url": f"/api/biomed/answer-runs/{clean}/trace",
+        "provenance_url": f"/api/biomed/answer-runs/{clean}/provenance",
+    }
+
+
+def _biomed_artifacts_for_watch(watch_id: str) -> dict[str, str]:
+    clean = str(watch_id or "").strip()
+    if not clean:
+        return {}
+    return {
+        "watch_id": clean,
+        "watch_url": f"/api/biomed/watch/{clean}",
+        "watch_check_url": f"/api/biomed/watch/{clean}/check",
+        "watch_drift_url": f"/api/biomed/watch/{clean}/drift",
+    }
+
+
+def _biomed_artifacts_from_text(text: str) -> dict[str, str]:
+    clean = str(text or "")
+    run_match = _BIOMED_RUN_ID_RE.search(clean)
+    if run_match:
+        return _biomed_artifacts_for_run(run_match.group(0))
+    watch_match = _BIOMED_WATCH_ID_RE.search(clean)
+    if watch_match:
+        return _biomed_artifacts_for_watch(watch_match.group(0))
+    return {}
+
+
+def _json_dict_from_tool_result(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _biomed_artifacts_from_tool_result(tool_name: str, result: Any) -> dict[str, str]:
+    parsed = _json_dict_from_tool_result(result)
+    if tool_name == "watch_research_topic":
+        return _biomed_artifacts_for_watch(str(parsed.get("watch_id") or ""))
+    if run_id := str(parsed.get("run_id") or "").strip():
+        return _biomed_artifacts_for_run(run_id)
+    return _biomed_artifacts_from_text(str(result))
+
+
+def _biomed_watch_schedule_interval(schedule: str) -> str:
+    normalized = str(schedule or "").strip().lower()
+    if normalized == "daily":
+        return "1d"
+    if normalized == "weekly":
+        return "7d"
+    return ""
+
+
+async def _register_biomed_watch_framework_schedule(
+    *,
+    tool_registry: Any,
+    watch: dict[str, Any],
+    session_key: str,
+) -> dict[str, Any]:
+    watch_id = str(watch.get("watch_id") or "").strip()
+    schedule = str(watch.get("schedule") or "").strip().lower()
+    interval = _biomed_watch_schedule_interval(schedule)
+    if not watch_id or not interval:
+        return {
+            "status": "skipped",
+            "reason": "manual_or_missing_schedule",
+        }
+    if hasattr(tool_registry, "has_tool") and not tool_registry.has_tool("schedule"):
+        return {
+            "status": "unavailable",
+            "reason": "schedule_tool_unavailable",
+        }
+    topic = str(watch.get("topic") or watch_id).strip()
+    prompt = (
+        f"Run Biomedical Evidence research watch {watch_id} ({topic}). "
+        "Call check_research_watch_topic with source=pubmed when live PubMed is enabled; "
+        "otherwise use source=mock. Summarize new pushed papers, skipped papers, "
+        "uncertainty, and next review actions in Dashboard Chat."
+    )
+    result = await tool_registry.execute(
+        "schedule",
+        {
+            "tier": "soft",
+            "trigger": "every",
+            "when": interval,
+            "prompt": prompt,
+            "channel": _DASHBOARD_CHAT_CHANNEL,
+            "chat_id": _dashboard_chat_id(session_key),
+            "name": f"biomed-watch:{watch_id}",
+        },
+    )
+    return {
+        "status": "registered",
+        "name": f"biomed-watch:{watch_id}",
+        "interval": interval,
+        "result": _preview_text(_redact_dashboard_chat_string(str(result)), 500),
+    }
+
+
+async def _cancel_biomed_watch_framework_schedule(
+    *,
+    tool_registry: Any,
+    watch_id: str,
+) -> dict[str, Any]:
+    clean = str(watch_id or "").strip()
+    if not clean:
+        return {"status": "skipped", "reason": "missing_watch_id"}
+    if hasattr(tool_registry, "has_tool") and not tool_registry.has_tool("cancel_schedule"):
+        return {
+            "status": "unavailable",
+            "reason": "cancel_schedule_tool_unavailable",
+        }
+    result = await tool_registry.execute(
+        "cancel_schedule",
+        {"name": f"biomed-watch:{clean}"},
+    )
+    return {
+        "status": "requested",
+        "name": f"biomed-watch:{clean}",
+        "result": _preview_text(_redact_dashboard_chat_string(str(result)), 500),
+    }
+
+
+def _approval_schedule_markdown(schedule: dict[str, Any] | None) -> str:
+    if not schedule:
+        return ""
+    status = str(schedule.get("status") or "").strip()
+    if status == "registered":
+        return (
+            "\n\n**Framework schedule**\n\n"
+            "| Field | Value |\n"
+            "|---|---|\n"
+            f"| Status | Registered |\n"
+            f"| Job | `{schedule.get('name')}` |\n"
+            f"| Interval | `{schedule.get('interval')}` |\n"
+        )
+    if status == "requested":
+        return (
+            "\n\n**Framework schedule**\n\n"
+            "| Field | Value |\n"
+            "|---|---|\n"
+            f"| Status | Cancellation requested |\n"
+            f"| Job | `{schedule.get('name')}` |\n"
+        )
+    if status == "skipped":
+        return "\n\n**Framework schedule:** skipped because this watch is manual or has no schedule."
+    if status:
+        return f"\n\n**Framework schedule:** not registered ({schedule.get('reason') or status})."
+    return ""
+
+
+def _dashboard_chat_approval_success_markdown(
+    *,
+    tool_name: str,
+    result: Any,
+    final_arguments: dict[str, Any],
+    framework_schedule: dict[str, Any] | None,
+) -> str:
+    parsed = _json_dict_from_tool_result(result)
+    if tool_name == "watch_research_topic" and parsed.get("watch_id"):
+        rows = [
+            ("Watch ID", f"`{parsed.get('watch_id')}`"),
+            ("Topic", str(parsed.get("topic") or "")),
+            ("Schedule", str(parsed.get("schedule") or "")),
+            ("Enabled", "Yes" if parsed.get("enabled", True) else "No"),
+            ("Next check", str(parsed.get("next_check_at") or "Not scheduled")),
+        ]
+        return (
+            "## Research watch created\n\n"
+            + "| Field | Value |\n|---|---|\n"
+            + "\n".join(f"| {label} | {value} |" for label, value in rows)
+            + _approval_schedule_markdown(framework_schedule)
+        )
+    if tool_name == "delete_research_watch_topic":
+        watch_id = str(
+            final_arguments.get("watch_id") or parsed.get("watch_id") or ""
+        ).strip()
+        deleted = parsed.get("deleted")
+        status = "Deleted" if deleted is True else "Delete requested"
+        return (
+            "## Research watch deleted\n\n"
+            "| Field | Value |\n"
+            "|---|---|\n"
+            f"| Watch ID | `{watch_id}` |\n"
+            f"| Status | {status} |\n"
+            + _approval_schedule_markdown(framework_schedule)
+        )
+    return (
+        f"## Approved action completed\n\n"
+        f"Tool: `{tool_name}`\n\n"
+        f"{_preview_text(_redact_dashboard_chat_string(str(result)), 1200)}"
+    )
+
+
+
 def _dashboard_chat_history_item(row: dict[str, Any]) -> dict[str, Any]:
     reserved = {
         "id",
@@ -407,6 +637,30 @@ def _dashboard_chat_history_item(row: dict[str, Any]) -> dict[str, Any]:
         "tool_chain": None,
         "extra": _sanitize_dashboard_chat_value(extra),
         "ts": row.get("ts") or row.get("timestamp"),
+    }
+
+
+def _dashboard_chat_pending_approval_from_history(row: dict[str, Any]) -> dict[str, Any] | None:
+    if row.get("status") != "approval_required":
+        return None
+    approval_id = str(row.get("approval_id") or "").strip()
+    if not approval_id:
+        confirmation = row.get("confirmation")
+        if isinstance(confirmation, dict):
+            approval_id = str(confirmation.get("approval_id") or "").strip()
+    if not approval_id:
+        return None
+    return {
+        "approval_id": approval_id,
+        "status": "pending",
+        "tool_name": row.get("tool_name"),
+        "call_id": row.get("call_id"),
+        "iteration": row.get("iteration"),
+        "arguments": row.get("arguments"),
+        "final_arguments": row.get("final_arguments"),
+        "reason": row.get("detail") or row.get("label") or "Approval required",
+        "confirmation": row.get("confirmation") if isinstance(row.get("confirmation"), dict) else {"approval_id": approval_id},
+        "created_at": row.get("ts") or row.get("timestamp") or utcnow().isoformat(),
     }
 
 
@@ -523,6 +777,10 @@ class DashboardChatMultiplexer:
         if msg.channel != _DASHBOARD_CHAT_CHANNEL:
             return
         session_key = _session_key_from_outbound(msg)
+        metadata = dict(msg.metadata or {})
+        artifacts = _biomed_artifacts_from_text(msg.content)
+        if artifacts and "artifacts" not in metadata:
+            metadata["artifacts"] = artifacts
         await self._publish(
             session_key,
             "assistant_message",
@@ -534,7 +792,7 @@ class DashboardChatMultiplexer:
                 "media": list(msg.media or []),
                 "kind": "assistant",
                 "label": "Assistant",
-                "metadata": _sanitize_dashboard_chat_value(dict(msg.metadata or {})),
+                "metadata": _sanitize_dashboard_chat_value(metadata),
             },
         )
         await self._publish(
@@ -599,6 +857,32 @@ class DashboardChatMultiplexer:
     async def _on_tool_completed(self, event: ToolCallCompleted) -> None:
         if event.channel != _DASHBOARD_CHAT_CHANNEL:
             return
+        approval_id = ""
+        if event.status == "approval_required":
+            match = re.search(r"\bApproval ID:\s*([A-Za-z0-9_-]+)\b", event.result_preview)
+            if match:
+                approval_id = match.group(1)
+            if self._store is not None and approval_id:
+                _store_dashboard_chat_pending_approval(
+                    self._store,
+                    session_key=event.session_key,
+                    approval={
+                        "approval_id": approval_id,
+                        "tool_name": event.tool_name,
+                        "call_id": event.call_id,
+                        "iteration": event.iteration,
+                        "arguments": event.arguments,
+                        "final_arguments": event.final_arguments,
+                        "reason": event.result_preview,
+                        "confirmation": {
+                            "approval_id": approval_id,
+                            "session_key": event.session_key,
+                            "chat_id": event.chat_id,
+                            "channel": event.channel,
+                        },
+                        "created_at": utcnow().isoformat(),
+                    },
+                )
         await self._publish(
             event.session_key,
             "tool_completed",
@@ -610,6 +894,7 @@ class DashboardChatMultiplexer:
                 "iteration": event.iteration,
                 "call_id": event.call_id,
                 "status": event.status,
+                "approval_id": approval_id,
                 "detail": _preview_text(
                     _redact_dashboard_chat_string(event.result_preview),
                     360,
@@ -1582,6 +1867,7 @@ def _chat_command_manifest(
                     "/biomed export provenance biomed-run-...",
                     "/biomed project create \"Microglia AD\" --question \"What links microglial activation to AD progression?\"",
                     "/biomed watch create \"Microglia AD\" --query \"microglia Alzheimer disease progression\"",
+                    "/biomed watch delete watch-...",
                 ],
                 "options": {
                     "source": ["mock", "pubmed"],
@@ -1590,6 +1876,7 @@ def _chat_command_manifest(
                     "support-refute": {"type": "boolean"},
                     "project": {"type": "string"},
                     "run_id": {"type": "string"},
+                    "watch_id": {"type": "string"},
                 },
                 "workflows": [
                     {
@@ -1615,6 +1902,12 @@ def _chat_command_manifest(
                         "label": "Literature retrieval",
                         "tool_name": "search_literature",
                         "contract": contracts.get("search_literature", {}),
+                    },
+                    {
+                        "name": "watch delete",
+                        "label": "Delete research watch",
+                        "tool_name": "delete_research_watch_topic",
+                        "contract": contracts.get("delete_research_watch_topic", {}),
                     },
                     {
                         "name": "review",
@@ -1662,6 +1955,17 @@ def _flag_int(flags: dict[str, Any], *keys: str, default: int) -> int:
             continue
         try:
             return max(1, int(flags[key]))
+        except Exception:
+            return default
+    return default
+
+
+def _flag_float(flags: dict[str, Any], *keys: str, default: float) -> float:
+    for key in keys:
+        if key not in flags:
+            continue
+        try:
+            return float(flags[key])
         except Exception:
             return default
     return default
@@ -1764,9 +2068,186 @@ def _biomed_prompt_for_preview(action: str, args: dict[str, Any]) -> str:
     if action == "watch_create":
         return (
             "Create a Biomedical Evidence research watch after confirmation. "
-            f"Topic: {args.get('topic')}. Query: {args.get('query')}."
+            f"Topic: {args.get('topic')}. Query: {args.get('description') or args.get('query')}."
+        )
+    if action == "watch_delete":
+        return (
+            "Delete a Biomedical Evidence research watch after confirmation and "
+            f"cancel its framework schedule. Watch ID: {args.get('watch_id')}."
         )
     return "Handle this Biomedical Evidence command."
+
+
+def _deterministic_dashboard_chat_command(content: str) -> str:
+    text = str(content or "").strip()
+    if text.startswith("/"):
+        return text
+    lowered = text.lower()
+    watch_match = _BIOMED_WATCH_ID_RE.search(text)
+    if watch_match and re.search(
+        r"\b(delete|remove|cancel|stop|disable)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return f"/biomed watch delete {watch_match.group(0)}"
+    run_match = _BIOMED_RUN_ID_RE.search(text)
+    if run_match and re.search(r"\b(provenance|graph|export)\b", text, re.IGNORECASE):
+        return f"/biomed export provenance {run_match.group(0)}"
+    if run_match and re.search(r"\b(review|packet|trace|open|inspect)\b", text, re.IGNORECASE):
+        return f"/biomed review {run_match.group(0)}"
+    if re.search(r"\b(biomed|biomedical|pubmed|llm provider)\b", lowered):
+        if re.search(r"\b(status|readiness|ready|configured|configuration)\b", lowered):
+            return "/biomed status"
+        if re.search(r"\b(enable|turn on|allow|activate)\b", lowered) and "pubmed" in lowered:
+            return "/biomed enable pubmed"
+        if re.search(r"\b(check|test|verify|smoke)\b", lowered) and "pubmed" in lowered:
+            return "/biomed check pubmed"
+    if "watch" in lowered and re.search(r"\b(create|add|monitor|track)\b", lowered):
+        topic_match = re.search(
+            r"\btopic\s*:\s*([^.;\n]+)",
+            text,
+            re.IGNORECASE,
+        )
+        query_match = re.search(
+            r"\b(query|question)\s*:\s*([^.;\n]+)",
+            text,
+            re.IGNORECASE,
+        )
+        quoted = re.findall(r'"([^"]+)"', text)
+        topic = (topic_match.group(1).strip() if topic_match else "")
+        query = (query_match.group(2).strip() if query_match else "")
+        if not topic and quoted:
+            topic = quoted[0].strip()
+        if not query and len(quoted) > 1:
+            query = quoted[1].strip()
+        if topic and query:
+            return f'/biomed watch create "{topic}" --query "{query}"'
+    if re.search(r"\b(pubmed|literature|papers?|论文|文献)\b", lowered):
+        quoted = re.findall(r'"([^"]+)"', text)
+        papers_match = re.search(r"\b(\d{1,2})\s*(papers?|篇|篇论文|results?)\b", lowered)
+        papers = papers_match.group(1) if papers_match else "10"
+        source = "pubmed" if "pubmed" in lowered else "mock"
+        if re.search(r"\b(audit|review|evidence review|full audit|调研|审查)\b", lowered) and quoted:
+            llm = " --llm all" if re.search(r"\b(llm|all stages|full)\b", lowered) else ""
+            support_refute = " --support-refute" if re.search(r"\b(refute|contradict|support-refute|反驳)\b", lowered) else ""
+            return f'/biomed audit "{quoted[0].strip()}" --source {source} --papers {papers}{llm}{support_refute}'
+        if re.search(r"\b(search|literature|retrieve|find|检索)\b", lowered) and quoted:
+            return f'/biomed literature "{quoted[0].strip()}" --source {source} --papers {papers}'
+    return text
+
+
+def _safe_json_object_from_text(text: str) -> dict[str, Any]:
+    clean = str(text or "").strip()
+    if not clean:
+        return {}
+    if clean.startswith("```"):
+        clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r"\s*```$", "", clean)
+    try:
+        parsed = json.loads(clean)
+    except Exception:
+        match = re.search(r"\{.*\}", clean, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group(0))
+        except Exception:
+            return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _llm_dashboard_chat_command_or_none(
+    *,
+    content: str,
+    provider: Any | None,
+    model: str,
+) -> str:
+    if provider is None or not model:
+        return ""
+    text = str(content or "").strip()
+    if not text or text.startswith("/"):
+        return ""
+    if not re.search(
+        r"\b(biomed|biomedical|pubmed|literature|evidence|paper|papers|audit|review|watch|provenance|microglia|alzheimer|claim|claims)\b|biomed-run-|watch-",
+        text,
+        re.IGNORECASE,
+    ):
+        return ""
+    try:
+        response = await provider.chat(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You route Dashboard Chat user requests to Biomedical Evidence slash commands. "
+                        "Return one JSON object only with keys: command, confidence, reason. "
+                        "Use an empty command when the request is not clearly a Biomedical Evidence workflow. "
+                        "Allowed command forms: /biomed status; /biomed enable pubmed; /biomed check pubmed; "
+                        "/biomed audit \"question\" --source mock|pubmed --papers N [--llm all] [--support-refute]; "
+                        "/biomed literature \"query\" --source mock|pubmed --papers N; "
+                        "/biomed review biomed-run-...; /biomed export provenance biomed-run-...; "
+                        "/biomed watch create \"topic\" --query \"query\" [--schedule daily|weekly|manual]; "
+                        "/biomed watch delete watch-.... Never invent run IDs or watch IDs."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+            tools=[],
+            model=model,
+            max_tokens=220,
+            tool_choice="none",
+            disable_thinking=True,
+        )
+    except Exception:
+        return ""
+    payload = _safe_json_object_from_text(getattr(response, "content", ""))
+    command = str(payload.get("command") or "").strip()
+    try:
+        confidence = float(payload.get("confidence") or 0)
+    except Exception:
+        confidence = 0
+    if confidence < 0.65 or not command.startswith("/biomed"):
+        return ""
+    return command
+
+
+async def _normalize_dashboard_chat_command(
+    *,
+    content: str,
+    provider: Any | None,
+    model: str,
+) -> str:
+    deterministic = _deterministic_dashboard_chat_command(content)
+    if deterministic != str(content or "").strip():
+        return deterministic
+    llm_command = await _llm_dashboard_chat_command_or_none(
+        content=content,
+        provider=provider,
+        model=model,
+    )
+    return llm_command or deterministic
+
+
+def _biomed_keywords_from_query(query: str) -> list[str]:
+    text = re.sub(r"\s+", " ", str(query or "")).strip(" .,:;!?\"'")
+    raw = re.split(r"[,;/]|\band\b|\bor\b", text, flags=re.IGNORECASE)
+    keywords: list[str] = []
+    if text:
+        keywords.append(text)
+    words = [word for word in re.split(r"\s+", text) if len(word.strip(" .,:;!?\"'")) >= 3]
+    raw.extend(words)
+    for item in raw:
+        clean = re.sub(r"\s+", " ", item).strip(" .,:;!?\"'")
+        if len(clean) < 3:
+            continue
+        if clean.lower() in {"the", "with", "for", "from", "into"}:
+            continue
+        if clean not in keywords:
+            keywords.append(clean)
+    return keywords[:12]
 
 
 def _biomed_help_markdown(readiness: dict[str, Any]) -> str:
@@ -1790,6 +2271,7 @@ def _biomed_help_markdown(readiness: dict[str, Any]) -> str:
             "| `/biomed export provenance <run_id>` | Prepare provenance export when enabled. |",
             "| `/biomed project create \"name\" --question \"...\"` | Create a project after confirmation. |",
             "| `/biomed watch create \"topic\" --query \"...\"` | Create a research watch after confirmation. |",
+            "| `/biomed watch delete <watch_id>` | Delete a research watch and cancel its framework schedule after confirmation. |",
             "",
             "Biomedical Evidence is research-only. It will not diagnose, recommend treatment, interpret private records, or answer patient-specific medical questions.",
         ]
@@ -1967,11 +2449,29 @@ def _parse_biomed_command(
             errors.append("Watch creation requires --query.")
         normalized_action = "watch_create"
         tool_name = "watch_research_topic"
-        args = {"topic": topic, "query": query}
+        args = {
+            "topic": topic,
+            "description": query,
+            "include_keywords": _biomed_keywords_from_query(query),
+            "schedule": _flag_str(flags, "schedule", default="daily") or "daily",
+            "min_relevance_score": _flag_float(flags, "min_relevance_score", "min-relevance", "threshold", default=0.7),
+        }
+        if args["schedule"] not in {"daily", "weekly", "manual"}:
+            errors.append("Watch schedule must be daily, weekly, or manual.")
+    elif action == "watch" and len(action_tokens) > 2 and action_tokens[1].lower() in {"delete", "remove"}:
+        watch_id = action_tokens[2]
+        if not watch_id:
+            errors.append("Watch deletion requires a watch id.")
+        normalized_action = "watch_delete"
+        tool_name = "delete_research_watch_topic"
+        args = {"watch_id": watch_id}
     else:
         errors.append("Unknown /biomed command. Try /biomed help.")
     confirmation = _confirmation_preview(tool_name, contracts) if tool_name else None
     final_prompt = _biomed_prompt_for_preview(normalized_action, args)
+    artifacts = _biomed_artifacts_for_run(str(args.get("run_id") or ""))
+    if not artifacts:
+        artifacts = _biomed_artifacts_from_text(final_prompt)
     deterministic_response = ""
     if normalized_action == "help":
         deterministic_response = _biomed_help_markdown(readiness)
@@ -1987,6 +2487,7 @@ def _parse_biomed_command(
         "missing_requirements": missing,
         "confirmation": confirmation,
         "final_prompt": final_prompt,
+        "artifacts": artifacts or None,
         "deterministic_response": deterministic_response,
         "can_send": not errors and not missing,
         "errors": errors,
@@ -2003,6 +2504,7 @@ def create_dashboard_app(
     message_bus: MessageBus | None = None,
     event_bus: EventBus | None = None,
     tool_registry: Any | None = None,
+    tool_hooks: list[Any] | None = None,
     biomed_revision_provider: Any | None = None,
     biomed_revision_model: str = "",
 ) -> FastAPI:
@@ -2021,6 +2523,7 @@ def create_dashboard_app(
         event_bus=event_bus,
         store=store,
     )
+    approval_tool_executor = ToolExecutor(tool_hooks or [])
 
     def get_proactive_reader() -> ProactiveDashboardReader:
         nonlocal proactive_reader
@@ -2142,9 +2645,14 @@ def create_dashboard_app(
         )
 
     @app.post("/api/dashboard/chat/commands/parse")
-    def parse_chat_command(payload: ChatCommandParsePayload) -> dict[str, Any]:
+    async def parse_chat_command(payload: ChatCommandParsePayload) -> dict[str, Any]:
         session_key = _validate_dashboard_chat_session(payload.session_key)
         content = _validate_dashboard_chat_content(payload.content)
+        routed_content = await _normalize_dashboard_chat_command(
+            content=content,
+            provider=biomed_revision_provider,
+            model=biomed_revision_model,
+        )
         readiness = _biomed_readiness(
             workspace=workspace,
             plugin_dir=plugins_root / "biomed_evidence",
@@ -2152,9 +2660,9 @@ def create_dashboard_app(
             model=biomed_revision_model,
         )
         contracts = _biomed_tool_contract_map()
-        if content.strip().startswith("/biomed"):
+        if routed_content.strip().startswith("/biomed"):
             parsed = _parse_biomed_command(
-                content,
+                routed_content,
                 readiness=readiness,
                 contracts=contracts,
             )
@@ -2162,6 +2670,7 @@ def create_dashboard_app(
                 "session_key": session_key,
                 "kind": "biomed",
                 "readiness": readiness,
+                "routed_from": content if routed_content != content else "",
                 **parsed,
             }
         return {
@@ -2205,15 +2714,28 @@ def create_dashboard_app(
             sort_by="seq",
             sort_order="asc",
         )
+        pending_approvals = _dashboard_chat_pending_approvals(metadata)
+        for item in items:
+            extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+            restored = _dashboard_chat_pending_approval_from_history({
+                **dict(extra or {}),
+                **{key: value for key, value in item.items() if key not in {"extra"}},
+            })
+            if restored:
+                approval_id = str(restored.get("approval_id") or "").strip()
+                if approval_id and approval_id not in pending_approvals:
+                    pending_approvals[approval_id] = restored
         return {
             "items": [_dashboard_chat_history_item(item) for item in items],
             "total": total,
             "page": 1,
             "page_size": max(1, min(page_size, 200)),
             "session_key": clean_session_key,
-            "pending_approvals": list(
-                _dashboard_chat_pending_approvals(metadata).values()
-            ),
+            "pending_approvals": [
+                approval
+                for approval in pending_approvals.values()
+                if str(approval.get("status") or "pending") == "pending"
+            ],
         }
 
     @app.post("/api/dashboard/chat/messages", status_code=202)
@@ -2225,11 +2747,16 @@ def create_dashboard_app(
         )
         session_key = _validate_dashboard_chat_session(payload.session_key)
         content = _validate_dashboard_chat_content(payload.content)
+        routed_content = await _normalize_dashboard_chat_command(
+            content=content,
+            provider=biomed_revision_provider,
+            model=biomed_revision_model,
+        )
         effective_content = content
         command_preview: dict[str, Any] | None = None
-        if content.startswith("/biomed"):
+        if routed_content.startswith("/biomed"):
             command_preview = _parse_biomed_command(
-                content,
+                routed_content,
                 readiness=_biomed_readiness(
                     workspace=workspace,
                     plugin_dir=plugins_root / "biomed_evidence",
@@ -2275,6 +2802,9 @@ def create_dashboard_app(
                     seq=user_seq,
                     extra={
                         "command": command_preview,
+                        "routed_command": routed_content
+                        if routed_content != content
+                        else "",
                         "source": "dashboard_chat_command",
                     },
                 )
@@ -2303,7 +2833,11 @@ def create_dashboard_app(
                             "session_key_override": session_key,
                             "source": "dashboard_chat_command",
                             "command": command_preview,
+                            "routed_command": routed_content
+                            if routed_content != content
+                            else "",
                             "command_action": command_preview.get("action"),
+                            "artifacts": command_preview.get("artifacts") or None,
                         },
                     )
                 )
@@ -2322,7 +2856,118 @@ def create_dashboard_app(
                         "missing_requirements": command_preview["missing_requirements"],
                     },
                 )
-            effective_content = str(command_preview.get("final_prompt") or content)
+            if command_preview.get("confirmation"):
+                chat_id = _dashboard_chat_id(session_key)
+                _ensure_dashboard_chat_session_title(store, session_key, content)
+                now = utcnow().isoformat()
+                user_seq = store.next_seq(session_key)
+                store.insert_message(
+                    session_key,
+                    role="user",
+                    content=content,
+                    ts=now,
+                    seq=user_seq,
+                    extra={
+                        "command": command_preview,
+                        "source": "dashboard_chat_command",
+                        "routed_command": routed_content
+                        if routed_content != content
+                        else "",
+                    },
+                )
+                await chat_mux.publish_user_message_accepted(
+                    session_key=session_key,
+                    content=content,
+                )
+                tool_name = str(command_preview.get("tool_name") or "").strip()
+                final_arguments = dict(command_preview.get("arguments") or {})
+                approval_id = _dashboard_chat_command_approval_id(
+                    session_key,
+                    tool_name,
+                    final_arguments,
+                )
+                confirmation = {
+                    **dict(command_preview.get("confirmation") or {}),
+                    "approval_id": approval_id,
+                    "session_key": session_key,
+                    "chat_id": chat_id,
+                    "channel": _DASHBOARD_CHAT_CHANNEL,
+                }
+                reason = str(
+                    (command_preview.get("confirmation") or {}).get("reason")
+                    or "This Biomedical Evidence action requires confirmation before execution."
+                )
+                _store_dashboard_chat_pending_approval(
+                    store,
+                    session_key=session_key,
+                    approval={
+                        "approval_id": approval_id,
+                        "tool_name": tool_name,
+                        "call_id": f"command:{approval_id}",
+                        "iteration": 1,
+                        "arguments": final_arguments,
+                        "final_arguments": final_arguments,
+                        "reason": reason,
+                        "confirmation": confirmation,
+                        "command": command_preview,
+                        "created_at": utcnow().isoformat(),
+                    },
+                )
+                assistant_content = (
+                    f"Approval required for `{tool_name}`.\n\n"
+                    "Review the action below, then approve it to run."
+                )
+                seq = store.next_seq(session_key)
+                store.insert_message(
+                    session_key,
+                    role="assistant",
+                    content=assistant_content,
+                    ts=utcnow().isoformat(),
+                    seq=seq,
+                    extra={
+                        "command": command_preview,
+                        "source": "dashboard_chat_command",
+                    },
+                )
+                await chat_mux._on_outbound(
+                    OutboundMessage(
+                        channel=_DASHBOARD_CHAT_CHANNEL,
+                        chat_id=chat_id,
+                        content=assistant_content,
+                        metadata={
+                            "session_key_override": session_key,
+                            "source": "dashboard_chat_command",
+                            "command": command_preview,
+                            "routed_command": routed_content
+                            if routed_content != content
+                            else "",
+                            "command_action": command_preview.get("action"),
+                        },
+                    )
+                )
+                await chat_mux._on_tool_approval_required(
+                    ToolCallApprovalRequired(
+                        session_key=session_key,
+                        channel=_DASHBOARD_CHAT_CHANNEL,
+                        chat_id=chat_id,
+                        iteration=1,
+                        call_id=f"command:{approval_id}",
+                        tool_name=tool_name,
+                        arguments=final_arguments,
+                        final_arguments=final_arguments,
+                        reason=reason,
+                        confirmation=confirmation,
+                    )
+                )
+                return {
+                    "accepted": True,
+                    "session_key": session_key,
+                    "chat_id": chat_id,
+                    "command": command_preview,
+                    "approval_required": True,
+                    "approval_id": approval_id,
+                }
+            effective_content = str(command_preview.get("final_prompt") or routed_content)
         chat_id = _dashboard_chat_id(session_key)
         _ensure_dashboard_chat_session_title(store, session_key, content)
         metadata = {
@@ -2402,7 +3047,21 @@ def create_dashboard_app(
         if not tool_name or not isinstance(final_arguments, dict):
             raise HTTPException(status_code=409, detail="approval payload is invalid")
         try:
-            result = await tool_registry.execute(tool_name, dict(final_arguments))
+            exec_result = await approval_tool_executor.execute(
+                ToolExecutionRequest(
+                    call_id=f"dashboard-approval:{clean_approval_id}",
+                    tool_name=tool_name,
+                    arguments=dict(final_arguments),
+                    source="passive",
+                    session_key=clean_session_key,
+                    channel=_DASHBOARD_CHAT_CHANNEL,
+                    chat_id=_dashboard_chat_id(clean_session_key),
+                    request_text=f"Approved Dashboard Chat action {clean_approval_id}.",
+                    approval_id=clean_approval_id,
+                    approved=True,
+                ),
+                tool_registry.execute,
+            )
         except Exception as exc:
             approval["status"] = "failed"
             approval["resolved_at"] = utcnow().isoformat()
@@ -2415,30 +3074,97 @@ def create_dashboard_app(
                 message=f"Approved tool failed: {tool_name}: {exc}",
             )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if exec_result.status != "success":
+            approval["status"] = "failed"
+            approval["resolved_at"] = utcnow().isoformat()
+            approval["error"] = str(exec_result.output)
+            pending[clean_approval_id] = approval
+            metadata[_DASHBOARD_CHAT_APPROVALS_META_KEY] = pending
+            store.update_session(clean_session_key, metadata=metadata)
+            await chat_mux.publish_error(
+                session_key=clean_session_key,
+                message=f"Approved tool did not run: {tool_name}: {exec_result.output}",
+            )
+            raise HTTPException(status_code=409, detail=str(exec_result.output))
+        result = exec_result.output
         text = str(result)
+        artifacts = _biomed_artifacts_from_tool_result(tool_name, result)
+        watch_schedule: dict[str, Any] | None = None
+        if tool_name == "watch_research_topic" and tool_registry is not None:
+            watch_payload = _json_dict_from_tool_result(result)
+            try:
+                watch_schedule = await _register_biomed_watch_framework_schedule(
+                    tool_registry=tool_registry,
+                    watch=watch_payload,
+                    session_key=clean_session_key,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to register framework schedule for biomed watch: %s",
+                    exc,
+                    exc_info=True,
+                )
+                watch_schedule = {
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+        elif tool_name == "delete_research_watch_topic" and tool_registry is not None:
+            deleted_watch_id = str(
+                dict(final_arguments).get("watch_id")
+                or _json_dict_from_tool_result(result).get("watch_id")
+                or ""
+            ).strip()
+            try:
+                watch_schedule = await _cancel_biomed_watch_framework_schedule(
+                    tool_registry=tool_registry,
+                    watch_id=deleted_watch_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to cancel framework schedule for biomed watch: %s",
+                    exc,
+                    exc_info=True,
+                )
+                watch_schedule = {
+                    "status": "failed",
+                    "reason": str(exc),
+                }
         approval["status"] = "approved"
         approval["resolved_at"] = utcnow().isoformat()
         approval["result_preview"] = _preview_text(
             _redact_dashboard_chat_string(text),
             1200,
         )
+        if artifacts:
+            approval["artifacts"] = artifacts
+        if watch_schedule is not None:
+            approval["framework_schedule"] = _sanitize_dashboard_chat_value(
+                watch_schedule
+            )
         pending[clean_approval_id] = approval
         metadata[_DASHBOARD_CHAT_APPROVALS_META_KEY] = pending
         store.update_session(clean_session_key, metadata=metadata)
         seq = store.next_seq(clean_session_key)
+        assistant_markdown = _dashboard_chat_approval_success_markdown(
+            tool_name=tool_name,
+            result=result,
+            final_arguments=dict(final_arguments),
+            framework_schedule=watch_schedule,
+        )
         row = store.insert_message(
             clean_session_key,
             role="assistant",
-            content=(
-                f"Approved action completed: {tool_name}\n\n"
-                f"{approval['result_preview']}"
-            ),
+            content=assistant_markdown,
             ts=utcnow().isoformat(),
             seq=seq,
             extra={
                 "approval_id": clean_approval_id,
                 "tool_name": tool_name,
                 "source": "dashboard_chat_approval",
+                "artifacts": artifacts,
+                "framework_schedule": _sanitize_dashboard_chat_value(
+                    watch_schedule or {}
+                ),
             },
         )
         await chat_mux._on_outbound(
@@ -2446,7 +3172,13 @@ def create_dashboard_app(
                 channel=_DASHBOARD_CHAT_CHANNEL,
                 chat_id=_dashboard_chat_id(clean_session_key),
                 content=str(row["content"]),
-                metadata={"session_key_override": clean_session_key},
+                metadata={
+                    "session_key_override": clean_session_key,
+                    "artifacts": artifacts,
+                    "framework_schedule": _sanitize_dashboard_chat_value(
+                        watch_schedule or {}
+                    ),
+                },
             )
         )
         return {
@@ -2455,6 +3187,10 @@ def create_dashboard_app(
             "status": "approved",
             "tool_name": tool_name,
             "result_preview": approval["result_preview"],
+            "artifacts": artifacts,
+            "framework_schedule": _sanitize_dashboard_chat_value(
+                watch_schedule or {}
+            ),
         }
 
     @app.get("/api/dashboard/chat/stream")
@@ -3118,6 +3854,7 @@ def _build_dashboard_uvicorn_config(
     message_bus: MessageBus | None = None,
     event_bus: EventBus | None = None,
     tool_registry: Any | None = None,
+    tool_hooks: list[Any] | None = None,
     biomed_revision_provider: Any | None = None,
     biomed_revision_model: str = "",
 ) -> uvicorn.Config:
@@ -3131,6 +3868,7 @@ def _build_dashboard_uvicorn_config(
             message_bus=message_bus,
             event_bus=event_bus,
             tool_registry=tool_registry,
+            tool_hooks=tool_hooks,
             biomed_revision_provider=biomed_revision_provider,
             biomed_revision_model=biomed_revision_model,
         ),
@@ -3154,6 +3892,7 @@ def build_dashboard_server(
     message_bus: MessageBus | None = None,
     event_bus: EventBus | None = None,
     tool_registry: Any | None = None,
+    tool_hooks: list[Any] | None = None,
     biomed_revision_provider: Any | None = None,
     biomed_revision_model: str = "",
 ) -> uvicorn.Server:
@@ -3168,6 +3907,7 @@ def build_dashboard_server(
         message_bus=message_bus,
         event_bus=event_bus,
         tool_registry=tool_registry,
+        tool_hooks=tool_hooks,
         biomed_revision_provider=biomed_revision_provider,
         biomed_revision_model=biomed_revision_model,
     )

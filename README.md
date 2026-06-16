@@ -103,7 +103,9 @@ chips: Help, Status, Mock audit, and Live audit. Type `/` for the full command
 palette, then preview readiness, setup needs, run IDs, or confirmation
 requirements before anything is sent.
 
-![Dashboard chat-to-review workflow](./assets/biomed-dashboard-chat-workflow.gif)
+![Dashboard chat to review workflow](./assets/biomed-dashboard-chat-workflow.gif)
+
+![Dashboard audit summary and table output](./assets/biomed-dashboard-audit-summary.gif)
 
 `/biomed status` separates PubMed command policy from network reachability, so
 the UI can explain whether live PubMed is disabled by configuration or simply

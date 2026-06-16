@@ -578,6 +578,8 @@ class _PluginToolHook(ToolHook):
             call_id=ctx.request.call_id,
             source=ctx.request.source,
             request_text=ctx.request.request_text,
+            approval_id=ctx.request.approval_id,
+            approved=ctx.request.approved,
             tool_batch=ctx.request.tool_batch,
             tool_batch_index=ctx.request.tool_batch_index,
         )

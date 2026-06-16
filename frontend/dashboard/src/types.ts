@@ -118,6 +118,17 @@ export interface ChatCommandPreview {
   can_send: boolean;
   errors: string[];
   readiness?: BiomedCommandStatus;
+  artifacts?: ChatRunArtifacts | null;
+}
+
+export interface ChatRunArtifacts {
+  run_id?: string;
+  watch_id?: string;
+  review_url?: string;
+  packet_url?: string;
+  trace_url?: string;
+  provenance_url?: string;
+  [key: string]: unknown;
 }
 
 export interface ChatSessionMetadata {
@@ -166,7 +177,9 @@ export interface ChatTurn {
   assistant?: ChatEventRow | null;
   thinking?: ChatThinkingState | null;
   approval?: ChatEventRow | null;
+  actionTarget?: "review" | "packet" | "provenance" | "trace";
   error?: ChatEventRow | null;
+  warning?: ChatEventRow | null;
 }
 
 export interface ChatThinkingState {

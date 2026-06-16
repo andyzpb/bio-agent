@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ChevronDown, Copy, Info, LoaderCircle, Plus, Search, Trash2 } from "lucide-react";
+import { ChevronDown, Copy, ExternalLink, FileText, Info, LoaderCircle, Plus, Search, Trash2 } from "lucide-react";
 import { api, asPageResult, pageCount } from "./api";
 import {
   encodePath,
@@ -22,6 +22,7 @@ import type {
   ChatEventRow,
   ChatCommandManifest,
   ChatCommandPreview,
+  ChatRunArtifacts,
   ChatSessionMetadata,
   ChatStatus,
   ChatThinkingState,
@@ -41,6 +42,17 @@ import type {
 } from "./types";
 
 type NavOpen = Record<string, boolean>;
+
+interface RunReviewDrawerState {
+  runId: string;
+  target: "review" | "packet" | "provenance" | "trace";
+  loading: boolean;
+  error: string | null;
+  review: Record<string, unknown> | null;
+  packet: Record<string, unknown> | null;
+  trace: Record<string, unknown> | null;
+  provenance: Record<string, unknown> | null;
+}
 
 // Creates a PluginDispatch bound to the given plugin + latest state getter.
 function makeDispatch(
@@ -157,6 +169,8 @@ function App(): React.ReactElement {
   const [chatCommandPreviewKey, setChatCommandPreviewKey] = useState("");
   const [chatCommandPreviewLoading, setChatCommandPreviewLoading] = useState(false);
   const [chatDeleteTarget, setChatDeleteTarget] = useState<SessionRow | null>(null);
+  const [chatReviewDrawer, setChatReviewDrawer] = useState<RunReviewDrawerState | null>(null);
+  const [chatApprovalState, setChatApprovalState] = useState<Record<string, "approving" | "rejecting" | "approved" | "rejected" | "failed">>({});
   const [creatingChat, setCreatingChat] = useState(false);
   const [deletingChatKey, setDeletingChatKey] = useState<string | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
@@ -268,7 +282,7 @@ function App(): React.ReactElement {
       : [];
     setChatEvents((current) => {
       const otherSessions = current.filter((event) => event.session_key !== sessionKey);
-      const liveForSession = current.filter((event) => event.session_key === sessionKey && event.source !== "history");
+      const liveForSession = current.filter((event) => event.session_key === sessionKey && shouldKeepLiveEventAfterHistoryReload(event, history));
       return [...otherSessions, ...history, ...approvals, ...liveForSession];
     });
   }, []);
@@ -381,6 +395,7 @@ function App(): React.ReactElement {
       label: "You",
       content,
       detail: content,
+      metadata: preview ? { command: preview, source: "dashboard_chat_command" } : undefined,
       session_key: chatSessionKey,
       source: "local",
     });
@@ -451,14 +466,23 @@ function App(): React.ReactElement {
 
   const decideChatApproval = useCallback(async (approvalId: string, decision: "approve" | "reject"): Promise<void> => {
     if (!approvalId) return;
+    setChatApprovalState((current) => ({
+      ...current,
+      [approvalId]: decision === "approve" ? "approving" : "rejecting",
+    }));
     try {
       await api(`/api/dashboard/chat/approvals/${encodeURIComponent(approvalId)}?session_key=${encodeURIComponent(chatSessionKey)}`, {
         method: "POST",
         body: JSON.stringify({ decision }),
       });
+      setChatApprovalState((current) => ({
+        ...current,
+        [approvalId]: decision === "approve" ? "approved" : "rejected",
+      }));
       await loadChatHistory(chatSessionKey);
       void loadSessions();
     } catch (exc) {
+      setChatApprovalState((current) => ({ ...current, [approvalId]: "failed" }));
       appendChatEvent({
         event: "error",
         kind: "error",
@@ -468,6 +492,39 @@ function App(): React.ReactElement {
       });
     }
   }, [appendChatEvent, chatSessionKey, loadChatHistory, loadSessions]);
+
+  const openRunReviewDrawer = useCallback((runId: string, target: RunReviewDrawerState["target"] = "review"): void => {
+    const cleanRunId = String(runId || "").trim();
+    if (!cleanRunId) return;
+    setChatReviewDrawer({
+      runId: cleanRunId,
+      target,
+      loading: true,
+      error: null,
+      review: null,
+      packet: null,
+      trace: null,
+      provenance: null,
+    });
+    void run(async () => {
+      const [review, packet, trace, provenance] = await Promise.all([
+        api<Record<string, unknown>>(`/api/biomed/answer-runs/${encodeURIComponent(cleanRunId)}/evidence-review`).catch((exc) => ({ error: exc instanceof Error ? exc.message : String(exc) })),
+        api<Record<string, unknown>>(`/api/biomed/answer-runs/${encodeURIComponent(cleanRunId)}/evidence-review/packet`).catch((exc) => ({ error: exc instanceof Error ? exc.message : String(exc) })),
+        api<Record<string, unknown>>(`/api/biomed/answer-runs/${encodeURIComponent(cleanRunId)}/trace`).catch((exc) => ({ error: exc instanceof Error ? exc.message : String(exc) })),
+        api<Record<string, unknown>>(`/api/biomed/answer-runs/${encodeURIComponent(cleanRunId)}/provenance`).catch((exc) => ({ error: exc instanceof Error ? exc.message : String(exc) })),
+      ]);
+      setChatReviewDrawer({
+        runId: cleanRunId,
+        target,
+        loading: false,
+        error: null,
+        review,
+        packet,
+        trace,
+        provenance,
+      });
+    });
+  }, [run]);
 
   const loadProactivePanel = useCallback(async () => {
     const params = new URLSearchParams();
@@ -951,6 +1008,8 @@ function App(): React.ReactElement {
             onDeleteChat={() => activeChatSession && setChatDeleteTarget(activeChatSession)}
             onSend={() => void run(sendChatMessage)}
             onApproval={(approvalId, decision) => void run(() => decideChatApproval(approvalId, decision))}
+            approvalState={chatApprovalState}
+            onOpenRunReview={openRunReviewDrawer}
             onOpenSession={() => {
               setActiveSessionKey(chatSessionKey);
               setActiveSession(sessions.find((session) => session.key === chatSessionKey) ?? null);
@@ -1063,6 +1122,16 @@ function App(): React.ReactElement {
         )}
       </main>
       {error && <div className="modal-backdrop" onClick={() => setError(null)}><div className="modal"><div className="modal-title">Request failed</div><p>{error}</p><div className="modal-actions"><button className="primary" type="button" onClick={() => setError(null)}>Close</button></div></div></div>}
+      {chatReviewDrawer && (
+        <RunReviewDrawer
+          state={chatReviewDrawer}
+          onClose={() => setChatReviewDrawer(null)}
+          onOpenWorkspace={() => {
+            setChatReviewDrawer(null);
+            selectView("plugin:biomed_evidence");
+          }}
+        />
+      )}
       {chatDeleteTarget && (
         <div className="modal-backdrop" onClick={() => setChatDeleteTarget(null)}>
           <div className="modal" onClick={(event) => event.stopPropagation()}>
@@ -1172,27 +1241,16 @@ function ChatPane(props: {
   onDeleteChat(): void;
   onSend(): void;
   onApproval(approvalId: string, decision: "approve" | "reject"): void;
+  approvalState: Record<string, "approving" | "rejecting" | "approved" | "rejected" | "failed">;
+  onOpenRunReview(runId: string, target?: RunReviewDrawerState["target"]): void;
   onOpenSession(): void;
 }): React.ReactElement {
   const disabled = !props.status?.enabled;
   const streamRef = useRef<HTMLDivElement>(null);
   const turns = useMemo(() => deriveChatTurns(props.events), [props.events]);
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
-  const [shortcutsCollapsed, setShortcutsCollapsed] = useState<boolean | null>(() => {
-    try {
-      const value = window.localStorage.getItem("dashboard-chat-shortcuts-collapsed");
-      if (value === "1") return true;
-      if (value === "0") return false;
-      return null;
-    } catch {
-      return null;
-    }
-  });
   const activeThinkingKey = props.session?.key ?? props.status?.session_key ?? "dashboard:default";
   const currentThinkingExpanded = expandedThinking[activeThinkingKey] ?? false;
-  const hasConversation = turns.length > 0;
-  const effectiveShortcutsCollapsed = shortcutsCollapsed ?? hasConversation;
-  const showShortcutCards = !effectiveShortcutsCollapsed;
   const latestContentKey = useMemo(
     () => props.events
       .filter((event) => event.kind === "user" || event.kind === "assistant" || event.event === "done")
@@ -1207,18 +1265,6 @@ function ChatPane(props: {
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior: props.sending ? "smooth" : "auto" });
   }, [disabled, latestContentKey, props.sending]);
-
-  const toggleShortcuts = (): void => {
-    setShortcutsCollapsed((current) => {
-      const next = !(current ?? hasConversation);
-      try {
-        window.localStorage.setItem("dashboard-chat-shortcuts-collapsed", next ? "1" : "0");
-      } catch {
-        // Ignore storage failures; the UI state still updates for this session.
-      }
-      return next;
-    });
-  };
 
   return (
     <section className="chat-pane">
@@ -1252,26 +1298,7 @@ function ChatPane(props: {
           </button>
         </div>
       </header>
-      <div className="chat-command-strip">
-        <div className="command-mini-title">Commands</div>
-        <div className="command-mini-list">
-          {(props.commands?.commands ?? []).map((command) => (
-            <button
-              key={command.prefix}
-              className="command-mini-chip"
-              type="button"
-              onClick={() => props.setInput(command.examples?.[0] ?? `${command.prefix} `)}
-            >
-              <span>{command.prefix}</span>
-              <small>{command.display_name}</small>
-            </button>
-          ))}
-        </div>
-      </div>
       <CommandQuickStart
-        collapsed={!showShortcutCards}
-        hasConversation={hasConversation}
-        onToggle={toggleShortcuts}
         setInput={props.setInput}
       />
       {disabled ? (
@@ -1292,6 +1319,8 @@ function ChatPane(props: {
                   [activeThinkingKey]: !currentThinkingExpanded,
                 }))}
                 onApproval={props.onApproval}
+                approvalState={props.approvalState}
+                onOpenRunReview={props.onOpenRunReview}
               />
             )) : (
               <div className="chat-empty">
@@ -1349,7 +1378,7 @@ function CommandPreviewCard(props: {
   preview: ChatCommandPreview;
   loading: boolean;
 }): React.ReactElement {
-  const status = props.preview.can_send ? "Ready" : props.preview.errors.length ? "Needs edits" : "Needs setup";
+  const status = commandPreviewStatusLabel(props.preview);
   const commandLabel = props.preview.command || "Command";
   return (
     <div className={`command-preview-card ${props.preview.can_send ? "ready" : "blocked"}`}>
@@ -1393,34 +1422,19 @@ function CommandPreviewCard(props: {
 }
 
 function CommandQuickStart(props: {
-  collapsed: boolean;
-  hasConversation: boolean;
-  onToggle(): void;
   setInput(value: string): void;
 }): React.ReactElement {
-  const commands = biomedCommandSuggestions();
+  const frequent = biomedCommandSuggestions().filter((item) => item.label === "Help" || item.label === "Status" || item.label === "Mock audit" || item.label === "Live audit");
   return (
-    <div className={`command-quickstart${props.collapsed ? " collapsed" : ""}`}>
-      <div className="command-quickstart-head">
-        <div>
-          <strong>Biomedical command shortcuts</strong>
-          <span>{props.collapsed ? "Use / for the full command palette." : "Pick one, then edit the question or run id."}</span>
-        </div>
-        <button className="command-toggle" type="button" onClick={props.onToggle}>
-          {props.collapsed ? "Show shortcuts" : "Hide shortcuts"}
-        </button>
+    <div className="command-rail">
+      <div className="command-rail-tag">/biomed</div>
+      <div className="command-chip-row">
+        {frequent.map((item) => (
+          <button key={`chip-${item.label}`} type="button" className="command-chip" onClick={() => props.setInput(item.command)}>
+            {item.label}
+          </button>
+        ))}
       </div>
-      {!props.collapsed && (
-        <div className="command-card-grid">
-          {commands.slice(0, props.hasConversation ? 3 : 6).map((item) => (
-            <button key={item.label} type="button" className="command-card" onClick={() => props.setInput(item.command)}>
-              <span>{item.label}</span>
-              <small>{item.description}</small>
-              <code>{item.command}</code>
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -1507,6 +1521,11 @@ function biomedCommandSuggestions(): Array<{ label: string; description: string;
       description: "Create a literature watch after confirmation.",
       command: '/biomed watch create "Microglia AD" --query "microglia Alzheimer disease progression"',
     },
+    {
+      label: "Delete watch",
+      description: "Remove a research watch and cancel its framework schedule.",
+      command: "/biomed watch delete watch-...",
+    },
   ];
 }
 
@@ -1515,7 +1534,11 @@ function ChatTurnItem(props: {
   expanded: boolean;
   onToggleThinking(): void;
   onApproval(approvalId: string, decision: "approve" | "reject"): void;
+  approvalState: Record<string, "approving" | "rejecting" | "approved" | "rejected" | "failed">;
+  onOpenRunReview(runId: string, target?: RunReviewDrawerState["target"]): void;
 }): React.ReactElement {
+  const artifacts = useMemo(() => chatTurnRunArtifacts(props.turn), [props.turn]);
+  const approvalId = extractTurnApprovalId(props.turn);
   return (
     <div className="chat-turn">
       {props.turn.user && (
@@ -1531,8 +1554,14 @@ function ChatTurnItem(props: {
           <div className="chat-bubble" dangerouslySetInnerHTML={{ __html: renderMarkdown(props.turn.assistant.content || props.turn.assistant.detail || " ") }} />
         </div>
       )}
+      {(artifacts.run_id || artifacts.watch_id) && (
+        <ArtifactActionBar
+          artifacts={artifacts}
+          onOpenRunReview={props.onOpenRunReview}
+        />
+      )}
       {props.turn.approval && (
-        <ApprovalCard event={props.turn.approval} onDecision={props.onApproval} />
+        <ApprovalCard event={props.turn.approval} approvalId={approvalId} state={props.approvalState[approvalId]} onDecision={props.onApproval} />
       )}
       {props.turn.error && (
         <div className="chat-error-card">
@@ -1540,31 +1569,247 @@ function ChatTurnItem(props: {
           <span>{props.turn.error.summary || props.turn.error.detail}</span>
         </div>
       )}
+      {props.turn.warning && (
+        <div className="chat-error-card warning">
+          <span className="status-pill proactive-result-idle">warning</span>
+          <span>{props.turn.warning.summary || props.turn.warning.detail}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ArtifactActionBar(props: {
+  artifacts: ChatRunArtifacts;
+  onOpenRunReview(runId: string, target?: RunReviewDrawerState["target"]): void;
+}): React.ReactElement {
+  const runId = String(props.artifacts.run_id || "").trim();
+  const watchId = String(props.artifacts.watch_id || "").trim();
+  if (!runId && !watchId) return <></>;
+  if (watchId && !runId) {
+    return (
+      <div className="run-action-bar">
+        <div className="run-action-title">
+          <FileText size={14} aria-hidden="true" />
+          <div>
+            <strong>Research watch created</strong>
+            <code>{watchId}</code>
+          </div>
+        </div>
+        <div className="run-action-buttons">
+          <button className="ghost" type="button" onClick={() => void copySessionKey(watchId)}>
+            <Copy size={13} aria-hidden="true" />
+            <span>Copy watch ID</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="run-action-bar">
+      <div className="run-action-title">
+        <FileText size={14} aria-hidden="true" />
+        <div>
+          <strong>Review this run</strong>
+          <code>{runId}</code>
+        </div>
+      </div>
+      <div className="run-action-buttons">
+        <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "review")}>Open review</button>
+        <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "packet")}>Evidence packet</button>
+        <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "provenance")}>Provenance</button>
+        <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "trace")}>Trace</button>
+        <button className="ghost" type="button" onClick={() => void copySessionKey(runId)}>
+          <Copy size={13} aria-hidden="true" />
+          <span>Copy run ID</span>
+        </button>
+      </div>
     </div>
   );
 }
 
 function ApprovalCard(props: {
   event: ChatEventRow;
+  approvalId: string;
+  state?: "approving" | "rejecting" | "approved" | "rejected" | "failed";
   onDecision(approvalId: string, decision: "approve" | "reject"): void;
 }): React.ReactElement {
-  const approvalId = props.event.approval_id || "";
+  const approvalId = props.approvalId || extractApprovalId(props.event);
   const toolName = props.event.tool_name || "tool";
-  const pending = (props.event.status || "pending") === "pending";
+  const status = props.state || props.event.status || "pending";
+  const pending = status === "pending" || status === "failed";
+  const busy = status === "approving" || status === "rejecting";
+  const missingExecutableApproval = !approvalId;
+  const resolved = status === "approved" || status === "rejected";
+  const statusLabel = status === "approving"
+    ? "Approving..."
+    : status === "rejecting"
+      ? "Rejecting..."
+      : status === "approved"
+        ? "Approved"
+        : status === "rejected"
+          ? "Rejected"
+          : status === "failed"
+            ? "Approval failed"
+            : "Confirm action";
   return (
     <div className="approval-card">
       <div className="approval-card-body">
         <span className="status-pill proactive-result-busy">approval</span>
         <div>
-          <strong>Confirm action</strong>
+          <strong>{statusLabel}</strong>
           <p>{toolName} requires confirmation before it can run.</p>
+          {approvalId && <small>Approval ID: {approvalId}</small>}
+          {missingExecutableApproval && <small>This approval is missing its executable approval ID. Retry the command to create a fresh approval.</small>}
           {props.event.detail && <small>{props.event.detail}</small>}
         </div>
       </div>
       <div className="approval-card-actions">
-        <button type="button" className="ghost" disabled={!pending || !approvalId} onClick={() => props.onDecision(approvalId, "reject")}>Reject</button>
-        <button type="button" className="primary compact" disabled={!pending || !approvalId} onClick={() => props.onDecision(approvalId, "approve")}>Approve</button>
+        {resolved ? (
+          <span className="approval-card-missing">{status === "approved" ? "Approved" : "Rejected"}</span>
+        ) : missingExecutableApproval ? (
+          <span className="approval-card-missing">Not executable</span>
+        ) : (
+          <>
+            <button type="button" className="ghost" disabled={!pending || busy} onClick={() => props.onDecision(approvalId, "reject")}>
+              {status === "rejecting" ? "Rejecting" : "Reject"}
+            </button>
+            <button type="button" className="primary compact" disabled={!pending || busy} onClick={() => props.onDecision(approvalId, "approve")}>
+              {status === "approving" ? "Approving" : "Approve"}
+            </button>
+          </>
+        )}
       </div>
+    </div>
+  );
+}
+
+function RunReviewDrawer(props: {
+  state: RunReviewDrawerState;
+  onClose(): void;
+  onOpenWorkspace(): void;
+}): React.ReactElement {
+  const review = props.state.review ?? {};
+  const trace = props.state.trace ?? {};
+  const packet = props.state.packet ?? {};
+  const provenance = props.state.provenance ?? {};
+  const claims = reviewClaims(review, packet).slice(0, 5);
+  const warnings = collectReviewWarnings(review, trace, packet).slice(0, 6);
+  const status = stringFromUnknown(review.status)
+    || stringFromUnknown(review.review_status)
+    || stringFromUnknown(packet.status)
+    || stringFromUnknown(trace.status)
+    || (props.state.loading ? "Loading" : "Available");
+  const source = stringFromUnknown(review.source)
+    || stringFromUnknown(review.source_policy)
+    || stringFromUnknown(trace.source)
+    || stringFromUnknown(packet.source)
+    || stringFromUnknown(packet.source_policy)
+    || "Unknown";
+  const paperCount = numberFromUnknown(review.paper_count)
+    ?? numberFromUnknown(review.papers_retrieved)
+    ?? numberFromUnknown(review.retrieved_paper_count)
+    ?? numberFromUnknown(trace.paper_count)
+    ?? numberFromUnknown(packet.paper_count)
+    ?? numberFromUnknown(packet.retrieved_paper_count)
+    ?? countNestedItems(packet, ["papers", "citations"]);
+  const verdict = stringFromUnknown(review.audit_verdict)
+    || stringFromUnknown(review.verdict)
+    || stringFromUnknown(review.recommended_action)
+    || nestedString(review, "audit", "recommended_action")
+    || nestedString(review, "audit", "verdict")
+    || stringFromUnknown(packet.recommended_action)
+    || stringFromUnknown(packet.audit_verdict)
+    || "Review recommended";
+  const activeArtifactLabel = {
+    review: "Review summary",
+    packet: "Evidence packet",
+    provenance: "Provenance",
+    trace: "Trace",
+  }[props.state.target];
+  return (
+    <div className="review-drawer-backdrop" onClick={props.onClose}>
+      <aside className="review-drawer" onClick={(event) => event.stopPropagation()}>
+        <header className="review-drawer-head">
+          <div>
+            <div className="review-drawer-kicker">Run Evidence Review</div>
+            <h2>{props.state.runId}</h2>
+            <div className="review-drawer-target">{{
+              review: "Review summary",
+              packet: "Evidence packet",
+              provenance: "Provenance",
+              trace: "Trace",
+            }[props.state.target]}</div>
+          </div>
+          <button className="ghost" type="button" onClick={props.onClose}>Close</button>
+        </header>
+        {props.state.loading ? (
+          <div className="review-drawer-loading">
+            <LoaderCircle size={16} aria-hidden="true" className="spin" />
+            <span>Loading review artifacts...</span>
+          </div>
+        ) : (
+          <>
+            <div className="review-drawer-grid">
+              <ReviewMetric label="Status" value={status} />
+              <ReviewMetric label="Source" value={source} />
+              <ReviewMetric label="Papers" value={paperCount === undefined ? "Unknown" : String(paperCount)} />
+              <ReviewMetric label="Audit" value={verdict} />
+            </div>
+            <section className="review-drawer-section">
+              <h3>{activeArtifactLabel}</h3>
+              <p className="muted-text">{artifactSummary(props.state.target, review, packet, trace, provenance)}</p>
+            </section>
+            {warnings.length > 0 && (
+              <section className="review-drawer-section">
+                <h3>Warnings</h3>
+                <ul>
+                  {warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                </ul>
+              </section>
+            )}
+            <section className="review-drawer-section">
+              <h3>Claims and evidence</h3>
+              {claims.length ? (
+                <div className="review-claim-list">
+                  {claims.map((claim, index) => (
+                    <div key={`${props.state.runId}-claim-${index}`} className="review-claim-card">
+                      <strong>{stringFromUnknown(claim.claim) || stringFromUnknown(claim.text) || stringFromUnknown(claim.claim_text) || `Claim ${index + 1}`}</strong>
+                      <span>{claimEvidenceSummary(claim)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted-text">No claim cards were returned by the lightweight review endpoint.</p>
+              )}
+            </section>
+            <section className="review-drawer-section">
+              <h3>Artifacts</h3>
+              <div className="review-artifact-links">
+                <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/evidence-review`} target="_blank" rel="noreferrer">Review JSON <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/evidence-review/packet`} target="_blank" rel="noreferrer">Evidence packet <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/trace`} target="_blank" rel="noreferrer">Trace <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/provenance`} target="_blank" rel="noreferrer">Provenance <ExternalLink size={12} aria-hidden="true" /></a>
+              </div>
+            </section>
+            <div className="review-drawer-actions">
+              <button className="ghost" type="button" onClick={() => void copySessionKey(props.state.runId)}>Copy run ID</button>
+              <button className="primary compact" type="button" onClick={props.onOpenWorkspace}>Open Biomedical Evidence</button>
+            </div>
+            {props.state.error && <div className="chat-error-card"><span className="status-pill proactive-result-busy">error</span><span>{props.state.error}</span></div>}
+            {hasArtifactError(provenance) && <p className="muted-text">Some optional artifacts are unavailable for this run.</p>}
+          </>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+function ReviewMetric(props: { label: string; value: string }): React.ReactElement {
+  return (
+    <div className="review-metric">
+      <span>{props.label}</span>
+      <strong>{props.value}</strong>
     </div>
   );
 }
@@ -1574,12 +1819,15 @@ function ThinkingPanel(props: {
   expanded: boolean;
   onToggle(): void;
 }): React.ReactElement {
+  const [showAllSteps, setShowAllSteps] = useState(false);
   const statusLabel = props.state.status === "done"
     ? "Completed"
     : props.state.status === "error"
       ? "Failed"
       : "Working";
   const latestStep = props.state.steps[props.state.steps.length - 1] || props.state.summary || "Working";
+  const visibleSteps = showAllSteps ? props.state.steps : props.state.steps.slice(0, 6);
+  const hiddenStepCount = Math.max(0, props.state.steps.length - visibleSteps.length);
   return (
     <div className={`thinking-panel ${props.expanded ? "expanded" : "collapsed"}`}>
       <button type="button" className="thinking-panel-head" onClick={props.onToggle}>
@@ -1595,13 +1843,18 @@ function ThinkingPanel(props: {
       </button>
       {props.expanded && (
         <div className="thinking-panel-body">
-          {props.state.steps.length ? props.state.steps.map((step, index) => (
+          {visibleSteps.length ? visibleSteps.map((step, index) => (
             <div key={`${step}-${index}`} className="thinking-step">
               <span className="status-pill">step {index + 1}</span>
               <span>{step}</span>
             </div>
           )) : (
             <div className="muted-text">No internal steps were captured.</div>
+          )}
+          {hiddenStepCount > 0 && (
+            <button className="thinking-more" type="button" onClick={() => setShowAllSteps(true)}>
+              Show all steps ({props.state.steps.length})
+            </button>
           )}
           {props.state.technicalDetail && (
             <details className="thinking-detail">
@@ -1893,6 +2146,16 @@ function chatHistoryToEvents(items: MessageRow[]): ChatEventRow[] {
   return events;
 }
 
+function shouldKeepLiveEventAfterHistoryReload(event: ChatEventRow, history: ChatEventRow[]): boolean {
+  if (event.source === "history") return false;
+  if (event.source === "local" && event.kind === "user") {
+    const text = String(event.content || event.detail || "").trim();
+    return Boolean(text) && !history.some((item) => item.kind === "user" && String(item.content || item.detail || "").trim() === text);
+  }
+  if (event.source === "local") return event.kind === "error";
+  return event.kind === "error";
+}
+
 function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
   const turns: ChatTurn[] = [];
   for (const event of events) {
@@ -1932,6 +2195,20 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
     }
     if (event.kind === "assistant") {
       current.assistant = event;
+      const textOnlyApprovalId = extractApprovalIdFromText(`${event.content || ""}\n${event.detail || ""}`);
+      if (textOnlyApprovalId) {
+        current.warning = {
+          id: `${event.session_key}:pseudo-approval:${textOnlyApprovalId}`,
+          session_key: event.session_key,
+          event: "pseudo_approval",
+          kind: "warning",
+          label: "Approval not executable",
+          detail: `The assistant mentioned approval ID ${textOnlyApprovalId}, but no framework approval was created. Ask the agent to call the tool, or use /biomed watch create ... to generate an approval card.`,
+          created_at: event.created_at,
+          ts: event.ts,
+          source: "local",
+        };
+      }
       if (isLocalCommandAssistant(event)) {
         continue;
       }
@@ -1949,8 +2226,24 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
       }
       continue;
     }
-    if (event.event === "tool_approval_required" || event.kind === "approval") {
-      current.approval = event;
+    if (isApprovalEvent(event)) {
+      const nextApprovalId = extractApprovalId(event);
+      const currentApprovalId = extractApprovalId(current.approval);
+      if (nextApprovalId || !currentApprovalId) {
+        current.approval = event;
+      } else {
+        current.warning = {
+          id: `${event.session_key}:approval-missing-id:${event.call_id || event.id}`,
+          session_key: event.session_key,
+          event: "approval_missing_id",
+          kind: "warning",
+          label: "Approval not executable",
+          detail: "A later approval event was missing its executable approval ID, so the existing approval card was kept.",
+          created_at: event.created_at,
+          ts: event.ts,
+          source: "local",
+        };
+      }
       const steps = appendThinkingStep(current.thinking?.steps ?? [], "Waiting for confirmation");
       current.thinking = {
         status: "done",
@@ -2005,6 +2298,13 @@ function isLocalCommandAssistant(event: ChatEventRow | null | undefined): boolea
   return source === "dashboard_chat_command" && Boolean(commandAction);
 }
 
+function isApprovalEvent(event: ChatEventRow): boolean {
+  if (event.event === "tool_approval_required" || event.kind === "approval") {
+    return true;
+  }
+  return event.status === "approval_required" && Boolean(extractApprovalId(event));
+}
+
 function appendThinkingStep(steps: string[], rawStep: string): string[] {
   const step = humanThinkingStep(rawStep);
   if (!step) return steps;
@@ -2028,6 +2328,233 @@ function humanThinkingStep(raw: unknown): string {
   if (normalized.includes("started")) return "Starting workflow";
   if (normalized.includes("completed")) return "Completed";
   return text.length > 80 ? `${text.slice(0, 80).trim()}...` : text;
+}
+
+function chatTurnRunArtifacts(turn: ChatTurn): ChatRunArtifacts {
+  const metadataArtifacts = extractArtifactsFromMetadata(turn.assistant?.metadata)
+    ?? extractArtifactsFromMetadata(turn.user?.metadata);
+  const text = [
+    turn.assistant?.content,
+    turn.assistant?.detail,
+    turn.user?.content,
+    turn.user?.detail,
+  ].filter(Boolean).join("\n");
+  const textRunId = extractRunId(text);
+  const textWatchId = extractWatchId(text);
+  const runId = metadataArtifacts?.run_id || textRunId;
+  const watchId = metadataArtifacts?.watch_id || textWatchId;
+  if (!runId && !watchId) return {};
+  if (watchId && !runId) {
+    return {
+      watch_id: watchId,
+      watch_url: `/api/biomed/watch/${encodeURIComponent(watchId)}`,
+      watch_check_url: `/api/biomed/watch/${encodeURIComponent(watchId)}/check`,
+      watch_drift_url: `/api/biomed/watch/${encodeURIComponent(watchId)}/drift`,
+      ...(metadataArtifacts ?? {}),
+    };
+  }
+  return {
+    run_id: runId,
+    review_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`,
+    packet_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/packet`,
+    trace_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`,
+    provenance_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/provenance`,
+    ...(metadataArtifacts ?? {}),
+  };
+}
+
+function extractArtifactsFromMetadata(metadata: Record<string, unknown> | undefined): ChatRunArtifacts | null {
+  if (!metadata) return null;
+  const direct = metadata.artifacts;
+  if (direct && typeof direct === "object") {
+    return direct as ChatRunArtifacts;
+  }
+  const command = metadata.command;
+  if (command && typeof command === "object") {
+    const commandArtifacts = (command as Record<string, unknown>).artifacts;
+    if (commandArtifacts && typeof commandArtifacts === "object") {
+      return commandArtifacts as ChatRunArtifacts;
+    }
+    const args = (command as Record<string, unknown>).arguments;
+    if (args && typeof args === "object") {
+      const runId = String((args as Record<string, unknown>).run_id || "").trim();
+      if (runId) return { run_id: runId };
+      const watchId = String((args as Record<string, unknown>).watch_id || "").trim();
+      if (watchId) return { watch_id: watchId };
+    }
+  }
+  const runId = String(metadata.run_id || "").trim();
+  if (runId) return { run_id: runId };
+  const watchId = String(metadata.watch_id || "").trim();
+  if (watchId) return { watch_id: watchId };
+  for (const urlKey of ["review_url", "packet_url", "trace_url", "provenance_url"]) {
+    const value = String(metadata[urlKey] || "").trim();
+    const runFromUrl = extractRunId(value);
+    if (runFromUrl) return { run_id: runFromUrl };
+  }
+  return null;
+}
+
+function extractTurnApprovalId(turn: ChatTurn): string {
+  return extractApprovalId(turn.approval);
+}
+
+function extractApprovalId(event: Partial<ChatEventRow> | null | undefined): string {
+  if (!event) return "";
+  const direct = stringFromUnknown(event.approval_id);
+  if (direct) return direct;
+  const confirmation = event.confirmation;
+  if (confirmation && typeof confirmation === "object") {
+    const confirmationId = stringFromUnknown((confirmation as Record<string, unknown>).approval_id);
+    if (confirmationId) return confirmationId;
+  }
+  const metadata = event.metadata;
+  if (metadata && typeof metadata === "object") {
+    const metadataId = stringFromUnknown((metadata as Record<string, unknown>).approval_id);
+    if (metadataId) return metadataId;
+  }
+  const finalArguments = event.final_arguments;
+  if (finalArguments && typeof finalArguments === "object") {
+    const finalApprovalId = stringFromUnknown((finalArguments as Record<string, unknown>).approval_id);
+    if (finalApprovalId) return finalApprovalId;
+  }
+  return "";
+}
+
+function extractApprovalIdFromText(text: string): string {
+  const match = String(text || "").match(/\bApproval ID:\s*`?([A-Za-z0-9_-]{8,64})`?/i)
+    || String(text || "").match(/\bapproval ID\s*`?([A-Za-z0-9_-]{8,64})`?/i);
+  return match?.[1] ?? "";
+}
+
+function extractRunId(text: string): string {
+  const match = String(text || "").match(/\bbiomed-run-[A-Za-z0-9_-]+\b/);
+  return match?.[0] ?? "";
+}
+
+function extractWatchId(text: string): string {
+  const match = String(text || "").match(/\bwatch-[A-Za-z0-9_-]+\b/);
+  return match?.[0] ?? "";
+}
+
+function arrayFromUnknown(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function nestedString(source: Record<string, unknown>, ...path: string[]): string {
+  let current: unknown = source;
+  for (const key of path) {
+    current = recordFromUnknown(current)[key];
+  }
+  return stringFromUnknown(current);
+}
+
+function countNestedItems(source: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (Array.isArray(value)) return value.length;
+  }
+  return undefined;
+}
+
+function reviewClaims(review: Record<string, unknown>, packet: Record<string, unknown>): Record<string, unknown>[] {
+  const candidates = [
+    review.claims,
+    review.claim_summaries,
+    review.claim_reviews,
+    recordFromUnknown(review.audit).claim_audits,
+    packet.claims,
+    packet.claim_summaries,
+    packet.evidence_summary,
+  ];
+  for (const candidate of candidates) {
+    const items = arrayFromUnknown(candidate);
+    if (items.length) return items;
+  }
+  return [];
+}
+
+function claimEvidenceSummary(claim: Record<string, unknown>): string {
+  const direct = stringFromUnknown(claim.verdict)
+    || stringFromUnknown(claim.status)
+    || stringFromUnknown(claim.support_level)
+    || stringFromUnknown(claim.evidence_strength)
+    || stringFromUnknown(claim.audit_status);
+  if (direct) return direct;
+  const evidenceIds = Array.isArray(claim.evidence_ids) ? claim.evidence_ids.length : 0;
+  if (evidenceIds > 0) return `${evidenceIds} evidence item${evidenceIds === 1 ? "" : "s"}`;
+  return "Evidence review item";
+}
+
+function artifactSummary(
+  target: RunReviewDrawerState["target"],
+  review: Record<string, unknown>,
+  packet: Record<string, unknown>,
+  trace: Record<string, unknown>,
+  provenance: Record<string, unknown>,
+): string {
+  if (target === "packet") {
+    const citations = countNestedItems(packet, ["citations", "papers", "evidence_summary"]);
+    return citations === undefined
+      ? "The evidence packet endpoint is available for this run."
+      : `Packet loaded with ${citations} evidence or citation item${citations === 1 ? "" : "s"}.`;
+  }
+  if (target === "trace") {
+    const steps = countNestedItems(trace, ["steps", "trace", "events"]);
+    return steps === undefined
+      ? "The trace endpoint is available for this run."
+      : `Trace loaded with ${steps} captured step${steps === 1 ? "" : "s"}.`;
+  }
+  if (target === "provenance") {
+    const nodes = countNestedItems(recordFromUnknown(provenance.graph), ["nodes", "entities"]) ?? countNestedItems(provenance, ["nodes", "entities"]);
+    return nodes === undefined
+      ? "The provenance endpoint is available for this run."
+      : `Provenance loaded with ${nodes} graph item${nodes === 1 ? "" : "s"}.`;
+  }
+  const claims = reviewClaims(review, packet).length;
+  return claims
+    ? `Review loaded with ${claims} claim card${claims === 1 ? "" : "s"}.`
+    : "The Run Evidence Review endpoint is available for this run.";
+}
+
+function stringFromUnknown(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function numberFromUnknown(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+function collectReviewWarnings(...items: Array<Record<string, unknown>>): string[] {
+  const warnings: string[] = [];
+  for (const item of items) {
+    for (const key of ["warnings", "limitations", "caveats"]) {
+      const value = item[key];
+      if (Array.isArray(value)) {
+        for (const warning of value) {
+          const text = stringFromUnknown(warning);
+          if (text && !warnings.includes(text)) warnings.push(text);
+        }
+      }
+    }
+    const error = item.error;
+    const errorText = stringFromUnknown(error);
+    if (errorText && !warnings.includes(errorText)) warnings.push(errorText);
+  }
+  return warnings;
+}
+
+function hasArtifactError(item: Record<string, unknown>): boolean {
+  return Boolean(item.error);
 }
 
 function normalizeChatEvent(
@@ -2096,6 +2623,16 @@ function commandPreviewProblem(preview: ChatCommandPreview): string {
   return "Command is not ready to send.";
 }
 
+function commandPreviewStatusLabel(preview: ChatCommandPreview): string {
+  if (preview.can_send && preview.confirmation) return "Confirmation required";
+  if (preview.can_send) return "Ready";
+  if (preview.errors.some((item) => item.toLowerCase().includes("run id"))) return "Needs run ID";
+  if (preview.errors.some((item) => item.toLowerCase().includes("confirmation"))) return "Confirmation required";
+  if (preview.missing_requirements.length) return "Needs setup";
+  if (preview.errors.length) return "Needs edits";
+  return "Needs setup";
+}
+
 async function copySessionKey(value: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(value);
@@ -2152,6 +2689,7 @@ function mergeChatEvent(current: ChatEventRow[], next: ChatEventRow): ChatEventR
         content: next.content ?? target.content,
         detail: next.content ?? target.detail ?? target.content,
         thinking: next.thinking ?? target.thinking,
+        metadata: next.metadata ?? target.metadata,
         final: true,
         pending: false,
         ts: next.ts ?? target.ts,
@@ -2395,6 +2933,7 @@ function handleChatSsePayload(
       session_key: String(data.session_key ?? ""),
       content: String(data.content ?? ""),
       thinking: typeof data.thinking === "string" ? data.thinking : undefined,
+      metadata: recordFromUnknown(data.metadata),
       final: true,
       pending: false,
       source: "live",
@@ -2440,6 +2979,7 @@ function handleChatSsePayload(
       final_arguments: data.final_arguments,
       status: typeof data.status === "string" ? data.status : undefined,
       iteration: typeof data.iteration === "number" ? data.iteration : undefined,
+      metadata: recordFromUnknown(data.metadata),
       source: "live",
     });
     ctx.setChatLiveEvent(presentation.summary);
@@ -2512,6 +3052,8 @@ function handleChatSsePayload(
     call_id: typeof data.call_id === "string" ? data.call_id : undefined,
     arguments: data.arguments,
     final_arguments: data.final_arguments,
+    approval_id: typeof data.approval_id === "string" ? data.approval_id : undefined,
+    confirmation: data.confirmation,
     status: typeof data.status === "string" ? data.status : undefined,
     iteration: typeof data.iteration === "number" ? data.iteration : undefined,
     has_more: typeof data.has_more === "boolean" ? data.has_more : undefined,

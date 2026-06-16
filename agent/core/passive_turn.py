@@ -1944,6 +1944,8 @@ def build_deferred_tools_hint(
     lines.append(
         f"\n共 {total} 个。加载方式：\n"
         "- 已知工具名 → tool_search(query=\"select:工具名\")，支持逗号分隔多个\n"
-        "- 描述功能   → tool_search(query=\"关键词\") 搜索匹配"
+        "- 描述功能   → tool_search(query=\"关键词\") 搜索匹配\n"
+        "- 如果用户要求执行写入、导出、watch、project、保存或删除等需要确认的工具，"
+        "必须先加载并真实调用对应工具来触发框架审批流；禁止在自然语言回复中编造或复述 Approval ID。"
     )
     return "\n".join(lines) + "\n\n"

@@ -19,6 +19,8 @@ class ToolExecutionRequest:
     channel: str = ""
     chat_id: str = ""
     request_text: str = ""
+    approval_id: str = ""
+    approved: bool = False
     tool_batch: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     tool_batch_index: int = 0
 
