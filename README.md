@@ -98,6 +98,12 @@ Useful commands:
 /biomed export provenance biomed-run-...
 ```
 
+The composer opens a compact command palette when you type `/`, with command
+examples, readiness chips, and a preview of the prompt or policy change before
+anything is sent.
+
+![Dashboard chat slash command palette](./assets/biomed-command-palette.png)
+
 `/biomed status` separates PubMed command policy from network reachability, so
 the UI can explain whether live PubMed is disabled by configuration or simply
 unchecked. `/biomed enable pubmed` explicitly sets
