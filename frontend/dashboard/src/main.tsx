@@ -1178,8 +1178,21 @@ function ChatPane(props: {
   const streamRef = useRef<HTMLDivElement>(null);
   const turns = useMemo(() => deriveChatTurns(props.events), [props.events]);
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
+  const [shortcutsCollapsed, setShortcutsCollapsed] = useState<boolean | null>(() => {
+    try {
+      const value = window.localStorage.getItem("dashboard-chat-shortcuts-collapsed");
+      if (value === "1") return true;
+      if (value === "0") return false;
+      return null;
+    } catch {
+      return null;
+    }
+  });
   const activeThinkingKey = props.session?.key ?? props.status?.session_key ?? "dashboard:default";
   const currentThinkingExpanded = expandedThinking[activeThinkingKey] ?? false;
+  const hasConversation = turns.length > 0;
+  const effectiveShortcutsCollapsed = shortcutsCollapsed ?? hasConversation;
+  const showShortcutCards = !effectiveShortcutsCollapsed;
   const latestContentKey = useMemo(
     () => props.events
       .filter((event) => event.kind === "user" || event.kind === "assistant" || event.event === "done")
@@ -1194,6 +1207,18 @@ function ChatPane(props: {
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior: props.sending ? "smooth" : "auto" });
   }, [disabled, latestContentKey, props.sending]);
+
+  const toggleShortcuts = (): void => {
+    setShortcutsCollapsed((current) => {
+      const next = !(current ?? hasConversation);
+      try {
+        window.localStorage.setItem("dashboard-chat-shortcuts-collapsed", next ? "1" : "0");
+      } catch {
+        // Ignore storage failures; the UI state still updates for this session.
+      }
+      return next;
+    });
+  };
 
   return (
     <section className="chat-pane">
@@ -1243,7 +1268,12 @@ function ChatPane(props: {
           ))}
         </div>
       </div>
-      <CommandQuickStart setInput={props.setInput} />
+      <CommandQuickStart
+        collapsed={!showShortcutCards}
+        hasConversation={hasConversation}
+        onToggle={toggleShortcuts}
+        setInput={props.setInput}
+      />
       {disabled ? (
         <div className="chat-disabled">
           <div className="detail-empty-title">Full runtime is not enabled</div>
@@ -1363,26 +1393,34 @@ function CommandPreviewCard(props: {
 }
 
 function CommandQuickStart(props: {
+  collapsed: boolean;
+  hasConversation: boolean;
+  onToggle(): void;
   setInput(value: string): void;
 }): React.ReactElement {
   const commands = biomedCommandSuggestions();
   return (
-    <div className="command-quickstart">
+    <div className={`command-quickstart${props.collapsed ? " collapsed" : ""}`}>
       <div className="command-quickstart-head">
         <div>
           <strong>Biomedical command shortcuts</strong>
-          <span>Pick one, then edit the question or run id.</span>
+          <span>{props.collapsed ? "Use / for the full command palette." : "Pick one, then edit the question or run id."}</span>
         </div>
+        <button className="command-toggle" type="button" onClick={props.onToggle}>
+          {props.collapsed ? "Show shortcuts" : "Hide shortcuts"}
+        </button>
       </div>
-      <div className="command-card-grid">
-        {commands.slice(0, 6).map((item) => (
-          <button key={item.label} type="button" className="command-card" onClick={() => props.setInput(item.command)}>
-            <span>{item.label}</span>
-            <small>{item.description}</small>
-            <code>{item.command}</code>
-          </button>
-        ))}
-      </div>
+      {!props.collapsed && (
+        <div className="command-card-grid">
+          {commands.slice(0, props.hasConversation ? 3 : 6).map((item) => (
+            <button key={item.label} type="button" className="command-card" onClick={() => props.setInput(item.command)}>
+              <span>{item.label}</span>
+              <small>{item.description}</small>
+              <code>{item.command}</code>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -980,11 +980,16 @@ textarea:focus {
 }
 
 .command-quickstart {
-  padding: 12px max(28px, calc((100% - 1040px) / 2));
+  padding: 8px max(28px, calc((100% - 1040px) / 2));
   display: grid;
-  gap: 10px;
+  gap: 8px;
   border-bottom: 1px solid var(--line);
   background: rgba(248, 248, 246, 0.62);
+}
+
+.command-quickstart.collapsed {
+  padding-top: 7px;
+  padding-bottom: 7px;
 }
 
 .command-quickstart-head {
@@ -1008,6 +1013,24 @@ textarea:focus {
 .command-quickstart-head span {
   color: var(--text-soft);
   font-size: 12px;
+}
+
+.command-toggle {
+  height: 30px;
+  padding: 0 10px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper-strong);
+  color: var(--text-soft);
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.command-toggle:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
 }
 
 .command-card-grid {
@@ -1060,8 +1083,10 @@ textarea:focus {
 .command-palette {
   width: min(100%, 982px);
   margin: 0 auto;
-  padding: 10px;
+  max-height: min(36vh, 320px);
+  padding: 9px;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -1090,11 +1115,16 @@ textarea:focus {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
 }
 
 .command-palette-row {
   min-width: 0;
-  padding: 8px 9px;
+  min-height: 42px;
+  padding: 7px 9px;
   display: grid;
   grid-template-columns: minmax(86px, 0.38fr) minmax(0, 0.9fr) minmax(120px, 1fr);
   gap: 8px;
@@ -1157,9 +1187,11 @@ textarea:focus {
 .command-preview-card {
   width: min(100%, 982px);
   margin: 0 auto;
+  max-height: min(32vh, 260px);
   padding: 10px 12px;
   display: grid;
   gap: 8px;
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: rgba(255, 255, 255, 0.82);
@@ -2737,6 +2769,30 @@ textarea:focus {
     flex-direction: column;
   }
 
+  .command-quickstart {
+    padding: 8px 16px;
+  }
+
+  .command-quickstart-head {
+    align-items: flex-start;
+  }
+
+  .command-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .command-palette {
+    max-height: min(34vh, 260px);
+  }
+
+  .command-palette-list {
+    grid-template-columns: 1fr;
+  }
+
+  .command-palette-row {
+    grid-template-columns: minmax(78px, 0.34fr) minmax(0, 0.9fr) minmax(100px, 1fr);
+  }
+
   .chat-composer-shell {
     padding: 10px 16px 12px;
   }
@@ -2810,6 +2866,33 @@ textarea:focus {
 
   .filter-row {
     flex-wrap: wrap;
+  }
+
+  .command-quickstart-head {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .command-toggle {
+    width: 100%;
+  }
+
+  .command-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .command-palette {
+    max-height: min(42vh, 300px);
+  }
+
+  .command-palette-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .command-palette-row {
+    grid-template-columns: 1fr;
+    gap: 3px;
   }
 
   .table-head.mode-messages,
