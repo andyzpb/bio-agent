@@ -82,8 +82,8 @@ tool contracts, and command previews surfaced before execution.
 Dashboard Chat now includes a Codex-style `/biomed` command surface for
 research-only biomedical workflows. The command layer stays framework-native:
 commands preview into the shared dashboard chat route instead of bypassing the
-agent loop, while deterministic control commands such as help, status, and
-policy updates return directly without triggering an extra LLM response.
+agent loop, while deterministic control commands such as help and status return
+directly without triggering an extra LLM response.
 
 Useful commands:
 
@@ -98,11 +98,12 @@ Useful commands:
 /biomed export provenance biomed-run-...
 ```
 
-The composer opens a compact command palette when you type `/`, with command
-examples, readiness chips, and a preview of the prompt or policy change before
-anything is sent.
+The composer keeps the common Biomedical Evidence actions visible as compact
+chips: Help, Status, Mock audit, and Live audit. Type `/` for the full command
+palette, then preview readiness, setup needs, run IDs, or confirmation
+requirements before anything is sent.
 
-![Dashboard chat slash command palette](./assets/biomed-command-palette.png)
+![Dashboard chat-to-review workflow](./assets/biomed-dashboard-chat-workflow.gif)
 
 `/biomed status` separates PubMed command policy from network reachability, so
 the UI can explain whether live PubMed is disabled by configuration or simply
@@ -111,11 +112,9 @@ unchecked. `/biomed enable pubmed` explicitly sets
 which PubMed-backed audit and literature commands are no longer blocked by the
 policy gate. Markdown answers are rendered as normal tables, lists, and code
 blocks, while tool progress is folded into one compact work panel per assistant
-turn instead of raw log spam.
-
-![Dashboard chat live PubMed audit](./assets/biomed-chat-status-audit.png)
-
-![Dashboard chat command status and markdown table output](./assets/biomed-chat-help-pubmed-enabled.png)
+turn instead of raw log spam. Completed audit and watch flows expose immediate
+next actions in chat, including copyable run/watch IDs and review-oriented
+artifact links where available.
 
 Release 2.0 live smoke was validated with live PubMed plus DeepSeek
 `deepseek-v4-flash`: `27/27` checks passed, including audited answer, trace,
