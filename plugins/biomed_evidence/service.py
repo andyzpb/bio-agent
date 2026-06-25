@@ -2190,7 +2190,7 @@ class BiomedEvidenceService:
             return None
         document, sections = stored
         evidence: list[EvidenceItem] = []
-        for section in sections:
+        for section in sorted(sections, key=_full_text_section_rank):
             section_paper = paper.model_copy(
                 update={
                     "source": "pubmed",
@@ -10342,6 +10342,36 @@ def _full_text_sections(
         )
         page += page_count
     return sections
+
+
+def _full_text_section_role(label: str) -> str:
+    normalized = re.sub(r"[^a-z]+", " ", label.lower()).strip()
+    if "abstract" in normalized:
+        return "abstract"
+    if "method" in normalized or "material" in normalized:
+        return "methods"
+    if "result" in normalized or "finding" in normalized:
+        return "results"
+    if "discussion" in normalized:
+        return "discussion"
+    if "limitation" in normalized:
+        return "limitations"
+    if "introduction" in normalized or normalized == "background":
+        return "introduction"
+    return "other"
+
+
+def _full_text_section_rank(section: FullTextSection) -> tuple[int, int]:
+    order = {
+        "results": 0,
+        "abstract": 1,
+        "limitations": 2,
+        "discussion": 3,
+        "methods": 4,
+        "introduction": 5,
+        "other": 6,
+    }
+    return (order.get(_full_text_section_role(section.label), 6), section.ordinal)
 
 
 def _split_full_text_sections(content: str) -> list[tuple[str, str]]:

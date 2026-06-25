@@ -1125,6 +1125,43 @@ def test_full_text_ingestion_extracts_locator_backed_evidence(tmp_path: Path) ->
     assert any(node.properties.get("source_scope") == "full_text" for node in evidence_nodes)
 
 
+def test_full_text_evidence_prefers_results_sections(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        paper = BiomedicalPaper(
+            paper_id="MOCK-FULLTEXT-RANK",
+            source="mock",
+            title="Full text microglia ranking study",
+            abstract="Abstract-level summary only.",
+        )
+        service.storage.upsert_paper(paper)
+        ingested = service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper.paper_id,
+                source="mock",
+                content=(
+                    "## Discussion\n"
+                    "Microglial activation may be relevant to Alzheimer's disease.\n\n"
+                    "## Results\n"
+                    "Microglial activation was associated with Alzheimer's disease progression "
+                    "in a longitudinal human cohort."
+                ),
+            )
+        )
+        extracted = service.extract_full_text_evidence(
+            paper_id=paper.paper_id,
+            source="mock",
+            research_question="microglial activation Alzheimer progression",
+        )
+    finally:
+        service.storage.close()
+
+    assert ingested.ok is True
+    assert extracted is not None
+    assert extracted.evidence
+    assert extracted.evidence[0].section_label == "Results"
+
+
 def test_watch_graph_drift_reports_paper_and_claim_changes(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
     try:
