@@ -459,12 +459,12 @@ def _dashboard_chat_cockpit_phase(tool_name: str, status: str = "") -> str:
         return "audit"
     if "revision" in tool or "revise" in tool:
         return "revision"
+    if "export" in tool or "report" in tool:
+        return "export-ready"
     if "packet" in tool or "provenance" in tool or "graph" in tool:
         return "packet"
     if "review" in tool:
         return "review"
-    if "export" in tool or "report" in tool:
-        return "export-ready"
     return "planning"
 
 

@@ -2005,6 +2005,35 @@ async def test_dashboard_chat_tool_failure_includes_recovery_guidance(
     assert "PubMed" in payload["recovery"]["label"]
 
 
+@pytest.mark.asyncio
+async def test_dashboard_chat_export_provenance_graph_is_export_ready(
+    tmp_path,
+) -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    queue = await mux.subscribe("dashboard:default")
+    try:
+        await mux._on_tool_completed(
+            ToolCallCompleted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="export_provenance_graph",
+                arguments={},
+                final_arguments={},
+                status="success",
+                result_preview="exported provenance graph",
+            )
+        )
+        event, payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert event == "tool_completed"
+    assert payload["cockpit_phase"] == "export-ready"
+
+
 def test_update_and_delete_session(tmp_path) -> None:
     _seed_workspace(tmp_path)
     with TestClient(create_dashboard_app(tmp_path)) as client:
