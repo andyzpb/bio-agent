@@ -1248,6 +1248,7 @@ textarea:focus {
 
 .command-plan-grid div,
 .command-plan-row {
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 8px;
@@ -1265,6 +1266,12 @@ textarea:focus {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.command-plan-grid strong,
+.command-plan-row code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .command-final-prompt {
