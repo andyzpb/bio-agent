@@ -637,6 +637,44 @@ def test_dashboard_chat_biomed_parse_audit_preview_expands_llm_flags(
     assert "Run a research-only Biomedical Evidence audited answer workflow" in payload["final_prompt"]
 
 
+def test_dashboard_chat_biomed_parse_audit_includes_cockpit_plan_preview(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed audit "microglia Alzheimer disease" --source mock --papers 10 --llm all --support-refute',
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    plan = payload["plan_preview"]
+    assert plan["kind"] == "biomed_audit"
+    assert plan["question"] == "microglia Alzheimer disease"
+    assert plan["source"] == "mock"
+    assert plan["paper_count"] == 10
+    assert plan["llm_mode"] == "all"
+    assert plan["policy"]["research_only"] is True
+    assert plan["policy"]["memory_is_evidence"] is False
+    assert "retrieval" in plan["phases"]
+    assert "audit" in plan["phases"]
+    assert "Run Evidence Review" in plan["expected_artifacts"]
+    assert "latency_seconds" in plan["observability_fields"]
+
+
 def test_dashboard_chat_biomed_parse_blocks_pubmed_when_disabled(tmp_path) -> None:
     bus = _FakeBus()
     event_bus = EventBus()
@@ -663,6 +701,36 @@ def test_dashboard_chat_biomed_parse_blocks_pubmed_when_disabled(tmp_path) -> No
     assert payload["can_send"] is False
     assert payload["missing_requirements"][0]["kind"] == "pubmed"
     assert "allow_live_pubmed_tools" in payload["missing_requirements"][0]["detail"]
+
+
+def test_dashboard_chat_biomed_parse_blocked_audit_keeps_plan_preview(
+    tmp_path,
+) -> None:
+    bus = _FakeBus()
+    event_bus = EventBus()
+    with TestClient(
+        create_dashboard_app(
+            tmp_path,
+            message_bus=bus,
+            event_bus=event_bus,
+            biomed_revision_provider=object(),
+            biomed_revision_model="test-model",
+        )
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed audit "microglia Alzheimer disease" --source pubmed --papers 10',
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["can_send"] is False
+    assert payload["plan_preview"]["source"] == "pubmed"
+    assert payload["plan_preview"]["readiness"] == "blocked"
+    assert payload["plan_preview"]["blocking_requirements"][0]["kind"] == "pubmed"
 
 
 def test_dashboard_chat_biomed_enable_pubmed_updates_command_policy(tmp_path) -> None:

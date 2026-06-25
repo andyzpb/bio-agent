@@ -2064,6 +2064,64 @@ def _confirmation_preview(tool_name: str, contracts: dict[str, dict[str, Any]]) 
     }
 
 
+def _biomed_audit_plan_preview(
+    *,
+    args: dict[str, Any],
+    readiness: dict[str, Any],
+    missing_requirements: list[dict[str, str]],
+    errors: list[str],
+    confirmation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    source = str(args.get("source") or readiness["source"]["default_source"] or "mock")
+    llm_mode = str(args.get("llm") or "off")
+    phases = [
+        "planning",
+        "retrieval",
+        "audit",
+        "revision" if llm_mode == "all" else "",
+        "packet",
+        "review",
+        "export-ready",
+    ]
+    return {
+        "kind": "biomed_audit",
+        "question": str(args.get("question") or ""),
+        "source": source,
+        "paper_count": int(args.get("max_papers") or 0),
+        "llm_mode": llm_mode,
+        "support_refute": bool(args.get("execute_support_refute")),
+        "readiness": "ready" if not missing_requirements and not errors else "blocked",
+        "blocking_requirements": list(missing_requirements),
+        "errors": list(errors),
+        "requires_confirmation": bool(confirmation),
+        "policy": {
+            "research_only": True,
+            "patient_specific_clinical_refusal": True,
+            "pubmed_opt_in": source == "pubmed",
+            "memory_is_evidence": False,
+            "telemetry_is_evidence": False,
+        },
+        "phases": [phase for phase in phases if phase],
+        "expected_artifacts": [
+            "Answer Run",
+            "Citation Audit",
+            "Evidence Packet",
+            "Run Evidence Review",
+            "Trace",
+            "Provenance",
+            "Pilot Report",
+        ],
+        "observability_fields": [
+            "source_call_count",
+            "latency_seconds",
+            "prompt_tokens",
+            "cache_hit_tokens",
+            "cache_hit_rate",
+            "estimated_cost_usd",
+        ],
+    }
+
+
 def _biomed_prompt_for_preview(action: str, args: dict[str, Any]) -> str:
     if action == "status":
         return "Show Biomedical Evidence provider, source, confirmation, and export readiness. Keep the answer concise."
@@ -2572,6 +2630,15 @@ def _parse_biomed_command(
     artifacts = _biomed_artifacts_for_run(str(args.get("run_id") or ""))
     if not artifacts:
         artifacts = _biomed_artifacts_from_text(final_prompt)
+    plan_preview = None
+    if normalized_action == "audit":
+        plan_preview = _biomed_audit_plan_preview(
+            args=args,
+            readiness=readiness,
+            missing_requirements=missing,
+            errors=errors,
+            confirmation=confirmation,
+        )
     deterministic_response = ""
     if normalized_action == "help":
         deterministic_response = _biomed_help_markdown(readiness)
@@ -2587,6 +2654,7 @@ def _parse_biomed_command(
         "missing_requirements": missing,
         "confirmation": confirmation,
         "final_prompt": final_prompt,
+        "plan_preview": plan_preview,
         "artifacts": artifacts or None,
         "deterministic_response": deterministic_response,
         "can_send": not errors and not missing,
