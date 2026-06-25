@@ -103,6 +103,23 @@ export interface ChatCommandRequirement {
   detail: string;
 }
 
+export interface ChatCommandPlanPreview {
+  kind: string;
+  question?: string;
+  source?: string;
+  paper_count?: number;
+  llm_mode?: string;
+  support_refute?: boolean;
+  readiness?: string;
+  blocking_requirements?: ChatCommandRequirement[];
+  errors?: string[];
+  requires_confirmation?: boolean;
+  policy?: Record<string, unknown>;
+  phases?: string[];
+  expected_artifacts?: string[];
+  observability_fields?: string[];
+}
+
 export interface ChatCommandPreview {
   session_key: string;
   kind: "biomed" | "message" | string;
@@ -117,6 +134,7 @@ export interface ChatCommandPreview {
   final_prompt: string;
   can_send: boolean;
   errors: string[];
+  plan_preview?: ChatCommandPlanPreview | null;
   readiness?: BiomedCommandStatus;
   artifacts?: ChatRunArtifacts | null;
 }
@@ -169,6 +187,13 @@ export interface ChatEventRow {
   technical_detail?: string;
   raw?: unknown;
   metadata?: Record<string, unknown>;
+  cockpit_phase?: string;
+  cockpit_status?: string;
+  recovery?: {
+    retryable?: boolean;
+    action?: string;
+    label?: string;
+  } | null;
   source?: "history" | "live" | "local";
   pending?: boolean;
   ts?: string;

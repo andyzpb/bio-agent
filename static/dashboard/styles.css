@@ -1234,11 +1234,50 @@ textarea:focus {
   font-size: 12px;
 }
 
+.command-plan-preview {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.command-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.command-plan-grid div,
+.command-plan-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px;
+}
+
+.command-plan-grid span,
+.command-plan-row > span {
+  display: block;
+  color: var(--text-soft);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.command-plan-row div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .command-final-prompt {
   color: var(--text-soft);
   font-size: 12px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.chat-error-card small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-soft);
 }
 
 .chat-composer {
@@ -2954,6 +2993,10 @@ textarea:focus {
 
   .command-preview-head > div {
     flex-wrap: wrap;
+  }
+
+  .command-plan-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .chat-composer .primary,

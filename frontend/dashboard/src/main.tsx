@@ -21,6 +21,7 @@ import type {
   DashboardColumn,
   ChatEventRow,
   ChatCommandManifest,
+  ChatCommandPlanPreview,
   ChatCommandPreview,
   ChatRunArtifacts,
   ChatSessionMetadata,
@@ -1414,8 +1415,40 @@ function CommandPreviewCard(props: {
           {props.preview.errors.map((error) => <div key={error} className="command-preview-issue"><strong>Syntax</strong><span>{error}</span></div>)}
         </div>
       )}
+      <PlanPreviewDetails plan={props.preview.plan_preview} />
       {props.preview.can_send && (
         <div className="command-final-prompt">{props.preview.final_prompt}</div>
+      )}
+    </div>
+  );
+}
+
+function PlanPreviewDetails(props: {
+  plan: ChatCommandPlanPreview | null | undefined;
+}): React.ReactElement {
+  const plan = props.plan;
+  if (!plan) return <></>;
+  const phases = Array.isArray(plan.phases) ? plan.phases : [];
+  const artifacts = Array.isArray(plan.expected_artifacts) ? plan.expected_artifacts : [];
+  return (
+    <div className="command-plan-preview">
+      <div className="command-plan-grid">
+        <div><span>Question</span><strong>{plan.question || "Missing"}</strong></div>
+        <div><span>Source</span><strong>{plan.source || "mock"}</strong></div>
+        <div><span>Papers</span><strong>{plan.paper_count ?? "Unknown"}</strong></div>
+        <div><span>LLM</span><strong>{plan.llm_mode || "off"}</strong></div>
+      </div>
+      {phases.length > 0 && (
+        <div className="command-plan-row">
+          <span>Phases</span>
+          <div>{phases.map((phase) => <code key={phase}>{phase}</code>)}</div>
+        </div>
+      )}
+      {artifacts.length > 0 && (
+        <div className="command-plan-row">
+          <span>Artifacts</span>
+          <div>{artifacts.map((artifact) => <code key={artifact}>{artifact}</code>)}</div>
+        </div>
       )}
     </div>
   );
@@ -1567,6 +1600,12 @@ function ChatTurnItem(props: {
         <div className="chat-error-card">
           <span className="status-pill proactive-result-busy">error</span>
           <span>{props.turn.error.summary || props.turn.error.detail}</span>
+          {props.turn.error.recovery?.label && (
+            <small>
+              {props.turn.error.recovery.label}
+              {props.turn.error.recovery.retryable ? " This action can be retried." : ""}
+            </small>
+          )}
         </div>
       )}
       {props.turn.warning && (
@@ -2276,7 +2315,11 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
     }
     if (event.kind === "tool" || event.kind === "system") {
       const currentSteps = current.thinking?.steps ?? [];
-      const rawStep = event.event === "tool_completed" ? "" : event.summary || event.label || event.detail || event.event;
+      const rawStep = event.cockpit_phase
+        ? `${event.cockpit_status || "running"} ${event.cockpit_phase}`
+        : event.event === "tool_completed"
+          ? ""
+          : event.summary || event.label || event.detail || event.event;
       const nextStep = humanThinkingStep(rawStep);
       const steps = appendThinkingStep(currentSteps, nextStep);
       current.thinking = {
@@ -2321,6 +2364,15 @@ function humanThinkingStep(raw: unknown): string {
   const text = String(raw ?? "").trim();
   const normalized = text.toLowerCase();
   if (!text) return "";
+  if (normalized.includes("failed")) return "Run needs recovery";
+  if (normalized.includes("planning")) return "Planning the evidence run";
+  if (normalized.includes("retrieval")) return "Searching literature";
+  if (normalized.includes("full-text")) return "Inspecting full text";
+  if (normalized.includes("revision")) return "Revising unsupported claims";
+  if (normalized.includes("packet")) return "Preparing evidence packet";
+  if (normalized.includes("review")) return "Preparing Run Evidence Review";
+  if (normalized.includes("export-ready")) return "Preparing export actions";
+  if (normalized.includes("done")) return "Run completed";
   if (normalized.includes("provider") || normalized.includes("readiness")) return "Checking provider readiness";
   if (normalized.includes("plan") || normalized.includes("search planning")) return "Planning retrieval";
   if (normalized.includes("pubmed") || normalized.includes("literature") || normalized.includes("retrieval")) return "Searching literature";
@@ -2600,6 +2652,9 @@ function normalizeChatEvent(
     technical_detail: event.technical_detail,
     raw: event.raw,
     metadata: (event.metadata && typeof event.metadata === "object") ? event.metadata as Record<string, unknown> : undefined,
+    cockpit_phase: typeof event.cockpit_phase === "string" ? event.cockpit_phase : undefined,
+    cockpit_status: typeof event.cockpit_status === "string" ? event.cockpit_status : undefined,
+    recovery: event.recovery && typeof event.recovery === "object" ? event.recovery as ChatEventRow["recovery"] : null,
     source: event.source,
     pending: event.pending,
     ts: event.ts,
@@ -2895,6 +2950,11 @@ function handleChatSsePayload(
   }
   const seq = readChatSeq(data);
   const presentation = presentChatEvent(event, data);
+  const cockpit = {
+    cockpit_phase: typeof data.cockpit_phase === "string" ? data.cockpit_phase : undefined,
+    cockpit_status: typeof data.cockpit_status === "string" ? data.cockpit_status : undefined,
+    recovery: data.recovery && typeof data.recovery === "object" ? data.recovery as ChatEventRow["recovery"] : null,
+  };
   if (event === "user_message_accepted") {
     ctx.setChatLiveEvent("Message received");
     return;
@@ -2909,6 +2969,7 @@ function handleChatSsePayload(
       summary: presentation.summary,
       technical_detail: presentation.technicalDetail,
       raw: data,
+      ...cockpit,
       session_key: String(data.session_key ?? ""),
       source: "live",
     });
@@ -2960,6 +3021,7 @@ function handleChatSsePayload(
       summary: presentation.summary,
       technical_detail: presentation.technicalDetail,
       raw: data,
+      ...cockpit,
       session_key: String(data.session_key ?? ""),
       tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
       call_id: typeof data.call_id === "string" ? data.call_id : undefined,
@@ -2980,6 +3042,7 @@ function handleChatSsePayload(
       summary: presentation.summary,
       technical_detail: presentation.technicalDetail,
       raw: data,
+      ...cockpit,
       session_key: String(data.session_key ?? ""),
       tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
       call_id: typeof data.call_id === "string" ? data.call_id : undefined,
@@ -3003,6 +3066,7 @@ function handleChatSsePayload(
       summary: presentation.summary,
       technical_detail: presentation.technicalDetail,
       raw: data,
+      ...cockpit,
       session_key: String(data.session_key ?? ""),
       iteration: typeof data.iteration === "number" ? data.iteration : undefined,
       has_more: typeof data.has_more === "boolean" ? data.has_more : undefined,
@@ -3021,6 +3085,7 @@ function handleChatSsePayload(
       kind: "system",
       label: "Completed",
       summary: "Completed",
+      ...cockpit,
       session_key: String(data.session_key ?? ""),
       source: "live",
     });
@@ -3038,6 +3103,7 @@ function handleChatSsePayload(
       summary: presentation.summary,
       technical_detail: presentation.technicalDetail,
       raw: data,
+      ...cockpit,
       session_key: String(data.session_key ?? ""),
       source: "live",
     });
@@ -3054,6 +3120,7 @@ function handleChatSsePayload(
     summary: presentation.summary,
     technical_detail: presentation.technicalDetail,
     raw: data,
+    ...cockpit,
     content_delta: typeof data.content_delta === "string" ? data.content_delta : undefined,
     thinking_delta: typeof data.thinking_delta === "string" ? data.thinking_delta : undefined,
     tool_name: typeof data.tool_name === "string" ? data.tool_name : undefined,
