@@ -411,6 +411,7 @@ def _biomed_artifacts_for_run(run_id: str) -> dict[str, str]:
     return {
         "run_id": clean,
         "review_url": f"/api/biomed/answer-runs/{clean}/evidence-review",
+        "full_text_enhance_url": f"/api/biomed/answer-runs/{clean}/full-text-enhance",
         "packet_url": f"/api/biomed/answer-runs/{clean}/evidence-review/packet",
         "trace_url": f"/api/biomed/answer-runs/{clean}/trace",
         "provenance_url": f"/api/biomed/answer-runs/{clean}/provenance",
@@ -2812,6 +2813,11 @@ def create_dashboard_app(
     app.state.memory_store = memory_store or MemoryStore(workspace)
     app.state.biomed_revision_provider = biomed_revision_provider
     app.state.biomed_revision_model = biomed_revision_model
+    app.state.biomed_allow_live_pubmed_tools = _bool_config(
+        _read_biomed_config(workspace, plugins_root / "biomed_evidence"),
+        "allow_live_pubmed_tools",
+        False,
+    )
     app.state.dashboard_chat = chat_mux
     app.mount("/assets", StaticFiles(directory=static_dir), name="dashboard-assets")
 

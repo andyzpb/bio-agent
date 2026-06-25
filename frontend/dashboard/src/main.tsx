@@ -171,6 +171,7 @@ function App(): React.ReactElement {
   const [chatCommandPreviewLoading, setChatCommandPreviewLoading] = useState(false);
   const [chatDeleteTarget, setChatDeleteTarget] = useState<SessionRow | null>(null);
   const [chatReviewDrawer, setChatReviewDrawer] = useState<RunReviewDrawerState | null>(null);
+  const [chatEnhancingRunId, setChatEnhancingRunId] = useState<string | null>(null);
   const [chatApprovalState, setChatApprovalState] = useState<Record<string, "approving" | "rejecting" | "approved" | "rejected" | "failed">>({});
   const [creatingChat, setCreatingChat] = useState(false);
   const [deletingChatKey, setDeletingChatKey] = useState<string | null>(null);
@@ -526,6 +527,24 @@ function App(): React.ReactElement {
       });
     });
   }, [run]);
+
+  const enhanceRunWithFullText = useCallback(async (runId: string, url?: string): Promise<void> => {
+    const cleanRunId = String(runId || "").trim();
+    const targetUrl = String(url || `/api/biomed/answer-runs/${encodeURIComponent(cleanRunId)}/full-text-enhance`).trim();
+    if (!cleanRunId || !targetUrl || chatEnhancingRunId === cleanRunId) return;
+    await run(async () => {
+      setChatEnhancingRunId(cleanRunId);
+      try {
+        await api(targetUrl, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        openRunReviewDrawer(cleanRunId, "review");
+      } finally {
+        setChatEnhancingRunId((current) => (current === cleanRunId ? null : current));
+      }
+    });
+  }, [chatEnhancingRunId, openRunReviewDrawer, run]);
 
   const loadProactivePanel = useCallback(async () => {
     const params = new URLSearchParams();
@@ -1011,6 +1030,8 @@ function App(): React.ReactElement {
             onApproval={(approvalId, decision) => void run(() => decideChatApproval(approvalId, decision))}
             approvalState={chatApprovalState}
             onOpenRunReview={openRunReviewDrawer}
+            onEnhanceRun={(runId, url) => void run(() => enhanceRunWithFullText(runId, url))}
+            enhancingRunId={chatEnhancingRunId}
             onOpenSession={() => {
               setActiveSessionKey(chatSessionKey);
               setActiveSession(sessions.find((session) => session.key === chatSessionKey) ?? null);
@@ -1244,6 +1265,8 @@ function ChatPane(props: {
   onApproval(approvalId: string, decision: "approve" | "reject"): void;
   approvalState: Record<string, "approving" | "rejecting" | "approved" | "rejected" | "failed">;
   onOpenRunReview(runId: string, target?: RunReviewDrawerState["target"]): void;
+  onEnhanceRun(runId: string, url?: string): void;
+  enhancingRunId: string | null;
   onOpenSession(): void;
 }): React.ReactElement {
   const disabled = !props.status?.enabled;
@@ -1322,6 +1345,8 @@ function ChatPane(props: {
                 onApproval={props.onApproval}
                 approvalState={props.approvalState}
                 onOpenRunReview={props.onOpenRunReview}
+                onEnhanceRun={props.onEnhanceRun}
+                enhancingRunId={props.enhancingRunId}
               />
             )) : (
               <div className="chat-empty">
@@ -1569,6 +1594,8 @@ function ChatTurnItem(props: {
   onApproval(approvalId: string, decision: "approve" | "reject"): void;
   approvalState: Record<string, "approving" | "rejecting" | "approved" | "rejected" | "failed">;
   onOpenRunReview(runId: string, target?: RunReviewDrawerState["target"]): void;
+  onEnhanceRun(runId: string, url?: string): void;
+  enhancingRunId: string | null;
 }): React.ReactElement {
   const artifacts = useMemo(() => chatTurnRunArtifacts(props.turn), [props.turn]);
   const approvalId = extractTurnApprovalId(props.turn);
@@ -1591,6 +1618,8 @@ function ChatTurnItem(props: {
         <ArtifactActionBar
           artifacts={artifacts}
           onOpenRunReview={props.onOpenRunReview}
+          onEnhanceRun={props.onEnhanceRun}
+          enhancingRunId={props.enhancingRunId}
         />
       )}
       {props.turn.approval && (
@@ -1621,9 +1650,13 @@ function ChatTurnItem(props: {
 function ArtifactActionBar(props: {
   artifacts: ChatRunArtifacts;
   onOpenRunReview(runId: string, target?: RunReviewDrawerState["target"]): void;
+  onEnhanceRun(runId: string, url?: string): void;
+  enhancingRunId: string | null;
 }): React.ReactElement {
   const runId = String(props.artifacts.run_id || "").trim();
   const watchId = String(props.artifacts.watch_id || "").trim();
+  const enhanceUrl = String(props.artifacts.full_text_enhance_url || "").trim();
+  const enhancing = props.enhancingRunId === runId;
   if (!runId && !watchId) return <></>;
   if (watchId && !runId) {
     return (
@@ -1654,6 +1687,12 @@ function ArtifactActionBar(props: {
         </div>
       </div>
       <div className="run-action-buttons">
+        {enhanceUrl && (
+          <button className="ghost" type="button" onClick={() => props.onEnhanceRun(runId, enhanceUrl)} disabled={enhancing}>
+            {enhancing && <LoaderCircle size={13} aria-hidden="true" className="spin" />}
+            <span>{enhancing ? "Enhancing..." : "Enhance full text"}</span>
+          </button>
+        )}
         <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "review")}>Open review</button>
         <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "packet")}>Evidence packet</button>
         <button className="ghost" type="button" onClick={() => props.onOpenRunReview(runId, "provenance")}>Provenance</button>

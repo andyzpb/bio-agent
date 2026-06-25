@@ -56,6 +56,9 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         workspace,
         revision_provider=getattr(app.state, "biomed_revision_provider", None),
         revision_model=str(getattr(app.state, "biomed_revision_model", "") or ""),
+        allow_live_pubmed_tools=bool(
+            getattr(app.state, "biomed_allow_live_pubmed_tools", False)
+        ),
     )
 
     @app.get("/api/biomed/search")

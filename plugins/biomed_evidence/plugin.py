@@ -34,6 +34,7 @@ from plugins.biomed_evidence.schemas import (
     EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    FullTextEnhancementRequest,
     FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
@@ -100,6 +101,7 @@ _BIOMED_TOOL_NAMES = frozenset(
         "ingest_paper_full_text",
         "get_paper_full_text",
         "extract_full_text_evidence",
+        "enhance_run_with_full_text",
         "get_evidence_graph",
         "get_evidence_card",
         "validate_evidence_graph",
@@ -126,6 +128,7 @@ _TOOLS_WITH_SOURCE = frozenset(
         "ingest_paper_full_text",
         "get_paper_full_text",
         "extract_full_text_evidence",
+        "enhance_run_with_full_text",
         "answer_with_evidence",
         "answer_with_audit",
         "record_project_paper_decision",
@@ -217,6 +220,7 @@ _SENSITIVE_CHAT_TOOL_NAMES = frozenset(
         "ingest_paper_full_text",
         "get_paper_full_text",
         "extract_full_text_evidence",
+        "enhance_run_with_full_text",
         "save_biomed_workflow_template",
         "delete_biomed_workflow_template",
         "record_run_review_decision",
@@ -272,6 +276,11 @@ class BiomedEvidencePlugin(Plugin):
             workspace,
             revision_provider=revision_provider,
             revision_model=revision_model,
+            allow_live_pubmed_tools=_config_bool(
+                self,
+                "allow_live_pubmed_tools",
+                False,
+            ),
         )
 
     async def terminate(self) -> None:
@@ -664,6 +673,32 @@ class BiomedEvidencePlugin(Plugin):
         )
         if result is None:
             return _dump({"error": "paper_or_full_text_not_found", "paper_id": paper_id})
+        return _dump(result.model_dump(mode="json"))
+
+    @tool(
+        name="enhance_run_with_full_text",
+        risk="read-write",
+        search_hint="enhance completed biomedical answer run with stored or open full text",
+    )
+    async def enhance_run_with_full_text(
+        self,
+        event,
+        run_id: str,
+        source: Literal["pubmed", "mock"] | None = None,
+        max_papers: int = 10,
+        max_evidence_items: int = 20,
+        use_open_provider: bool = False,
+    ) -> str:
+        """Enhance an existing research-only biomedical run with full-text evidence."""
+        result = self._service.enhance_run_with_full_text(
+            FullTextEnhancementRequest(
+                run_id=run_id,
+                source=source,
+                max_papers=max_papers,
+                max_evidence_items=max_evidence_items,
+                use_open_provider=use_open_provider,
+            )
+        )
         return _dump(result.model_dump(mode="json"))
 
     @tool(

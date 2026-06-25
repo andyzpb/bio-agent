@@ -143,6 +143,7 @@ export interface ChatRunArtifacts {
   run_id?: string;
   watch_id?: string;
   review_url?: string;
+  full_text_enhance_url?: string | null;
   packet_url?: string;
   trace_url?: string;
   provenance_url?: string;

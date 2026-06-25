@@ -990,6 +990,9 @@ def test_dashboard_chat_biomed_parse_review_includes_run_artifacts(tmp_path) -> 
     assert payload["action"] == "review"
     assert payload["artifacts"]["run_id"] == "biomed-run-123abc"
     assert payload["artifacts"]["review_url"].endswith("/biomed-run-123abc/evidence-review")
+    assert payload["artifacts"]["full_text_enhance_url"].endswith(
+        "/biomed-run-123abc/full-text-enhance"
+    )
     assert "report_type=pilot" in payload["artifacts"]["pilot_report_json_url"]
     assert payload["artifacts"]["argument_graph_url"].endswith("/biomed-run-123abc/argument-graph")
 
@@ -1062,6 +1065,9 @@ def test_dashboard_chat_biomed_parse_export_includes_artifact_urls(tmp_path) -> 
     payload = response.json()
     assert payload["action"] == "export_provenance"
     assert payload["artifacts"]["run_id"] == "biomed-run-123abc"
+    assert payload["artifacts"]["full_text_enhance_url"].endswith(
+        "/biomed-run-123abc/full-text-enhance"
+    )
     assert payload["artifacts"]["packet_url"].endswith("/biomed-run-123abc/evidence-review/packet")
     assert payload["artifacts"]["trace_url"].endswith("/biomed-run-123abc/trace")
     assert payload["artifacts"]["provenance_url"].endswith("/biomed-run-123abc/provenance")

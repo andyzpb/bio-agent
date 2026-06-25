@@ -168,7 +168,10 @@ from plugins.biomed_evidence.schemas import (
 )
 from plugins.biomed_evidence.storage import BiomedStorage
 from plugins.biomed_evidence.telemetry_service import build_step_telemetry
-from plugins.biomed_evidence.tool_contracts import get_release_tool_metadata
+from plugins.biomed_evidence.tool_contracts import (
+    get_release_tool_metadata,
+    release_source_policy_error,
+)
 
 
 @dataclass(frozen=True)
@@ -197,11 +200,13 @@ class BiomedEvidenceService:
         http_client: httpx.AsyncClient | None = None,
         revision_provider: Any | None = None,
         revision_model: str | None = None,
+        allow_live_pubmed_tools: bool = False,
     ) -> None:
         self.workspace = Path(workspace)
         self.storage = BiomedStorage(self.workspace / "biomed_evidence" / "biomed.db")
         self.revision_provider = revision_provider
         self.revision_model = revision_model or ""
+        self.allow_live_pubmed_tools = allow_live_pubmed_tools
         self.mock_client = MockLiteratureClient()
         self.pubmed_client = PubMedLiteratureClient(
             client=http_client,
@@ -2265,6 +2270,13 @@ class BiomedEvidenceService:
             )
 
         source = cast(Literal["pubmed", "mock"], request.source or run.retrieval_manifest.source)
+        policy_error = release_source_policy_error(
+            tool_name=tool_name,
+            source=source,
+            allow_live_pubmed_tools=self.allow_live_pubmed_tools,
+        )
+        if policy_error is not None:
+            return policy_error
         enhancement_id = f"fulltext-enhance-{uuid.uuid4().hex[:12]}"
         candidate_ids = _run_candidate_paper_ids(run)[: max(1, request.max_papers)]
         statuses: list[FullTextEnhancementPaperStatus] = []

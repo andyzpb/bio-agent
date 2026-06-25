@@ -346,6 +346,40 @@ async def test_release_workflow_tools_are_guarded(
         assert source_blocked.decision == "deny"
         assert "source_policy_blocked" in source_blocked.reason
 
+        enhance_blocked = await plugin.guard_biomedical_tool(
+            PreToolCtx(
+                session_key="test",
+                channel="cli",
+                chat_id="local",
+                tool_name="enhance_run_with_full_text",
+                arguments={
+                    "run_id": "biomed-run-pubmed",
+                    "source": "pubmed",
+                    "use_open_provider": False,
+                },
+                source="passive",
+            )
+        )
+        assert enhance_blocked is not None
+        assert enhance_blocked.decision == "deny"
+        assert "source_policy_blocked" in enhance_blocked.reason
+
+        enhance_mock = await plugin.guard_biomedical_tool(
+            PreToolCtx(
+                session_key="test",
+                channel="cli",
+                chat_id="local",
+                tool_name="enhance_run_with_full_text",
+                arguments={
+                    "run_id": "biomed-run-mock",
+                    "source": "mock",
+                    "use_open_provider": False,
+                },
+                source="passive",
+            )
+        )
+        assert enhance_mock is None
+
         capped = await plugin.guard_biomedical_tool(
             PreToolCtx(
                 session_key="test",

@@ -1218,6 +1218,34 @@ def test_biomed_run_full_text_enhance_reuses_stored_document(tmp_path: Path) -> 
         assert "full-text evidence items" in extract_step["output_summary"]
 
 
+def test_biomed_run_full_text_enhance_blocks_pubmed_without_policy(
+    tmp_path: Path,
+) -> None:
+    app = FastAPI()
+    app.state.biomed_allow_live_pubmed_tools = False
+    register(app, Path(__file__).parents[1] / "plugins" / "biomed_evidence", tmp_path)
+    with TestClient(app) as client:
+        answer = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What evidence links microglia to Alzheimer's disease?",
+                "source": "mock",
+                "max_papers": 1,
+            },
+        )
+        assert answer.status_code == 200
+        run_id = answer.json()["answer_result"]["run_id"]
+
+        response = client.post(
+            f"/api/biomed/answer-runs/{run_id}/full-text-enhance",
+            json={"source": "pubmed"},
+        )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "source_policy_blocked"
+
+
 def test_biomed_artifact_cache_full_text_and_packet_metadata(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         answer = client.post(
