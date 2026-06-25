@@ -7813,6 +7813,16 @@ def _build_trace_steps(
     clinical_boundary: bool,
 ) -> list[AgentTraceStep]:
     steps: list[AgentTraceStep] = []
+    retrieval_cache_entries = _retrieval_artifact_cache_entries(result)
+    retrieval_cache_hits = sum(
+        1 for entry in retrieval_cache_entries if entry.get("status") == "hit"
+    )
+    retrieval_cache_misses = sum(
+        1 for entry in retrieval_cache_entries if entry.get("status") == "miss"
+    )
+    retrieval_cache_writes = sum(
+        1 for entry in retrieval_cache_entries if entry.get("status") == "write"
+    )
 
     def add(
         step: str,
@@ -7944,6 +7954,7 @@ def _build_trace_steps(
                 if result.retrieval_manifest is not None
                 else []
             ),
+            "artifact_cache": retrieval_cache_entries,
             "retrieval_bundle": _retrieval_bundle_trace(result.retrieval_bundle),
             "evidence_packet": (
                 result.evidence_packet.model_dump(mode="json")
@@ -7952,6 +7963,10 @@ def _build_trace_steps(
             ),
             "project_context_trace": result.project_context_trace,
             "observability": _trace_observability(
+                artifact_cache_hit_count=retrieval_cache_hits,
+                artifact_cache_miss_count=retrieval_cache_misses,
+                artifact_cache_write_count=retrieval_cache_writes,
+                saved_source_call_count=retrieval_cache_hits,
                 source_call_count=_pilot_source_call_count(result),
             ),
         },
@@ -8118,6 +8133,10 @@ def _trace_observability(
     llm_call_count: int | None = None,
     source_call_count: int | None = None,
     prompt_tokens: int | None = None,
+    artifact_cache_hit_count: int | None = None,
+    artifact_cache_miss_count: int | None = None,
+    artifact_cache_write_count: int | None = None,
+    saved_source_call_count: int | None = None,
 ) -> dict[str, int]:
     return {
         key: value
@@ -8125,9 +8144,88 @@ def _trace_observability(
             "llm_call_count": llm_call_count,
             "source_call_count": source_call_count,
             "prompt_tokens": prompt_tokens,
+            "artifact_cache_hit_count": artifact_cache_hit_count,
+            "artifact_cache_miss_count": artifact_cache_miss_count,
+            "artifact_cache_write_count": artifact_cache_write_count,
+            "saved_source_call_count": saved_source_call_count,
         }.items()
         if value is not None
     }
+
+
+def _trace_cache_entry(
+    *,
+    kind: str,
+    status: str | None,
+    cache_key: str | None,
+    artifact_id: str | None,
+    basis: str | None,
+) -> dict[str, object] | None:
+    if not status:
+        return None
+    return {
+        "kind": kind,
+        "status": status,
+        "cache_key": cache_key,
+        "artifact_id": artifact_id,
+        "basis": basis or "exact artifact cache key",
+    }
+
+
+def _retrieval_artifact_cache_entries(
+    result: AnswerWithEvidenceResult,
+) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    seen: set[tuple[object, object]] = set()
+
+    def add_manifest(manifest: RetrievalManifest | None) -> None:
+        if manifest is None:
+            return
+        entry = _trace_cache_entry(
+            kind="literature_search",
+            status=manifest.cache_status,
+            cache_key=manifest.cache_key,
+            artifact_id=manifest.retrieval_id,
+            basis=manifest.cache_basis,
+        )
+        if entry is None:
+            return
+        key = (entry.get("cache_key"), entry.get("artifact_id"))
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(entry)
+
+    add_manifest(result.retrieval_manifest)
+    if result.retrieval_bundle is not None:
+        for record in result.retrieval_bundle.records:
+            add_manifest(record.manifest)
+    return entries
+
+
+def _artifact_cache_entries_from_trace(
+    trace: list[AgentTraceStep],
+) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for step in trace:
+        raw = step.metadata.get("artifact_cache")
+        if isinstance(raw, list):
+            entries.extend(item for item in raw if isinstance(item, dict))
+        elif isinstance(raw, dict):
+            entries.append(raw)
+    return entries
+
+
+def _artifact_cache_counts(
+    entries: list[dict[str, object]],
+) -> tuple[int, int, int, int, float | None]:
+    hits = sum(1 for item in entries if item.get("status") == "hit")
+    misses = sum(1 for item in entries if item.get("status") == "miss")
+    writes = sum(1 for item in entries if item.get("status") == "write")
+    saved = hits
+    total = hits + misses + writes
+    hit_rate = round(hits / total, 4) if total else None
+    return hits, misses, writes, saved, hit_rate
 
 
 def _text_token_estimate(*values: object) -> int | None:
@@ -8810,6 +8908,13 @@ def _render_pilot_markdown_report(report: PilotReport) -> str:
             f"- Cache hit rate: `{_pilot_value(report.observability.cache_hit_rate)}`",
             f"- LLM calls: `{_pilot_value(report.observability.llm_call_count)}`",
             f"- Source calls: `{_pilot_value(report.observability.source_call_count)}`",
+            f"- Artifact cache hits: `{_pilot_value(report.observability.artifact_cache_hit_count)}`",
+            f"- Artifact cache misses: `{_pilot_value(report.observability.artifact_cache_miss_count)}`",
+            f"- Artifact cache writes: `{_pilot_value(report.observability.artifact_cache_write_count)}`",
+            f"- Saved source calls: `{_pilot_value(report.observability.saved_source_call_count)}`",
+            f"- Artifact cache hit rate: `{_pilot_value(report.observability.artifact_cache_hit_rate)}`",
+            f"- Cache entry count: `{len(report.observability.cache_entries)}`",
+            f"- Cache basis: {report.observability.cache_basis}",
             f"- Estimated cost USD: `{_pilot_value(report.observability.estimated_cost_usd)}`",
             f"- Latency seconds: `{_pilot_value(report.observability.latency_seconds)}`",
             f"- Basis: {report.observability.basis}",
@@ -8979,14 +9084,32 @@ def build_run_observability(
     result: AnswerWithEvidenceResult,
     trace: list[AgentTraceStep],
 ) -> PilotReportObservability:
+    cache_entries = _artifact_cache_entries_from_trace(trace)
+    (
+        cache_hits,
+        cache_misses,
+        cache_writes,
+        saved_source_calls,
+        artifact_hit_rate,
+    ) = _artifact_cache_counts(cache_entries)
     values = {
         "prompt_tokens": _run_prompt_token_estimate(trace),
         "cache_hit_tokens": None,
         "cache_hit_rate": None,
         "llm_call_count": _run_llm_call_count(trace),
         "source_call_count": _run_source_call_count(result, trace),
+        "artifact_cache_hit_count": cache_hits,
+        "artifact_cache_miss_count": cache_misses,
+        "artifact_cache_write_count": cache_writes,
+        "saved_source_call_count": saved_source_calls,
+        "artifact_cache_hit_rate": artifact_hit_rate,
         "estimated_cost_usd": None,
         "latency_seconds": _pilot_trace_latency_seconds(trace),
+        "cache_entries": cache_entries,
+        "cache_basis": (
+            "Provider prompt-cache telemetry comes from provider usage fields; "
+            "biomedical artifact-cache telemetry comes from persisted trace metadata."
+        ),
     }
     available = [key for key, value in values.items() if value is not None]
     unavailable = [key for key, value in values.items() if value is None]
@@ -8995,9 +9118,8 @@ def build_run_observability(
         available_fields=available,
         unavailable_fields=unavailable,
         basis=(
-            "Derived from persisted run artifacts. Prompt tokens are estimated "
-            "from trace text; cache and cost fields remain null until real "
-            "cache/billing telemetry lands."
+            "Provider prompt-cache telemetry comes from provider usage fields; "
+            "biomedical artifact-cache telemetry comes from persisted trace metadata."
         ),
     )
 

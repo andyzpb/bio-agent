@@ -19,6 +19,37 @@ def _client(tmp_path: Path) -> TestClient:
 
 def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
+        def assert_artifact_cache_observability(
+            observability: dict[str, object],
+            *,
+            expected_writes: int = 1,
+            min_entries: int = 1,
+        ) -> None:
+            assert observability["artifact_cache_hit_count"] == 0
+            assert observability["artifact_cache_miss_count"] == 0
+            assert observability["artifact_cache_write_count"] == expected_writes
+            assert observability["saved_source_call_count"] == 0
+            assert observability["artifact_cache_hit_rate"] == 0.0
+            assert isinstance(observability["cache_basis"], str)
+            assert "trace metadata" in observability["cache_basis"]
+            cache_entries = observability["cache_entries"]
+            assert isinstance(cache_entries, list)
+            assert len(cache_entries) >= min_entries
+            for cache_entry in cache_entries:
+                assert cache_entry["kind"] == "literature_search"
+                assert cache_entry["status"] == "write"
+                assert cache_entry["artifact_id"]
+                assert cache_entry["cache_key"]
+
+        def assert_pilot_markdown_artifact_cache(markdown: str) -> None:
+            assert "Artifact cache hits" in markdown
+            assert "Artifact cache misses" in markdown
+            assert "Artifact cache writes" in markdown
+            assert "Saved source calls" in markdown
+            assert "Artifact cache hit rate" in markdown
+            assert "Cache entry count" in markdown
+            assert "Cache basis" in markdown
+
         search = client.get(
             "/api/biomed/search",
             params={"query": "microglia", "source": "mock"},
@@ -537,6 +568,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert "## ROI" in pilot_markdown.text
         assert "Run Evidence Review" in pilot_markdown.text
         assert "not a new evidence source" in pilot_markdown.text
+        assert_pilot_markdown_artifact_cache(pilot_markdown.text)
 
         audited = client.post(
             "/api/biomed/answer/audited",
@@ -570,6 +602,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         trace = client.get(f"/api/biomed/answer-runs/{audited_run_id}/trace")
         assert trace.status_code == 200
         trace_payload = trace.json()
+        retrieval_bundle_records = audited_payload["answer_result"]["retrieval_bundle"]["records"]
         assert trace_payload["run_id"] == audited_run_id
         assert trace_payload["revision"]["revision_id"] == audited_payload["revision"]["revision_id"]
         assert trace_payload["latest_advisory_verifier"]["verifier_mode"] == "fallback"
@@ -580,6 +613,11 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert trace_payload["observability"]["latency_seconds"] is not None
         assert trace_payload["observability"]["cache_hit_tokens"] is None
         assert trace_payload["observability"]["estimated_cost_usd"] is None
+        assert_artifact_cache_observability(
+            trace_payload["observability"],
+            expected_writes=trace_payload["observability"]["artifact_cache_write_count"],
+            min_entries=len(retrieval_bundle_records),
+        )
         assert trace_payload["memory"]["memory_as_evidence"] is False
         assert {step["step"] for step in trace_payload["trace"]} == {
             "classify",
@@ -599,6 +637,15 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert retrieve_step["metadata"]["retrieval_bundle"]["coverage_matrix"]
         assert retrieve_step["metadata"]["evidence_packet"]["coverage_matrix"]
         assert retrieve_step["metadata"]["observability"]["source_call_count"] is not None
+        artifact_cache = retrieve_step["metadata"]["artifact_cache"]
+        assert isinstance(artifact_cache, list)
+        assert len(artifact_cache) >= len(retrieval_bundle_records)
+        assert all(entry["kind"] == "literature_search" for entry in artifact_cache)
+        assert all(entry["status"] == "write" for entry in artifact_cache)
+        assert trace_payload["observability"]["artifact_cache_write_count"] >= len(
+            retrieval_bundle_records
+        )
+        assert len(trace_payload["observability"]["cache_entries"]) == len(artifact_cache)
 
         audited_pilot = client.get(
             "/api/biomed/export",
@@ -614,6 +661,24 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert audited_pilot_observability["source_call_count"] is not None
         assert audited_pilot_observability["latency_seconds"] is not None
         assert audited_pilot_observability["cache_hit_rate"] is None
+        assert audited_pilot_observability["artifact_cache_hit_count"] == 0
+        assert audited_pilot_observability["artifact_cache_miss_count"] == 0
+        assert (
+            audited_pilot_observability["artifact_cache_write_count"]
+            >= len(retrieval_bundle_records)
+        )
+        assert audited_pilot_observability["saved_source_call_count"] == 0
+        assert audited_pilot_observability["artifact_cache_hit_rate"] == 0.0
+        assert isinstance(audited_pilot_observability["cache_basis"], str)
+        assert "trace metadata" in audited_pilot_observability["cache_basis"]
+        assert len(audited_pilot_observability["cache_entries"]) == len(artifact_cache)
+
+        audited_pilot_markdown = client.get(
+            "/api/biomed/export",
+            params={"run_id": audited_run_id, "report_type": "pilot"},
+        )
+        assert audited_pilot_markdown.status_code == 200
+        assert_pilot_markdown_artifact_cache(audited_pilot_markdown.text)
 
         argument_graph = client.get(
             f"/api/biomed/answer-runs/{audited_run_id}/argument-graph"
@@ -1108,8 +1173,14 @@ def test_biomed_artifact_cache_storage_records_mock_retrieval(tmp_path: Path) ->
         first_retrieval_id = first_payload["retrieval_manifest"]["retrieval_id"]
         stored_first = client.get(f"/api/biomed/retrievals/{first_retrieval_id}")
         assert stored_first.status_code == 200
+        stored_first_payload = stored_first.json()
+        assert first_payload["retrieval_manifest"]["cache_basis"] == "exact literature cache key"
+        assert first_payload["retrieval_manifest"]["cache_key"]
         assert second.json()["retrieval_manifest"]["cache_status"] == "hit"
-        assert stored_first.json()["cache_status"] == "write"
+        assert stored_first_payload["cache_status"] == "write"
+        assert stored_first_payload["cache_basis"] == first_payload["retrieval_manifest"]["cache_basis"]
+        assert stored_first_payload["cache_key"] == first_payload["retrieval_manifest"]["cache_key"]
+        assert stored_first_payload["retrieval_id"] == first_retrieval_id
         assert second_payload["retrieval_manifest"]["returned_paper_ids"] == first_payload[
             "retrieval_manifest"
         ]["returned_paper_ids"]

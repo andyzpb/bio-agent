@@ -2115,8 +2115,15 @@ class PilotReportObservability(BaseModel):
     cache_hit_rate: float | None = None
     llm_call_count: int | None = None
     source_call_count: int | None = None
+    artifact_cache_hit_count: int | None = None
+    artifact_cache_miss_count: int | None = None
+    artifact_cache_write_count: int | None = None
+    saved_source_call_count: int | None = None
+    artifact_cache_hit_rate: float | None = None
     estimated_cost_usd: float | None = None
     latency_seconds: float | None = None
+    cache_entries: list[dict[str, Any]] = Field(default_factory=list)
+    cache_basis: str = "Biomedical artifact cache telemetry is derived from trace metadata."
     available_fields: list[str] = Field(default_factory=list)
     unavailable_fields: list[str] = Field(default_factory=list)
     basis: str = "Release 2.1 observability contract; telemetry may be unavailable."
