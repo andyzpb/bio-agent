@@ -1914,11 +1914,22 @@ class BiomedEvidenceService:
             normalized_filters=normalized_filters,
         )
         cached_entry = self.storage.get_artifact_cache_entry(cache_key)
-        if cached_entry is not None and not _cache_entry_is_expired(cached_entry):
+        if (
+            cached_entry is not None
+            and cached_entry.get("cache_kind") == "literature_search"
+            and cached_entry.get("source") == request.source
+            and not _cache_entry_is_expired(cached_entry)
+        ):
             cached_manifest = self.storage.get_retrieval_manifest(
                 str(cached_entry["artifact_id"])
             )
-            if cached_manifest is not None:
+            if cached_manifest is not None and _valid_literature_cache_artifact(
+                cached_entry,
+                source=request.source,
+                compiled_query=compiled_query,
+                normalized_filters=normalized_filters,
+                returned_paper_ids=cached_manifest.returned_paper_ids,
+            ):
                 cached_items: list[PaperMetadata] = []
                 for paper_id in cached_manifest.returned_paper_ids:
                     metadata = _paper_metadata_from_stored_paper(
@@ -2023,10 +2034,13 @@ class BiomedEvidenceService:
             source=request.source,
             artifact_id=manifest.retrieval_id,
             artifact={
+                "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+                "source": request.source,
                 "returned_paper_ids": returned_ids,
                 "compiled_query": compiled_query,
                 "normalized_filters": normalized_filters,
             },
+            expires_at=_pubmed_cache_expires_at(request.source),
         )
         return SearchBiomedicalLiteratureResult(
             items=items,
@@ -7155,6 +7169,12 @@ ARTIFACT_CACHE_SCHEMA_VERSION = "biomed-artifact-cache-v1"
 EVIDENCE_PACKET_CACHE_SCHEMA_VERSION = "biomed-evidence-packet-v1"
 
 
+def _pubmed_cache_expires_at(source: str) -> str | None:
+    if source != "pubmed":
+        return None
+    return (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+
+
 def _artifact_cache_key(kind: str, payload: dict[str, object]) -> str:
     stable = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
@@ -7178,6 +7198,29 @@ def _literature_cache_key(
             "store": bool(request.store),
         },
     )
+
+
+def _valid_literature_cache_artifact(
+    entry: dict[str, object],
+    *,
+    source: str,
+    compiled_query: str,
+    normalized_filters: dict[str, object],
+    returned_paper_ids: list[str],
+) -> bool:
+    artifact = entry.get("artifact")
+    if not isinstance(artifact, dict):
+        return False
+    if artifact.get("schema") != ARTIFACT_CACHE_SCHEMA_VERSION:
+        return False
+    if artifact.get("source") != source:
+        return False
+    if artifact.get("compiled_query") != compiled_query:
+        return False
+    if artifact.get("normalized_filters") != normalized_filters:
+        return False
+    cached_ids = artifact.get("returned_paper_ids")
+    return isinstance(cached_ids, list) and cached_ids == returned_paper_ids
 
 
 def _full_text_cache_key(
@@ -8439,10 +8482,10 @@ def _artifact_cache_counts(
     entries: list[dict[str, object]],
 ) -> tuple[int, int, int, int, float | None]:
     hits = sum(1 for item in entries if item.get("status") == "hit")
-    misses = sum(1 for item in entries if item.get("status") == "miss")
+    misses = sum(1 for item in entries if item.get("status") in {"miss", "write"})
     writes = sum(1 for item in entries if item.get("status") == "write")
     saved = hits
-    total = hits + misses + writes
+    total = hits + misses
     hit_rate = round(hits / total, 4) if total else None
     return hits, misses, writes, saved, hit_rate
 

@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from plugins.biomed_evidence.dashboard import register
+from plugins.biomed_evidence.service import _pubmed_cache_expires_at
 
 
 def _client(tmp_path: Path) -> TestClient:
@@ -23,10 +24,13 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
             observability: dict[str, object],
             *,
             expected_writes: int = 1,
+            expected_misses: int | None = None,
             min_entries: int = 1,
         ) -> None:
             assert observability["artifact_cache_hit_count"] == 0
-            assert observability["artifact_cache_miss_count"] == 0
+            if expected_misses is None:
+                expected_misses = expected_writes
+            assert observability["artifact_cache_miss_count"] == expected_misses
             assert observability["artifact_cache_write_count"] == expected_writes
             assert observability["saved_source_call_count"] == 0
             assert observability["artifact_cache_hit_rate"] == 0.0
@@ -662,7 +666,7 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert audited_pilot_observability["latency_seconds"] is not None
         assert audited_pilot_observability["cache_hit_rate"] is None
         assert audited_pilot_observability["artifact_cache_hit_count"] == 0
-        assert audited_pilot_observability["artifact_cache_miss_count"] == 0
+        assert audited_pilot_observability["artifact_cache_miss_count"] >= 1
         assert (
             audited_pilot_observability["artifact_cache_write_count"]
             >= len(retrieval_bundle_records)
@@ -1302,15 +1306,25 @@ def test_biomed_artifact_cache_storage_records_mock_retrieval(tmp_path: Path) ->
         ]["returned_paper_ids"]
 
         db_path = tmp_path / "biomed_evidence" / "biomed.db"
-        expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         with sqlite3.connect(db_path) as db:
+            row = db.execute(
+                """
+                SELECT cache_key, artifact_json
+                FROM biomed_artifact_cache
+                WHERE artifact_id = ?
+                """,
+                (first_retrieval_id,),
+            ).fetchone()
+            assert row is not None
+            corrupted_artifact = json.loads(row[1])
+            corrupted_artifact["source"] = "pubmed"
             db.execute(
                 """
                 UPDATE biomed_artifact_cache
-                SET expires_at = ?
-                WHERE artifact_id = ?
+                SET artifact_json = ?
+                WHERE cache_key = ?
                 """,
-                (expired_at, first_retrieval_id),
+                (json.dumps(corrupted_artifact), row[0]),
             )
             db.commit()
 
@@ -1324,7 +1338,42 @@ def test_biomed_artifact_cache_storage_records_mock_retrieval(tmp_path: Path) ->
             },
         )
         assert third.status_code == 200
-        assert third.json()["retrieval_manifest"]["cache_status"] == "write"
+        third_payload = third.json()
+        assert third_payload["retrieval_manifest"]["cache_status"] == "write"
+
+        expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                """
+                UPDATE biomed_artifact_cache
+                SET expires_at = ?
+                WHERE artifact_id = ?
+                """,
+                (expired_at, third_payload["retrieval_manifest"]["retrieval_id"]),
+            )
+            db.commit()
+
+        fourth = client.post(
+            "/api/biomed/literature/search",
+            json={
+                "query": "microglial activation Alzheimer's disease progression",
+                "source": "mock",
+                "max_results": 3,
+                "store": True,
+            },
+        )
+        assert fourth.status_code == 200
+        assert fourth.json()["retrieval_manifest"]["cache_status"] == "write"
+
+
+def test_pubmed_cache_writes_get_default_ttl() -> None:
+    expires_at = _pubmed_cache_expires_at("pubmed")
+    assert expires_at is not None
+    parsed = datetime.fromisoformat(expires_at)
+    assert parsed.tzinfo is not None
+    remaining = parsed - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23) < remaining < timedelta(days=7, minutes=1)
+    assert _pubmed_cache_expires_at("mock") is None
 
 
 def test_biomed_workflow_templates_api(tmp_path: Path) -> None:
