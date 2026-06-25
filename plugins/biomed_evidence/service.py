@@ -1828,6 +1828,38 @@ class BiomedEvidenceService:
         compiled_query, normalized_filters, unsupported_filters = _compile_query(
             request
         )
+        cache_key = _literature_cache_key(
+            request,
+            compiled_query=compiled_query,
+            normalized_filters=normalized_filters,
+        )
+        cached_entry = self.storage.get_artifact_cache_entry(cache_key)
+        if cached_entry is not None and not _cache_entry_is_expired(cached_entry):
+            cached_manifest = self.storage.get_retrieval_manifest(
+                str(cached_entry["artifact_id"])
+            )
+            if cached_manifest is not None:
+                cached_items: list[PaperMetadata] = []
+                for paper_id in cached_manifest.returned_paper_ids:
+                    metadata = _paper_metadata_from_stored_paper(
+                        self.storage.get_paper(paper_id, source=cached_manifest.source)
+                    )
+                    if metadata is None:
+                        cached_items = []
+                        break
+                    cached_items.append(metadata)
+                if len(cached_items) == len(cached_manifest.returned_paper_ids):
+                    response_manifest = cached_manifest.model_copy(
+                        update={
+                            "cache_status": "hit",
+                            "cache_key": cache_key,
+                            "cache_basis": "exact literature cache key",
+                        }
+                    )
+                    return SearchBiomedicalLiteratureResult(
+                        items=cached_items,
+                        retrieval_manifest=response_manifest,
+                    )
         warnings: list[str] = []
         errors: list[str] = []
         trace: dict[str, object]
@@ -1890,6 +1922,9 @@ class BiomedEvidenceService:
             warnings=warnings,
             errors=errors,
         )
+        manifest.cache_status = "write"
+        manifest.cache_key = cache_key
+        manifest.cache_basis = "exact literature cache key"
         self.storage.save_retrieval_manifest(manifest)
         if request.store:
             self.storage.link_retrieval_papers(
@@ -1902,6 +1937,17 @@ class BiomedEvidenceService:
                 paper = stored or await client.fetch(item.paper_id)
                 if paper is not None:
                     self.storage.upsert_paper(paper)
+        self.storage.upsert_artifact_cache_entry(
+            cache_key=cache_key,
+            cache_kind="literature_search",
+            source=request.source,
+            artifact_id=manifest.retrieval_id,
+            artifact={
+                "returned_paper_ids": returned_ids,
+                "compiled_query": compiled_query,
+                "normalized_filters": normalized_filters,
+            },
+        )
         return SearchBiomedicalLiteratureResult(
             items=items,
             retrieval_manifest=manifest,
@@ -6961,6 +7007,38 @@ def _retrieval_id(request: SearchBiomedicalLiteratureRequest, started_at: str) -
     return f"retrieval-{digest}"
 
 
+ARTIFACT_CACHE_SCHEMA_VERSION = "biomed-artifact-cache-v1"
+
+
+def _artifact_cache_key(kind: str, payload: dict[str, object]) -> str:
+    stable = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
+    return f"{kind}-{digest}"
+
+
+def _literature_cache_key(
+    request: SearchBiomedicalLiteratureRequest,
+    *,
+    compiled_query: str,
+    normalized_filters: dict[str, object],
+) -> str:
+    return _artifact_cache_key(
+        "literature",
+        {
+            "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+            "source": request.source,
+            "compiled_query": _normalize_cache_text(compiled_query),
+            "filters": normalized_filters,
+            "max_results": max(0, min(request.max_results, 50)),
+            "store": bool(request.store),
+        },
+    )
+
+
+def _normalize_cache_text(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
 def _clean_list(values: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -8999,6 +9077,16 @@ def _parse_iso_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _cache_entry_is_expired(entry: dict[str, Any]) -> bool:
+    expires_at = entry.get("expires_at")
+    if not expires_at:
+        return False
+    parsed = _parse_iso_datetime(str(expires_at))
+    if parsed is None:
+        return True
+    return parsed <= datetime.now(timezone.utc)
 
 
 def _pilot_artifact_links(run_id: str) -> dict[str, str]:

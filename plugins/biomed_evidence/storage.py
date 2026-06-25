@@ -1615,6 +1615,73 @@ class BiomedStorage:
             return None
         return RetrievalManifest.model_validate_json(str(row["manifest_json"]))
 
+    def get_artifact_cache_entry(self, cache_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT cache_key, cache_kind, source, artifact_id, artifact_json,
+                       source_hash, expires_at, created_at, updated_at
+                FROM biomed_artifact_cache
+                WHERE cache_key=?
+                """,
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "cache_key": str(row["cache_key"]),
+            "cache_kind": str(row["cache_kind"]),
+            "source": str(row["source"]),
+            "artifact_id": str(row["artifact_id"]),
+            "artifact": _loads_dict(row["artifact_json"]),
+            "source_hash": row["source_hash"],
+            "expires_at": row["expires_at"],
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def upsert_artifact_cache_entry(
+        self,
+        *,
+        cache_key: str,
+        cache_kind: str,
+        source: str,
+        artifact_id: str,
+        artifact: dict[str, Any] | None = None,
+        source_hash: str | None = None,
+        expires_at: str | None = None,
+    ) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO biomed_artifact_cache(
+                    cache_key, cache_kind, source, artifact_id, artifact_json,
+                    source_hash, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    cache_kind=excluded.cache_kind,
+                    source=excluded.source,
+                    artifact_id=excluded.artifact_id,
+                    artifact_json=excluded.artifact_json,
+                    source_hash=excluded.source_hash,
+                    expires_at=excluded.expires_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    cache_key,
+                    cache_kind,
+                    source,
+                    artifact_id,
+                    _json(artifact or {}),
+                    source_hash,
+                    expires_at,
+                    now,
+                    now,
+                ),
+            )
+            self._db.commit()
+
     def link_retrieval_papers(
         self,
         retrieval_id: str,
@@ -2106,6 +2173,19 @@ class BiomedStorage:
                 finished_at TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS biomed_artifact_cache(
+                cache_key TEXT PRIMARY KEY,
+                cache_kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                artifact_json TEXT NOT NULL DEFAULT '{}',
+                source_hash TEXT,
+                expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_biomed_artifact_cache_kind_source
+                ON biomed_artifact_cache(cache_kind, source, updated_at);
             CREATE TABLE IF NOT EXISTS biomed_retrieval_papers(
                 retrieval_id TEXT NOT NULL,
                 source TEXT NOT NULL,
@@ -2535,6 +2615,16 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, object]:
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _loads_dict(value: object) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _json_list(value: object) -> list[str]:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -1077,6 +1079,65 @@ def test_biomed_api_full_text_and_watch_drift(tmp_path: Path) -> None:
         assert drift_payload["schema_version"] == "biomed-watch-graph-drift-v1"
         assert drift_payload["advisory_only"] is True
         assert drift_payload["status"] == "ok"
+
+
+def test_biomed_artifact_cache_storage_records_mock_retrieval(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        first = client.post(
+            "/api/biomed/literature/search",
+            json={
+                "query": "microglial activation Alzheimer's disease progression",
+                "source": "mock",
+                "max_results": 3,
+                "store": True,
+            },
+        )
+        assert first.status_code == 200
+        second = client.post(
+            "/api/biomed/literature/search",
+            json={
+                "query": "microglial activation Alzheimer's disease progression",
+                "source": "mock",
+                "max_results": 3,
+                "store": True,
+            },
+        )
+        assert second.status_code == 200
+        first_payload = first.json()
+        second_payload = second.json()
+        first_retrieval_id = first_payload["retrieval_manifest"]["retrieval_id"]
+        stored_first = client.get(f"/api/biomed/retrievals/{first_retrieval_id}")
+        assert stored_first.status_code == 200
+        assert second.json()["retrieval_manifest"]["cache_status"] == "hit"
+        assert stored_first.json()["cache_status"] == "write"
+        assert second_payload["retrieval_manifest"]["returned_paper_ids"] == first_payload[
+            "retrieval_manifest"
+        ]["returned_paper_ids"]
+
+        db_path = tmp_path / "biomed_evidence" / "biomed.db"
+        expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                """
+                UPDATE biomed_artifact_cache
+                SET expires_at = ?
+                WHERE artifact_id = ?
+                """,
+                (expired_at, first_retrieval_id),
+            )
+            db.commit()
+
+        third = client.post(
+            "/api/biomed/literature/search",
+            json={
+                "query": "microglial activation Alzheimer's disease progression",
+                "source": "mock",
+                "max_results": 3,
+                "store": True,
+            },
+        )
+        assert third.status_code == 200
+        assert third.json()["retrieval_manifest"]["cache_status"] == "write"
 
 
 def test_biomed_workflow_templates_api(tmp_path: Path) -> None:

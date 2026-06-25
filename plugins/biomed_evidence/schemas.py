@@ -949,6 +949,9 @@ class RetrievalManifest(BaseModel):
     finished_at: str | None = None
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    cache_status: Literal["hit", "miss", "write", "disabled", "error"] | None = None
+    cache_key: str | None = None
+    cache_basis: str | None = None
     software_version: str = "biomed-evidence-v1.2"
 
 
