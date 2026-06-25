@@ -1485,6 +1485,61 @@ class BiomedEvidenceService:
                 detail={"run_id": request.run_id},
                 metadata=metadata,
             )
+        packet_cache_key = _evidence_packet_cache_key(
+            run=run,
+            max_items=request.max_evidence_items,
+            strategy=request.selection_strategy,
+        )
+        cached_entry = self.storage.get_artifact_cache_entry(packet_cache_key)
+        cached_packet = None
+        if cached_entry is not None and not _cache_entry_is_expired(cached_entry):
+            cached_packet_payload = cached_entry["artifact"].get("packet")
+            if (
+                isinstance(cached_packet_payload, dict)
+                and cached_packet_payload.get("packet_id") == str(cached_entry["artifact_id"])
+            ):
+                try:
+                    cached_packet = EvidencePacketSummary.model_validate(cached_packet_payload)
+                except Exception:
+                    cached_packet = None
+        if cached_packet is not None:
+            updated_run = run.model_copy(update={"evidence_packet": cached_packet})
+            self.storage.save_answer_run(updated_run, question=cached_packet.question)
+            result_payload = EvidencePacketBuildResult(
+                run_id=request.run_id,
+                evidence_packet=cached_packet,
+                selection=_select_evidence_for_packet(
+                    run.evidence_summary,
+                    max_items=request.max_evidence_items,
+                    strategy=request.selection_strategy,
+                ),
+                availability="persisted",
+                memory_trace=_run_memory_trace(run),
+                step_telemetry=build_step_telemetry(
+                    self.storage.list_agent_trace_steps(request.run_id),
+                    run_id=request.run_id,
+                    coverage_matrix=cached_packet.coverage_matrix,
+                    stop_reason=cached_packet.stop_reason,
+                ),
+            ).model_dump(mode="json")
+            result_payload["cache"] = {
+                "status": "hit",
+                "cache_key": packet_cache_key,
+                "artifact_id": str(cached_entry["artifact_id"]),
+            }
+            return release_ok(
+                tool_name=tool_name,
+                result=result_payload,
+                ids={
+                    "run_id": request.run_id,
+                    "packet_id": cached_packet.packet_id,
+                },
+                trace={
+                    "memory": result_payload["memory_trace"],
+                    "step_telemetry": result_payload["step_telemetry"],
+                },
+                metadata=metadata,
+            )
         selected = _select_evidence_for_packet(
             run.evidence_summary,
             max_items=request.max_evidence_items,
@@ -1508,11 +1563,7 @@ class BiomedEvidenceService:
         metadata_items = [item for item in metadata_items if item is not None]
         packet = _build_evidence_packet(
             request=AnswerWithEvidenceRequest(
-                question=(
-                    run.query_plan.question
-                    if run.query_plan is not None
-                    else run.answer[:240]
-                ),
+                question=_pilot_question(run) or run.answer[:240],
                 source=cast(Any, run.retrieval_manifest.source),
                 max_papers=len(metadata_items) or len(run.retrieval_manifest.returned_paper_ids),
             ),
@@ -1522,8 +1573,31 @@ class BiomedEvidenceService:
             metadata=cast(list[PaperMetadata], metadata_items),
             evidence=selected_evidence,
         )
+        packet = packet.model_copy(
+            update={
+                "packet_id": _evidence_packet_variant_id(
+                    base_packet_id=packet.packet_id,
+                    evidence_ids=selected.selected_evidence_ids,
+                    max_items=request.max_evidence_items,
+                    strategy=request.selection_strategy,
+                )
+            }
+        )
         updated_run = run.model_copy(update={"evidence_packet": packet})
         self.storage.save_answer_run(updated_run, question=packet.question)
+        self.storage.upsert_artifact_cache_entry(
+            cache_key=packet_cache_key,
+            cache_kind="evidence_packet",
+            source=run.retrieval_manifest.source,
+            artifact_id=packet.packet_id,
+            artifact={
+                "run_id": run.run_id,
+                "retrieval_id": run.retrieval_id,
+                "packet": packet.model_dump(mode="json"),
+                "paper_ids": list(packet.paper_ids),
+                "evidence_ids": [item.evidence_id for item in selected_evidence],
+            },
+        )
         trace = [
             _tool_trace_step(
                 run_id=request.run_id,
@@ -1551,9 +1625,15 @@ class BiomedEvidenceService:
             memory_trace=_run_memory_trace(run),
             step_telemetry=step_telemetry,
         )
+        result_payload = result.model_dump(mode="json")
+        result_payload["cache"] = {
+            "status": "write",
+            "cache_key": packet_cache_key,
+            "artifact_id": packet.packet_id,
+        }
         return release_ok(
             tool_name=tool_name,
-            result=result.model_dump(mode="json"),
+            result=result_payload,
             ids={"run_id": request.run_id, "packet_id": packet.packet_id},
             trace={
                 "trace": [item.model_dump(mode="json") for item in trace],
@@ -1973,12 +2053,47 @@ class BiomedEvidenceService:
                 ok=False,
                 errors=[f"unknown paper_id: {request.paper_id}"],
             )
+        normalized = _normalize_full_text_content(
+            request.content,
+            content_type=request.content_type,
+        )
+        source_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        document_id = _full_text_document_id(
+            paper_id=request.paper_id,
+            source=request.source,
+            source_hash=source_hash,
+        )
+        cache_key = _full_text_cache_key(
+            paper_id=request.paper_id,
+            source=request.source,
+            document_id=document_id,
+            source_locator=request.source_filename,
+            source_hash=source_hash,
+        )
         existing = self.storage.get_full_text_document(
             request.paper_id,
             source=request.source,
         )
         if existing is not None and not request.overwrite:
             document, sections = existing
+            if normalized.strip() and document.document_id == document_id:
+                self.storage.upsert_artifact_cache_entry(
+                    cache_key=cache_key,
+                    cache_kind="full_text",
+                    source=request.source,
+                    artifact_id=document.document_id,
+                    source_hash=source_hash,
+                    artifact={
+                        "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+                        "paper_id": request.paper_id,
+                        "source_locator": request.source_filename or "",
+                        "document_id": document.document_id,
+                        "source_hash": source_hash,
+                        "section_count": document.section_count,
+                        "parser_version": document.parser_version or "1",
+                        **({"parser": document.parser} if document.parser else {}),
+                    },
+                )
             return FullTextIngestionResult(
                 ok=True,
                 document=document,
@@ -1987,22 +2102,12 @@ class BiomedEvidenceService:
                     "Existing full-text document returned; set overwrite=true to replace it."
                 ],
             )
-        normalized = _normalize_full_text_content(
-            request.content,
-            content_type=request.content_type,
-        )
         if not normalized.strip():
             return FullTextIngestionResult(
                 ok=False,
                 errors=["full-text content is empty after normalization"],
             )
         now = _now_iso()
-        source_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        document_id = _full_text_document_id(
-            paper_id=request.paper_id,
-            source=request.source,
-            source_hash=source_hash,
-        )
         sections = _full_text_sections(
             document_id=document_id,
             paper_id=request.paper_id,
@@ -2023,6 +2128,23 @@ class BiomedEvidenceService:
             updated_at=now,
         )
         self.storage.upsert_full_text_document(document, sections)
+        self.storage.upsert_artifact_cache_entry(
+            cache_key=cache_key,
+            cache_kind="full_text",
+            source=request.source,
+            artifact_id=document.document_id,
+            source_hash=source_hash,
+            artifact={
+                "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+                "paper_id": request.paper_id,
+                "source_locator": request.source_filename or "",
+                "document_id": document.document_id,
+                "source_hash": source_hash,
+                "section_count": len(sections),
+                "parser_version": document.parser_version or "1",
+                **({"parser": document.parser} if document.parser else {}),
+            },
+        )
         return FullTextIngestionResult(ok=True, document=document, sections=sections)
 
     def get_full_text_document(
@@ -6111,6 +6233,28 @@ def _evidence_packet_id(question: str, retrieval_id: str) -> str:
     return f"packet-{digest}"
 
 
+def _evidence_packet_variant_id(
+    *,
+    base_packet_id: str,
+    evidence_ids: list[str],
+    max_items: int,
+    strategy: str,
+) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "base_packet_id": base_packet_id,
+                "evidence_ids": sorted(evidence_ids),
+                "max_items": max_items,
+                "strategy": strategy,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"packet-{digest}"
+
+
 def _llm_extraction_payload(
     *,
     paper: BiomedicalPaper,
@@ -7008,6 +7152,7 @@ def _retrieval_id(request: SearchBiomedicalLiteratureRequest, started_at: str) -
 
 
 ARTIFACT_CACHE_SCHEMA_VERSION = "biomed-artifact-cache-v1"
+EVIDENCE_PACKET_CACHE_SCHEMA_VERSION = "biomed-evidence-packet-v1"
 
 
 def _artifact_cache_key(kind: str, payload: dict[str, object]) -> str:
@@ -7031,6 +7176,80 @@ def _literature_cache_key(
             "filters": normalized_filters,
             "max_results": max(0, min(request.max_results, 50)),
             "store": bool(request.store),
+        },
+    )
+
+
+def _full_text_cache_key(
+    *,
+    paper_id: str,
+    source: str,
+    document_id: str,
+    source_locator: str | None,
+    source_hash: str,
+    parser_version: str = "1",
+) -> str:
+    return _artifact_cache_key(
+        "full_text",
+        {
+            "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+            "paper_id": paper_id,
+            "source": source,
+            "document_id": document_id,
+            "source_locator": _normalize_cache_text(source_locator or ""),
+            "source_hash": source_hash,
+            "parser_version": parser_version,
+        },
+    )
+
+
+def _evidence_packet_cache_key(
+    *, run: AnswerWithEvidenceResult, max_items: int, strategy: str
+) -> str:
+    evidence_ids = sorted(item.evidence_id for item in run.evidence_summary)
+    question = _normalize_cache_text(_pilot_question(run))
+    source = _pilot_source(run)
+    retrieval_manifest_ids = (
+        list(run.evidence_packet.retrieval_manifest_ids)
+        if run.evidence_packet is not None and run.evidence_packet.retrieval_manifest_ids
+        else _merge_unique(
+            [run.retrieval_id] if run.retrieval_id else [],
+            (
+                [record.retrieval_id for record in run.retrieval_bundle.records if record.retrieval_id]
+                if run.retrieval_bundle is not None
+                else []
+            ),
+        )
+    )
+    paper_ids = (
+        run.retrieval_bundle.deduped_paper_ids
+        if run.retrieval_bundle is not None
+        else run.retrieval_manifest.returned_paper_ids
+        if run.retrieval_manifest is not None
+        else []
+    )
+    source_hashes = sorted(
+        {
+            item.source_hash.strip()
+            for item in run.evidence_summary
+            if item.source_hash and item.source_hash.strip()
+        }
+    )
+    return _artifact_cache_key(
+        "evidence_packet",
+        {
+            "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+            "run_id": run.run_id,
+            "question": question,
+            "source": source,
+            "retrieval_id": run.retrieval_id,
+            "retrieval_manifest_ids": sorted(retrieval_manifest_ids),
+            "packet_schema": EVIDENCE_PACKET_CACHE_SCHEMA_VERSION,
+            "paper_ids": sorted(paper_ids),
+            "evidence_ids": evidence_ids,
+            "source_hashes": source_hashes or evidence_ids,
+            "max_items": max_items,
+            "strategy": strategy,
         },
     )
 

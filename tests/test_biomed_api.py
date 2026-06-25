@@ -1146,6 +1146,122 @@ def test_biomed_api_full_text_and_watch_drift(tmp_path: Path) -> None:
         assert drift_payload["status"] == "ok"
 
 
+def test_biomed_artifact_cache_full_text_and_packet_metadata(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        answer = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+                "max_papers": 4,
+            },
+        )
+        assert answer.status_code == 200
+        run_id = answer.json()["answer_result"]["run_id"]
+
+        four_item_packet = client.post(
+            "/api/biomed/evidence/packet",
+            json={"run_id": run_id, "max_evidence_items": 4},
+        )
+        assert four_item_packet.status_code == 200
+        four_item_payload = four_item_packet.json()["result"]["evidence_packet"]
+        four_item_packet_id = four_item_payload["packet_id"]
+        four_item_count = len(four_item_payload["evidence_ids"])
+
+        one_item_packet = client.post(
+            "/api/biomed/evidence/packet",
+            json={"run_id": run_id, "max_evidence_items": 1},
+        )
+        assert one_item_packet.status_code == 200
+        one_item_payload = one_item_packet.json()["result"]["evidence_packet"]
+        one_item_packet_id = one_item_payload["packet_id"]
+        assert one_item_packet_id != four_item_packet_id
+        assert len(one_item_payload["evidence_ids"]) <= 1
+
+        cached_four_item_packet = client.post(
+            "/api/biomed/evidence/packet",
+            json={"run_id": run_id, "max_evidence_items": 4},
+        )
+        assert cached_four_item_packet.status_code == 200
+        cached_four_item_payload = cached_four_item_packet.json()["result"]
+        assert cached_four_item_payload["cache"]["status"] == "hit"
+        assert cached_four_item_payload["evidence_packet"]["packet_id"] == four_item_packet_id
+        assert len(cached_four_item_payload["evidence_packet"]["evidence_ids"]) == four_item_count
+        persisted_packet = client.get(f"/api/biomed/answer-runs/{run_id}/evidence-packet")
+        assert persisted_packet.status_code == 200
+        persisted_packet_payload = persisted_packet.json()["result"]["evidence_packet"]
+        assert (
+            persisted_packet_payload["packet_id"]
+            == cached_four_item_payload["evidence_packet"]["packet_id"]
+        )
+        assert len(persisted_packet_payload["evidence_ids"]) == four_item_count
+
+        db_path = tmp_path / "biomed_evidence" / "biomed.db"
+        expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                """
+                UPDATE biomed_artifact_cache
+                SET expires_at = ?
+                WHERE cache_kind = ? AND artifact_id = ?
+                """,
+                (expired_at, "evidence_packet", four_item_packet_id),
+            )
+            db.commit()
+
+        refreshed_four_item_packet = client.post(
+            "/api/biomed/evidence/packet",
+            json={"run_id": run_id, "max_evidence_items": 4},
+        )
+        assert refreshed_four_item_packet.status_code == 200
+        refreshed_four_item_payload = refreshed_four_item_packet.json()["result"]
+        assert refreshed_four_item_payload["cache"]["status"] == "write"
+        assert refreshed_four_item_payload["evidence_packet"]["packet_id"]
+        assert len(refreshed_four_item_payload["evidence_packet"]["evidence_ids"]) == four_item_count
+
+        paper_id = answer.json()["answer_result"]["retrieval_manifest"]["returned_paper_ids"][0]
+        full_text = client.post(
+            f"/api/biomed/papers/{paper_id}/full-text",
+            json={
+                "source": "mock",
+                "content": "Introduction\nMicroglial activation is measured.\nResults\nDisease progression is associated.",
+                "content_type": "text/plain",
+                "source_filename": "cache-test.txt",
+            },
+        )
+        assert full_text.status_code == 200
+        second_full_text = client.post(
+            f"/api/biomed/papers/{paper_id}/full-text",
+            json={
+                "source": "mock",
+                "content": "Introduction\nMicroglial activation is measured.\nResults\nDisease progression is associated.",
+                "content_type": "text/plain",
+                "source_filename": "cache-test.txt",
+            },
+        )
+        assert second_full_text.status_code == 200
+        assert second_full_text.json()["document"]["document_id"] == full_text.json()[
+            "document"
+        ]["document_id"]
+        with sqlite3.connect(db_path) as db:
+            row = db.execute(
+                """
+                SELECT artifact_json
+                FROM biomed_artifact_cache
+                WHERE cache_kind = ? AND artifact_id = ?
+                """,
+                ("full_text", full_text.json()["document"]["document_id"]),
+            ).fetchone()
+        assert row is not None
+        artifact = json.loads(row[0])
+        document = full_text.json()["document"]
+        assert artifact["source_locator"] == "cache-test.txt"
+        assert artifact["document_id"] == document["document_id"]
+        assert artifact["source_hash"] == document["source_hash"]
+        assert artifact["schema"] == "biomed-artifact-cache-v1"
+        assert artifact["parser_version"] == document.get("parser_version", "1")
+
+
 def test_biomed_artifact_cache_storage_records_mock_retrieval(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         first = client.post(
