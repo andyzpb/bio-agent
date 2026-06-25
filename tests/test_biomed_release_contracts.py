@@ -114,6 +114,16 @@ def test_release_tool_contract_registry_and_source_policy() -> None:
         "external_network",
         "llm_call",
     ]
+    enhance_contract = get_release_tool_metadata("enhance_run_with_full_text")
+    assert enhance_contract.risk_level == "external_network"
+    assert enhance_contract.source_policy == "live_opt_in"
+    assert enhance_contract.side_effects == [
+        "read_storage",
+        "write_storage",
+        "external_network",
+    ]
+    assert enhance_contract.max_runtime_seconds == 90
+    assert enhance_contract.requires_confirmation is False
 
     blocked = release_source_policy_error(
         tool_name="search_literature",

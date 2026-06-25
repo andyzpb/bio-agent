@@ -155,6 +155,7 @@ def _register_defaults() -> None:
 
     for tool_name in (
         "run_multi_pass_literature_search",
+        "enhance_run_with_full_text",
         "extract_evidence_batch",
         "analyze_coverage_gaps",
         "build_evidence_packet",
@@ -169,7 +170,11 @@ def _register_defaults() -> None:
             risk_level=(
                 "external_network"
                 if tool_name
-                in {"run_multi_pass_literature_search", "run_saved_tool_chain_template"}
+                in {
+                    "run_multi_pass_literature_search",
+                    "enhance_run_with_full_text",
+                    "run_saved_tool_chain_template",
+                }
                 else "read_only"
             ),
             source_policy=(
@@ -177,6 +182,7 @@ def _register_defaults() -> None:
                 if tool_name
                 in {
                     "run_multi_pass_literature_search",
+                    "enhance_run_with_full_text",
                     "extract_evidence_batch",
                     "run_saved_tool_chain_template",
                 }
@@ -186,7 +192,8 @@ def _register_defaults() -> None:
                 ["read_storage", "write_storage", "external_network", "llm_call"]
                 if tool_name == "run_saved_tool_chain_template"
                 else ["read_storage", "write_storage", "external_network"]
-                if tool_name == "run_multi_pass_literature_search"
+                if tool_name
+                in {"run_multi_pass_literature_search", "enhance_run_with_full_text"}
                 else ["read_storage"]
             ),
             max_runtime_seconds=90,

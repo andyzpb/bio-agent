@@ -1225,6 +1225,54 @@ class FullTextIngestionResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class FullTextEnhancementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    max_papers: int = 10
+    max_evidence_items: int = 20
+    source: Literal["pubmed", "mock"] | None = None
+    use_open_provider: bool = False
+    overwrite_full_text: bool = False
+
+
+class FullTextEnhancementPaperStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: str
+    source: Literal["pubmed", "mock"]
+    status: Literal[
+        "cached",
+        "stored",
+        "unavailable",
+        "extracted",
+        "failed",
+        "skipped",
+    ]
+    document_id: str | None = None
+    section_count: int = 0
+    evidence_ids: list[str] = Field(default_factory=list)
+    warning: str | None = None
+    error: str | None = None
+
+
+class FullTextEnhancementResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enhancement_id: str
+    run_id: str
+    source: Literal["pubmed", "mock"]
+    processed_paper_ids: list[str] = Field(default_factory=list)
+    unavailable_paper_ids: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    extracted_evidence_ids: list[str] = Field(default_factory=list)
+    packet_id: str | None = None
+    review_available: bool = False
+    paper_statuses: list[FullTextEnhancementPaperStatus] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
 class FetchBiomedicalPaperRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
