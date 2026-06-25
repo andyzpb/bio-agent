@@ -121,6 +121,9 @@ from plugins.biomed_evidence.schemas import (
     ObsidianExportRequest,
     ObsidianExportResult,
     PaperMetadata,
+    PilotReport,
+    PilotReportObservability,
+    PilotReportRoi,
     PlanBiomedicalSearchRequest,
     PlanBiomedicalSearchResult,
     ProjectClaimRecord,
@@ -4731,6 +4734,9 @@ class BiomedEvidenceService:
             "answer_run": result.model_dump(mode="json"),
             "trace": [item.model_dump(mode="json") for item in trace],
             "step_telemetry": step_telemetry.model_dump(mode="json"),
+            "observability": build_run_observability(result, trace).model_dump(
+                mode="json"
+            ),
             "memory": _run_memory_trace(result),
             "revision": (
                 revision.model_dump(mode="json") if revision is not None else None
@@ -4823,10 +4829,53 @@ class BiomedEvidenceService:
         self.storage.save_conflict_audit(result)
         return result
 
+    def build_pilot_report(
+        self,
+        result: AnswerWithEvidenceResult,
+        request: ExportEvidenceReportRequest,
+    ) -> PilotReport:
+        audit = self.storage.get_latest_citation_audit_for_run(result.run_id)
+        revision = self.storage.get_answer_revision(result.run_id)
+        trace = self.storage.list_agent_trace_steps(result.run_id)
+        review = self.get_run_evidence_review(result.run_id)
+        decisions = self.storage.list_run_review_decisions(result.run_id)
+        return PilotReport(
+            run_id=result.run_id,
+            question=_pilot_question(result),
+            source=_pilot_source(result),
+            generated_at=_now_iso(),
+            paper_count=_pilot_paper_count(result),
+            retrieval_id=result.retrieval_id,
+            evidence_packet_id=(
+                result.evidence_packet.packet_id
+                if result.evidence_packet is not None
+                else None
+            ),
+            audit_summary=_pilot_audit_summary(audit, revision),
+            review_summary=_pilot_review_summary(review, decisions),
+            roi=_pilot_roi(
+                manual_baseline_minutes=request.manual_baseline_minutes,
+                reviewer_minutes=request.reviewer_minutes,
+            ),
+            observability=build_run_observability(result, trace),
+            artifact_links=_pilot_artifact_links(result.run_id),
+            policy=_pilot_report_policy(review),
+            limitations=list(result.limitations),
+        )
+
     async def export_report(self, request: ExportEvidenceReportRequest) -> str:
         result: AnswerWithEvidenceResult | None = None
         if request.run_id:
             result = self.storage.get_answer_run(request.run_id)
+        if request.report_type == "pilot":
+            if not request.run_id:
+                raise ValueError("Pilot Report export requires an existing run_id.")
+            if result is None:
+                raise ValueError("No answer run was found for Pilot Report export.")
+            report = self.build_pilot_report(result, request)
+            if request.format == "json":
+                return report.model_dump_json(indent=2)
+            return _render_pilot_markdown_report(report)
         if result is None and request.question:
             result = await self.answer_with_evidence(
                 AnswerWithEvidenceRequest(question=request.question, source="mock")
@@ -7768,6 +7817,15 @@ def _build_trace_steps(
             "refute_query_count": (
                 len(result.query_plan.refute_queries) if result.query_plan else 0
             ),
+            "observability": _trace_observability(
+                llm_call_count=(
+                    1
+                    if result.query_plan is not None
+                    and result.query_plan.llm_prompt_hash
+                    else 0
+                ),
+                prompt_tokens=_text_token_estimate(request.question),
+            ),
         },
     )
     add(
@@ -7815,8 +7873,16 @@ def _build_trace_steps(
                 else None
             ),
             "project_context_trace": result.project_context_trace,
+            "observability": _trace_observability(
+                source_call_count=_pilot_source_call_count(result),
+            ),
         },
     )
+    extractor_prompt_hashes = {
+        item.extractor_prompt_hash
+        for item in result.evidence_summary
+        if item.extractor_prompt_hash
+    }
     add(
         "extract",
         "skipped" if clinical_boundary else "completed",
@@ -7835,6 +7901,12 @@ def _build_trace_steps(
                 if result.evidence_packet is not None
                 else 0
             ),
+            "observability": _trace_observability(
+                llm_call_count=len(extractor_prompt_hashes),
+                prompt_tokens=_text_token_estimate(
+                    *(item.evidence_span or item.finding for item in result.evidence_summary)
+                ),
+            ),
         },
     )
     add(
@@ -7847,8 +7919,15 @@ def _build_trace_steps(
             "synthesis_model": result.synthesis_model,
             "synthesis_prompt_hash": result.synthesis_prompt_hash,
             "synthesis_fallback_reason": result.synthesis_fallback_reason,
+            "observability": _trace_observability(
+                llm_call_count=1 if result.synthesis_prompt_hash else 0,
+                prompt_tokens=_text_token_estimate(
+                    *(item.finding for item in result.evidence_summary)
+                ),
+            ),
         },
     )
+    logic_trace = _logic_audit_trace(audit)
     add(
         "audit",
         "completed",
@@ -7860,7 +7939,11 @@ def _build_trace_steps(
             "unsupported_claim_rate": audit.unsupported_claim_rate,
             "overclaim_rate": audit.overclaim_rate,
             "recommended_action": audit.recommended_action,
-            "logic_audit": _logic_audit_trace(audit),
+            "logic_audit": logic_trace,
+            "observability": _trace_observability(
+                llm_call_count=1 if logic_trace["parser_prompt_hashes"] else 0,
+                prompt_tokens=_text_token_estimate(revision.draft_answer),
+            ),
         },
     )
     add(
@@ -7907,6 +7990,15 @@ def _build_trace_steps(
                 if advisory_verifier is not None
                 else None
             ),
+            "observability": _trace_observability(
+                llm_call_count=(
+                    1
+                    if advisory_verifier is not None
+                    and advisory_verifier.verifier_mode == "llm"
+                    else 0
+                ),
+                prompt_tokens=_text_token_estimate(revision.draft_answer),
+            ),
         },
     )
     add(
@@ -7920,6 +8012,10 @@ def _build_trace_steps(
             "changed_claims": revision.changed_claims,
             "removed_claims": revision.removed_claims,
             "softened_claims": revision.softened_claims,
+            "observability": _trace_observability(
+                llm_call_count=1 if revision.revision_mode == "llm" else 0,
+                prompt_tokens=_text_token_estimate(revision.draft_answer),
+            ),
         },
     )
     add(
@@ -7937,6 +8033,28 @@ def _build_trace_steps(
         metadata={"final_answer_chars": len(revision.final_answer)},
     )
     return steps
+
+
+def _trace_observability(
+    *,
+    llm_call_count: int | None = None,
+    source_call_count: int | None = None,
+    prompt_tokens: int | None = None,
+) -> dict[str, int]:
+    return {
+        key: value
+        for key, value in {
+            "llm_call_count": llm_call_count,
+            "source_call_count": source_call_count,
+            "prompt_tokens": prompt_tokens,
+        }.items()
+        if value is not None
+    }
+
+
+def _text_token_estimate(*values: object) -> int | None:
+    text = "\n".join(str(item) for item in values if item)
+    return max(1, (len(text) + 3) // 4) if text.strip() else None
 
 
 def _logic_audit_trace(audit: CitationAuditResult) -> dict[str, object]:
@@ -8342,6 +8460,97 @@ def default_workflow_templates() -> list[SavedToolChainTemplate]:
             created_at=now,
             updated_at=now,
         ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-literature-audit",
+            name="Literature Audit",
+            description="Repeatable mock-source literature audit for team review.",
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=8,
+            max_queries=4,
+            max_followups=1,
+            execute_support_refute=True,
+            use_llm_claim_logic=True,
+            export_logic_facts=True,
+            export_provenance=True,
+            required_skills=["biomed-evidence-review", "biomed-pilot-report"],
+            stop_conditions=["clinical_boundary", "budget_exceeded", "empty_evidence"],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-weekly-watch-review",
+            name="Weekly Watch Review",
+            description="Deterministic watch-review workflow for recurring paper triage.",
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=6,
+            max_queries=3,
+            max_followups=1,
+            execute_support_refute=True,
+            export_provenance=True,
+            required_skills=["biomed-watch", "biomed-evidence-review"],
+            stop_conditions=["clinical_boundary", "empty_evidence"],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-reviewer-handoff",
+            name="Reviewer Handoff",
+            description="Small audited run intended for Run Evidence Review and Pilot Report handoff.",
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=5,
+            max_queries=3,
+            max_followups=0,
+            execute_support_refute=True,
+            use_llm_claim_logic=True,
+            export_logic_facts=True,
+            export_provenance=True,
+            required_skills=["biomed-evidence-review", "biomed-pilot-report"],
+            stop_conditions=["clinical_boundary", "empty_evidence"],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-evidence-packet-export",
+            name="Evidence Packet Export",
+            description="Packet-first workflow for reproducible evidence-review exports.",
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=5,
+            max_queries=3,
+            max_followups=0,
+            execute_support_refute=False,
+            export_provenance=True,
+            required_skills=["biomed-evidence-packet", "biomed-evidence-review"],
+            stop_conditions=["clinical_boundary", "empty_evidence"],
+            created_at=now,
+            updated_at=now,
+        ),
+        SavedToolChainTemplate(
+            template_id="biomed-template-conflicting-evidence-check",
+            name="Conflicting Evidence Check",
+            description="Support/refute workflow for finding conflicting biomedical evidence.",
+            builtin=True,
+            source="mock",
+            source_policy="mock_only",
+            max_papers=8,
+            max_queries=5,
+            max_followups=1,
+            execute_support_refute=True,
+            use_llm_claim_logic=True,
+            export_logic_facts=True,
+            export_provenance=True,
+            required_skills=["biomed-conflict-audit", "biomed-evidence-review"],
+            stop_conditions=["clinical_boundary", "budget_exceeded", "empty_evidence"],
+            created_at=now,
+            updated_at=now,
+        ),
     ]
 
 
@@ -8463,6 +8672,375 @@ def _render_markdown_report(result: AnswerWithEvidenceResult) -> str:
         lines.append(f"- {limitation}")
     lines.extend(["", "## Disclaimer", "", result.disclaimer])
     return "\n".join(lines)
+
+
+def _render_pilot_markdown_report(report: PilotReport) -> str:
+    lines = [
+        "# Biomedical Evidence Pilot Report",
+        "",
+        "## Run",
+        "",
+        f"- Run ID: `{report.run_id}`",
+        f"- Generated at: `{report.generated_at}`",
+        f"- Question: {report.question or 'Unavailable'}",
+        f"- Source: `{report.source}`",
+        f"- Papers reviewed: `{report.paper_count}`",
+        f"- Retrieval ID: `{report.retrieval_id or 'unavailable'}`",
+        "",
+        "## ROI",
+        "",
+        f"- Manual baseline minutes: `{_pilot_value(report.roi.manual_baseline_minutes)}`",
+        f"- Reviewer minutes: `{_pilot_value(report.roi.reviewer_minutes)}`",
+        f"- Time saved minutes: `{_pilot_value(report.roi.time_saved_minutes)}`",
+        f"- Basis: {report.roi.roi_basis}",
+        "",
+        "## Evidence Packet",
+        "",
+        f"- Evidence packet ID: `{report.evidence_packet_id or 'unavailable'}`",
+        f"- Evidence packet link: {report.artifact_links.get('evidence_packet', 'unavailable')}",
+        "",
+        "## Audit",
+        "",
+    ]
+    if report.audit_summary.get("available"):
+        lines.extend(
+            [
+                f"- Audit ID: `{report.audit_summary.get('audit_id')}`",
+                f"- Claim support rate: `{report.audit_summary.get('claim_support_rate')}`",
+                f"- Citation precision: `{report.audit_summary.get('citation_precision')}`",
+                f"- Unsupported claim rate: `{report.audit_summary.get('unsupported_claim_rate')}`",
+                f"- Overclaim rate: `{report.audit_summary.get('overclaim_rate')}`",
+                f"- Recommended action: `{report.audit_summary.get('recommended_action')}`",
+            ]
+        )
+    else:
+        lines.append("- Citation audit unavailable.")
+    lines.extend(
+        [
+            "",
+            "## Run Evidence Review",
+            "",
+            f"- Available: `{report.review_summary.get('available')}`",
+            f"- Total claims: `{report.review_summary.get('total_claims', 0)}`",
+            f"- Reviewer decisions: `{report.review_summary.get('latest_decision_count', 0)}`",
+            f"- Validation OK: `{report.review_summary.get('validation_ok')}`",
+            "",
+            "## Observability",
+            "",
+            f"- Prompt tokens: `{_pilot_value(report.observability.prompt_tokens)}`",
+            f"- Cache hit tokens: `{_pilot_value(report.observability.cache_hit_tokens)}`",
+            f"- Cache hit rate: `{_pilot_value(report.observability.cache_hit_rate)}`",
+            f"- LLM calls: `{_pilot_value(report.observability.llm_call_count)}`",
+            f"- Source calls: `{_pilot_value(report.observability.source_call_count)}`",
+            f"- Estimated cost USD: `{_pilot_value(report.observability.estimated_cost_usd)}`",
+            f"- Latency seconds: `{_pilot_value(report.observability.latency_seconds)}`",
+            f"- Basis: {report.observability.basis}",
+            "",
+            "## Artifact Links",
+            "",
+        ]
+    )
+    for label, href in sorted(report.artifact_links.items()):
+        lines.append(f"- {label}: {href}")
+    lines.extend(["", "## Policy", ""])
+    for key, value in sorted(report.policy.items()):
+        lines.append(f"- {key}: `{value}`")
+    lines.extend(
+        [
+            "",
+            "Pilot Report is not a new evidence source. It is a team-review handoff "
+            "artifact over retrieved papers, evidence spans, manifests, audits, "
+            "evidence packets, and reviewer decisions.",
+            "",
+            "## Limitations",
+            "",
+        ]
+    )
+    if report.limitations:
+        for limitation in report.limitations:
+            lines.append(f"- {limitation}")
+    else:
+        lines.append("- No run limitations were recorded.")
+    return "\n".join(lines)
+
+
+def _pilot_question(result: AnswerWithEvidenceResult) -> str:
+    candidates = (
+        result.evidence_packet.question if result.evidence_packet is not None else "",
+        result.query_plan.question if result.query_plan is not None else "",
+        (
+            result.question_classification.question
+            if result.question_classification is not None
+            else ""
+        ),
+        result.retrieval_manifest.original_query
+        if result.retrieval_manifest is not None
+        else "",
+    )
+    return next((item.strip() for item in candidates if item and item.strip()), "")
+
+
+def _pilot_source(result: AnswerWithEvidenceResult) -> Literal["pubmed", "mock"]:
+    source = "mock"
+    if result.evidence_packet is not None:
+        source = result.evidence_packet.source
+    elif result.retrieval_manifest is not None:
+        source = result.retrieval_manifest.source
+    elif result.retrieval_bundle is not None:
+        source = result.retrieval_bundle.source
+    if source not in {"pubmed", "mock"}:
+        source = "mock"
+    return cast(Literal["pubmed", "mock"], source)
+
+
+def _pilot_paper_count(result: AnswerWithEvidenceResult) -> int:
+    paper_ids: set[str] = set()
+    if result.evidence_packet is not None:
+        paper_ids.update(item for item in result.evidence_packet.paper_ids if item)
+    if result.retrieval_bundle is not None:
+        paper_ids.update(item for item in result.retrieval_bundle.deduped_paper_ids if item)
+    if result.retrieval_manifest is not None:
+        paper_ids.update(item for item in result.retrieval_manifest.returned_paper_ids if item)
+    paper_ids.update(item.paper_id for item in result.evidence_summary if item.paper_id)
+    paper_ids.update(item.paper_id for item in result.conflicting_evidence if item.paper_id)
+    paper_ids.update(item.paper_id for item in result.citations if item.paper_id)
+    return len(paper_ids)
+
+
+def _pilot_audit_summary(
+    audit: CitationAuditResult | None,
+    revision: AnswerRevision | None,
+) -> dict[str, Any]:
+    if audit is None:
+        return {
+            "available": False,
+            "revision": {
+                "available": revision is not None,
+                "revision_action": revision.revision_action if revision is not None else None,
+            },
+        }
+    return {
+        "available": True,
+        "audit_id": audit.audit_id,
+        "retrieval_id": audit.retrieval_id,
+        "claim_count": len(audit.claim_audits),
+        "failed_claim_count": len(audit.failed_claims),
+        "claim_support_rate": audit.claim_support_rate,
+        "citation_precision": audit.citation_precision,
+        "unsupported_claim_rate": audit.unsupported_claim_rate,
+        "overclaim_rate": audit.overclaim_rate,
+        "conflict_awareness": audit.conflict_awareness,
+        "uncertainty_calibrated": audit.uncertainty_calibrated,
+        "recommended_action": audit.recommended_action,
+        "created_at": audit.created_at,
+        "warning_count": len(audit.warnings),
+        "error_count": len(audit.errors),
+        "revision": {
+            "available": revision is not None,
+            "revision_id": revision.revision_id if revision is not None else None,
+            "revision_action": revision.revision_action if revision is not None else None,
+            "post_revision_audit_id": (
+                revision.post_revision_audit_id if revision is not None else None
+            ),
+        },
+    }
+
+
+def _pilot_review_summary(
+    review: RunEvidenceReview | None,
+    decisions: list[RunReviewDecision],
+) -> dict[str, Any]:
+    latest_decisions = list(_latest_review_decisions_by_claim(decisions).values())
+    latest_decisions.sort(key=lambda item: item.claim_id)
+    if review is None:
+        return {
+            "available": False,
+            "latest_decision_count": len(latest_decisions),
+            "latest_decisions": [
+                item.model_dump(mode="json") for item in latest_decisions
+            ],
+        }
+    summary = review.summary.model_dump(mode="json")
+    summary.update(
+        {
+            "available": True,
+            "schema_version": review.schema_version,
+            "snapshot_id": review.snapshot.snapshot_id,
+            "snapshot_status": review.snapshot.status,
+            "audit_id": review.audit_id,
+            "claim_count": len(review.claims),
+            "latest_decision_count": len(latest_decisions),
+            "latest_decisions": [
+                item.model_dump(mode="json") for item in latest_decisions
+            ],
+            "warnings": list(review.warnings),
+        }
+    )
+    return summary
+
+
+def _pilot_roi(
+    *,
+    manual_baseline_minutes: float | None,
+    reviewer_minutes: float | None,
+) -> PilotReportRoi:
+    time_saved = None
+    basis = "manual/reviewer minutes incomplete"
+    if manual_baseline_minutes is not None and reviewer_minutes is not None:
+        time_saved = round(manual_baseline_minutes - reviewer_minutes, 4)
+        basis = "manual_baseline_minutes - reviewer_minutes"
+    return PilotReportRoi(
+        manual_baseline_minutes=manual_baseline_minutes,
+        reviewer_minutes=reviewer_minutes,
+        time_saved_minutes=time_saved,
+        roi_basis=basis,
+    )
+
+
+def build_run_observability(
+    result: AnswerWithEvidenceResult,
+    trace: list[AgentTraceStep],
+) -> PilotReportObservability:
+    values = {
+        "prompt_tokens": _run_prompt_token_estimate(trace),
+        "cache_hit_tokens": None,
+        "cache_hit_rate": None,
+        "llm_call_count": _run_llm_call_count(trace),
+        "source_call_count": _run_source_call_count(result, trace),
+        "estimated_cost_usd": None,
+        "latency_seconds": _pilot_trace_latency_seconds(trace),
+    }
+    available = [key for key, value in values.items() if value is not None]
+    unavailable = [key for key, value in values.items() if value is None]
+    return PilotReportObservability(
+        **values,
+        available_fields=available,
+        unavailable_fields=unavailable,
+        basis=(
+            "Derived from persisted run artifacts. Prompt tokens are estimated "
+            "from trace text; cache and cost fields remain null until real "
+            "cache/billing telemetry lands."
+        ),
+    )
+
+
+def _run_prompt_token_estimate(trace: list[AgentTraceStep]) -> int | None:
+    explicit = _sum_observability_int(trace, "prompt_tokens")
+    if explicit is not None:
+        return explicit
+    text = "\n".join(
+        item
+        for step in trace
+        for item in (step.input_summary, step.output_summary)
+        if item
+    )
+    if not text.strip():
+        return None
+    return max(1, (len(text) + 3) // 4)
+
+
+def _run_llm_call_count(trace: list[AgentTraceStep]) -> int:
+    return _sum_observability_int(trace, "llm_call_count") or 0
+
+
+def _run_source_call_count(
+    result: AnswerWithEvidenceResult,
+    trace: list[AgentTraceStep],
+) -> int | None:
+    return _sum_observability_int(trace, "source_call_count") or _pilot_source_call_count(
+        result
+    )
+
+
+def _sum_observability_int(
+    trace: list[AgentTraceStep],
+    key: str,
+) -> int | None:
+    total = 0
+    found = False
+    for step in trace:
+        observability = step.metadata.get("observability")
+        if isinstance(observability, dict):
+            value = observability.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                total += value
+                found = True
+    return total if found else None
+
+
+def _pilot_source_call_count(result: AnswerWithEvidenceResult) -> int | None:
+    if result.retrieval_bundle is not None:
+        count = len(
+            [
+                item
+                for item in result.retrieval_bundle.records
+                if item.retrieval_id or item.manifest is not None
+            ]
+        )
+        return count if count > 0 else None
+    if result.retrieval_manifest is not None or result.retrieval_id:
+        return 1
+    return None
+
+
+def _pilot_trace_latency_seconds(trace: list[AgentTraceStep]) -> float | None:
+    parsed = [_parse_iso_datetime(item.created_at) for item in trace if item.created_at]
+    parsed = [item for item in parsed if item is not None]
+    if len(parsed) < 2:
+        return None
+    return round(max(0.0, (max(parsed) - min(parsed)).total_seconds()), 4)
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _pilot_artifact_links(run_id: str) -> dict[str, str]:
+    links = dict(_review_links(run_id))
+    links.update(
+        {
+            "evidence_packet": f"/api/biomed/answer-runs/{run_id}/evidence-packet",
+            "pilot_report_markdown": (
+                f"/api/biomed/export?run_id={run_id}&report_type=pilot&format=markdown"
+            ),
+            "pilot_report_json": (
+                f"/api/biomed/export?run_id={run_id}&report_type=pilot&format=json"
+            ),
+        }
+    )
+    return links
+
+
+def _pilot_report_policy(review: RunEvidenceReview | None) -> dict[str, Any]:
+    return {
+        "research_only": True,
+        "pilot_report_is_evidence_source": False,
+        "pilot_report_role": "team_review_handoff",
+        "memory_as_evidence": False,
+        "reviewer_notes_are_evidence": False,
+        "model_output_as_evidence": False,
+        "supports_biomedical_claims_from": [
+            "retrieved_papers",
+            "evidence_spans",
+            "retrieval_manifests",
+            "citation_audit",
+            "logic_audit",
+            "evidence_packets",
+        ],
+        "clinical_refusal": review.summary.clinical_refusal if review is not None else False,
+    }
+
+
+def _pilot_value(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return str(value)
 
 
 def _slug(value: str) -> str:

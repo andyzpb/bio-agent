@@ -1790,6 +1790,10 @@ function RunReviewDrawer(props: {
                 <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/evidence-review/packet`} target="_blank" rel="noreferrer">Evidence packet <ExternalLink size={12} aria-hidden="true" /></a>
                 <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/trace`} target="_blank" rel="noreferrer">Trace <ExternalLink size={12} aria-hidden="true" /></a>
                 <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/provenance`} target="_blank" rel="noreferrer">Provenance <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/export?run_id=${encodeURIComponent(props.state.runId)}&report_type=pilot&format=markdown`} target="_blank" rel="noreferrer">Pilot Report <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/export?run_id=${encodeURIComponent(props.state.runId)}&report_type=pilot&format=json`} target="_blank" rel="noreferrer">Pilot JSON <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/argument-graph`} target="_blank" rel="noreferrer">Argument Graph <ExternalLink size={12} aria-hidden="true" /></a>
+                <a href={`/api/biomed/answer-runs/${encodeURIComponent(props.state.runId)}/evidence-graph`} target="_blank" rel="noreferrer">Evidence Graph <ExternalLink size={12} aria-hidden="true" /></a>
               </div>
             </section>
             <div className="review-drawer-actions">
@@ -2359,6 +2363,10 @@ function chatTurnRunArtifacts(turn: ChatTurn): ChatRunArtifacts {
     packet_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/packet`,
     trace_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/trace`,
     provenance_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/provenance`,
+    pilot_report_markdown_url: `/api/biomed/export?run_id=${encodeURIComponent(runId)}&report_type=pilot&format=markdown`,
+    pilot_report_json_url: `/api/biomed/export?run_id=${encodeURIComponent(runId)}&report_type=pilot&format=json`,
+    argument_graph_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/argument-graph`,
+    evidence_graph_url: `/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-graph`,
     ...(metadataArtifacts ?? {}),
   };
 }

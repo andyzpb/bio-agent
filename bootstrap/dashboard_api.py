@@ -414,6 +414,10 @@ def _biomed_artifacts_for_run(run_id: str) -> dict[str, str]:
         "packet_url": f"/api/biomed/answer-runs/{clean}/evidence-review/packet",
         "trace_url": f"/api/biomed/answer-runs/{clean}/trace",
         "provenance_url": f"/api/biomed/answer-runs/{clean}/provenance",
+        "pilot_report_markdown_url": f"/api/biomed/export?run_id={clean}&report_type=pilot&format=markdown",
+        "pilot_report_json_url": f"/api/biomed/export?run_id={clean}&report_type=pilot&format=json",
+        "argument_graph_url": f"/api/biomed/answer-runs/{clean}/argument-graph",
+        "evidence_graph_url": f"/api/biomed/answer-runs/{clean}/evidence-graph",
     }
 
 
@@ -452,11 +456,23 @@ def _json_dict_from_tool_result(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _biomed_run_id_from_mapping(value: dict[str, Any]) -> str:
+    for key in ("run_id",):
+        if run_id := str(value.get(key) or "").strip():
+            return run_id
+    for key in ("ids", "answer_result", "audited_answer"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            if run_id := _biomed_run_id_from_mapping(nested):
+                return run_id
+    return ""
+
+
 def _biomed_artifacts_from_tool_result(tool_name: str, result: Any) -> dict[str, str]:
     parsed = _json_dict_from_tool_result(result)
     if tool_name == "watch_research_topic":
         return _biomed_artifacts_for_watch(str(parsed.get("watch_id") or ""))
-    if run_id := str(parsed.get("run_id") or "").strip():
+    if run_id := _biomed_run_id_from_mapping(parsed):
         return _biomed_artifacts_for_run(run_id)
     return _biomed_artifacts_from_text(str(result))
 
@@ -903,6 +919,12 @@ class DashboardChatMultiplexer:
                 "final_arguments": _sanitize_dashboard_chat_value(
                     dict(event.final_arguments)
                 ),
+                "metadata": {
+                    "artifacts": _biomed_artifacts_from_tool_result(
+                        event.tool_name,
+                        event.result_preview,
+                    )
+                },
             },
         )
 
@@ -1864,7 +1886,9 @@ def _chat_command_manifest(
                     "/biomed audit \"microglial activation Alzheimer disease progression\" --source pubmed --papers 10 --llm all --support-refute",
                     "/biomed literature \"TREM2 microglia Alzheimer\" --source pubmed --papers 10",
                     "/biomed review biomed-run-...",
+                    "/biomed pilot-report biomed-run-... --format markdown",
                     "/biomed export provenance biomed-run-...",
+                    "/biomed template run biomed-template-reviewer-handoff \"TREM2 microglia Alzheimer\" --source mock",
                     "/biomed project create \"Microglia AD\" --question \"What links microglial activation to AD progression?\"",
                     "/biomed watch create \"Microglia AD\" --query \"microglia Alzheimer disease progression\"",
                     "/biomed watch delete watch-...",
@@ -1914,6 +1938,18 @@ def _chat_command_manifest(
                         "label": "Run evidence review",
                         "tool_name": "get_run_evidence_review",
                         "contract": contracts.get("get_run_evidence_review", {}),
+                    },
+                    {
+                        "name": "pilot-report",
+                        "label": "Pilot Report export",
+                        "tool_name": "export_evidence_report",
+                        "contract": contracts.get("export_evidence_report", {}),
+                    },
+                    {
+                        "name": "template run",
+                        "label": "Run workflow template",
+                        "tool_name": "run_saved_tool_chain_template",
+                        "contract": contracts.get("run_saved_tool_chain_template", {}),
                     },
                     {
                         "name": "export provenance",
@@ -2058,6 +2094,17 @@ def _biomed_prompt_for_preview(action: str, args: dict[str, Any]) -> str:
         )
     if action == "review":
         return f"Open and summarize the Run Evidence Review for {args.get('run_id')}."
+    if action == "pilot_report":
+        return (
+            "Export the Biomedical Evidence Pilot Report for "
+            f"{args.get('run_id')} as {args.get('format', 'markdown')}."
+        )
+    if action == "template_run":
+        return (
+            "Run Biomedical Evidence workflow template "
+            f"{args.get('template_id')}. Question: {args.get('question')}. "
+            f"Source override: {args.get('source_override') or 'template default'}."
+        )
     if action == "export_provenance":
         return f"Export or prepare the provenance graph for Biomedical Evidence run {args.get('run_id')}."
     if action == "project_create":
@@ -2091,6 +2138,8 @@ def _deterministic_dashboard_chat_command(content: str) -> str:
     ):
         return f"/biomed watch delete {watch_match.group(0)}"
     run_match = _BIOMED_RUN_ID_RE.search(text)
+    if run_match and re.search(r"\b(pilot|roi|handoff|report)\b", text, re.IGNORECASE):
+        return f"/biomed pilot-report {run_match.group(0)}"
     if run_match and re.search(r"\b(provenance|graph|export)\b", text, re.IGNORECASE):
         return f"/biomed export provenance {run_match.group(0)}"
     if run_match and re.search(r"\b(review|packet|trace|open|inspect)\b", text, re.IGNORECASE):
@@ -2185,7 +2234,9 @@ async def _llm_dashboard_chat_command_or_none(
                         "Allowed command forms: /biomed status; /biomed enable pubmed; /biomed check pubmed; "
                         "/biomed audit \"question\" --source mock|pubmed --papers N [--llm all] [--support-refute]; "
                         "/biomed literature \"query\" --source mock|pubmed --papers N; "
-                        "/biomed review biomed-run-...; /biomed export provenance biomed-run-...; "
+                        "/biomed review biomed-run-...; /biomed pilot-report biomed-run-... [--format json|markdown]; "
+                        "/biomed export provenance biomed-run-...; "
+                        "/biomed template run template-id \"question\" [--source mock|pubmed] [--project project-id]; "
                         "/biomed watch create \"topic\" --query \"query\" [--schedule daily|weekly|manual]; "
                         "/biomed watch delete watch-.... Never invent run IDs or watch IDs."
                     ),
@@ -2268,7 +2319,9 @@ def _biomed_help_markdown(readiness: dict[str, Any]) -> str:
             "| `/biomed audit \"question\" --source pubmed --papers 10 --llm all --support-refute` | Run a live PubMed audit with all configured LLM stages. |",
             "| `/biomed literature \"query\" --source pubmed --papers 10` | Retrieve literature only, without answer synthesis. |",
             "| `/biomed review <run_id>` | Open a saved Run Evidence Review. |",
+            "| `/biomed pilot-report <run_id> --format markdown` | Export the team Pilot Report handoff. |",
             "| `/biomed export provenance <run_id>` | Prepare provenance export when enabled. |",
+            "| `/biomed template run <template_id> \"question\" --source mock` | Run a saved or built-in workflow template. |",
             "| `/biomed project create \"name\" --question \"...\"` | Create a project after confirmation. |",
             "| `/biomed watch create \"topic\" --query \"...\"` | Create a research watch after confirmation. |",
             "| `/biomed watch delete <watch_id>` | Delete a research watch and cancel its framework schedule after confirmation. |",
@@ -2423,6 +2476,30 @@ def _parse_biomed_command(
         normalized_action = "review"
         tool_name = "get_run_evidence_review"
         args = {"run_id": run_id}
+    elif action in {"pilot-report", "pilot_report"}:
+        run_id = action_tokens[1] if len(action_tokens) > 1 else ""
+        report_format = _flag_str(flags, "format", default="markdown") or "markdown"
+        if not run_id:
+            errors.append("Pilot Report requires a run id.")
+        if report_format not in {"markdown", "json"}:
+            errors.append("Pilot Report format must be markdown or json.")
+        normalized_action = "pilot_report"
+        tool_name = "export_evidence_report"
+        args = {
+            "run_id": run_id,
+            "report_type": "pilot",
+            "format": report_format,
+        }
+        for flag_name, arg_name in (
+            ("baseline_minutes", "manual_baseline_minutes"),
+            ("manual_baseline_minutes", "manual_baseline_minutes"),
+            ("reviewer_minutes", "reviewer_minutes"),
+        ):
+            if flag_name in flags:
+                try:
+                    args[arg_name] = float(flags[flag_name])
+                except Exception:
+                    errors.append(f"{flag_name.replace('_', '-')} must be numeric.")
     elif action == "export" and len(action_tokens) > 2 and action_tokens[1].lower() == "provenance":
         run_id = action_tokens[2]
         normalized_action = "export_provenance"
@@ -2434,6 +2511,29 @@ def _parse_biomed_command(
                 "label": "Provenance export disabled",
                 "detail": "Set enable_provenance_export=true before using provenance export from chat.",
             })
+    elif action == "template" and len(action_tokens) > 1 and action_tokens[1].lower() == "run":
+        template_id = action_tokens[2] if len(action_tokens) > 2 else ""
+        question = action_tokens[3] if len(action_tokens) > 3 else ""
+        if not template_id:
+            errors.append("Template run requires a template id.")
+        if not question:
+            errors.append("Template run requires a quoted question.")
+        normalized_action = "template_run"
+        tool_name = "run_saved_tool_chain_template"
+        args = {"template_id": template_id, "question": question}
+        if "source" in flags:
+            args["source_override"] = source
+            missing.extend(_missing_for_source(source, readiness))
+        project_id = _flag_str(flags, "project", "project_id", default="")
+        if project_id:
+            args["project_id"] = project_id
+        if "papers" in flags or "max_papers" in flags:
+            args["max_papers_override"] = _flag_int(
+                flags,
+                "papers",
+                "max_papers",
+                default=readiness["limits"]["max_papers"],
+            )
     elif action == "project" and len(action_tokens) > 2 and action_tokens[1].lower() == "create":
         name = action_tokens[2]
         question = _flag_str(flags, "question", default="")

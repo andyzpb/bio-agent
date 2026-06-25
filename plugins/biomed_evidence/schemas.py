@@ -2095,12 +2095,59 @@ class EvidenceGraph(BaseModel):
     edges: list[GraphEdge] = Field(default_factory=list)
 
 
+class PilotReportRoi(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manual_baseline_minutes: float | None = None
+    reviewer_minutes: float | None = None
+    time_saved_minutes: float | None = None
+    roi_basis: str = "not_provided"
+
+
+class PilotReportObservability(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: int | None = None
+    cache_hit_tokens: int | None = None
+    cache_hit_rate: float | None = None
+    llm_call_count: int | None = None
+    source_call_count: int | None = None
+    estimated_cost_usd: float | None = None
+    latency_seconds: float | None = None
+    available_fields: list[str] = Field(default_factory=list)
+    unavailable_fields: list[str] = Field(default_factory=list)
+    basis: str = "Release 2.1 observability contract; telemetry may be unavailable."
+
+
+class PilotReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = "biomed-pilot-report-v1"
+    run_id: str
+    question: str
+    source: Literal["pubmed", "mock"] = "mock"
+    generated_at: str
+    paper_count: int = 0
+    retrieval_id: str | None = None
+    evidence_packet_id: str | None = None
+    audit_summary: dict[str, Any] = Field(default_factory=dict)
+    review_summary: dict[str, Any] = Field(default_factory=dict)
+    roi: PilotReportRoi
+    observability: PilotReportObservability
+    artifact_links: dict[str, str] = Field(default_factory=dict)
+    policy: dict[str, Any] = Field(default_factory=dict)
+    limitations: list[str] = Field(default_factory=list)
+
+
 class ExportEvidenceReportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str | None = None
     question: str | None = None
     format: Literal["markdown", "json"] = "markdown"
+    report_type: Literal["standard", "pilot"] = "standard"
+    manual_baseline_minutes: float | None = None
+    reviewer_minutes: float | None = None
 
 
 class PageResult(BaseModel):

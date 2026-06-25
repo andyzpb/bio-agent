@@ -412,6 +412,7 @@ interface TracePayload {
   answer_run: AnswerResult;
   trace: AgentTraceStep[];
   step_telemetry?: StepTelemetrySummary | null;
+  observability?: Record<string, unknown> | null;
   memory?: Record<string, unknown>;
   revision?: AnswerRevision | null;
   latest_citation_audit?: CitationAuditResult | null;
@@ -1983,6 +1984,11 @@ function renderTraceResult(payload: TracePayload): string {
   const budgetSnapshots = payload.trace
     .map((step) => step.metadata?.budget)
     .filter((item) => item && typeof item === "object");
+  const observability = payload.observability || {};
+  const obs = (key: string): string => {
+    const value = observability[key];
+    return escapeHtml(value === null || value === undefined ? "-" : String(value));
+  };
   const memory = payload.memory || payload.answer_run.project_context_trace || {};
   return `
     <div class="biomed-provenance">
@@ -1993,6 +1999,17 @@ function renderTraceResult(payload: TracePayload): string {
         <div><span>Audit</span><code>${escapeHtml(audit?.audit_id || "-")}</code></div>
         <div><span>Verifier</span><strong>${escapeHtml(advisory?.verifier_mode || "-")}</strong></div>
         <div><span>Trace</span><strong>${payload.trace.length}</strong></div>
+      </div>
+    </div>
+    <div class="biomed-label">Run Observability</div>
+    <div class="biomed-provenance">
+      <div class="biomed-provenance-grid">
+        <div><span>Prompt tokens</span><strong>${obs("prompt_tokens")}</strong></div>
+        <div><span>LLM calls</span><strong>${obs("llm_call_count")}</strong></div>
+        <div><span>Source calls</span><strong>${obs("source_call_count")}</strong></div>
+        <div><span>Latency seconds</span><strong>${obs("latency_seconds")}</strong></div>
+        <div><span>Cache hit tokens</span><strong>${obs("cache_hit_tokens")}</strong></div>
+        <div><span>Estimated cost USD</span><strong>${obs("estimated_cost_usd")}</strong></div>
       </div>
     </div>
     <div class="biomed-two-col">

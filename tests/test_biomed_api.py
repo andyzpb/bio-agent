@@ -455,6 +455,87 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert "Biomedical Evidence Report" in report.text
         assert "Retrieval Provenance" in report.text
 
+        missing_pilot_run = client.get(
+            "/api/biomed/export",
+            params={"report_type": "pilot", "format": "json"},
+        )
+        assert missing_pilot_run.status_code == 400
+        assert "requires an existing run_id" in missing_pilot_run.json()["detail"]
+
+        unknown_pilot_run = client.get(
+            "/api/biomed/export",
+            params={
+                "run_id": "unknown-run",
+                "report_type": "pilot",
+                "format": "json",
+            },
+        )
+        assert unknown_pilot_run.status_code == 400
+        assert "No answer run was found" in unknown_pilot_run.json()["detail"]
+
+        pilot_json = client.get(
+            "/api/biomed/export",
+            params={
+                "run_id": payload["run_id"],
+                "report_type": "pilot",
+                "format": "json",
+                "manual_baseline_minutes": 120,
+                "reviewer_minutes": 45,
+            },
+        )
+        assert pilot_json.status_code == 200
+        pilot_payload = pilot_json.json()
+        assert pilot_payload["schema_version"] == "biomed-pilot-report-v1"
+        assert pilot_payload["run_id"] == payload["run_id"]
+        assert pilot_payload["retrieval_id"] == payload["retrieval_id"]
+        assert pilot_payload["evidence_packet_id"]
+        assert pilot_payload["audit_summary"]["audit_id"] == audit_payload["audit_id"]
+        assert pilot_payload["review_summary"]["available"] is True
+        assert pilot_payload["review_summary"]["latest_decision_count"] == 1
+        assert pilot_payload["roi"]["time_saved_minutes"] == 75
+        assert (
+            pilot_payload["roi"]["roi_basis"]
+            == "manual_baseline_minutes - reviewer_minutes"
+        )
+        assert pilot_payload["observability"]["cache_hit_tokens"] is None
+        assert pilot_payload["observability"]["estimated_cost_usd"] is None
+        assert pilot_payload["observability"]["source_call_count"] is not None
+        assert pilot_payload["artifact_links"]["review"].endswith(
+            f"/{payload['run_id']}/evidence-review"
+        )
+        assert pilot_payload["artifact_links"]["evidence_packet"].endswith(
+            f"/{payload['run_id']}/evidence-packet"
+        )
+        assert pilot_payload["policy"]["research_only"] is True
+        assert pilot_payload["policy"]["pilot_report_is_evidence_source"] is False
+        assert pilot_payload["policy"]["memory_as_evidence"] is False
+        assert pilot_payload["policy"]["reviewer_notes_are_evidence"] is False
+        assert "evidence_packets" in pilot_payload["policy"][
+            "supports_biomedical_claims_from"
+        ]
+
+        pilot_json_no_roi = client.get(
+            "/api/biomed/export",
+            params={
+                "run_id": payload["run_id"],
+                "report_type": "pilot",
+                "format": "json",
+                "manual_baseline_minutes": 120,
+            },
+        )
+        assert pilot_json_no_roi.status_code == 200
+        assert pilot_json_no_roi.json()["roi"]["time_saved_minutes"] is None
+
+        pilot_markdown = client.get(
+            "/api/biomed/export",
+            params={"run_id": payload["run_id"], "report_type": "pilot"},
+        )
+        assert pilot_markdown.status_code == 200
+        assert "Biomedical Evidence Pilot Report" in pilot_markdown.text
+        assert "## ROI" in pilot_markdown.text
+        assert "Run Evidence Review" in pilot_markdown.text
+        assert "not a new evidence source" in pilot_markdown.text
+
         audited = client.post(
             "/api/biomed/answer/audited",
             json={
@@ -491,6 +572,12 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert trace_payload["revision"]["revision_id"] == audited_payload["revision"]["revision_id"]
         assert trace_payload["latest_advisory_verifier"]["verifier_mode"] == "fallback"
         assert trace_payload["step_telemetry"]["advisory_only"] is True
+        assert trace_payload["observability"]["prompt_tokens"] > 0
+        assert trace_payload["observability"]["llm_call_count"] == 0
+        assert trace_payload["observability"]["source_call_count"] is not None
+        assert trace_payload["observability"]["latency_seconds"] is not None
+        assert trace_payload["observability"]["cache_hit_tokens"] is None
+        assert trace_payload["observability"]["estimated_cost_usd"] is None
         assert trace_payload["memory"]["memory_as_evidence"] is False
         assert {step["step"] for step in trace_payload["trace"]} == {
             "classify",
@@ -509,6 +596,22 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert retrieve_step["metadata"]["retrieval_bundle"]["executed_multi_query"] is True
         assert retrieve_step["metadata"]["retrieval_bundle"]["coverage_matrix"]
         assert retrieve_step["metadata"]["evidence_packet"]["coverage_matrix"]
+        assert retrieve_step["metadata"]["observability"]["source_call_count"] is not None
+
+        audited_pilot = client.get(
+            "/api/biomed/export",
+            params={
+                "run_id": audited_run_id,
+                "report_type": "pilot",
+                "format": "json",
+            },
+        )
+        assert audited_pilot.status_code == 200
+        audited_pilot_observability = audited_pilot.json()["observability"]
+        assert audited_pilot_observability["prompt_tokens"] > 0
+        assert audited_pilot_observability["source_call_count"] is not None
+        assert audited_pilot_observability["latency_seconds"] is not None
+        assert audited_pilot_observability["cache_hit_rate"] is None
 
         argument_graph = client.get(
             f"/api/biomed/answer-runs/{audited_run_id}/argument-graph"
@@ -984,7 +1087,12 @@ def test_biomed_workflow_templates_api(tmp_path: Path) -> None:
         template_ids = {item["template_id"] for item in template_payload["items"]}
         assert "biomed-template-mock-ci" in template_ids
         assert "biomed-template-pubmed-live-research" in template_ids
-        assert template_payload["total"] >= 4
+        assert "biomed-template-literature-audit" in template_ids
+        assert "biomed-template-weekly-watch-review" in template_ids
+        assert "biomed-template-reviewer-handoff" in template_ids
+        assert "biomed-template-evidence-packet-export" in template_ids
+        assert "biomed-template-conflicting-evidence-check" in template_ids
+        assert template_payload["total"] >= 9
 
         pubmed_blocked = client.post(
             "/api/biomed/workflow/templates/biomed-template-pubmed-live-research/run",

@@ -5,8 +5,8 @@ biomedical literature work. It supports deterministic mock demos, optional
 PubMed retrieval, structured planning, multi-pass retrieval bundles, evidence
 extraction, citation-grounded answers, claim-level audit, logic audit,
 audit/revise traces, project workspaces, Research Watch, Evidence Graph v1,
-Run Evidence Review, provenance export, one-way Obsidian export, and a
-review-first dashboard workspace.
+Run Evidence Review, Pilot Report handoff export, provenance export, one-way
+Obsidian export, and a review-first dashboard workspace.
 
 It is implemented as a plugin on top of the collaborative Akashic framework,
 not as a standalone clinical system and not as a separate chat runtime.
@@ -125,6 +125,8 @@ Registered agent tools:
 - `export_project_to_obsidian`
 - `export_research_watch_to_obsidian`
 - `export_evidence_report`
+- `run_saved_tool_chain_template`
+- `list_biomed_workflow_templates`
 - `validate_citation_support`
 - `audit_biomedical_answer`
 - `find_conflicting_evidence`
@@ -330,6 +332,42 @@ same review loop to agent workflows. Reviewer notes are persisted as QA
 metadata and are never treated as biomedical evidence. Snapshot creation is
 intentionally not exposed as an agent tool in this phase.
 
+## Release 2.1 Team Evidence Review Pilot
+
+Release 2.1 adds the team handoff layer around existing audited runs:
+
+```text
+/biomed audit
+  -> Run Evidence Review / evidence packet / trace / provenance links
+  -> /biomed pilot-report <run_id> [--format json|markdown]
+  -> reviewer decision/export
+```
+
+Pilot Report is available through the existing export surface:
+
+```text
+GET /api/biomed/export?run_id={run_id}&report_type=pilot&format=json
+GET /api/biomed/export?run_id={run_id}&report_type=pilot&format=markdown
+```
+
+It returns `schema_version=biomed-pilot-report-v1`, ROI fields, review state,
+artifact links, and run-level observability derived from persisted trace
+artifacts where available. Cost/cache fields remain nullable until real
+billing/cache telemetry exists. Pilot Report is not a new evidence source:
+biomedical support still comes from retrieved papers, evidence spans,
+manifests, audits, logic audit, and evidence packets.
+
+Dashboard Chat also accepts:
+
+```text
+/biomed pilot-report <run_id> --format markdown
+/biomed template run <template_id> "question" [--source mock|pubmed]
+```
+
+Built-in pilot templates cover literature audit, weekly Watch review, reviewer
+handoff, evidence packet export, and conflicting-evidence check. Live PubMed
+remains opt-in behind `allow_live_pubmed_tools`.
+
 ## Release 2.0 Full-Text Contract
 
 Release 2.0 extends the abstract-level workflow with deterministic full-text/PDF
@@ -396,6 +434,7 @@ Common routes:
 - `POST /api/biomed/answer`
 - `POST /api/biomed/answer/audited`
 - `POST /api/biomed/answer-runs/{run_id}/audit`
+- `GET /api/biomed/export?run_id={run_id}&report_type=pilot`
 - `GET /api/biomed/answer-runs/{run_id}/trace`
 - `GET /api/biomed/answer-runs/{run_id}/evidence-graph`
 - `GET /api/biomed/answer-runs/{run_id}/argument-graph`

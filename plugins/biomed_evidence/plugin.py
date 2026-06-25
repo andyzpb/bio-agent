@@ -2176,6 +2176,9 @@ class BiomedEvidencePlugin(Plugin):
         run_id: str | None = None,
         question: str | None = None,
         format: Literal["markdown", "json"] = "markdown",
+        report_type: Literal["standard", "pilot"] = "standard",
+        manual_baseline_minutes: float | None = None,
+        reviewer_minutes: float | None = None,
     ) -> str:
         """Export a biomedical evidence report.
 
@@ -2183,9 +2186,19 @@ class BiomedEvidencePlugin(Plugin):
             run_id: Existing answer run id.
             question: Optional question to answer and export if run_id is absent.
             format: markdown or json.
+            report_type: standard evidence report or pilot team handoff report.
+            manual_baseline_minutes: Optional manual-review baseline for pilot ROI.
+            reviewer_minutes: Optional actual reviewer time for pilot ROI.
         """
         report = await self._service.export_report(
-            ExportEvidenceReportRequest(run_id=run_id, question=question, format=format)
+            ExportEvidenceReportRequest(
+                run_id=run_id,
+                question=question,
+                format=format,
+                report_type=report_type,
+                manual_baseline_minutes=manual_baseline_minutes,
+                reviewer_minutes=reviewer_minutes,
+            )
         )
         return report
 

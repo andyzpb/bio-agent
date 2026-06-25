@@ -128,6 +128,10 @@ export interface ChatRunArtifacts {
   packet_url?: string;
   trace_url?: string;
   provenance_url?: string;
+  pilot_report_markdown_url?: string;
+  pilot_report_json_url?: string;
+  argument_graph_url?: string;
+  evidence_graph_url?: string;
   [key: string]: unknown;
 }
 

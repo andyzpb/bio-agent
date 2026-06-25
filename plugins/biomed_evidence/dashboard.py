@@ -979,6 +979,9 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         run_id: str | None = None,
         question: str | None = None,
         format: Literal["markdown", "json"] = "markdown",
+        report_type: Literal["standard", "pilot"] = "standard",
+        manual_baseline_minutes: float | None = None,
+        reviewer_minutes: float | None = None,
     ) -> Response:
         try:
             report = await service.export_report(
@@ -986,6 +989,9 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
                     run_id=run_id,
                     question=question,
                     format=format,
+                    report_type=report_type,
+                    manual_baseline_minutes=manual_baseline_minutes,
+                    reviewer_minutes=reviewer_minutes,
                 )
             )
         except ValueError as exc:

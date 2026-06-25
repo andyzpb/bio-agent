@@ -14,6 +14,7 @@ from plugins.biomed_evidence.schemas import (
     CoverageGapAnalysisRequest,
     EvidenceExtractionRequest,
     EvidencePacketBuildRequest,
+    ExportEvidenceReportRequest,
     FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
@@ -160,6 +161,14 @@ async def _run(args: argparse.Namespace) -> dict:
     clinical_refusal_graph_claim_checks: list[bool] = []
     evidence_graph_export_redaction_checks: list[bool] = []
     run_evidence_review_checks: list[bool] = []
+    pilot_report_schema_checks: list[bool] = []
+    pilot_report_roi_checks: list[bool] = []
+    pilot_report_review_completion_checks: list[bool] = []
+    pilot_report_observability_checks: list[bool] = []
+    pilot_report_cost_cache_nullable_checks: list[bool] = []
+    pilot_report_artifact_reproducibility_checks: list[bool] = []
+    pilot_report_no_memory_evidence_checks: list[bool] = []
+    pilot_report_latency_checks: list[bool] = []
     argument_graph_v2_schema_checks: list[bool] = []
     argument_graph_link_checks: list[bool] = []
     watch_drift_schema_checks: list[bool] = []
@@ -379,6 +388,51 @@ async def _run(args: argparse.Namespace) -> dict:
                     review.model_dump(mode="json") if review is not None else None,
                     expected_refusal=bool(case.get("expected_refusal")),
                 )
+            )
+            pilot_report = json.loads(
+                await service.export_report(
+                    ExportEvidenceReportRequest(
+                        run_id=result.run_id,
+                        report_type="pilot",
+                        format="json",
+                        manual_baseline_minutes=120,
+                        reviewer_minutes=45,
+                    )
+                )
+            )
+            pilot_observability = pilot_report.get("observability", {})
+            pilot_links = pilot_report.get("artifact_links", {})
+            pilot_policy = pilot_report.get("policy", {})
+            pilot_report_schema_checks.append(
+                pilot_report.get("schema_version") == "biomed-pilot-report-v1"
+            )
+            pilot_report_roi_checks.append(
+                pilot_report.get("roi", {}).get("time_saved_minutes") == 75
+            )
+            pilot_report_review_completion_checks.append(
+                bool(pilot_report.get("review_summary", {}).get("available"))
+            )
+            pilot_report_observability_checks.append(
+                isinstance(pilot_observability, dict)
+                and "source_call_count" in pilot_observability
+                and "latency_seconds" in pilot_observability
+            )
+            pilot_report_cost_cache_nullable_checks.append(
+                pilot_observability.get("cache_hit_tokens") is None
+                and pilot_observability.get("cache_hit_rate") is None
+                and pilot_observability.get("estimated_cost_usd") is None
+            )
+            pilot_report_artifact_reproducibility_checks.append(
+                isinstance(pilot_links, dict)
+                and pilot_links.get("review", "").endswith("/evidence-review")
+                and "report_type=pilot" in pilot_links.get("pilot_report_json", "")
+            )
+            pilot_report_no_memory_evidence_checks.append(
+                pilot_policy.get("memory_as_evidence") is False
+                and pilot_policy.get("pilot_report_is_evidence_source") is False
+            )
+            pilot_report_latency_checks.append(
+                pilot_observability.get("latency_seconds") is not None
             )
             argument_graph = service.get_answer_argument_graph(result.run_id)
             if argument_graph is not None:
@@ -1030,6 +1084,24 @@ async def _run(args: argparse.Namespace) -> dict:
                 evidence_graph_export_redaction_checks
             ),
             "run_evidence_review_validity": rate(run_evidence_review_checks),
+            "pilot_report_schema_validity": rate(pilot_report_schema_checks),
+            "pilot_report_roi_presence_rate": rate(pilot_report_roi_checks),
+            "pilot_report_review_completion_rate": rate(
+                pilot_report_review_completion_checks
+            ),
+            "pilot_report_observability_field_rate": rate(
+                pilot_report_observability_checks
+            ),
+            "pilot_report_cost_cache_nullable_rate": rate(
+                pilot_report_cost_cache_nullable_checks
+            ),
+            "pilot_report_artifact_reproducibility_rate": rate(
+                pilot_report_artifact_reproducibility_checks
+            ),
+            "pilot_report_no_memory_as_evidence_rate": rate(
+                pilot_report_no_memory_evidence_checks
+            ),
+            "pilot_report_latency_available_rate": rate(pilot_report_latency_checks),
             "argument_graph_v2_schema_validity": rate(
                 argument_graph_v2_schema_checks
             ),

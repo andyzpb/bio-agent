@@ -577,6 +577,10 @@ def test_dashboard_chat_commands_manifest_includes_biomed(tmp_path) -> None:
     workflows = {item["name"]: item for item in command["workflows"]}
     assert workflows["audit"]["contract"]["tool_name"] == "answer_with_audit"
     assert workflows["audit"]["contract"]["source_policy"] == "live_opt_in"
+    assert workflows["pilot-report"]["contract"]["tool_name"] == "export_evidence_report"
+    assert workflows["pilot-report"]["contract"]["requires_confirmation"] is False
+    assert workflows["template run"]["contract"]["tool_name"] == "run_saved_tool_chain_template"
+    assert "/biomed pilot-report biomed-run-... --format markdown" in command["examples"]
 
 
 def test_dashboard_chat_biomed_status_reports_disabled_pubmed_and_missing_llm(
@@ -918,6 +922,58 @@ def test_dashboard_chat_biomed_parse_review_includes_run_artifacts(tmp_path) -> 
     assert payload["action"] == "review"
     assert payload["artifacts"]["run_id"] == "biomed-run-123abc"
     assert payload["artifacts"]["review_url"].endswith("/biomed-run-123abc/evidence-review")
+    assert "report_type=pilot" in payload["artifacts"]["pilot_report_json_url"]
+    assert payload["artifacts"]["argument_graph_url"].endswith("/biomed-run-123abc/argument-graph")
+
+
+def test_dashboard_chat_biomed_parse_pilot_report_command(tmp_path) -> None:
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=_FakeBus(), event_bus=EventBus())
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": "/biomed pilot-report biomed-run-123abc --format json --baseline-minutes 120 --reviewer-minutes 45",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "pilot_report"
+    assert payload["tool_name"] == "export_evidence_report"
+    assert payload["can_send"] is True
+    assert payload["arguments"]["report_type"] == "pilot"
+    assert payload["arguments"]["format"] == "json"
+    assert payload["arguments"]["manual_baseline_minutes"] == 120
+    assert payload["arguments"]["reviewer_minutes"] == 45
+    assert payload["confirmation"] is None
+    assert payload["artifacts"]["pilot_report_markdown_url"].endswith("format=markdown")
+
+
+def test_dashboard_chat_biomed_parse_template_run_command(tmp_path) -> None:
+    with TestClient(
+        create_dashboard_app(tmp_path, message_bus=_FakeBus(), event_bus=EventBus())
+    ) as client:
+        response = client.post(
+            "/api/dashboard/chat/commands/parse",
+            json={
+                "session_key": "dashboard:default",
+                "content": '/biomed template run biomed-template-reviewer-handoff "microglia Alzheimer disease" --source mock --project project-1',
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "template_run"
+    assert payload["tool_name"] == "run_saved_tool_chain_template"
+    assert payload["can_send"] is True
+    assert payload["arguments"] == {
+        "template_id": "biomed-template-reviewer-handoff",
+        "question": "microglia Alzheimer disease",
+        "source_override": "mock",
+        "project_id": "project-1",
+    }
 
 
 def test_dashboard_chat_biomed_parse_export_includes_artifact_urls(tmp_path) -> None:
@@ -941,6 +997,7 @@ def test_dashboard_chat_biomed_parse_export_includes_artifact_urls(tmp_path) -> 
     assert payload["artifacts"]["packet_url"].endswith("/biomed-run-123abc/evidence-review/packet")
     assert payload["artifacts"]["trace_url"].endswith("/biomed-run-123abc/trace")
     assert payload["artifacts"]["provenance_url"].endswith("/biomed-run-123abc/provenance")
+    assert payload["artifacts"]["evidence_graph_url"].endswith("/biomed-run-123abc/evidence-graph")
 
 
 def test_dashboard_chat_biomed_message_routes_command_prompt_through_bus(
@@ -1058,6 +1115,7 @@ def test_dashboard_chat_biomed_review_history_preserves_artifact_metadata(tmp_pa
     command = bus.inbound_items[0].metadata["command"]
     assert command["artifacts"]["run_id"] == "biomed-run-123abc"
     assert command["artifacts"]["review_url"].endswith("/biomed-run-123abc/evidence-review")
+    assert command["artifacts"]["pilot_report_json_url"].endswith("format=json")
 
 
 @pytest.mark.asyncio
@@ -1079,6 +1137,34 @@ async def test_dashboard_chat_outbound_adds_artifacts_from_run_id_text(tmp_path)
 
     assert assistant_event == "assistant_message"
     assert assistant_payload["metadata"]["artifacts"]["run_id"] == "biomed-run-abc123"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_tool_completed_adds_nested_run_artifacts(tmp_path) -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    queue = await mux.subscribe("dashboard:default")
+    try:
+        await mux._on_tool_completed(
+            ToolCallCompleted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="answer_with_audit",
+                arguments={},
+                final_arguments={},
+                status="success",
+                result_preview='{"answer_result":{"run_id":"biomed-run-abc123"}}',
+            )
+        )
+        event, payload = await queue.get()
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert event == "tool_completed"
+    assert payload["metadata"]["artifacts"]["run_id"] == "biomed-run-abc123"
+    assert payload["metadata"]["artifacts"]["pilot_report_json_url"].endswith("format=json")
 
 
 def test_dashboard_chat_first_message_updates_placeholder_title(tmp_path) -> None:
@@ -1320,6 +1406,51 @@ def test_dashboard_chat_approval_endpoint_executes_confirmed_tool(tmp_path) -> N
         )
 
     assert response.status_code == 200
+
+
+def test_dashboard_chat_approval_endpoint_rejects_without_execution_and_blocks_duplicates(tmp_path) -> None:
+    registry = _FakeToolRegistry()
+    app = create_dashboard_app(
+        tmp_path,
+        message_bus=_FakeBus(),
+        event_bus=EventBus(),
+        tool_registry=registry,
+    )
+    with TestClient(app) as client:
+        create = client.post("/api/dashboard/chat/sessions", json={})
+        session_key = create.json()["key"]
+        session = SessionStore(tmp_path / "sessions.db")
+        try:
+            session.update_session(
+                session_key,
+                metadata={
+                    "pending_approvals": {
+                        "approval-1": {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "tool_name": "record_run_review_decision",
+                            "final_arguments": {"run_id": "run-1", "decision": "accept"},
+                        }
+                    },
+                },
+            )
+        finally:
+            session.close()
+        rejected = client.post(
+            "/api/dashboard/chat/approvals/approval-1",
+            params={"session_key": session_key},
+            json={"decision": "reject"},
+        )
+        duplicate = client.post(
+            "/api/dashboard/chat/approvals/approval-1",
+            params={"session_key": session_key},
+            json={"decision": "approve"},
+        )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert duplicate.status_code == 409
+    assert registry.calls == []
 
 
 def test_dashboard_chat_approval_endpoint_marks_tool_call_approved(tmp_path) -> None:
