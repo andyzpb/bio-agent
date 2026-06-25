@@ -168,6 +168,8 @@ async def _run(args: argparse.Namespace) -> dict:
     pilot_report_cost_cache_nullable_checks: list[bool] = []
     pilot_report_artifact_reproducibility_checks: list[bool] = []
     pilot_report_no_memory_evidence_checks: list[bool] = []
+    artifact_cache_field_checks: list[bool] = []
+    artifact_cache_not_evidence_checks: list[bool] = []
     pilot_report_latency_checks: list[bool] = []
     argument_graph_v2_schema_checks: list[bool] = []
     argument_graph_link_checks: list[bool] = []
@@ -421,6 +423,24 @@ async def _run(args: argparse.Namespace) -> dict:
                 pilot_observability.get("cache_hit_tokens") is None
                 and pilot_observability.get("cache_hit_rate") is None
                 and pilot_observability.get("estimated_cost_usd") is None
+            )
+            artifact_cache_field_checks.append(
+                isinstance(pilot_observability, dict)
+                and all(
+                    key in pilot_observability
+                    for key in (
+                        "artifact_cache_hit_count",
+                        "artifact_cache_miss_count",
+                        "artifact_cache_write_count",
+                        "saved_source_call_count",
+                        "cache_entries",
+                    )
+                )
+            )
+            artifact_cache_not_evidence_checks.append(
+                isinstance(pilot_observability.get("cache_entries"), list)
+                and pilot_policy.get("pilot_report_is_evidence_source") is False
+                and pilot_policy.get("memory_as_evidence") is False
             )
             pilot_report_artifact_reproducibility_checks.append(
                 isinstance(pilot_links, dict)
@@ -1094,6 +1114,10 @@ async def _run(args: argparse.Namespace) -> dict:
             ),
             "pilot_report_cost_cache_nullable_rate": rate(
                 pilot_report_cost_cache_nullable_checks
+            ),
+            "artifact_cache_fields_present": rate(artifact_cache_field_checks),
+            "artifact_cache_not_evidence_rate": rate(
+                artifact_cache_not_evidence_checks
             ),
             "pilot_report_artifact_reproducibility_rate": rate(
                 pilot_report_artifact_reproducibility_checks
