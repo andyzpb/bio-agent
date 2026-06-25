@@ -2331,6 +2331,11 @@ function deriveChatTurns(events: ChatEventRow[]): ChatTurn[] {
         updatedAt: event.ts ?? current.thinking?.updatedAt,
         expanded: current.thinking?.expanded,
       };
+      const failedStatus = [event.cockpit_status, event.status]
+        .some((value) => value === "failed" || value === "error");
+      if (event.event === "tool_completed" && event.recovery && failedStatus) {
+        current.error = event;
+      }
       continue;
     }
   }
