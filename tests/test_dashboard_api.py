@@ -1923,6 +1923,88 @@ async def test_dashboard_chat_multiplexer_maps_lifecycle_events_and_redacts() ->
     assert "[redacted]" in completed_payload["detail"]
 
 
+@pytest.mark.asyncio
+async def test_dashboard_chat_tool_events_include_cockpit_phase_metadata(
+    tmp_path,
+) -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    queue = await mux.subscribe("dashboard:default")
+    try:
+        await mux._on_tool_started(
+            ToolCallStarted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="search_literature",
+                arguments={"query": "microglia"},
+            )
+        )
+        started_event, started_payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        await mux._on_tool_completed(
+            ToolCallCompleted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="answer_with_audit",
+                arguments={},
+                final_arguments={},
+                status="success",
+                result_preview='{"answer_result":{"run_id":"biomed-run-abc123"}}',
+            )
+        )
+        completed_event, completed_payload = await asyncio.wait_for(
+            queue.get(), timeout=1.0
+        )
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert started_event == "tool_started"
+    assert started_payload["cockpit_phase"] == "retrieval"
+    assert started_payload["cockpit_status"] == "running"
+    assert completed_event == "tool_completed"
+    assert completed_payload["cockpit_phase"] == "done"
+    assert completed_payload["cockpit_status"] == "completed"
+    assert completed_payload["metadata"]["artifacts"]["run_id"] == "biomed-run-abc123"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_chat_tool_failure_includes_recovery_guidance(
+    tmp_path,
+) -> None:
+    mux = DashboardChatMultiplexer(bus=None, event_bus=None)
+    queue = await mux.subscribe("dashboard:default")
+    try:
+        await mux._on_tool_completed(
+            ToolCallCompleted(
+                session_key="dashboard:default",
+                channel="dashboard",
+                chat_id="default",
+                iteration=1,
+                call_id="call-1",
+                tool_name="search_literature",
+                arguments={"source": "pubmed"},
+                final_arguments={"source": "pubmed"},
+                status="error",
+                result_preview="Live PubMed disabled by source policy.",
+            )
+        )
+        event, payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+    finally:
+        await mux.unsubscribe("dashboard:default", queue)
+
+    assert event == "tool_completed"
+    assert payload["cockpit_phase"] == "retrieval"
+    assert payload["cockpit_status"] == "failed"
+    assert payload["recovery"]["retryable"] is False
+    assert payload["recovery"]["action"] == "enable_pubmed"
+    assert "PubMed" in payload["recovery"]["label"]
+
+
 def test_update_and_delete_session(tmp_path) -> None:
     _seed_workspace(tmp_path)
     with TestClient(create_dashboard_app(tmp_path)) as client:

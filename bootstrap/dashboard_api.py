@@ -444,6 +444,84 @@ def _biomed_artifacts_from_text(text: str) -> dict[str, str]:
     return {}
 
 
+def _dashboard_chat_cockpit_phase(tool_name: str, status: str = "") -> str:
+    tool = str(tool_name or "").lower()
+    state = str(status or "").lower()
+    if state in {"success", "completed", "done"} and tool == "answer_with_audit":
+        return "done"
+    if "plan" in tool:
+        return "planning"
+    if "search_literature" in tool or "pubmed" in tool or "literature" in tool:
+        return "retrieval"
+    if "extract" in tool or "full_text" in tool or "full-text" in tool:
+        return "full-text"
+    if "audit" in tool or "verify" in tool or "claim" in tool:
+        return "audit"
+    if "revision" in tool or "revise" in tool:
+        return "revision"
+    if "packet" in tool or "provenance" in tool or "graph" in tool:
+        return "packet"
+    if "review" in tool:
+        return "review"
+    if "export" in tool or "report" in tool:
+        return "export-ready"
+    return "planning"
+
+
+def _dashboard_chat_cockpit_status(status: str, *, started: bool = False) -> str:
+    clean = str(status or "").lower()
+    if started:
+        return "running"
+    if clean in {"success", "completed", "done"}:
+        return "completed"
+    if clean in {"error", "failed", "failure"}:
+        return "failed"
+    if clean == "approval_required":
+        return "waiting_for_approval"
+    return clean or "running"
+
+
+def _dashboard_chat_recovery_guidance(
+    *,
+    tool_name: str,
+    status: str,
+    detail: str,
+) -> dict[str, Any] | None:
+    clean_status = str(status or "").lower()
+    if clean_status not in {"error", "failed", "failure", "approval_required"}:
+        return None
+    text = f"{tool_name} {detail}".lower()
+    if "pubmed" in text and ("disabled" in text or "policy" in text):
+        return {
+            "retryable": False,
+            "action": "enable_pubmed",
+            "label": "Enable PubMed policy, then retry the audit.",
+        }
+    if "timeout" in text:
+        return {
+            "retryable": True,
+            "action": "retry",
+            "label": "Retry the same command when the provider is responsive.",
+        }
+    if "approval" in text:
+        return {
+            "retryable": False,
+            "action": "review_approval",
+            "label": "Review or recreate the pending approval.",
+        }
+    if "no evidence" in text or "not found" in text:
+        return {
+            "retryable": True,
+            "action": "refine_query",
+            "label": "Refine the research question or source constraints.",
+        }
+    return {
+        "retryable": False,
+        "action": "open_trace",
+        "label": "Open the trace for details before retrying.",
+    }
+
+
 def _json_dict_from_tool_result(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -867,12 +945,15 @@ class DashboardChatMultiplexer:
                 "iteration": event.iteration,
                 "call_id": event.call_id,
                 "arguments": _sanitize_dashboard_chat_value(dict(event.arguments)),
+                "cockpit_phase": _dashboard_chat_cockpit_phase(event.tool_name),
+                "cockpit_status": _dashboard_chat_cockpit_status("", started=True),
             },
         )
 
     async def _on_tool_completed(self, event: ToolCallCompleted) -> None:
         if event.channel != _DASHBOARD_CHAT_CHANNEL:
             return
+        detail = _preview_text(_redact_dashboard_chat_string(event.result_preview), 360)
         approval_id = ""
         if event.status == "approval_required":
             match = re.search(r"\bApproval ID:\s*([A-Za-z0-9_-]+)\b", event.result_preview)
@@ -911,13 +992,20 @@ class DashboardChatMultiplexer:
                 "call_id": event.call_id,
                 "status": event.status,
                 "approval_id": approval_id,
-                "detail": _preview_text(
-                    _redact_dashboard_chat_string(event.result_preview),
-                    360,
-                ),
+                "detail": detail,
                 "arguments": _sanitize_dashboard_chat_value(dict(event.arguments)),
                 "final_arguments": _sanitize_dashboard_chat_value(
                     dict(event.final_arguments)
+                ),
+                "cockpit_phase": _dashboard_chat_cockpit_phase(
+                    event.tool_name,
+                    event.status,
+                ),
+                "cockpit_status": _dashboard_chat_cockpit_status(event.status),
+                "recovery": _dashboard_chat_recovery_guidance(
+                    tool_name=event.tool_name,
+                    status=event.status,
+                    detail=detail,
                 ),
                 "metadata": {
                     "artifacts": _biomed_artifacts_from_tool_result(
