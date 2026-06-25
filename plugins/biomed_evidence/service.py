@@ -99,6 +99,9 @@ from plugins.biomed_evidence.schemas import (
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     FullTextDocument,
+    FullTextEnhancementPaperStatus,
+    FullTextEnhancementRequest,
+    FullTextEnhancementResult,
     FullTextIngestionRequest,
     FullTextIngestionResult,
     FullTextSection,
@@ -2235,6 +2238,172 @@ class BiomedEvidenceService:
             paper_id=paper.paper_id,
             evidence=evidence,
             reason=None if evidence else "No full-text evidence could be extracted.",
+        )
+
+    def enhance_run_with_full_text(
+        self,
+        request: FullTextEnhancementRequest,
+    ) -> ReleaseToolEnvelope:
+        tool_name = "enhance_run_with_full_text"
+        metadata = get_release_tool_metadata(tool_name)
+        run = self.storage.get_answer_run(request.run_id)
+        if run is None:
+            return release_error(
+                tool_name=tool_name,
+                code="unknown_run_id",
+                message="No biomedical answer run exists for run_id.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+        if run.retrieval_manifest is None:
+            return release_error(
+                tool_name=tool_name,
+                code="missing_retrieval_manifest",
+                message="Full-text enhancement requires a retrieval manifest.",
+                detail={"run_id": request.run_id},
+                metadata=metadata,
+            )
+
+        source = cast(Literal["pubmed", "mock"], request.source or run.retrieval_manifest.source)
+        enhancement_id = f"fulltext-enhance-{uuid.uuid4().hex[:12]}"
+        candidate_ids = _run_candidate_paper_ids(run)[: max(1, request.max_papers)]
+        statuses: list[FullTextEnhancementPaperStatus] = []
+        warnings: list[str] = []
+        enhanced_evidence: list[EvidenceItem] = []
+        new_evidence: list[EvidenceItem] = []
+        seen_evidence_ids = {item.evidence_id for item in run.evidence_summary}
+        document_ids: list[str] = []
+
+        for paper_id in candidate_ids:
+            stored = self.storage.get_full_text_document(paper_id, source=source)
+            if stored is None:
+                statuses.append(
+                    FullTextEnhancementPaperStatus(
+                        paper_id=paper_id,
+                        source=source,
+                        status="unavailable",
+                        warning="full_text_unavailable",
+                    )
+                )
+                warnings.append(f"Open or stored full text unavailable for {paper_id}.")
+                continue
+            document, sections = stored
+            extracted = self.extract_full_text_evidence(
+                paper_id=paper_id,
+                source=source,
+                research_question=_pilot_question(run) or run.answer[:240],
+            )
+            evidence = extracted.evidence if extracted is not None else []
+            enhanced_evidence.extend(evidence)
+            paper_new_evidence = [
+                item for item in evidence if item.evidence_id not in seen_evidence_ids
+            ]
+            seen_evidence_ids.update(item.evidence_id for item in paper_new_evidence)
+            new_evidence.extend(paper_new_evidence)
+            document_ids.append(document.document_id)
+            statuses.append(
+                FullTextEnhancementPaperStatus(
+                    paper_id=paper_id,
+                    source=source,
+                    status="extracted" if paper_new_evidence else "cached",
+                    document_id=document.document_id,
+                    section_count=len(sections),
+                    evidence_ids=[item.evidence_id for item in paper_new_evidence],
+                    warning=(
+                        None
+                        if paper_new_evidence
+                        else "Full-text evidence already present."
+                        if evidence
+                        else "No full-text evidence extracted."
+                    ),
+                )
+            )
+
+        merged_evidence = [*run.evidence_summary, *new_evidence]
+        packet_id: str | None = None
+        if len(merged_evidence) != len(run.evidence_summary):
+            updated_run = run.model_copy(update={"evidence_summary": merged_evidence})
+            self.storage.save_answer_run(
+                updated_run,
+                question=_pilot_question(run) or run.answer[:240],
+            )
+            packet = self.build_evidence_packet(
+                EvidencePacketBuildRequest(
+                    run_id=request.run_id,
+                    max_evidence_items=max(1, request.max_evidence_items),
+                )
+            )
+            packet_id = str(packet.ids.get("packet_id") or "") if packet.ids else None
+
+        result = FullTextEnhancementResult(
+            enhancement_id=enhancement_id,
+            run_id=request.run_id,
+            source=source,
+            processed_paper_ids=candidate_ids,
+            unavailable_paper_ids=[
+                item.paper_id for item in statuses if item.status == "unavailable"
+            ],
+            document_ids=_merge_unique(document_ids),
+            extracted_evidence_ids=[item.evidence_id for item in new_evidence],
+            packet_id=packet_id or None,
+            review_available=self.get_run_evidence_review(request.run_id) is not None,
+            paper_statuses=statuses,
+            warnings=_merge_unique(warnings),
+        )
+        existing_trace = next(
+            (
+                item
+                for item in self.storage.list_agent_trace_steps(request.run_id)
+                if item.step == "extract"
+            ),
+            None,
+        )
+        trace_step = _tool_trace_step(
+            run_id=request.run_id,
+            step="extract",
+            status="completed",
+            input_summary=f"{len(candidate_ids)} candidate papers",
+            output_summary=f"{len(enhanced_evidence)} full-text evidence items",
+            warnings=result.warnings,
+            metadata={
+                "enhancement_id": enhancement_id,
+                "full_text_enhance": True,
+                "document_ids": result.document_ids,
+                "unavailable_paper_ids": result.unavailable_paper_ids,
+                "memory_as_evidence": False,
+            },
+        )
+        if existing_trace is not None:
+            trace_step = existing_trace.model_copy(
+                update={
+                    "status": trace_step.status,
+                    "input_summary": trace_step.input_summary,
+                    "output_summary": trace_step.output_summary,
+                    "warnings": _merge_unique(existing_trace.warnings, result.warnings),
+                    "metadata": {
+                        **existing_trace.metadata,
+                        "enhancement_id": enhancement_id,
+                        "full_text_enhance": True,
+                        "full_text_document_ids": result.document_ids,
+                        "full_text_unavailable_paper_ids": result.unavailable_paper_ids,
+                        "full_text_extracted_evidence_ids": result.extracted_evidence_ids,
+                        "memory_as_evidence": False,
+                    },
+                }
+            )
+        trace = [trace_step]
+        self.storage.save_agent_trace_steps(trace)
+        return release_ok(
+            tool_name=tool_name,
+            result=result.model_dump(mode="json"),
+            ids={
+                "run_id": request.run_id,
+                "enhancement_id": enhancement_id,
+                "packet_id": packet_id or "",
+            },
+            warnings=result.warnings,
+            trace={"trace": [item.model_dump(mode="json") for item in trace]},
+            metadata=metadata,
         )
 
     def extract_evidence(
@@ -9223,6 +9392,14 @@ def _pilot_question(result: AnswerWithEvidenceResult) -> str:
         else "",
     )
     return next((item.strip() for item in candidates if item and item.strip()), "")
+
+
+def _run_candidate_paper_ids(run: AnswerWithEvidenceResult) -> list[str]:
+    if run.retrieval_bundle is not None:
+        return _merge_unique(run.retrieval_bundle.deduped_paper_ids)
+    if run.retrieval_manifest is not None:
+        return _merge_unique(run.retrieval_manifest.returned_paper_ids)
+    return _merge_unique([item.paper_id for item in run.citations])
 
 
 def _pilot_source(result: AnswerWithEvidenceResult) -> Literal["pubmed", "mock"]:

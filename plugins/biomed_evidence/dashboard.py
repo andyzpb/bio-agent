@@ -29,6 +29,7 @@ from plugins.biomed_evidence.schemas import (
     EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
+    FullTextEnhancementRequest,
     FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
@@ -165,6 +166,23 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
     @app.get("/api/biomed/answer-runs/{run_id}/evidence-packet")
     def get_evidence_packet(run_id: str) -> dict[str, Any]:
         return service.get_evidence_packet(run_id).model_dump(mode="json")
+
+    @app.post("/api/biomed/answer-runs/{run_id}/full-text-enhance")
+    def enhance_run_with_full_text(
+        run_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request = FullTextEnhancementRequest.model_validate(
+            {**(payload or {}), "run_id": run_id}
+        )
+        result = service.enhance_run_with_full_text(
+            request.model_copy(update={"run_id": run_id})
+        )
+        if not result.ok and result.error_code == "unknown_run_id":
+            raise HTTPException(status_code=404, detail=result.model_dump(mode="json"))
+        if not result.ok:
+            raise HTTPException(status_code=400, detail=result.model_dump(mode="json"))
+        return result.model_dump(mode="json")
 
     @app.get("/api/biomed/answer-runs/{run_id}/provenance")
     def export_provenance_graph(run_id: str) -> dict[str, Any]:

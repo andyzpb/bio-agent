@@ -1150,6 +1150,74 @@ def test_biomed_api_full_text_and_watch_drift(tmp_path: Path) -> None:
         assert drift_payload["status"] == "ok"
 
 
+def test_biomed_run_full_text_enhance_reuses_stored_document(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        answer = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What evidence links microglial activation to Alzheimer's disease progression?",
+                "source": "mock",
+                "max_papers": 3,
+            },
+        )
+        assert answer.status_code == 200
+        answer_payload = answer.json()["answer_result"]
+        run_id = answer_payload["run_id"]
+        paper_id = answer_payload["retrieval_manifest"]["returned_paper_ids"][0]
+
+        full_text = client.post(
+            f"/api/biomed/papers/{paper_id}/full-text",
+            json={
+                "source": "mock",
+                "content": (
+                    "## Methods\n"
+                    "The study used a longitudinal human cohort.\n\n"
+                    "## Results\n"
+                    "Microglial activation was associated with Alzheimer's disease progression. "
+                    "Independent validation remains required."
+                ),
+                "content_type": "text/plain",
+                "source_filename": "enhance-fixture.txt",
+            },
+        )
+        assert full_text.status_code == 200
+
+        response = client.post(f"/api/biomed/answer-runs/{run_id}/full-text-enhance")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["run_id"] == run_id
+        assert result["extracted_evidence_ids"]
+        assert result["packet_id"]
+        assert result["paper_statuses"][0]["status"] in {"cached", "extracted"}
+        assert result["paper_statuses"][0]["document_id"] == full_text.json()["document"][
+            "document_id"
+        ]
+        assert payload["ids"]["run_id"] == run_id
+
+        second_response = client.post(
+            f"/api/biomed/answer-runs/{run_id}/full-text-enhance",
+            json={"max_papers": 1},
+        )
+        assert second_response.status_code == 200
+        second_payload = second_response.json()
+        assert second_payload["ok"] is True
+        second_result = second_payload["result"]
+        assert second_result["extracted_evidence_ids"] == []
+        assert second_result["packet_id"] in {None, ""}
+        assert second_result["paper_statuses"][0]["status"] == "cached"
+        assert second_result["paper_statuses"][0]["evidence_ids"] == []
+
+        trace = client.get(f"/api/biomed/answer-runs/{run_id}/trace")
+        assert trace.status_code == 200
+        extract_step = next(
+            item for item in trace.json()["trace"] if item["step"] == "extract"
+        )
+        assert extract_step["metadata"]["full_text_enhance"] is True
+        assert "full-text evidence items" in extract_step["output_summary"]
+
+
 def test_biomed_artifact_cache_full_text_and_packet_metadata(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         answer = client.post(
