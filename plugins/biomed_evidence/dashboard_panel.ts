@@ -2648,32 +2648,91 @@ function renderBiomedWorkbenchPage(
   if (body) renderBody(body);
 }
 
-function renderBiomedChatWorkspace(container: HTMLElement): void {
+function renderBiomedChatWorkspace(container: HTMLElement, dispatch?: PluginDispatch): void {
   container.innerHTML = `
     <div class="biomed-chat-workspace">
       <aside class="biomed-agent-rail">
         <div class="biomed-agent-brand">
           <div class="biomed-agent-mark">BE</div>
           <div>
-            <div class="biomed-agent-title">Biomedical Evidence Agent</div>
-            <div class="biomed-agent-subtitle">Research-only chat context</div>
+            <div class="biomed-agent-title">Evidence Workbench</div>
+            <div class="biomed-agent-subtitle">Research-only agent</div>
           </div>
         </div>
         <div class="biomed-rail-section">
-          <div class="biomed-label">Session</div>
-          <input id="biomed-chat-session" class="biomed-rail-input" value="dashboard:biomed" />
-          <div class="biomed-rail-actions">
-            <button id="biomed-chat-load">Load</button>
-          </div>
+          <div class="biomed-label">Start here</div>
+          <button class="biomed-run-link" data-biomed-target-view="runs" data-biomed-chat-prompt="Run a biomedical evidence audit for this research question: "><span>Ask a question</span><code>search, answer, audit</code></button>
+          <button class="biomed-run-link" data-biomed-artifact="review" data-biomed-chat-prompt="Open the latest audited biomedical run and summarize the evidence packet, audit result, reviewer state, and next actions."><span>Review evidence</span><code>packet, audit, review</code></button>
+          <button class="biomed-run-link" data-biomed-artifact="pilot" data-biomed-chat-prompt="Create a Pilot Report for the latest completed audited run using available ROI and observability fields."><span>Build pilot report</span><code>handoff, ROI, policy</code></button>
         </div>
         <div class="biomed-rail-section">
-          <div class="biomed-label">Prompts</div>
-          <button class="biomed-run-link" data-biomed-chat-prompt="Summarize the current biomedical evidence workspace."><span>Workspace summary</span></button>
-          <button class="biomed-run-link" data-biomed-chat-prompt="What evidence-backed biomedical run should I inspect next?"><span>Next run to inspect</span></button>
-          <button class="biomed-run-link" data-biomed-chat-prompt="List unresolved biomedical review queue risks."><span>Queue risks</span></button>
+          <div class="biomed-label">Queues</div>
+          <button class="biomed-run-link" data-biomed-target-view="queue" data-biomed-chat-prompt="List unresolved biomedical review queue risks and the run IDs I should inspect first."><span>Check review queue</span><code>triage risks</code></button>
+          <button class="biomed-run-link" data-biomed-target-view="library" data-biomed-chat-prompt="Summarize the current literature sets and explain which papers need review."><span>Manage papers</span><code>literature sets</code></button>
+          <button class="biomed-run-link" data-biomed-chat-prompt="Summarize the latest biomedical harness result and list release blockers."><span>Check harness</span><code>eval gates</code></button>
         </div>
       </aside>
-      <main class="biomed-chat-main">
+      <main class="biomed-artifact-workspace">
+        <section class="biomed-artifact-hero">
+          <div>
+            <div class="biomed-label">Current workspace</div>
+            <h2>Run-aware evidence review</h2>
+            <p>Pick a task on the left, then use the agent on the right. The middle stays focused on artifacts: runs, packets, reviews, reports, and harness results.</p>
+          </div>
+          <span class="biomed-safety-chip">research only</span>
+        </section>
+        <section class="biomed-workflow-steps" aria-label="Evidence review workflow">
+          <article>
+            <strong>1. Audit</strong>
+            <span>Search papers, answer with citations, and check support.</span>
+          </article>
+          <article>
+            <strong>2. Review</strong>
+            <span>Open packet, provenance, trace, and reviewer decisions.</span>
+          </article>
+          <article>
+            <strong>3. Report</strong>
+            <span>Export Pilot Report with ROI, policy, and observability.</span>
+          </article>
+        </section>
+        <section id="biomed-latest-run-actions" class="biomed-latest-run-actions">
+          <div class="biomed-muted">Loading latest run...</div>
+        </section>
+        <section class="biomed-artifact-grid">
+          <button class="biomed-artifact-action" data-biomed-target-view="runs" data-biomed-chat-prompt="Show me the latest biomedical answer runs with run IDs, source, paper count, review status, and artifact links.">
+            <strong>Runs</strong>
+            <span>Find the run to inspect.</span>
+          </button>
+          <button class="biomed-artifact-action" data-biomed-artifact="packet" data-biomed-chat-prompt="Open the evidence packet and provenance links for the latest audited run.">
+            <strong>Evidence Packet</strong>
+            <span>Check what supports the answer.</span>
+          </button>
+          <button class="biomed-artifact-action" data-biomed-artifact="review" data-biomed-chat-prompt="List reviewer decisions and unresolved issues for the latest audited run.">
+            <strong>Run Evidence Review</strong>
+            <span>See reviewer state and blockers.</span>
+          </button>
+          <button class="biomed-artifact-action" data-biomed-artifact="trace" data-biomed-chat-prompt="Show cost, cache, latency, source calls, and trace status for the latest audited run.">
+            <strong>Trace</strong>
+            <span>Inspect cost and execution.</span>
+          </button>
+        </section>
+        <section class="biomed-policy-strip">
+          <strong>Evidence boundary</strong>
+          <span>Biomedical support comes from retrieved papers, evidence spans, manifests, audits, logic audit, and evidence packets. Chat, memory, reviewer notes, and model output are context only.</span>
+        </section>
+      </main>
+      <aside class="biomed-chat-main biomed-agent-cockpit">
+        <div class="biomed-cockpit-head">
+          <div>
+            <div class="biomed-label">Agent cockpit</div>
+            <strong>Ask, approve, inspect</strong>
+          </div>
+          <details class="biomed-session-details">
+            <summary>Session</summary>
+            <input id="biomed-chat-session" class="biomed-rail-input" value="dashboard:biomed" />
+            <button id="biomed-chat-load" type="button">Load</button>
+          </details>
+        </div>
         <div id="biomed-chat-history" class="biomed-chat-history">
           <div class="biomed-empty-state">
             <div class="biomed-empty-title">No messages loaded.</div>
@@ -2681,10 +2740,10 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
           </div>
         </div>
         <form id="biomed-chat-form" class="biomed-chat-composer">
-          <textarea id="biomed-chat-input" rows="4" placeholder="Ask the agent about this biomedical workspace..."></textarea>
+          <textarea id="biomed-chat-input" rows="4" placeholder="Ask about a run, evidence packet, review queue, or pilot report..."></textarea>
           <button id="biomed-chat-send" class="biomed-primary-button" type="submit">Send</button>
         </form>
-      </main>
+      </aside>
     </div>
   `;
 
@@ -2692,6 +2751,28 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
     container.querySelector<HTMLInputElement>("#biomed-chat-session")?.value.trim()
     || "dashboard:biomed"
   );
+  let latestRunId = "";
+  const artifactUrl = (kind: string, runId: string): string => {
+    const encoded = encodeURIComponent(runId);
+    if (kind === "review") return `/api/biomed/answer-runs/${encoded}/evidence-review`;
+    if (kind === "packet") return `/api/biomed/answer-runs/${encoded}/evidence-packet`;
+    if (kind === "trace") return `/api/biomed/answer-runs/${encoded}/trace`;
+    if (kind === "pilot") return `/api/biomed/export?run_id=${encoded}&report_type=pilot&format=markdown`;
+    return `/api/biomed/answer-runs/${encoded}/provenance`;
+  };
+  const openLatestArtifact = (kind: string): void => {
+    if (!latestRunId) {
+      const target = container.querySelector<HTMLElement>("#biomed-latest-run-actions");
+      if (target) target.innerHTML = '<div class="biomed-muted">No run is available yet. Start with Ask a question.</div>';
+      return;
+    }
+    window.open(artifactUrl(kind, latestRunId), "_blank", "noopener,noreferrer");
+  };
+  const openView = (view: BiomedView): void => {
+    dispatch?.setFilter("_view", view);
+    dispatch?.activate();
+    if (!dispatch) renderBiomedWorkbench(container, view);
+  };
   const chatState = {
     events: [] as DashboardChatMessage[],
     latestSeq: 0,
@@ -2925,6 +3006,12 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
       if (input) input.value = button.dataset.biomedChatPrompt || "";
     });
   });
+  container.querySelectorAll<HTMLButtonElement>("[data-biomed-target-view]").forEach((button) => {
+    button.addEventListener("click", () => openView((button.dataset.biomedTargetView || "chat") as BiomedView));
+  });
+  container.querySelectorAll<HTMLButtonElement>("[data-biomed-artifact]").forEach((button) => {
+    button.addEventListener("click", () => openLatestArtifact(button.dataset.biomedArtifact || ""));
+  });
   container.querySelector<HTMLFormElement>("#biomed-chat-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const input = container.querySelector<HTMLTextAreaElement>("#biomed-chat-input");
@@ -2967,6 +3054,37 @@ function renderBiomedChatWorkspace(container: HTMLElement): void {
       if (send) send.disabled = false;
     }
   });
+  const loadLatestRunActions = async (): Promise<void> => {
+    const target = container.querySelector<HTMLElement>("#biomed-latest-run-actions");
+    if (!target) return;
+    try {
+      const data = await api<{ items: AnswerRunListItem[] }>("/api/biomed/answer-runs?page_size=1");
+      latestRunId = data.items[0]?.run_id || "";
+      if (!latestRunId) {
+        target.innerHTML = '<div class="biomed-muted">No runs yet. Start with Ask a question.</div>';
+        return;
+      }
+      target.innerHTML = `
+        <div>
+          <div class="biomed-label">Latest run</div>
+          <strong>${escapeHtml(data.items[0]?.question || latestRunId)}</strong>
+          <code>${escapeHtml(latestRunId)}</code>
+        </div>
+        <div class="biomed-latest-run-buttons">
+          <button data-biomed-artifact-open="review">Review</button>
+          <button data-biomed-artifact-open="packet">Packet</button>
+          <button data-biomed-artifact-open="trace">Trace</button>
+          <button data-biomed-artifact-open="pilot">Pilot Report</button>
+        </div>
+      `;
+      target.querySelectorAll<HTMLButtonElement>("[data-biomed-artifact-open]").forEach((button) => {
+        button.addEventListener("click", () => openLatestArtifact(button.dataset.biomedArtifactOpen || ""));
+      });
+    } catch (error) {
+      target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+    }
+  };
+  void loadLatestRunActions();
   void loadHistory();
 }
 
@@ -3086,10 +3204,10 @@ Microglial activation was associated with Alzheimer's disease progression in a h
   });
 }
 
-function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
+function renderBiomedWorkbench(root: HTMLElement, view: BiomedView, dispatch?: PluginDispatch): void {
   root.innerHTML = "";
   if (view === "chat") {
-    renderBiomedChatWorkspace(root);
+    renderBiomedChatWorkspace(root, dispatch);
     return;
   }
   if (view === "runs") {
@@ -3103,7 +3221,7 @@ function renderBiomedWorkbench(root: HTMLElement, view: BiomedView): void {
   } else if (view === "settings") {
     renderBiomedWorkbenchPage(root, "Responsible AI boundary", "Review the research-only safety contract enforced before tool execution.", renderResponsible);
   } else {
-    renderBiomedChatWorkspace(root);
+    renderBiomedChatWorkspace(root, dispatch);
   }
 }
 
@@ -4627,7 +4745,7 @@ function renderBiomedDetail(
     return;
   }
   if (view === "chat") {
-    renderBiomedChatWorkspace(root);
+    renderBiomedChatWorkspace(root, dispatch);
   } else if (view === "runs") {
     renderAskWorkspace(root);
   } else if (view === "queue") {
@@ -4637,7 +4755,7 @@ function renderBiomedDetail(
   } else if (view === "settings") {
     renderResponsible(root);
   } else {
-    renderBiomedChatWorkspace(root);
+    renderBiomedChatWorkspace(root, dispatch);
   }
   attachDetailTabs(root, item, dispatch);
 }
@@ -4714,7 +4832,7 @@ window.AkashicDashboard.registerPlugin({
     container.innerHTML = '<div class="biomed-wrap biomed-workbench-root"></div>';
     const root = container.querySelector<HTMLElement>(".biomed-wrap");
     if (!root) return;
-    renderBiomedWorkbench(root, view);
+    renderBiomedWorkbench(root, view, dispatch);
   },
 
   renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch?: PluginDispatch): void {
