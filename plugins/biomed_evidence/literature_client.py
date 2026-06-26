@@ -400,6 +400,30 @@ def parse_pubmed_articles(xml_text: str) -> list[BiomedicalPaper]:
     return papers
 
 
+def parse_bioc_json_full_text(payload: dict[str, object]) -> str:
+    passages: list[str] = []
+    documents = payload.get("documents")
+    if not isinstance(documents, list):
+        return ""
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        for passage in document.get("passages", []):
+            if not isinstance(passage, dict):
+                continue
+            text = str(passage.get("text") or "").strip()
+            if not text:
+                continue
+            infons = passage.get("infons")
+            label = ""
+            if isinstance(infons, dict):
+                label = str(
+                    infons.get("section_type") or infons.get("type") or ""
+                ).strip()
+            passages.append(f"## {label or 'Full text'}\n{text}")
+    return "\n\n".join(passages).strip()
+
+
 def _paper_to_metadata(
     paper: BiomedicalPaper,
     *,

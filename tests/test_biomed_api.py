@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from plugins.biomed_evidence.dashboard import register
+from plugins.biomed_evidence.schemas import (
+    AnswerWithEvidenceRequest,
+    FullTextEnhancementRequest,
+)
+from plugins.biomed_evidence.service import BiomedEvidenceService
 from plugins.biomed_evidence.service import _pubmed_cache_expires_at
 
 
@@ -1245,6 +1252,140 @@ def test_biomed_run_full_text_enhance_unavailable_is_nonfatal(tmp_path: Path) ->
         )
         assert report.status_code == 200
         assert report.json()["run_id"] == run_id
+
+
+def test_full_text_enhance_pubmed_requires_open_provider_flag(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    try:
+        base = asyncio.run(
+            service.answer_with_evidence(
+                AnswerWithEvidenceRequest(
+                    question="What evidence links microglia to Alzheimer's disease?",
+                    source="mock",
+                    max_papers=1,
+                )
+            )
+        )
+        run = service.storage.get_answer_run(base.run_id)
+        assert run is not None
+        assert run.retrieval_manifest is not None
+        pubmed_manifest = run.retrieval_manifest.model_copy(update={"source": "pubmed"})
+        pubmed_run = run.model_copy(
+            update={
+                "retrieval_manifest": pubmed_manifest,
+                "retrieval_id": pubmed_manifest.retrieval_id,
+            }
+        )
+        service.storage.save_answer_run(pubmed_run, question="pubmed fixture")
+
+        async def fail_fetch(*, paper_id: str, source: str) -> tuple[str | None, str | None, str | None]:
+            raise AssertionError("open provider should not be called when use_open_provider is false")
+
+        service._fetch_open_full_text_content = fail_fetch  # type: ignore[method-assign]
+        result = asyncio.run(
+            service.enhance_run_with_full_text(
+                FullTextEnhancementRequest(
+                    run_id=pubmed_run.run_id,
+                    source="pubmed",
+                    use_open_provider=False,
+                )
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert result.ok is True
+    assert result.result["source"] == "pubmed"
+    assert result.result["extracted_evidence_ids"] == []
+
+
+def test_full_text_enhance_pubmed_open_provider_ingests_normalized_text(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    try:
+        base = asyncio.run(
+            service.answer_with_evidence(
+                AnswerWithEvidenceRequest(
+                    question="What evidence links microglia to Alzheimer's disease?",
+                    source="mock",
+                    max_papers=1,
+                )
+            )
+        )
+        run = service.storage.get_answer_run(base.run_id)
+        assert run is not None
+        assert run.retrieval_manifest is not None
+        pubmed_manifest = run.retrieval_manifest.model_copy(update={"source": "pubmed"})
+        pubmed_run = run.model_copy(
+            update={
+                "retrieval_manifest": pubmed_manifest,
+                "retrieval_id": pubmed_manifest.retrieval_id,
+            }
+        )
+        service.storage.save_answer_run(pubmed_run, question="pubmed fixture")
+        paper_id = pubmed_manifest.returned_paper_ids[0]
+        stored_paper = service.storage.get_paper(paper_id, source="mock")
+        assert stored_paper is not None
+        service.storage.upsert_paper(stored_paper.model_copy(update={"source": "pubmed"}))
+
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            assert paper_id in str(request.url)
+            return httpx.Response(
+                200,
+                json={
+                    "documents": [
+                        {
+                            "passages": [
+                                {
+                                    "infons": {"section_type": "Results"},
+                                    "text": (
+                                        "Microglial activation was associated with "
+                                        "Alzheimer's disease progression."
+                                    ),
+                                },
+                                {
+                                    "infons": {"section_type": "Methods"},
+                                    "text": "A longitudinal human cohort was used.",
+                                },
+                            ]
+                        }
+                    ]
+                },
+            )
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+        result = asyncio.run(
+            service.enhance_run_with_full_text(
+                FullTextEnhancementRequest(
+                    run_id=pubmed_run.run_id,
+                    source="pubmed",
+                    use_open_provider=True,
+                )
+            )
+        )
+        stored = service.storage.get_full_text_document(paper_id, source="pubmed")
+    finally:
+        asyncio.run(service.aclose())
+
+    assert result.ok is True
+    assert result.result["extracted_evidence_ids"]
+    assert result.result["document_ids"]
+    assert stored is not None
+    document, sections = stored
+    assert paper_id in (document.source_filename or "")
+    assert document.source_hash
+    assert sections
+    stored_payload = json.dumps(
+        {
+            "document": document.model_dump(mode="json"),
+            "sections": [section.model_dump(mode="json") for section in sections],
+        }
+    )
+    assert '"documents"' not in stored_payload
+    assert '"passages"' not in stored_payload
 
 
 def test_biomed_run_full_text_enhance_blocks_pubmed_without_policy(

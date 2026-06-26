@@ -171,14 +171,14 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         return service.get_evidence_packet(run_id).model_dump(mode="json")
 
     @app.post("/api/biomed/answer-runs/{run_id}/full-text-enhance")
-    def enhance_run_with_full_text(
+    async def enhance_run_with_full_text(
         run_id: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request = FullTextEnhancementRequest.model_validate(
             {**(payload or {}), "run_id": run_id}
         )
-        result = service.enhance_run_with_full_text(
+        result = await service.enhance_run_with_full_text(
             request.model_copy(update={"run_id": run_id})
         )
         if not result.ok and result.error_code == "unknown_run_id":

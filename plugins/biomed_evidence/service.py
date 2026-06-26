@@ -28,6 +28,7 @@ from plugins.biomed_evidence.literature_client import (
     LiteratureClientError,
     MockLiteratureClient,
     PubMedLiteratureClient,
+    parse_bioc_json_full_text,
 )
 from plugins.biomed_evidence.math_signals import (
     build_argument_graph,
@@ -2245,7 +2246,32 @@ class BiomedEvidenceService:
             reason=None if evidence else "No full-text evidence could be extracted.",
         )
 
-    def enhance_run_with_full_text(
+    async def _fetch_open_full_text_content(
+        self,
+        *,
+        paper_id: str,
+        source: str,
+    ) -> tuple[str | None, str | None, str | None]:
+        if source != "pubmed":
+            return None, None, "open_full_text_provider_only_supports_pubmed"
+        assert self.pubmed_client.client is not None
+        url = (
+            "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/"
+            f"pmcoa.cgi/BioC_json/{paper_id}/unicode"
+        )
+        try:
+            response = await self.pubmed_client.client.get(url)
+            if response.status_code == 404:
+                return None, url, "full_text_unavailable"
+            response.raise_for_status()
+            content = parse_bioc_json_full_text(response.json())
+            if not content:
+                return None, url, "full_text_empty"
+            return content, url, None
+        except Exception as exc:
+            return None, url, f"full_text_provider_failed:{exc.__class__.__name__}"
+
+    async def enhance_run_with_full_text(
         self,
         request: FullTextEnhancementRequest,
     ) -> ReleaseToolEnvelope:
@@ -2288,16 +2314,45 @@ class BiomedEvidenceService:
 
         for paper_id in candidate_ids:
             stored = self.storage.get_full_text_document(paper_id, source=source)
+            provider_warning: str | None = None
+            if stored is None and request.use_open_provider:
+                content, locator, provider_error = await self._fetch_open_full_text_content(
+                    paper_id=paper_id,
+                    source=source,
+                )
+                if content:
+                    ingested = self.ingest_full_text(
+                        FullTextIngestionRequest(
+                            paper_id=paper_id,
+                            source=source,
+                            content=content,
+                            content_type="text/plain",
+                            source_filename=locator,
+                            overwrite=request.overwrite_full_text,
+                        )
+                    )
+                    if ingested.ok:
+                        stored = self.storage.get_full_text_document(
+                            paper_id, source=source
+                        )
+                    else:
+                        provider_warning = "full_text_ingestion_failed"
+                elif provider_error:
+                    provider_warning = provider_error
             if stored is None:
                 statuses.append(
                     FullTextEnhancementPaperStatus(
                         paper_id=paper_id,
                         source=source,
                         status="unavailable",
-                        warning="full_text_unavailable",
+                        warning=provider_warning or "full_text_unavailable",
                     )
                 )
-                warnings.append(f"Open or stored full text unavailable for {paper_id}.")
+                warnings.append(
+                    f"{paper_id}: {provider_warning}"
+                    if provider_warning
+                    else f"Open or stored full text unavailable for {paper_id}."
+                )
                 continue
             document, sections = stored
             extracted = self.extract_full_text_evidence(

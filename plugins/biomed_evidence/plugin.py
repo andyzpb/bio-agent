@@ -690,7 +690,7 @@ class BiomedEvidencePlugin(Plugin):
         use_open_provider: bool = False,
     ) -> str:
         """Enhance an existing research-only biomedical run with full-text evidence."""
-        result = self._service.enhance_run_with_full_text(
+        result = await self._service.enhance_run_with_full_text(
             FullTextEnhancementRequest(
                 run_id=run_id,
                 source=source,

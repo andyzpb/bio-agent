@@ -10,6 +10,7 @@ import pytest
 from agent.plugins.decorators import _derive_params_schema
 from plugins.biomed_evidence.literature_client import (
     PubMedLiteratureClient,
+    parse_bioc_json_full_text,
     parse_pubmed_articles,
 )
 from plugins.biomed_evidence.schemas import (
@@ -1160,6 +1161,56 @@ def test_full_text_evidence_prefers_results_sections(tmp_path: Path) -> None:
     assert extracted is not None
     assert extracted.evidence
     assert extracted.evidence[0].section_label == "Results"
+
+
+def test_parse_bioc_json_full_text_extracts_passages() -> None:
+    payload = {
+        "documents": [
+            {
+                "passages": [
+                    {
+                        "infons": {"section_type": "Results"},
+                        "text": "Microglia were associated with pathology.",
+                    },
+                    {
+                        "infons": {"section_type": "Methods"},
+                        "text": "A cohort design was used.",
+                    },
+                ]
+            }
+        ]
+    }
+
+    text = parse_bioc_json_full_text(payload)
+
+    assert "## Results" in text
+    assert "Microglia were associated with pathology." in text
+    assert "## Methods" in text
+
+
+def test_parse_bioc_json_full_text_skips_malformed_empty_passages() -> None:
+    payload = {
+        "documents": [
+            {
+                "passages": [
+                    {},
+                    {"text": "  "},
+                    {"infons": {"type": "Discussion"}, "text": "Validated passage."},
+                ]
+            },
+            "bad-document",
+            {"passages": [{"text": "Second document passage."}]},
+        ]
+    }
+
+    text = parse_bioc_json_full_text(payload)
+
+    assert text.count("##") == 2
+    assert "## Discussion" in text
+    assert "Validated passage." in text
+    assert "## Full text" in text
+    assert "Second document passage." in text
+    assert parse_bioc_json_full_text({"documents": "bad"}) == ""
 
 
 def test_watch_graph_drift_reports_paper_and_claim_changes(tmp_path: Path) -> None:
