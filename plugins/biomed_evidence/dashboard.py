@@ -557,6 +557,28 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             )
         return result.model_dump(mode="json")
 
+    @app.get("/api/biomed/answer-runs/{run_id}/papers")
+    def get_answer_run_literature_set(
+        run_id: str,
+        project_id: str = Query(default=""),
+    ) -> dict[str, Any]:
+        clean_project_id = project_id.strip()
+        if clean_project_id and service.get_project(clean_project_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error_code": "unknown_project_id",
+                    "project_id": clean_project_id,
+                },
+            )
+        result = service.get_run_literature_set(run_id, project_id=clean_project_id)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "unknown_run_id", "run_id": run_id},
+            )
+        return result.model_dump(mode="json")
+
     @app.get("/api/biomed/answer-runs/{run_id}/evidence-review")
     def get_answer_evidence_review(
         run_id: str,

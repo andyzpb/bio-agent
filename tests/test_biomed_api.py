@@ -1254,6 +1254,142 @@ def test_biomed_run_full_text_enhance_unavailable_is_nonfatal(tmp_path: Path) ->
         assert report.json()["run_id"] == run_id
 
 
+def test_biomed_run_literature_set_reflects_project_decisions(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        project = client.post(
+            "/api/biomed/projects",
+            json={"name": "Microglia review", "description": "Paper triage"},
+        )
+        assert project.status_code == 200
+        project_id = project.json()["project_id"]
+        answer = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What evidence links microglia to Alzheimer's disease?",
+                "source": "mock",
+                "max_papers": 3,
+                "project_id": project_id,
+            },
+        )
+        assert answer.status_code == 200
+        run_id = answer.json()["answer_result"]["run_id"]
+        retrieval_id = answer.json()["answer_result"]["retrieval_id"]
+        first = answer.json()["answer_result"]["retrieval_manifest"]["returned_paper_ids"][0]
+
+        decision = client.post(
+            f"/api/biomed/projects/{project_id}/papers",
+            json={
+                "paper_id": first,
+                "source": "mock",
+                "decision": "saved",
+                "reason": "Relevant seed paper",
+                "run_id": run_id,
+                "retrieval_id": retrieval_id,
+            },
+        )
+        assert decision.status_code == 200
+
+        response = client.get(
+            f"/api/biomed/answer-runs/{run_id}/papers?project_id={project_id}"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["run_id"] == run_id
+        assert payload["summary"]["total_papers"] == 3
+        assert payload["summary"]["saved_count"] == 1
+        assert payload["summary"]["used_in_answer_count"] == 3
+        assert payload["summary"]["packet_included_count"] == 3
+        assert payload["summary"]["full_text_count"] == 0
+        assert [item["retrieval_rank"] for item in payload["papers"]] == [1, 2, 3]
+        first_item = payload["papers"][0]
+        assert first_item["paper_id"] == first
+        assert first_item["decision"] == "saved"
+        assert first_item["decision_id"]
+        assert first_item["used_in_answer"] is True
+        assert first_item["evidence_count"] >= 1
+        assert first_item["has_full_text"] is False
+        assert first_item["packet_included"] is True
+        assert first_item["review_status"] == "needs_review"
+
+        review = client.get(f"/api/biomed/answer-runs/{run_id}/evidence-review")
+        assert review.status_code == 200
+        review_payload = review.json()
+        shared_paper_id, shared_claims = next(
+            (
+                paper_id,
+                claims,
+            )
+            for paper_id, claims in {
+                paper["paper_id"]: [
+                    claim
+                    for claim in review_payload["claims"]
+                    if paper["paper_id"] in claim["paper_ids"]
+                ]
+                for paper in payload["papers"]
+            }.items()
+            if len(claims) >= 2
+        )
+
+        first_claim = shared_claims[0]
+        first_claim_decision = client.post(
+            f"/api/biomed/answer-runs/{run_id}/evidence-review/decisions",
+            json={
+                "claim_id": first_claim["claim_id"],
+                "claim_node_id": first_claim["claim_node_id"],
+                "decision": "needs_more_evidence",
+            },
+        )
+        assert first_claim_decision.status_code == 200
+
+        partial = client.get(
+            f"/api/biomed/answer-runs/{run_id}/papers?project_id={project_id}"
+        )
+        assert partial.status_code == 200
+        partial_payload = partial.json()
+        partial_item = next(
+            item for item in partial_payload["papers"] if item["paper_id"] == shared_paper_id
+        )
+        assert partial_item["review_status"] == "needs_review"
+        assert partial_payload["summary"]["reviewed_count"] == 0
+
+        for claim in shared_claims[1:]:
+            claim_decision = client.post(
+                f"/api/biomed/answer-runs/{run_id}/evidence-review/decisions",
+                json={
+                    "claim_id": claim["claim_id"],
+                    "claim_node_id": claim["claim_node_id"],
+                    "decision": "needs_more_evidence",
+                },
+            )
+            assert claim_decision.status_code == 200
+
+        completed = client.get(
+            f"/api/biomed/answer-runs/{run_id}/papers?project_id={project_id}"
+        )
+        assert completed.status_code == 200
+        completed_payload = completed.json()
+        completed_item = next(
+            item
+            for item in completed_payload["papers"]
+            if item["paper_id"] == shared_paper_id
+        )
+        assert completed_item["review_status"] == "reviewed"
+        assert completed_payload["summary"]["reviewed_count"] >= 1
+
+        missing_run = client.get("/api/biomed/answer-runs/unknown-run/papers")
+        assert missing_run.status_code == 404
+        assert missing_run.json()["detail"]["error_code"] == "unknown_run_id"
+
+        missing_project = client.get(
+            f"/api/biomed/answer-runs/{run_id}/papers?project_id=missing-project"
+        )
+        assert missing_project.status_code == 404
+        assert missing_project.json()["detail"] == {
+            "error_code": "unknown_project_id",
+            "project_id": "missing-project",
+        }
+
+
 def test_full_text_enhance_pubmed_requires_open_provider_flag(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
     try:

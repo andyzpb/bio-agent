@@ -1725,6 +1725,53 @@ class RunEvidenceReview(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class RunLiteratureSetPaper(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: str
+    source: Literal["pubmed", "mock"] = "mock"
+    title: str = ""
+    journal: str | None = None
+    publication_date: str | None = None
+    doi: str | None = None
+    url: str | None = None
+    retrieval_rank: int = 0
+    abstract_available: bool = False
+    decision_id: str | None = None
+    decision: ProjectPaperDecisionValue | None = None
+    decision_reason: str | None = None
+    used_in_answer: bool = False
+    evidence_count: int = 0
+    has_full_text: bool = False
+    packet_included: bool = False
+    review_status: Literal["reviewed", "needs_review", "not_reviewed"] = "not_reviewed"
+
+
+class RunLiteratureSetSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_papers: int = 0
+    used_in_answer_count: int = 0
+    saved_count: int = 0
+    rejected_count: int = 0
+    needs_review_count: int = 0
+    full_text_count: int = 0
+    packet_included_count: int = 0
+    reviewed_count: int = 0
+    not_reviewed_count: int = 0
+
+
+class RunLiteratureSet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    project_id: str | None = None
+    retrieval_id: str | None = None
+    source: Literal["pubmed", "mock"] = "mock"
+    summary: RunLiteratureSetSummary
+    papers: list[RunLiteratureSetPaper] = Field(default_factory=list)
+
+
 class RunReviewPacket(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

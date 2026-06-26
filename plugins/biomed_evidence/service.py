@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 import os
@@ -149,6 +150,9 @@ from plugins.biomed_evidence.schemas import (
     RunEvidenceReview,
     RunEvidenceReviewClaim,
     RunEvidenceReviewSummary,
+    RunLiteratureSet,
+    RunLiteratureSetPaper,
+    RunLiteratureSetSummary,
     RunReviewDecision,
     RunReviewDecisionRequest,
     RunReviewPacket,
@@ -4676,6 +4680,102 @@ class BiomedEvidenceService:
             validation=validation_json,
             graph=graph_json if include_graph else None,
             warnings=warnings,
+        )
+
+    def get_run_literature_set(
+        self,
+        run_id: str,
+        project_id: str = "",
+    ) -> RunLiteratureSet | None:
+        clean_run_id = run_id.strip()
+        run = self.storage.get_answer_run(clean_run_id)
+        if run is None:
+            return None
+        clean_project_id = project_id.strip()
+        if clean_project_id and self.storage.get_project(clean_project_id) is None:
+            raise ValueError("project not found")
+
+        source = _pilot_source(run)
+        decision_map = (
+            self.storage.get_project_paper_decision_map(clean_project_id, source=source)
+            if clean_project_id
+            else {}
+        )
+        evidence_counts = Counter(
+            item.paper_id
+            for item in [*run.evidence_summary, *run.conflicting_evidence]
+            if item.paper_id
+        )
+        used_paper_ids = {
+            item.paper_id
+            for item in [*run.evidence_summary, *run.conflicting_evidence]
+            if item.paper_id
+        }
+        used_paper_ids.update(item.paper_id for item in run.citations if item.paper_id)
+        packet_paper_ids = set(run.evidence_packet.paper_ids if run.evidence_packet else [])
+        citation_by_paper = {item.paper_id: item for item in run.citations if item.paper_id}
+        review_statuses = _review_status_by_paper_id(
+            self.get_run_evidence_review(clean_run_id)
+        )
+
+        papers: list[RunLiteratureSetPaper] = []
+        for retrieval_rank, paper_id in enumerate(_run_candidate_paper_ids(run), start=1):
+            paper = self.storage.get_paper(paper_id, source=source)
+            decision = decision_map.get(paper_id)
+            citation = citation_by_paper.get(paper_id)
+            papers.append(
+                RunLiteratureSetPaper(
+                    paper_id=paper_id,
+                    source=cast(
+                        Literal["pubmed", "mock"],
+                        paper.source if paper is not None else source,
+                    ),
+                    title=(
+                        paper.title
+                        if paper is not None
+                        else citation.title if citation is not None else ""
+                    ),
+                    journal=paper.journal if paper is not None else None,
+                    publication_date=paper.publication_date if paper is not None else None,
+                    doi=paper.doi if paper is not None else citation.doi if citation else None,
+                    url=paper.url if paper is not None else citation.url if citation else None,
+                    retrieval_rank=retrieval_rank,
+                    abstract_available=bool(paper.abstract) if paper is not None else False,
+                    decision_id=decision.decision_id if decision is not None else None,
+                    decision=decision.decision if decision is not None else None,
+                    decision_reason=decision.reason if decision is not None else None,
+                    used_in_answer=paper_id in used_paper_ids,
+                    evidence_count=evidence_counts.get(paper_id, 0),
+                    has_full_text=(
+                        self.storage.get_full_text_document(paper_id, source=source)
+                        is not None
+                    ),
+                    packet_included=paper_id in packet_paper_ids,
+                    review_status=review_statuses.get(paper_id, "not_reviewed"),
+                )
+            )
+
+        return RunLiteratureSet(
+            run_id=clean_run_id,
+            project_id=clean_project_id or None,
+            retrieval_id=run.retrieval_id,
+            source=source,
+            summary=RunLiteratureSetSummary(
+                total_papers=len(papers),
+                used_in_answer_count=sum(1 for item in papers if item.used_in_answer),
+                saved_count=sum(1 for item in papers if item.decision == "saved"),
+                rejected_count=sum(1 for item in papers if item.decision == "rejected"),
+                needs_review_count=sum(
+                    1 for item in papers if item.decision == "needs_review"
+                ),
+                full_text_count=sum(1 for item in papers if item.has_full_text),
+                packet_included_count=sum(1 for item in papers if item.packet_included),
+                reviewed_count=sum(1 for item in papers if item.review_status == "reviewed"),
+                not_reviewed_count=sum(
+                    1 for item in papers if item.review_status == "not_reviewed"
+                ),
+            ),
+            papers=papers,
         )
 
     def record_run_review_decision(
@@ -10179,6 +10279,30 @@ def _latest_review_decisions_by_claim(
         ):
             latest[decision.claim_id] = decision
     return latest
+
+
+def _review_status_by_paper_id(
+    review: RunEvidenceReview | None,
+) -> dict[str, Literal["reviewed", "needs_review", "not_reviewed"]]:
+    statuses: dict[str, Literal["reviewed", "needs_review", "not_reviewed"]] = {}
+    if review is None:
+        return statuses
+    claim_counts: Counter[str] = Counter()
+    decided_counts: Counter[str] = Counter()
+    for claim in review.claims:
+        for paper_id in claim.paper_ids:
+            if not paper_id:
+                continue
+            claim_counts[paper_id] += 1
+            if claim.latest_decision is not None:
+                decided_counts[paper_id] += 1
+    for paper_id, claim_count in claim_counts.items():
+        statuses[paper_id] = (
+            "reviewed"
+            if claim_count > 0 and decided_counts[paper_id] == claim_count
+            else "needs_review"
+        )
+    return statuses
 
 
 def _find_review_claim(
