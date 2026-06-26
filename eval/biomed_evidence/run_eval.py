@@ -15,6 +15,7 @@ from plugins.biomed_evidence.schemas import (
     EvidenceExtractionRequest,
     EvidencePacketBuildRequest,
     ExportEvidenceReportRequest,
+    FullTextEnhancementRequest,
     FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
@@ -57,7 +58,10 @@ async def _run(args: argparse.Namespace) -> dict:
         for line in args.questions.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    service = BiomedEvidenceService(Path(tempfile.mkdtemp(prefix="biomed-eval-")))
+    service = BiomedEvidenceService(
+        Path(tempfile.mkdtemp(prefix="biomed-eval-")),
+        allow_live_pubmed_tools=bool(args.live_pubmed),
+    )
     started = time.monotonic()
     literature_check = await service.check_literature_access(
         LiteratureAccessCheckRequest(
@@ -174,6 +178,7 @@ async def _run(args: argparse.Namespace) -> dict:
     argument_graph_v2_schema_checks: list[bool] = []
     argument_graph_link_checks: list[bool] = []
     watch_drift_schema_checks: list[bool] = []
+    full_text_enhancement_checks: list[bool] = []
     full_text_ingestion_checks: list[bool] = []
     full_text_locator_checks: list[bool] = []
     prompt_injection_boundary_checks: list[bool] = []
@@ -693,6 +698,7 @@ async def _run(args: argparse.Namespace) -> dict:
             "export_project_to_obsidian",
             "export_research_watch_to_obsidian",
             "export_provenance_graph",
+            "enhance_run_with_full_text",
         }
         tool_schema_checks.append(
             required_release_tools <= contract_names
@@ -922,8 +928,26 @@ async def _run(args: argparse.Namespace) -> dict:
             for item in decisions
             if item.decision == "push"
         ]
-        if literature_search.items:
+        full_text_run_id: str | None = None
+        full_text_paper_id: str | None = None
+        for item in answer_results:
+            candidate_run = service.storage.get_answer_run(str(item.get("run_id") or ""))
+            candidate_manifest = (
+                candidate_run.retrieval_manifest if candidate_run is not None else None
+            )
+            candidate_ids = (
+                candidate_manifest.returned_paper_ids
+                if candidate_manifest is not None
+                else []
+            )
+            if candidate_ids:
+                full_text_run_id = candidate_run.run_id if candidate_run else None
+                full_text_paper_id = candidate_ids[0]
+                break
+        if full_text_paper_id is None and literature_search.items:
             full_text_paper_id = literature_search.items[0].paper_id
+
+        if full_text_paper_id:
             full_text_result = service.ingest_full_text(
                 FullTextIngestionRequest(
                     paper_id=full_text_paper_id,
@@ -952,6 +976,22 @@ async def _run(args: argparse.Namespace) -> dict:
                 and bool(extracted_full_text.evidence[0].section_id)
                 and extracted_full_text.evidence[0].char_start is not None
             )
+            if full_text_run_id is not None:
+                enhancement = await service.enhance_run_with_full_text(
+                    FullTextEnhancementRequest(
+                        run_id=full_text_run_id,
+                        source=args.source,
+                        use_open_provider=False,
+                        max_papers=1,
+                    )
+                )
+                enhancement_result = enhancement.result
+                full_text_enhancement_checks.append(
+                    enhancement.ok
+                    and bool(enhancement_result.get("extracted_evidence_ids"))
+                    and bool(enhancement_result.get("packet_id"))
+                    and not bool(enhancement_result.get("unavailable_paper_ids"))
+                )
         metrics = {
             "citation_coverage": rate(citation_checks),
             "schema_validity": rate(schema_checks) if schema_checks else 1.0,
@@ -1131,6 +1171,7 @@ async def _run(args: argparse.Namespace) -> dict:
             ),
             "argument_graph_evidence_link_rate": rate(argument_graph_link_checks),
             "watch_drift_schema_validity": rate(watch_drift_schema_checks),
+            "full_text_enhancement_success_rate": rate(full_text_enhancement_checks),
             "full_text_ingestion_success_rate": rate(full_text_ingestion_checks),
             "full_text_span_locator_validity": rate(full_text_locator_checks),
             "prompt_injection_boundary_success_rate": rate(
