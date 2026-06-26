@@ -1218,6 +1218,35 @@ def test_biomed_run_full_text_enhance_reuses_stored_document(tmp_path: Path) -> 
         assert "full-text evidence items" in extract_step["output_summary"]
 
 
+def test_biomed_run_full_text_enhance_unavailable_is_nonfatal(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        answer = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": "What evidence links microglia to Alzheimer's disease?",
+                "source": "mock",
+                "max_papers": 2,
+            },
+        )
+        assert answer.status_code == 200
+        run_id = answer.json()["answer_result"]["run_id"]
+
+        response = client.post(f"/api/biomed/answer-runs/{run_id}/full-text-enhance")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["extracted_evidence_ids"] == []
+        assert result["unavailable_paper_ids"]
+        assert any("unavailable" in warning for warning in result["warnings"])
+
+        report = client.get(
+            f"/api/biomed/export?run_id={run_id}&report_type=pilot&format=json"
+        )
+        assert report.status_code == 200
+        assert report.json()["run_id"] == run_id
+
+
 def test_biomed_run_full_text_enhance_blocks_pubmed_without_policy(
     tmp_path: Path,
 ) -> None:
