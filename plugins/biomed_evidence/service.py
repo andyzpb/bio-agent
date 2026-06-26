@@ -111,6 +111,7 @@ from plugins.biomed_evidence.schemas import (
     GenerateProjectEvidenceBriefRequest,
     GraphEdge,
     GraphNode,
+    HarnessScenario,
     LiteratureAccessCheckRequest,
     LiteratureAccessCheckResult,
     LiteraturePaperRecord,
@@ -3636,6 +3637,20 @@ class BiomedEvidenceService:
             revision=revision,
             trace=trace,
             final_action=revision.revision_action,
+        )
+
+    async def run_harness_scenario(
+        self,
+        scenario: HarnessScenario,
+    ) -> AuditedAnswerResult:
+        return await self.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question=scenario.question,
+                max_papers=scenario.max_papers,
+                project_id=scenario.project_id,
+                require_citations=scenario.require_citations,
+                source=scenario.source,
+            )
         )
 
     async def _audit_answer_with_optional_logic(

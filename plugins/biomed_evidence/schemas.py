@@ -2255,6 +2255,46 @@ class ExportEvidenceReportRequest(BaseModel):
     reviewer_minutes: float | None = None
 
 
+class HarnessScenario(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    question: str
+    source: Literal["pubmed", "mock"] = "mock"
+    max_papers: int = 3
+    project_id: str | None = None
+    require_citations: bool = True
+    enable_full_text_enhance: bool = False
+    manual_baseline_minutes: float | None = None
+    reviewer_minutes: float | None = None
+    must_include_citations: bool = True
+    forbidden_outputs: list[str] = Field(default_factory=list)
+    max_unsupported_rate: float | None = None
+    max_overclaim_rate: float | None = None
+    require_review_completion: bool = False
+    require_literature_set: bool = False
+
+
+class HarnessScenarioResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_id: str
+    run_id: str
+    retrieval_id: str | None = None
+    source: Literal["pubmed", "mock"] = "mock"
+    question: str
+    final_answer: str = ""
+    literature_set_summary: RunLiteratureSetSummary = Field(
+        default_factory=RunLiteratureSetSummary
+    )
+    pilot_report: PilotReport
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    gates: dict[str, Any] = Field(default_factory=dict)
+    full_text_enhancement: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    passed: bool = False
+
+
 class PageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
