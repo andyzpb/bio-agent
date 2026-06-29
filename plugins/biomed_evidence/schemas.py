@@ -171,6 +171,7 @@ LogicPredicate = Literal[
     "is_required_for",
     "is_sufficient_for",
     "has_no_effect",
+    "no_observed_benefit",
     "contradicts",
     "uncertain_or_inconclusive",
     "background_relation",

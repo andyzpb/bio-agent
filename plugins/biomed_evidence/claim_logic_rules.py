@@ -56,6 +56,15 @@ RULE_METADATA: dict[str, LogicRuleMetadata] = {
             "necessary, independent, or definitive causation."
         ),
     ),
+    "trial_no_observed_benefit_partially_entails_no_effect": LogicRuleMetadata(
+        rule_id="trial_no_observed_benefit_partially_entails_no_effect",
+        category="predicate_boundary",
+        severity="minor",
+        explanation=(
+            "Trial-level no-observed-benefit evidence supports a weaker negative "
+            "finding, but not a universal no-effect conclusion."
+        ),
+    ),
     "animal_evidence_does_not_entail_human_claim": LogicRuleMetadata(
         rule_id="animal_evidence_does_not_entail_human_claim",
         category="population_mismatch",
@@ -203,6 +212,15 @@ def audit_logical_support(
                 )
             else:
                 _add_rule(rules, "contribution_partially_entails_causation")
+
+        if (
+            evidence.predicate == "no_observed_benefit"
+            and claim_frame.predicate == "has_no_effect"
+        ):
+            _add_rule(
+                rules,
+                "trial_no_observed_benefit_partially_entails_no_effect",
+            )
 
         if claim_frame.population == "human" and evidence.population == "animal":
             _add_rule(rules, "animal_evidence_does_not_entail_human_claim")

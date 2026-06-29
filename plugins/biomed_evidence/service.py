@@ -7008,6 +7008,7 @@ def _llm_claim_logic_payload(
             "Return all frames; missing frames make the parser fail.",
             "Do not decide the final entailment verdict.",
             "Use contributes_to for cofactor, risk-factor, contributor, or progression-promoting wording that is stronger than association but weaker than definitive causation.",
+            "Use no_observed_benefit for trial- or study-level negative findings such as did not improve, no benefit, failed to improve, or no significant improvement.",
         ],
         "allowed_values": {
             "predicate": [
@@ -7023,6 +7024,7 @@ def _llm_claim_logic_payload(
                 "diagnoses",
                 "is_marker_of",
                 "has_no_effect",
+                "no_observed_benefit",
                 "uncertain_or_inconclusive",
                 "unspecified",
             ],
@@ -7206,6 +7208,29 @@ def _normalize_logic_payload(raw: dict[str, object]) -> dict[str, object]:
         warnings.append("Normalized modality 'uncertain' to 'inconclusive'.")
     text = _logic_payload_text(payload).lower()
     if (
+        _has_negative_benefit_language(text)
+        and payload.get("predicate")
+        in {
+            "has_no_effect",
+            "uncertain_or_inconclusive",
+            "treats",
+            "unspecified",
+        }
+    ):
+        original = payload.get("predicate")
+        payload["predicate"] = "no_observed_benefit"
+        payload["modality"] = "moderate"
+        if "claim_id" in payload:
+            payload["claim_strength"] = "clinical"
+            payload["qualifiers"] = _merge_unique(
+                _coerce_string_list(payload.get("qualifiers")),
+                _negative_benefit_qualifiers(text),
+            )
+        warnings.append(
+            f"Normalized negative trial finding predicate '{original}' to "
+            "'no_observed_benefit'."
+        )
+    if (
         _has_contribution_language(text)
         and not _has_explicit_sufficient_cause(text)
         and payload.get("predicate")
@@ -7253,6 +7278,39 @@ def _has_explicit_sufficient_cause(lowered: str) -> bool:
             lowered,
         )
     )
+
+
+def _has_negative_benefit_language(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:"
+            r"(?:did|does|do)\s+not\s+(?:significantly\s+)?(?:improve|benefit)"
+            r"|(?:did|does|do)\s+not\s+have\s+(?:a\s+)?lower\s+incidence"
+            r"|failed\s+to\s+(?:significantly\s+)?improve"
+            r"|no\s+(?:significant\s+)?(?:clinical\s+)?(?:benefit|improvement)"
+            r"|not\s+associated\s+with\s+(?:improved|better)"
+            r")\b",
+            lowered,
+        )
+    )
+
+
+def _negative_benefit_qualifiers(lowered: str) -> list[str]:
+    qualifiers: list[str] = []
+    if re.search(r"\b(trial|study|randomi[sz]ed)\b", lowered):
+        qualifiers.append("trial_scoped")
+    if re.search(r"\b(patients?|adults?|severe|hospitali[sz]ed|cohort)\b", lowered):
+        qualifiers.append("population_scoped")
+    if re.search(
+        r"\b(standard of care|usual care|placebo|comparator|compared with|versus|vs\.?)\b",
+        lowered,
+    ):
+        qualifiers.append("comparator_scoped")
+    if re.search(r"\b(outcomes?|mortality|death|discharge|ventilation)\b", lowered):
+        qualifiers.append("outcome_scoped")
+    if re.search(r"\b\d+\s*(?:day|days|week|weeks|month|months)\b", lowered):
+        qualifiers.append("timepoint_scoped")
+    return qualifiers
 
 
 def _contribution_qualifiers(lowered: str) -> list[str]:

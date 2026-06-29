@@ -24,6 +24,15 @@ COFACTOR_TEXT = (
     "Viral load and viral type are the main cofactors for progression from "
     "infection to cervical intraepithelial lesions and cancer"
 )
+AZITHROMYCIN_CLAIM = (
+    "When azithromycin was added to standard of care "
+    "(which included hydroxychloroquine), clinical outcomes did not improve."
+)
+AZITHROMYCIN_EVIDENCE = (
+    "In patients with severe COVID-19, adding azithromycin to standard of care "
+    "treatment (which included hydroxychloroquine) did not improve clinical "
+    "outcomes."
+)
 
 
 def _citation(paper_id: str = "PMID:123") -> Citation:
@@ -65,6 +74,21 @@ def _cofactor_evidence() -> EvidenceItem:
         limitations=["Review-level evidence."],
         confidence="medium",
         evidence_span=COFACTOR_TEXT,
+    )
+
+
+def _azithromycin_evidence() -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id="ev_azithro",
+        paper_id="32896292",
+        claim=AZITHROMYCIN_EVIDENCE,
+        finding=AZITHROMYCIN_EVIDENCE,
+        evidence_direction="inconclusive",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=["Trial-level evidence."],
+        confidence="medium",
+        evidence_span=AZITHROMYCIN_EVIDENCE,
     )
 
 
@@ -362,6 +386,167 @@ def test_llm_logic_parser_normalizes_cofactor_predicate_drift() -> None:
     assert evidence_frame.predicate == "contributes_to"
     assert any(
         "contributes_to" in warning for warning in evidence_frame.parser_warnings
+    )
+
+
+def test_deterministic_parser_maps_negative_trial_finding_to_no_observed_benefit() -> None:
+    claim = AtomicClaim(
+        claim_id="claim_azithro",
+        text=AZITHROMYCIN_CLAIM,
+        claim_type="clinical_implication",
+        cited_paper_ids=["32896292"],
+    )
+
+    result = audit_claim_logic(claim, [_azithromycin_evidence()])
+
+    assert result.claim_frame.predicate == "no_observed_benefit"
+    assert result.claim_frame.modality == "moderate"
+    assert "comparator_scoped" in result.claim_frame.qualifiers
+    assert "outcome_scoped" in result.claim_frame.qualifiers
+    assert result.evidence_frames[0].predicate == "no_observed_benefit"
+    assert result.evidence_frames[0].modality == "moderate"
+    assert result.logic_verdict == "entailed"
+
+
+def test_llm_logic_parser_normalizes_negative_trial_finding_drift() -> None:
+    raw_claim = {
+        "claim_id": "claim_azithro",
+        "claim_text": AZITHROMYCIN_CLAIM,
+        "subject": {"text": "azithromycin", "entity_type": "drug"},
+        "predicate": "has_no_effect",
+        "object": {"text": "clinical outcomes", "entity_type": "disease"},
+        "polarity": "negative",
+        "modality": "definitive",
+        "population": "human",
+        "claim_strength": "treatment",
+        "qualifiers": [],
+    }
+    raw_evidence = {
+        "evidence_id": "ev_azithro",
+        "paper_id": "32896292",
+        "evidence_text": AZITHROMYCIN_EVIDENCE,
+        "subject": {"text": "azithromycin", "entity_type": "drug"},
+        "predicate": "uncertain_or_inconclusive",
+        "object": {"text": "clinical outcomes", "entity_type": "disease"},
+        "polarity": "negative",
+        "modality": "inconclusive",
+        "population": "human",
+        "study_design": "randomized_trial",
+        "evidence_strength": "interventional",
+    }
+
+    claim_frames = biomed_service_module._logic_claim_frames_from_llm(
+        [raw_claim],
+        claims=[
+            AtomicClaim(
+                claim_id="claim_azithro",
+                text=AZITHROMYCIN_CLAIM,
+                claim_type="clinical_implication",
+            )
+        ],
+        model="fake",
+        prompt_hash="hash",
+    )
+    evidence_frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [raw_evidence],
+        evidence_items=[_azithromycin_evidence()],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    claim_frame = claim_frames["claim_azithro"]
+    evidence_frame = evidence_frames["ev_azithro"]
+    assert claim_frame.predicate == "no_observed_benefit"
+    assert claim_frame.modality == "moderate"
+    assert "outcome_scoped" in claim_frame.qualifiers
+    assert any(
+        "no_observed_benefit" in warning for warning in claim_frame.parser_warnings
+    )
+    assert evidence_frame.predicate == "no_observed_benefit"
+    assert evidence_frame.modality == "moderate"
+    assert any(
+        "no_observed_benefit" in warning for warning in evidence_frame.parser_warnings
+    )
+
+
+def test_aligned_negative_trial_finding_is_not_overclaimed_from_modality_mismatch() -> None:
+    answer = f"{AZITHROMYCIN_CLAIM} [32896292]"
+    evidence = _azithromycin_evidence()
+    base = validate_citation_support(
+        answer=answer,
+        citations=[_citation("32896292")],
+        evidence_items=[evidence],
+    )
+    claim = base.claims[0]
+    claim_frames = biomed_service_module._logic_claim_frames_from_llm(
+        [
+            {
+                "claim_id": claim.claim_id,
+                "claim_text": AZITHROMYCIN_CLAIM,
+                "subject": {"text": "azithromycin", "entity_type": "drug"},
+                "predicate": "has_no_effect",
+                "object": {"text": "clinical outcomes", "entity_type": "disease"},
+                "polarity": "negative",
+                "modality": "definitive",
+                "population": "human",
+                "claim_strength": "treatment",
+            }
+        ],
+        claims=[claim],
+        model="fake",
+        prompt_hash="hash",
+    )
+    evidence_frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [
+            {
+                "evidence_id": evidence.evidence_id,
+                "paper_id": evidence.paper_id,
+                "evidence_text": AZITHROMYCIN_EVIDENCE,
+                "subject": {"text": "azithromycin", "entity_type": "drug"},
+                "predicate": "uncertain_or_inconclusive",
+                "object": {"text": "clinical outcomes", "entity_type": "disease"},
+                "polarity": "negative",
+                "modality": "inconclusive",
+                "population": "human",
+                "study_design": "randomized_trial",
+                "evidence_strength": "interventional",
+            }
+        ],
+        evidence_items=[evidence],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    result = validate_citation_support(
+        answer=answer,
+        citations=[_citation("32896292")],
+        evidence_items=[evidence],
+        use_llm_claim_logic=True,
+        logic_claim_frames=claim_frames,
+        logic_evidence_frames=evidence_frames,
+    )
+
+    audit = result.claim_audits[0]
+    assert audit.verdict == "partial_support"
+    assert audit.logic_audit is not None
+    assert audit.logic_audit.logic_verdict == "entailed"
+
+
+def test_trial_no_observed_benefit_only_partially_supports_universal_no_effect() -> None:
+    claim = AtomicClaim(
+        claim_id="claim_no_effect",
+        text="Azithromycin has no effect on COVID-19 clinical outcomes.",
+        claim_type="clinical_implication",
+        cited_paper_ids=["32896292"],
+    )
+
+    result = audit_claim_logic(claim, [_azithromycin_evidence()])
+
+    assert result.claim_frame.predicate == "has_no_effect"
+    assert result.evidence_frames[0].predicate == "no_observed_benefit"
+    assert result.logic_verdict == "partially_entailed"
+    assert "trial_no_observed_benefit_partially_entails_no_effect" in (
+        result.rules_triggered
     )
 
 
