@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Iterable, cast
 
 from plugins.biomed_evidence.claim_logic import audit_claim_logic
+from plugins.biomed_evidence.evidence_maturity import derive_evidence_maturity
 from plugins.biomed_evidence.schemas import (
     AtomicClaim,
     AuditRecommendedAction,
@@ -19,6 +20,7 @@ from plugins.biomed_evidence.schemas import (
     ConflictAuditResult,
     ConflictVerdict,
     EvidenceItem,
+    EvidenceMaturity,
     EvidenceStrength,
     LogicAuditResult,
     LogicParserMode,
@@ -84,6 +86,10 @@ def validate_citation_support(
 ) -> CitationAuditResult:
     claims = extract_atomic_claims(answer)
     citation_ids = {citation.paper_id for citation in citations}
+    evidence_maturity = derive_evidence_maturity(
+        question=answer,
+        evidence=evidence_items,
+    )
     logic_parser_mode: LogicParserMode = (
         "llm"
         if use_llm_claim_logic and logic_claim_frames and logic_evidence_frames
@@ -100,14 +106,16 @@ def validate_citation_support(
             logic_claim_frames=logic_claim_frames,
             logic_evidence_frames=logic_evidence_frames,
             logic_parser_fallback_reason=logic_parser_fallback_reason,
+            evidence_maturity=evidence_maturity,
         )
         for claim in claims
     ]
     uncertainty_audit = derive_uncertainty_audit(
         claim_audits=claim_audits,
-        evidence_items=evidence_items,
+        evidence_items=_audit_relevant_evidence(evidence_items, claim_audits, citation_ids),
         retrieval_manifest=retrieval_manifest,
         observed_uncertainty=observed_uncertainty,
+        evidence_maturity=evidence_maturity,
     )
     failed_claims = [item for item in claim_audits if item.verdict in _FAILED_VERDICTS]
     supported_claims = [
@@ -196,6 +204,7 @@ def derive_uncertainty_audit(
     evidence_items: list[EvidenceItem],
     retrieval_manifest: RetrievalManifest | None,
     observed_uncertainty: str | None,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
 ) -> UncertaintyAudit:
     reasons: list[str] = []
     expected: ConfidenceLevel = "low"
@@ -228,8 +237,10 @@ def derive_uncertainty_audit(
     ):
         expected = "medium"
         reasons.append("Evidence includes animal or in-vitro model limitations.")
-    if expected != "high" and any(
-        _evidence_strength(item) == "abstract_only" for item in evidence_items
+    if (
+        expected != "high"
+        and evidence_maturity != "established_causal_risk_factor"
+        and any(_evidence_strength(item) == "abstract_only" for item in evidence_items)
     ):
         expected = "medium"
         reasons.append("Evidence is abstract-level only.")
@@ -272,6 +283,23 @@ def derive_uncertainty_audit(
             "publication_bias": "not_assessed",
         },
     )
+
+
+def _audit_relevant_evidence(
+    evidence_items: list[EvidenceItem],
+    claim_audits: list[ClaimAuditItem],
+    citation_ids: set[str],
+) -> list[EvidenceItem]:
+    used_ids = {
+        paper_id
+        for audit in claim_audits
+        for paper_id in audit.cited_paper_ids
+        if paper_id
+    } or citation_ids
+    if not used_ids:
+        return evidence_items
+    relevant = [item for item in evidence_items if item.paper_id in used_ids]
+    return relevant or evidence_items
 
 
 def find_conflicting_evidence(
@@ -334,6 +362,7 @@ def _audit_claim(
     logic_claim_frames: Mapping[str, LogicalClaimFrame] | None = None,
     logic_evidence_frames: Mapping[str, LogicalEvidenceFrame] | None = None,
     logic_parser_fallback_reason: str | None = None,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
 ) -> ClaimAuditItem:
     cited_ids = claim.cited_paper_ids or _infer_cited_ids(
         claim.text, evidence_items, citation_ids
@@ -369,13 +398,31 @@ def _audit_claim(
             logic_evidence_frames=logic_evidence_frames,
             logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
+    off_scope = [item for item in candidates if item.scope_match == "false"]
+    in_scope = [item for item in candidates if item.scope_match != "false"]
+    if off_scope and not in_scope:
+        return _claim_audit(
+            claim,
+            cited_paper_ids=cited_ids,
+            evidence_items=off_scope[:1],
+            verdict="irrelevant_citation",
+            support_score=0.0,
+            reason="The claim cites off-scope evidence for this research question.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
+        )
+    candidates = in_scope
     ranked = sorted(
         ((item, _overlap(claim.text, _evidence_text(item))) for item in candidates),
         key=lambda pair: pair[1],
         reverse=True,
     )
     best, score = ranked[0]
-    overclaim_reason = _overclaim_reason(claim.text, best)
+    overclaim_reason = _overclaim_reason(claim.text, best, evidence_maturity)
     if overclaim_reason:
         return _claim_audit(
             claim,
@@ -544,6 +591,28 @@ def _merge_logic_audit(
         "modality_mismatch",
         "insufficient_evidence",
     }:
+        if _logic_scope_limitation_text_match(audit_item, logic):
+            updates.update(
+                {
+                    "verdict": "partial_support",
+                    "support_score": min(audit_item.support_score, 0.65),
+                    "overclaim_reason": None,
+                    "reason": (
+                        f"{audit_item.reason} Logic entailment audit flagged "
+                        f"{logic.logic_verdict}: citation text is aligned, but "
+                        "the evidence model/source scope requires review."
+                    ),
+                    "reviewer_notes": _merge_unique(
+                        reviewer_notes,
+                        [
+                            "Full text or scope review needed: the cited abstract text "
+                            "supports the wording, but current extracted evidence is "
+                            "limited by model system or source scope."
+                        ],
+                    ),
+                }
+            )
+            return audit_item.model_copy(update=updates)
         new_verdict: CitationSupportVerdict = (
             "insufficient_evidence"
             if logic.logic_verdict == "insufficient_evidence"
@@ -561,6 +630,24 @@ def _merge_logic_audit(
             }
         )
     return audit_item.model_copy(update=updates)
+
+
+def _logic_scope_limitation_text_match(
+    audit_item: ClaimAuditItem,
+    logic: LogicAuditResult,
+) -> bool:
+    if not any(
+        rule
+        in {
+            "animal_evidence_does_not_entail_human_claim",
+            "in_vitro_evidence_does_not_entail_human_claim",
+        }
+        for rule in logic.rules_triggered
+    ):
+        return False
+    if not audit_item.evidence_span:
+        return False
+    return _overlap(audit_item.claim, audit_item.evidence_span) >= 0.75
 
 
 def _merge_unique(*groups: Iterable[str]) -> list[str]:
@@ -636,12 +723,102 @@ def _is_markdown_section_heading(line: str) -> bool:
     return bool(re.fullmatch(r"\*{1,3}\s*[^*][^.\n]{1,140}?\s*\*{1,3}", stripped))
 
 
+_SENTENCE_ABBREVIATIONS = {
+    "al",
+    "dr",
+    "e.g",
+    "fig",
+    "i.e",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "vs",
+}
+
+
 def _split_sentences(text: str) -> list[str]:
-    return [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
+    parts: list[str] = []
+    start = 0
+    paren_depth = 0
+    bracket_depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            paren_depth += 1
+            continue
+        if char == ")":
+            paren_depth = max(0, paren_depth - 1)
+            continue
+        if char == "[":
+            bracket_depth += 1
+            continue
+        if char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            continue
+        if char not in ".!?":
+            continue
+        if not _is_sentence_boundary(
+            text,
+            index,
+            paren_depth=paren_depth,
+            bracket_depth=bracket_depth,
+        ):
+            continue
+        end = index + 1
+        citation_start = end
+        while citation_start < len(text) and text[citation_start].isspace():
+            citation_start += 1
+        if citation_start < len(text) and text[citation_start] == "[":
+            citation_end = text.find("]", citation_start + 1)
+            if citation_end != -1:
+                end = citation_end + 1
+                if end < len(text) and text[end] in ".!?":
+                    end += 1
+        while end < len(text) and text[end] in ")]":
+            end += 1
+        part = text[start:end].strip()
+        if part:
+            parts.append(part)
+        start = end
+        while start < len(text) and text[start].isspace():
+            start += 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _is_sentence_boundary(
+    text: str,
+    index: int,
+    *,
+    paren_depth: int,
+    bracket_depth: int,
+) -> bool:
+    char = text[index]
+    previous = text[index - 1] if index > 0 else ""
+    next_char = text[index + 1] if index + 1 < len(text) else ""
+    if paren_depth or bracket_depth:
+        return False
+    if char == "." and previous.isdigit() and next_char.isdigit():
+        return False
+    token_match = re.search(r"([A-Za-z](?:[A-Za-z.]*)?)$", text[:index])
+    token = token_match.group(1).lower().rstrip(".") if token_match else ""
+    if char == "." and token in _SENTENCE_ABBREVIATIONS:
+        return False
+    lookahead = index + 1
+    while lookahead < len(text) and text[lookahead] in ")]":
+        lookahead += 1
+    while lookahead < len(text) and text[lookahead].isspace():
+        lookahead += 1
+    if lookahead >= len(text):
+        return True
+    return text[lookahead] == "[" or text[lookahead].isupper() or text[lookahead].isdigit()
 
 
 def _clean_claim_text(text: str) -> str:
     clean = re.sub(r"\[[^\]]*\]", "", text)
+    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
     clean = re.sub(r"\s+", " ", clean).strip(" -")
     return clean
 
@@ -708,9 +885,22 @@ def _terms(text: str) -> list[str]:
     ]
 
 
-def _overclaim_reason(claim_text: str, evidence: EvidenceItem) -> str | None:
+def _overclaim_reason(
+    claim_text: str,
+    evidence: EvidenceItem,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
+) -> str | None:
     lowered = claim_text.lower()
     evidence_text = _evidence_text(evidence).lower()
+    if (
+        evidence_maturity == "established_causal_risk_factor"
+        and re.search(r"\b(established|causal|causes?|risk factor)\b", lowered)
+        and re.search(
+            r"\b(established|causal|causes?|risk factor|carcinogen)\b",
+            evidence_text,
+        )
+    ):
+        return None
     if re.search(r"\b(causes?|caused|causal|drives?|proves?|establishes?)\b", lowered):
         if _claim_reports_limiting_evidence(claim_text):
             return None

@@ -31,6 +31,7 @@ from plugins.biomed_evidence.schemas import (
     FetchBiomedicalPaperRequest,
     FullTextEnhancementRequest,
     FullTextIngestionRequest,
+    FullTextReanalysisRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteratureSearchRequest,
@@ -185,6 +186,19 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
             raise HTTPException(status_code=404, detail=result.model_dump(mode="json"))
         if not result.ok:
             raise HTTPException(status_code=400, detail=result.model_dump(mode="json"))
+        return result.model_dump(mode="json")
+
+    @app.post("/api/biomed/answer-runs/{run_id}/full-text-reanalysis")
+    def reanalyze_run_with_full_text(
+        run_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request = FullTextReanalysisRequest.model_validate(
+            {**(payload or {}), "run_id": run_id}
+        )
+        result = service.reanalyze_run_with_full_text(request)
+        if result is None:
+            raise HTTPException(status_code=404, detail="full text evidence not found")
         return result.model_dump(mode="json")
 
     @app.get("/api/biomed/answer-runs/{run_id}/provenance")

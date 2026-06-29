@@ -189,8 +189,14 @@ def _merge_unique(*groups: list[str]) -> list[str]:
 
 def _predicate(text: str) -> LogicPredicate:
     lowered = text.lower()
+    if _has_negative_benefit_language(lowered):
+        return "no_observed_benefit"
     if re.search(r"\b(no effect|not associated|does not affect|reduced)\b", lowered):
         return "has_no_effect"
+    if _has_explicit_sufficient_cause(lowered):
+        return "causes_or_drives"
+    if _has_contribution_language(lowered):
+        return "contributes_to"
     if re.search(r"\b(caus\w*|driv\w*|lead(?:s)? to|result(?:s)? in)\b", lowered):
         return "causes_or_drives"
     if re.search(r"\b(predict|prognos)\w*\b", lowered):
@@ -216,12 +222,49 @@ def _predicate(text: str) -> LogicPredicate:
     return "unspecified"
 
 
+def _has_contribution_language(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(co-?factors?|risk factors?|contributors?|contribut(?:e|es|ed|ing)|promotes? progression|involved in progression|facilitates? progression)\b",
+            lowered,
+        )
+    )
+
+
+def _has_explicit_sufficient_cause(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(sufficient (?:cause|causes)|necessary (?:cause|causes)|definitive(?:ly)? caus|independent(?:ly)? caus)\b",
+            lowered,
+        )
+    )
+
+
+def _has_negative_benefit_language(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:"
+            r"(?:did|does|do)\s+not\s+(?:significantly\s+)?(?:improve|benefit)"
+            r"|(?:did|does|do)\s+not\s+have\s+(?:a\s+)?lower\s+incidence"
+            r"|failed\s+to\s+(?:significantly\s+)?improve"
+            r"|no\s+(?:significant\s+)?(?:clinical\s+)?(?:benefit|improvement)"
+            r"|not\s+associated\s+with\s+(?:improved|better)"
+            r")\b",
+            lowered,
+        )
+    )
+
+
 def _claim_strength(
     text: str,
     predicate: LogicPredicate,
     claim_type: str,
 ) -> LogicClaimStrength:
     lowered = text.lower()
+    if predicate == "no_observed_benefit":
+        return "clinical"
+    if predicate == "contributes_to":
+        return "contribution"
     if (
         predicate in {"causes_or_drives", "is_required_for", "is_sufficient_for"}
         or claim_type == "causal"
@@ -258,6 +301,10 @@ def _claim_modality(text: str, predicate: LogicPredicate) -> LogicModality:
         return "definitive"
     if predicate in {"causes_or_drives", "treats", "diagnoses", "predicts"}:
         return "strong"
+    if predicate == "no_observed_benefit":
+        return "moderate"
+    if predicate == "contributes_to":
+        return "moderate"
     if _is_hedged(text):
         return "suggestive"
     if re.search(r"\b(associated|correlated|linked)\b", lowered):
@@ -267,6 +314,10 @@ def _claim_modality(text: str, predicate: LogicPredicate) -> LogicModality:
 
 def _evidence_modality(evidence: EvidenceItem, text: str) -> LogicModality:
     lowered = " ".join([text, " ".join(evidence.limitations)]).lower()
+    if _has_negative_benefit_language(lowered) and not re.search(
+        r"\b(inconclusive|mixed)\b", lowered
+    ):
+        return "moderate"
     if evidence.evidence_direction == "inconclusive" or re.search(
         r"\b(inconclusive|not significant|mixed)\b", lowered
     ):
@@ -511,12 +562,37 @@ def _scope_terms(text: str) -> list[str]:
 def _qualifiers(text: str) -> list[str]:
     qualifiers: list[str] = []
     lowered = text.lower()
+    qualifiers.extend(_negative_benefit_qualifiers(lowered))
+    if re.search(r"\bco-?factors?\b", lowered):
+        qualifiers.append("cofactor")
+    if re.search(r"\brisk factors?\b", lowered):
+        qualifiers.append("risk_factor")
+    if "progression" in lowered:
+        qualifiers.append("progression")
     if _is_hedged(text):
         qualifiers.append("hedged")
     if "limited" in lowered:
         qualifiers.append("limited")
     if "adjust" in lowered:
         qualifiers.append("adjusted")
+    return qualifiers
+
+
+def _negative_benefit_qualifiers(lowered: str) -> list[str]:
+    qualifiers: list[str] = []
+    if re.search(r"\b(trial|study|randomi[sz]ed)\b", lowered):
+        qualifiers.append("trial_scoped")
+    if re.search(r"\b(patients?|adults?|severe|hospitali[sz]ed|cohort)\b", lowered):
+        qualifiers.append("population_scoped")
+    if re.search(
+        r"\b(standard of care|usual care|placebo|comparator|compared with|versus|vs\.?)\b",
+        lowered,
+    ):
+        qualifiers.append("comparator_scoped")
+    if re.search(r"\b(outcomes?|mortality|death|discharge|ventilation)\b", lowered):
+        qualifiers.append("outcome_scoped")
+    if re.search(r"\b\d+\s*(?:day|days|week|weeks|month|months)\b", lowered):
+        qualifiers.append("timepoint_scoped")
     return qualifiers
 
 

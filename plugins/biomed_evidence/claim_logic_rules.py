@@ -29,6 +29,52 @@ RULE_METADATA: dict[str, LogicRuleMetadata] = {
             "association or correlation."
         ),
     ),
+    "association_does_not_entail_contribution": LogicRuleMetadata(
+        rule_id="association_does_not_entail_contribution",
+        category="predicate_mismatch",
+        severity="critical",
+        explanation=(
+            "The claim states a contributing cofactor or risk-factor relation, "
+            "but the evidence only reports association or correlation."
+        ),
+    ),
+    "contribution_partially_entails_causation": LogicRuleMetadata(
+        rule_id="contribution_partially_entails_causation",
+        category="predicate_boundary",
+        severity="minor",
+        explanation=(
+            "Contribution or cofactor evidence supports a weaker causal-boundary "
+            "claim, but not definitive independent causation."
+        ),
+    ),
+    "contribution_does_not_entail_sufficient_causation": LogicRuleMetadata(
+        rule_id="contribution_does_not_entail_sufficient_causation",
+        category="predicate_mismatch",
+        severity="critical",
+        explanation=(
+            "Contribution or cofactor evidence does not establish sufficient, "
+            "necessary, independent, or definitive causation."
+        ),
+    ),
+    "trial_no_observed_benefit_partially_entails_no_effect": LogicRuleMetadata(
+        rule_id="trial_no_observed_benefit_partially_entails_no_effect",
+        category="predicate_boundary",
+        severity="minor",
+        explanation=(
+            "Trial-level no-observed-benefit evidence supports a weaker negative "
+            "finding, but not a universal no-effect conclusion."
+        ),
+    ),
+    "trial_scoped_no_observed_benefit_allows_moderate_evidence": LogicRuleMetadata(
+        rule_id="trial_scoped_no_observed_benefit_allows_moderate_evidence",
+        category="modality_boundary",
+        severity="minor",
+        explanation=(
+            "A trial-scoped no-observed-benefit claim can be supported by aligned "
+            "trial evidence without treating moderate wording as a universal "
+            "no-effect claim."
+        ),
+    ),
     "animal_evidence_does_not_entail_human_claim": LogicRuleMetadata(
         rule_id="animal_evidence_does_not_entail_human_claim",
         category="population_mismatch",
@@ -92,6 +138,16 @@ RULE_METADATA: dict[str, LogicRuleMetadata] = {
 PREDICATE_NO_ENTAILMENTS: tuple[tuple[str, str, str], ...] = (
     (
         "associated_with",
+        "contributes_to",
+        "association_does_not_entail_contribution",
+    ),
+    (
+        "correlates_with",
+        "contributes_to",
+        "association_does_not_entail_contribution",
+    ),
+    (
+        "associated_with",
         "causes_or_drives",
         "association_does_not_entail_causation",
     ),
@@ -147,6 +203,34 @@ def audit_logical_support(
                         "evidence_id": evidence.evidence_id,
                     }
                 )
+        if (
+            evidence.predicate == "contributes_to"
+            and claim_frame.predicate == "causes_or_drives"
+        ):
+            if _claims_sufficient_causation(claim_frame):
+                _add_rule(
+                    rules,
+                    "contribution_does_not_entail_sufficient_causation",
+                )
+                predicate_mismatches.append(
+                    {
+                        "axis": "predicate",
+                        "claim_value": claim_frame.predicate,
+                        "evidence_value": evidence.predicate,
+                        "evidence_id": evidence.evidence_id,
+                    }
+                )
+            else:
+                _add_rule(rules, "contribution_partially_entails_causation")
+
+        if (
+            evidence.predicate == "no_observed_benefit"
+            and claim_frame.predicate == "has_no_effect"
+        ):
+            _add_rule(
+                rules,
+                "trial_no_observed_benefit_partially_entails_no_effect",
+            )
 
         if claim_frame.population == "human" and evidence.population == "animal":
             _add_rule(rules, "animal_evidence_does_not_entail_human_claim")
@@ -203,12 +287,33 @@ def audit_logical_support(
                 )
             )
 
-        if claim_frame.modality in {"strong", "definitive"} and evidence.modality in {
-            "possible",
-            "suggestive",
-            "moderate",
-            "inconclusive",
-        }:
+        contribution_to_causation = (
+            evidence.predicate == "contributes_to"
+            and claim_frame.predicate == "causes_or_drives"
+            and not _claims_sufficient_causation(claim_frame)
+        )
+        aligned_trial_no_observed_benefit = (
+            evidence.predicate == "no_observed_benefit"
+            and claim_frame.predicate == "no_observed_benefit"
+            and evidence.study_design in {"randomized_trial", "interventional"}
+        )
+        if aligned_trial_no_observed_benefit:
+            _add_rule(
+                rules,
+                "trial_scoped_no_observed_benefit_allows_moderate_evidence",
+            )
+        if (
+            not contribution_to_causation
+            and not aligned_trial_no_observed_benefit
+            and claim_frame.modality in {"strong", "definitive"}
+            and evidence.modality
+            in {
+                "possible",
+                "suggestive",
+                "moderate",
+                "inconclusive",
+            }
+        ):
             _add_rule(rules, "weak_evidence_does_not_support_definitive_claim")
             modality_mismatches.append(
                 _mismatch(
@@ -291,6 +396,8 @@ def _logic_verdict(
 ) -> str:
     if not rules:
         return "entailed"
+    if set(rules) <= {"trial_scoped_no_observed_benefit_allows_moderate_evidence"}:
+        return "entailed"
     critical_rules = {
         rule
         for rule in rules
@@ -370,3 +477,27 @@ def _mismatch(
         "evidence_value": evidence_value,
         "evidence_id": evidence_id,
     }
+
+
+def _claims_sufficient_causation(claim_frame: LogicalClaimFrame) -> bool:
+    text = " ".join(
+        [
+            claim_frame.claim_text,
+            " ".join(claim_frame.qualifiers),
+            " ".join(claim_frame.source_spans),
+        ]
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "sufficient cause",
+            "sufficient causes",
+            "necessary cause",
+            "necessary causes",
+            "independent cause",
+            "independent causes",
+            "definitive cause",
+            "definitive causes",
+            "definitively cause",
+        )
+    )

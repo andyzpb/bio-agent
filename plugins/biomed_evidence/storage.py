@@ -244,15 +244,20 @@ class BiomedStorage:
                 """
                 INSERT INTO biomed_full_text_documents(
                     document_id, paper_id, source, content_type, title,
-                    source_filename, source_hash, byte_size, section_count,
+                    source_filename, provider, provider_status, lookup_id_type,
+                    license_or_rights, source_hash, byte_size, section_count,
                     parser, parser_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(document_id) DO UPDATE SET
                     paper_id=excluded.paper_id,
                     source=excluded.source,
                     content_type=excluded.content_type,
                     title=excluded.title,
                     source_filename=excluded.source_filename,
+                    provider=excluded.provider,
+                    provider_status=excluded.provider_status,
+                    lookup_id_type=excluded.lookup_id_type,
+                    license_or_rights=excluded.license_or_rights,
                     source_hash=excluded.source_hash,
                     byte_size=excluded.byte_size,
                     section_count=excluded.section_count,
@@ -267,6 +272,10 @@ class BiomedStorage:
                     document.content_type,
                     document.title,
                     document.source_filename,
+                    document.provider,
+                    document.provider_status,
+                    document.lookup_id_type,
+                    document.license_or_rights,
                     document.source_hash,
                     document.byte_size,
                     document.section_count,
@@ -1944,6 +1953,10 @@ class BiomedStorage:
                 content_type TEXT NOT NULL,
                 title TEXT,
                 source_filename TEXT,
+                provider TEXT,
+                provider_status TEXT,
+                lookup_id_type TEXT,
+                license_or_rights TEXT,
                 source_hash TEXT NOT NULL,
                 byte_size INTEGER NOT NULL DEFAULT 0,
                 section_count INTEGER NOT NULL DEFAULT 0,
@@ -2305,6 +2318,10 @@ class BiomedStorage:
         self._ensure_column("biomed_evidence", "char_start", "INTEGER")
         self._ensure_column("biomed_evidence", "char_end", "INTEGER")
         self._ensure_column("biomed_evidence", "source_hash", "TEXT")
+        self._ensure_column("biomed_full_text_documents", "provider", "TEXT")
+        self._ensure_column("biomed_full_text_documents", "provider_status", "TEXT")
+        self._ensure_column("biomed_full_text_documents", "lookup_id_type", "TEXT")
+        self._ensure_column("biomed_full_text_documents", "license_or_rights", "TEXT")
         self._ensure_column("biomed_watch_decisions", "retrieval_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "snapshot_id", "TEXT")
         self._ensure_column("biomed_watch_decisions", "dedupe_reason", "TEXT")
@@ -2356,6 +2373,10 @@ def _full_text_document_from_row(row: sqlite3.Row) -> FullTextDocument:
         content_type=row["content_type"],
         title=row["title"],
         source_filename=row["source_filename"],
+        provider=row["provider"],
+        provider_status=row["provider_status"],
+        lookup_id_type=row["lookup_id_type"],
+        license_or_rights=row["license_or_rights"],
         source_hash=str(row["source_hash"]),
         byte_size=int(row["byte_size"] or 0),
         section_count=int(row["section_count"] or 0),
