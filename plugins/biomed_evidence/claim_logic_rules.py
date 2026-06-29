@@ -29,6 +29,33 @@ RULE_METADATA: dict[str, LogicRuleMetadata] = {
             "association or correlation."
         ),
     ),
+    "association_does_not_entail_contribution": LogicRuleMetadata(
+        rule_id="association_does_not_entail_contribution",
+        category="predicate_mismatch",
+        severity="critical",
+        explanation=(
+            "The claim states a contributing cofactor or risk-factor relation, "
+            "but the evidence only reports association or correlation."
+        ),
+    ),
+    "contribution_partially_entails_causation": LogicRuleMetadata(
+        rule_id="contribution_partially_entails_causation",
+        category="predicate_boundary",
+        severity="minor",
+        explanation=(
+            "Contribution or cofactor evidence supports a weaker causal-boundary "
+            "claim, but not definitive independent causation."
+        ),
+    ),
+    "contribution_does_not_entail_sufficient_causation": LogicRuleMetadata(
+        rule_id="contribution_does_not_entail_sufficient_causation",
+        category="predicate_mismatch",
+        severity="critical",
+        explanation=(
+            "Contribution or cofactor evidence does not establish sufficient, "
+            "necessary, independent, or definitive causation."
+        ),
+    ),
     "animal_evidence_does_not_entail_human_claim": LogicRuleMetadata(
         rule_id="animal_evidence_does_not_entail_human_claim",
         category="population_mismatch",
@@ -92,6 +119,16 @@ RULE_METADATA: dict[str, LogicRuleMetadata] = {
 PREDICATE_NO_ENTAILMENTS: tuple[tuple[str, str, str], ...] = (
     (
         "associated_with",
+        "contributes_to",
+        "association_does_not_entail_contribution",
+    ),
+    (
+        "correlates_with",
+        "contributes_to",
+        "association_does_not_entail_contribution",
+    ),
+    (
+        "associated_with",
         "causes_or_drives",
         "association_does_not_entail_causation",
     ),
@@ -147,6 +184,25 @@ def audit_logical_support(
                         "evidence_id": evidence.evidence_id,
                     }
                 )
+        if (
+            evidence.predicate == "contributes_to"
+            and claim_frame.predicate == "causes_or_drives"
+        ):
+            if _claims_sufficient_causation(claim_frame):
+                _add_rule(
+                    rules,
+                    "contribution_does_not_entail_sufficient_causation",
+                )
+                predicate_mismatches.append(
+                    {
+                        "axis": "predicate",
+                        "claim_value": claim_frame.predicate,
+                        "evidence_value": evidence.predicate,
+                        "evidence_id": evidence.evidence_id,
+                    }
+                )
+            else:
+                _add_rule(rules, "contribution_partially_entails_causation")
 
         if claim_frame.population == "human" and evidence.population == "animal":
             _add_rule(rules, "animal_evidence_does_not_entail_human_claim")
@@ -203,12 +259,22 @@ def audit_logical_support(
                 )
             )
 
-        if claim_frame.modality in {"strong", "definitive"} and evidence.modality in {
-            "possible",
-            "suggestive",
-            "moderate",
-            "inconclusive",
-        }:
+        contribution_to_causation = (
+            evidence.predicate == "contributes_to"
+            and claim_frame.predicate == "causes_or_drives"
+            and not _claims_sufficient_causation(claim_frame)
+        )
+        if (
+            not contribution_to_causation
+            and claim_frame.modality in {"strong", "definitive"}
+            and evidence.modality
+            in {
+                "possible",
+                "suggestive",
+                "moderate",
+                "inconclusive",
+            }
+        ):
             _add_rule(rules, "weak_evidence_does_not_support_definitive_claim")
             modality_mismatches.append(
                 _mismatch(
@@ -370,3 +436,27 @@ def _mismatch(
         "evidence_value": evidence_value,
         "evidence_id": evidence_id,
     }
+
+
+def _claims_sufficient_causation(claim_frame: LogicalClaimFrame) -> bool:
+    text = " ".join(
+        [
+            claim_frame.claim_text,
+            " ".join(claim_frame.qualifiers),
+            " ".join(claim_frame.source_spans),
+        ]
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "sufficient cause",
+            "sufficient causes",
+            "necessary cause",
+            "necessary causes",
+            "independent cause",
+            "independent causes",
+            "definitive cause",
+            "definitive causes",
+            "definitively cause",
+        )
+    )

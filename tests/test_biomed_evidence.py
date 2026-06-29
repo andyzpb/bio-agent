@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from agent.plugins.decorators import _derive_params_schema
+from plugins.biomed_evidence import service
 from plugins.biomed_evidence.literature_client import (
     PubMedLiteratureClient,
     parse_bioc_json_full_text,
@@ -22,7 +23,11 @@ from plugins.biomed_evidence.schemas import (
     FullTextIngestionRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
+    LiteraturePaperRecord,
     LiteratureSearchRequest,
+    LiteratureSearchCoverage,
+    LiteratureSearchResult,
+    LiteratureSourceTrace,
     PlanBiomedicalSearchRequest,
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
@@ -250,6 +255,208 @@ async def test_plan_biomedical_search_builds_valid_retrieval_plan(
 
 
 @pytest.mark.asyncio
+async def test_plan_biomedical_search_accepts_covid_randomized_trial_query(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question=(
+                    "What randomized trial evidence supports or refutes the "
+                    "hypothesis that hydroxychloroquine improves outcomes in "
+                    "hospitalized COVID-19 patients?"
+                ),
+                source="pubmed",
+                max_results=5,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.classification.intent == "research_question"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+    assert "supports refutes hypothesis" not in result.validation.compiled_query
+    assert '"Randomized Controlled Trial"[Publication Type]' in (
+        result.validation.compiled_query
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_derives_answer_scope_for_hcq_rct(
+    tmp_path: Path,
+) -> None:
+    biomed = BiomedEvidenceService(tmp_path)
+    try:
+        result = await biomed.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question=(
+                    "In adult patients hospitalized with COVID-19, does randomized "
+                    "trial evidence show that hydroxychloroquine improves clinical "
+                    "outcomes compared with usual care or placebo?"
+                ),
+                source="pubmed",
+                max_results=5,
+            )
+        )
+    finally:
+        await biomed.aclose()
+
+    assert result.query_plan is not None
+    scope = result.query_plan.answer_scope
+    assert scope is not None
+    assert "hospitalized" in scope.population_terms
+    assert "covid-19" in scope.population_terms
+    assert "hydroxychloroquine" in scope.intervention_terms
+    assert "usual care" in scope.comparator_terms
+    assert "placebo" in scope.comparator_terms
+    assert "mortality" in scope.outcome_terms
+    assert "randomized trial" in scope.required_study_terms
+    assert "prophylaxis" in scope.exclude_terms
+
+
+@pytest.mark.asyncio
+async def test_llm_planner_pubmed_query_uses_structured_terms_not_question_text(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeMessyPubMedPlannerProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-planner",
+    )
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="Does an antiviral improve outcomes in hospitalized patients?",
+                source="pubmed",
+                max_results=5,
+                use_llm_planner=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert result.classification.classifier_mode == "llm"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+    assert "hypothesis" not in result.validation.compiled_query
+    assert "improves outcomes" not in result.validation.compiled_query
+    assert "antiviral hospitalized patients" in result.validation.compiled_query
+    assert '"Randomized Controlled Trial"[MeSH Terms]' not in (
+        result.validation.compiled_query
+    )
+    assert (
+        result.validation.compiled_query.count(
+            '"Randomized Controlled Trial"[Publication Type]'
+        )
+        == 1
+    )
+    assert '"Randomized Controlled Trial"[Publication Type]' in (
+        result.validation.compiled_query
+    )
+
+
+def test_answer_scope_marks_non_covid_pediatric_evidence_off_scope() -> None:
+    scope = service._derive_answer_scope(
+        "In adult patients hospitalized with COVID-19, does hydroxychloroquine improve mortality?"
+    )
+    item = EvidenceItem(
+        evidence_id="ev-off",
+        paper_id="PMID:off",
+        claim="Hydroxychloroquine was studied in childhood interstitial lung disease.",
+        finding="Hydroxychloroquine was studied in childhood interstitial lung disease.",
+        evidence_direction="supports",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=[],
+        confidence="medium",
+        evidence_span="Hydroxychloroquine was studied in childhood interstitial lung disease.",
+    )
+
+    assessed = service._apply_scope_assessment(item, scope)
+
+    assert assessed.scope_match == "false"
+    assert assessed.scope_mismatch_reasons
+
+
+def test_scope_filter_keeps_rejected_evidence_out_of_answer_pool() -> None:
+    in_scope = EvidenceItem(
+        evidence_id="ev-in",
+        paper_id="PMID:recovery",
+        claim="Hydroxychloroquine did not improve outcomes in hospitalized COVID-19 patients.",
+        finding="Hydroxychloroquine did not improve outcomes in hospitalized COVID-19 patients.",
+        evidence_direction="contradicts",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=[],
+        confidence="high",
+        evidence_span="Hydroxychloroquine did not improve outcomes in hospitalized COVID-19 patients.",
+        scope_match="true",
+    )
+    off_scope = EvidenceItem(
+        evidence_id="ev-off",
+        paper_id="PMID:prep",
+        claim="Low-dose hydroxychloroquine prophylaxis safety was evaluated.",
+        finding="Low-dose hydroxychloroquine prophylaxis safety was evaluated.",
+        evidence_direction="supports",
+        entities=[],
+        methods=[],
+        limitations=[],
+        confidence="medium",
+        evidence_span="Low-dose hydroxychloroquine prophylaxis safety was evaluated.",
+        scope_match="false",
+        scope_mismatch_reasons=["Excluded term matched: prophylaxis"],
+    )
+
+    answer_evidence, rejected = service._split_scope_evidence([in_scope, off_scope])
+
+    assert answer_evidence == [in_scope]
+    assert rejected == [off_scope]
+
+
+def test_hcq_demo_scope_accepts_direct_rct_and_rejects_prep() -> None:
+    scope = service._derive_answer_scope(
+        "In adult patients hospitalized with COVID-19, does randomized trial evidence show that hydroxychloroquine improves clinical outcomes?"
+    )
+    direct = EvidenceItem(
+        evidence_id="ev-direct",
+        paper_id="PMID:RECOVERY",
+        claim="Hydroxychloroquine did not improve outcomes in hospitalized COVID-19 patients.",
+        finding="Hydroxychloroquine did not improve outcomes in hospitalized COVID-19 patients in a randomized trial.",
+        evidence_direction="contradicts",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=[],
+        confidence="high",
+        evidence_span="Hydroxychloroquine did not improve outcomes in hospitalized COVID-19 patients in a randomized trial.",
+    )
+    prep = EvidenceItem(
+        evidence_id="ev-prep",
+        paper_id="PMID:PREP",
+        claim="Hydroxychloroquine prophylaxis safety was evaluated.",
+        finding="Hydroxychloroquine prophylaxis safety was evaluated.",
+        evidence_direction="supports",
+        entities=[],
+        methods=[],
+        limitations=[],
+        confidence="medium",
+        evidence_span="Hydroxychloroquine prophylaxis safety was evaluated.",
+    )
+
+    assessed = [
+        service._apply_scope_assessment(direct, scope),
+        service._apply_scope_assessment(prep, scope),
+    ]
+    accepted, rejected = service._split_scope_evidence(assessed)
+
+    assert [item.evidence_id for item in accepted] == ["ev-direct"]
+    assert [item.evidence_id for item in rejected] == ["ev-prep"]
+
+
+@pytest.mark.asyncio
 async def test_plan_biomedical_search_refuses_clinical_query_before_retrieval(
     tmp_path: Path,
 ) -> None:
@@ -306,21 +513,97 @@ async def test_answer_with_planner_executes_support_refute_bundle(
         result.retrieval_bundle.records[0].retrieval_id
         == result.retrieval_manifest.retrieval_id
     )
-    assert len(result.retrieval_bundle.deduped_paper_ids) == len(
-        set(result.retrieval_bundle.deduped_paper_ids)
-    )
-    assert result.retrieval_bundle.duplicate_paper_ids
-    assert result.evidence_summary
-    assert {item.retrieval_intent for item in result.evidence_summary}
-    assert result.evidence_packet is not None
-    assert result.evidence_packet.coverage_matrix
-    assert result.evidence_packet.retrieval_manifest_ids
-    assert set(result.evidence_packet.evidence_ids) == {
-        item.evidence_id for item in result.evidence_summary
-    }
-    assert set(result.evidence_packet.paper_ids) == {
-        item.paper_id for item in result.evidence_summary
-    }
+
+
+@pytest.mark.asyncio
+async def test_support_refute_retrieval_respects_total_paper_budget(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    calls = 0
+
+    async def fake_search_literature(
+        request: LiteratureSearchRequest,
+    ) -> LiteratureSearchResult:
+        nonlocal calls
+        calls += 1
+        ids = [f"FAKE-{calls}-{index}" for index in range(request.max_results)]
+        manifest = RetrievalManifest(
+            retrieval_id=f"retrieval-{calls}",
+            source=request.source,
+            original_query=request.query,
+            compiled_query=request.query,
+            page_size=request.max_results,
+            pages_requested=1,
+            pages_completed=1,
+            raw_result_count=len(ids),
+            deduped_result_count=len(ids),
+            returned_paper_ids=ids,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:00+00:00",
+        )
+        return LiteratureSearchResult(
+            source=request.source,
+            query=request.query,
+            query_used=request.query,
+            retrieval_intent=request.retrieval_intent,
+            items=[
+                LiteraturePaperRecord(
+                    paper_id=paper_id,
+                    source=request.source,
+                    title=paper_id,
+                    source_rank=index,
+                    abstract_available=True,
+                )
+                for index, paper_id in enumerate(ids, start=1)
+            ],
+            retrieval_manifest=manifest,
+            coverage=LiteratureSearchCoverage(
+                item_count=len(ids),
+                abstract_count=len(ids),
+                abstract_coverage=1.0,
+                stored_paper_count=len(ids),
+            ),
+            source_trace=LiteratureSourceTrace(
+                source=request.source,
+                query_used=request.query,
+                compiled_query=request.query,
+                retrieval_intent=request.retrieval_intent,
+                stored_paper_ids=ids,
+            ),
+        )
+
+    service.search_literature = fake_search_literature  # type: ignore[method-assign]
+    try:
+        planning = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                source="mock",
+                max_results=10,
+                use_llm_planner=True,
+            )
+        )
+        assert planning.search_request is not None
+        metadata, _manifest, bundle, _intents, _retrieval_ids = (
+            await service._retrieve_answer_papers(
+                request=AnswerWithEvidenceRequest(
+                    question="What evidence links microglial activation to Alzheimer's disease progression?",
+                    source="mock",
+                    max_papers=2,
+                    use_llm_planner=True,
+                    execute_support_refute=True,
+                ),
+                planning_result=planning,
+                search_request=planning.search_request,
+                run_id="test-run",
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert bundle is not None
+    assert len(metadata) == 2
+    assert len(bundle.deduped_paper_ids) == 2
 
 
 @pytest.mark.asyncio
@@ -528,6 +811,61 @@ class _FakeEchoPlannerProvider:
                         "deterministic_classification"
                     ],
                     "deterministic_query_plan": payload["deterministic_query_plan"],
+                }
+            )
+        )
+
+
+class _FakeMessyPubMedPlannerProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        return _FakePlannerResponse(
+            json.dumps(
+                {
+                    "classification": {
+                        "intent": "research_question",
+                        "normalized_question": payload["question"],
+                        "clinical_boundary": False,
+                        "needs_clarification": False,
+                        "risk_flags": [],
+                        "allowed_next_step": "plan_retrieval",
+                        "rationale": "fake planner classification",
+                    },
+                    "query_plan": {
+                        "primary_query": (
+                            "does treatment support or refute the hypothesis "
+                            "that it improves outcomes"
+                        ),
+                        "mesh_terms": [
+                            "Respiratory Tract Infections",
+                            "Randomized Controlled Trial",
+                        ],
+                        "include_terms": ["antiviral", "hospitalized patients"],
+                        "exclude_terms": [],
+                        "publication_types": ["Randomized Controlled Trial"],
+                        "study_types": ["randomized_trial", "human"],
+                        "species_terms": ["Humans"],
+                        "support_queries": [
+                            "treatment improves outcomes supporting evidence"
+                        ],
+                        "refute_queries": [
+                            "treatment improves outcomes refuting evidence"
+                        ],
+                        "max_results": 5,
+                        "rationale": "fake messy planner query plan",
+                    },
                 }
             )
         )

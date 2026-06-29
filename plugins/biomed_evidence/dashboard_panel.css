@@ -1734,6 +1734,46 @@
   gap: 10px;
 }
 
+.biomed-literature-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.biomed-literature-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line, #dfe3e2);
+  border-radius: 8px;
+  background: var(--paper-strong, #fff);
+}
+
+.biomed-literature-row > div {
+  min-width: 0;
+}
+
+.biomed-literature-row h3 {
+  margin: 6px 0 4px;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.biomed-literature-row p {
+  margin: 6px 0 0;
+  color: var(--text-soft, #5f6664);
+}
+
+.biomed-literature-row code {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .biomed-json-tall {
   max-height: none;
 }

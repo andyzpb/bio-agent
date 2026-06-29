@@ -17,6 +17,7 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     Citation,
     CitationAuditRequest,
+    EvidenceItem,
 )
 from plugins.biomed_evidence.service import (
     BiomedEvidenceService,
@@ -79,6 +80,48 @@ def test_citation_audit_ignores_markdown_section_headings() -> None:
     ]
     assert result.claim_support_rate == 1.0
     assert result.failed_claims == []
+
+
+def test_atomic_claim_splitter_handles_statistics_citations_and_abbreviations() -> None:
+    claims = extract_atomic_claims(
+        "RECOVERY Collaborative Group et al. reported no 28-day mortality benefit "
+        "(26.8% vs. 25.0%; rate ratio 1.09; 95% CI 0.97 to 1.23) [PMID:32622389]. "
+        "Patients allocated to hydroxychloroquine were less likely to be discharged "
+        "alive within 28 days (59.6% vs. 62.9%; rate ratio 0.90; 95% CI 0.83 to 0.98) "
+        "[PMID:32622389]."
+    )
+
+    assert [claim.text for claim in claims] == [
+        "RECOVERY Collaborative Group et al. reported no 28-day mortality benefit (26.8% vs. 25.0%; rate ratio 1.09; 95% CI 0.97 to 1.23).",
+        "Patients allocated to hydroxychloroquine were less likely to be discharged alive within 28 days (59.6% vs. 62.9%; rate ratio 0.90; 95% CI 0.83 to 0.98).",
+    ]
+
+
+def test_audit_treats_off_scope_citation_as_irrelevant() -> None:
+    answer = "Hydroxychloroquine improves hospitalized COVID-19 outcomes [PMID:PREP]."
+    evidence = EvidenceItem(
+        evidence_id="ev-prep",
+        paper_id="PMID:PREP",
+        claim="Hydroxychloroquine prophylaxis safety was evaluated.",
+        finding="Hydroxychloroquine prophylaxis safety was evaluated.",
+        evidence_direction="supports",
+        entities=[],
+        methods=[],
+        limitations=[],
+        confidence="medium",
+        evidence_span="Hydroxychloroquine prophylaxis safety was evaluated.",
+        scope_match="false",
+        scope_mismatch_reasons=["Excluded term matched: prophylaxis"],
+    )
+
+    result = validate_citation_support(
+        answer=answer,
+        citations=[_citation("PMID:PREP")],
+        evidence_items=[evidence],
+    )
+
+    assert result.claim_audits[0].verdict == "irrelevant_citation"
+    assert "off-scope" in result.claim_audits[0].reason
 
 
 def test_citation_audit_allows_causal_limitation_language() -> None:

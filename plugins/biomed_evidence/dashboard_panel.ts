@@ -588,11 +588,78 @@ interface AnswerRunListItem {
   created_at: string;
 }
 
+interface RunLiteratureSetPaper {
+  paper_id: string;
+  source: "pubmed" | "mock";
+  title: string;
+  journal?: string | null;
+  publication_date?: string | null;
+  retrieval_rank: number;
+  abstract_available: boolean;
+  decision?: string | null;
+  decision_reason?: string | null;
+  used_in_answer: boolean;
+  evidence_count: number;
+  has_full_text: boolean;
+  packet_included: boolean;
+  review_status: "reviewed" | "needs_review" | "not_reviewed";
+}
+
+interface RunLiteratureSetSummary {
+  total_papers: number;
+  used_in_answer_count: number;
+  saved_count: number;
+  rejected_count: number;
+  needs_review_count: number;
+  full_text_count: number;
+  packet_included_count: number;
+  reviewed_count: number;
+  not_reviewed_count: number;
+}
+
+interface RunLiteratureSet {
+  run_id: string;
+  project_id?: string | null;
+  retrieval_id?: string | null;
+  source: "pubmed" | "mock";
+  summary: RunLiteratureSetSummary;
+  papers: RunLiteratureSetPaper[];
+}
+
+interface FullTextEnhancementPaperStatus {
+  paper_id: string;
+  source: "pubmed" | "mock";
+  status: "cached" | "stored" | "unavailable" | "extracted" | "failed" | "skipped";
+  document_id?: string | null;
+  section_count: number;
+  evidence_ids: string[];
+  warning?: string | null;
+  error?: string | null;
+}
+
+interface FullTextEnhancementResult {
+  enhancement_id: string;
+  run_id: string;
+  source: "pubmed" | "mock";
+  processed_paper_ids: string[];
+  unavailable_paper_ids: string[];
+  document_ids: string[];
+  extracted_evidence_ids: string[];
+  packet_id?: string | null;
+  review_available: boolean;
+  paper_statuses: FullTextEnhancementPaperStatus[];
+  warnings: string[];
+  errors: string[];
+}
+
 interface WorkspaceRunContext {
   answer: AnswerResult;
   audited?: AuditedAnswerResult | null;
   trace?: TracePayload | null;
   provenance?: ReleaseToolEnvelope<ProvenanceGraphResult> | null;
+  literature?: RunLiteratureSet | null;
+  fullTextEnhancement?: ReleaseToolEnvelope<FullTextEnhancementResult> | null;
+  pilotReportMarkdown?: string | null;
   raw?: unknown;
 }
 
@@ -2151,7 +2218,10 @@ function renderWorkspaceRunSummary(context: WorkspaceRunContext): string {
 function renderInspectorTabs(active: string): string {
   const tabs = [
     ["overview", "Overview"],
+    ["literature", "Literature Set"],
+    ["fulltext", "Full Text"],
     ["review", "Review"],
+    ["pilot", "Pilot Report"],
     ["diff", "Diff"],
     ["trace", "Trace"],
     ["evidence", "Evidence"],
@@ -2169,6 +2239,114 @@ function renderInspectorTabs(active: string): string {
           ${escapeHtml(label)}
         </button>
       `).join("")}
+    </div>
+  `;
+}
+
+function renderRunLiteratureSet(literature: RunLiteratureSet): string {
+  const summary = literature.summary;
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Literature Set</div>
+      <div class="biomed-mini-grid">
+        <div><span>Papers</span><strong>${summary.total_papers}</strong></div>
+        <div><span>Used</span><strong>${summary.used_in_answer_count}</strong></div>
+        <div><span>Packet</span><strong>${summary.packet_included_count}</strong></div>
+        <div><span>Full Text</span><strong>${summary.full_text_count}</strong></div>
+        <div><span>Needs Review</span><strong>${summary.needs_review_count}</strong></div>
+        <div><span>Rejected</span><strong>${summary.rejected_count}</strong></div>
+      </div>
+      <div class="biomed-literature-list">
+        ${literature.papers.map((paper) => `
+          <article class="biomed-literature-row">
+            <div>
+              <div class="biomed-review-claim-head">
+                ${paper.used_in_answer ? pill("used") : pill("retrieved")}
+                ${paper.packet_included ? pill("packet") : ""}
+                ${paper.has_full_text ? pill("full_text") : ""}
+                ${paper.decision ? pill(paper.decision) : pill(paper.review_status)}
+              </div>
+              <h3>${escapeHtml(paper.title || paper.paper_id)}</h3>
+              <div class="biomed-watch-meta">
+                ${escapeHtml(paper.journal || paper.source)} · ${escapeHtml(paper.publication_date || "-")} · rank ${paper.retrieval_rank || "-"}
+              </div>
+              ${paper.decision_reason ? `<p>${escapeHtml(paper.decision_reason)}</p>` : ""}
+            </div>
+            <code>${escapeHtml(paper.paper_id)}</code>
+          </article>
+        `).join("") || '<div class="biomed-muted">No papers recorded for this run.</div>'}
+      </div>
+    </div>
+  `;
+}
+
+function renderFullTextEnhancement(envelope: ReleaseToolEnvelope<FullTextEnhancementResult>): string {
+  if (!envelope.ok) return renderReleaseError(envelope);
+  const result = envelope.result;
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Full Text Enhancement</div>
+      <div class="biomed-mini-grid">
+        <div><span>Processed</span><strong>${result.processed_paper_ids.length}</strong></div>
+        <div><span>Documents</span><strong>${result.document_ids.length}</strong></div>
+        <div><span>Extracted Evidence</span><strong>${result.extracted_evidence_ids.length}</strong></div>
+        <div><span>Unavailable</span><strong>${result.unavailable_paper_ids.length}</strong></div>
+        <div><span>Packet</span><strong>${escapeHtml(result.packet_id || "-")}</strong></div>
+        <div><span>Review</span><strong>${result.review_available ? "available" : "pending"}</strong></div>
+      </div>
+      ${result.warnings.length ? `<div class="biomed-label">Warnings</div>${renderList(result.warnings)}` : ""}
+      <div class="biomed-label">Paper Status</div>
+      <div class="biomed-literature-list">
+        ${result.paper_statuses.map((paper) => `
+          <article class="biomed-literature-row">
+            <div>
+              <div class="biomed-review-claim-head">
+                ${pill(paper.status)}
+                ${paper.document_id ? pill("document") : ""}
+                ${paper.evidence_ids.length ? pill(`${paper.evidence_ids.length} evidence`) : ""}
+              </div>
+              <h3>${escapeHtml(paper.paper_id)}</h3>
+              <div class="biomed-watch-meta">sections ${paper.section_count} · ${escapeHtml(paper.source)}</div>
+              ${paper.warning ? `<p>${escapeHtml(paper.warning)}</p>` : ""}
+              ${paper.error ? `<p>${escapeHtml(paper.error)}</p>` : ""}
+            </div>
+            <code>${escapeHtml(paper.document_id || "-")}</code>
+          </article>
+        `).join("") || '<div class="biomed-muted">No paper statuses returned.</div>'}
+      </div>
+    </div>
+  `;
+}
+
+function renderFullTextRunPanel(context: WorkspaceRunContext): string {
+  const literature = context.literature;
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Full Text</div>
+      ${
+        literature
+          ? renderRunLiteratureSet(literature)
+          : '<div class="biomed-muted">Load the Literature Set tab first to inspect current full-text coverage.</div>'
+      }
+      <div class="biomed-primary-actions">
+        <button id="biomed-run-enhance-fulltext" class="biomed-primary-button" type="button">Enhance Full Text</button>
+      </div>
+      <div id="biomed-run-fulltext-result">
+        ${
+          context.fullTextEnhancement
+            ? renderFullTextEnhancement(context.fullTextEnhancement)
+            : '<div class="biomed-muted">Run enhancement to reuse stored full text or attempt provider-backed full-text lookup.</div>'
+        }
+      </div>
+    </div>
+  `;
+}
+
+function renderPilotReportMarkdown(markdown: string): string {
+  return `
+    <div class="biomed-inspector-stack">
+      <div class="biomed-label">Pilot Report</div>
+      <div class="biomed-answer">${renderMarkdown(markdown)}</div>
     </div>
   `;
 }
@@ -2269,6 +2447,18 @@ async function loadWorkspaceRun(runId: string): Promise<WorkspaceRunContext> {
   };
 }
 
+async function loadRunLiteratureSet(context: WorkspaceRunContext): Promise<RunLiteratureSet> {
+  if (context.literature) return context.literature;
+  const params = new URLSearchParams();
+  if (context.answer.project_id) params.set("project_id", context.answer.project_id);
+  const query = params.toString();
+  const literature = await api<RunLiteratureSet>(
+    `/api/biomed/answer-runs/${encodeURIComponent(context.answer.run_id)}/papers${query ? `?${query}` : ""}`,
+  );
+  context.literature = literature;
+  return literature;
+}
+
 async function loadRecentRuns(container: HTMLElement): Promise<void> {
   const target = container.querySelector<HTMLElement>("#biomed-recent-runs");
   if (!target) return;
@@ -2336,9 +2526,56 @@ async function loadInspectorTab(
   try {
     if (tab === "overview") {
       content.innerHTML = renderInspectorOverview(context);
+    } else if (tab === "literature") {
+      const literature = await loadRunLiteratureSet(context);
+      content.innerHTML = renderRunLiteratureSet(literature);
+    } else if (tab === "fulltext") {
+      if (!context.literature) {
+        context.literature = await loadRunLiteratureSet(context).catch(() => null);
+      }
+      content.innerHTML = renderFullTextRunPanel(context);
+      content.querySelector<HTMLButtonElement>("#biomed-run-enhance-fulltext")?.addEventListener("click", async () => {
+        const target = content.querySelector<HTMLElement>("#biomed-run-fulltext-result");
+        const button = content.querySelector<HTMLButtonElement>("#biomed-run-enhance-fulltext");
+        if (!target) return;
+        target.innerHTML = renderLoading("Enhancing full text...");
+        if (button) button.disabled = true;
+        try {
+          const envelope = await api<ReleaseToolEnvelope<FullTextEnhancementResult>>(
+            `/api/biomed/answer-runs/${encodeURIComponent(runId)}/full-text-enhance`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                run_id: runId,
+                source: context.answer.retrieval_manifest?.source || "mock",
+                max_papers: 10,
+              }),
+            },
+          );
+          context.fullTextEnhancement = envelope;
+          context.literature = null;
+          target.innerHTML = renderFullTextEnhancement(envelope);
+        } catch (error) {
+          target.innerHTML = `<div class="biomed-error">${escapeHtml(String(error))}</div>`;
+        } finally {
+          if (button) button.disabled = false;
+        }
+      });
     } else if (tab === "review") {
       const review = await api<RunEvidenceReview>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review`);
       content.innerHTML = renderInspectorEvidenceReview(review);
+    } else if (tab === "pilot") {
+      let markdown = context.pilotReportMarkdown;
+      if (!markdown) {
+        const response = await fetch(`/api/biomed/export?run_id=${encodeURIComponent(runId)}&report_type=pilot&format=markdown`);
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        markdown = await response.text();
+      }
+      context.pilotReportMarkdown = markdown;
+      content.innerHTML = renderPilotReportMarkdown(markdown);
     } else if (tab === "diff") {
       const diff = await api<EvidenceGraphSnapshotDiff>(`/api/biomed/answer-runs/${encodeURIComponent(runId)}/evidence-review/snapshot-diff`);
       content.innerHTML = renderSnapshotDiff(diff);
@@ -3672,19 +3909,22 @@ function renderAskWorkspace(container: HTMLElement): void {
 }
 
 function workspaceAnswerPayload(container: HTMLElement, audited: boolean): Record<string, unknown> {
+  const source = container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock";
+  const usePlanner = Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked);
+  const useAssistedPubmedAudit = audited && source === "pubmed" && usePlanner;
   return {
     question: container.querySelector<HTMLTextAreaElement>("#biomed-question")?.value || "",
     project_id: container.querySelector<HTMLSelectElement>("#biomed-project-select")?.value || null,
-    source: container.querySelector<HTMLSelectElement>("#biomed-source")?.value || "mock",
+    source,
     max_papers: Number(container.querySelector<HTMLInputElement>("#biomed-max-papers")?.value || 5),
     include_rejected_papers: Boolean(container.querySelector<HTMLInputElement>("#biomed-include-rejected")?.checked),
-    use_llm_planner: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-planner")?.checked),
+    use_llm_planner: usePlanner,
     execute_support_refute: Boolean(container.querySelector<HTMLInputElement>("#biomed-execute-support-refute")?.checked),
-    use_llm_extractor: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked),
-    use_llm_synthesis: Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked),
+    use_llm_extractor: useAssistedPubmedAudit || Boolean(container.querySelector<HTMLInputElement>("#biomed-use-extractor")?.checked),
+    use_llm_synthesis: useAssistedPubmedAudit || Boolean(container.querySelector<HTMLInputElement>("#biomed-use-synthesis")?.checked),
     use_llm_verifier: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-verifier")?.checked),
-    use_llm_revision: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked),
-    use_llm_claim_logic: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked),
+    use_llm_revision: useAssistedPubmedAudit || (audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-revision")?.checked)),
+    use_llm_claim_logic: useAssistedPubmedAudit || (audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-use-claim-logic")?.checked)),
     export_logic_facts: audited && Boolean(container.querySelector<HTMLInputElement>("#biomed-export-logic-facts")?.checked),
   };
 }

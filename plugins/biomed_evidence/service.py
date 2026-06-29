@@ -57,6 +57,7 @@ from plugins.biomed_evidence.schemas import (
     AdvisoryVerifierDisagreement,
     AdvisoryVerifierResult,
     AgentTraceStep,
+    AnswerScope,
     AnswerWithEvidenceRequest,
     AnswerWithEvidenceResult,
     AnswerRevision,
@@ -163,6 +164,7 @@ from plugins.biomed_evidence.schemas import (
     SavedToolChainTemplateSaveRequest,
     SearchBiomedicalLiteratureRequest,
     SearchBiomedicalLiteratureResult,
+    ScopeMatch,
     WatchCheckResult,
     WatchDecisionDetail,
     WatchDriftChange,
@@ -196,6 +198,10 @@ class _LogicParserOutcome:
     prompt_hash: str | None
     model: str | None
     fallback_reason: str | None = None
+
+
+_LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE = 2
+_LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE = 2
 
 
 class BiomedEvidenceService:
@@ -1284,6 +1290,7 @@ class BiomedEvidenceService:
         evidence: list[EvidenceItem] = []
         warnings: list[str] = []
         resolved_paper_ids: list[str] = []
+        answer_scope = _derive_answer_scope(research_question)
         for paper_id in paper_ids:
             paper = await self.fetch(
                 FetchBiomedicalPaperRequest(
@@ -1303,6 +1310,7 @@ class BiomedEvidenceService:
                     or (retrieval_manifest.retrieval_id if retrieval_manifest else None)
                 ),
                 retrieval_intent="unknown",
+                answer_scope=answer_scope,
             )
             evidence.extend(extracted.evidence)
             if len(evidence) > request.max_evidence_items:
@@ -2520,6 +2528,7 @@ class BiomedEvidenceService:
         paper: BiomedicalPaper,
         retrieval_id: str | None,
         retrieval_intent: RetrievalIntent,
+        answer_scope: AnswerScope | None,
     ) -> EvidenceExtractionResult:
         if request.use_llm_extractor:
             llm_result = await self._llm_extract_evidence_or_none(
@@ -2527,10 +2536,11 @@ class BiomedEvidenceService:
                 research_question=request.question,
                 retrieval_id=retrieval_id,
                 retrieval_intent=retrieval_intent,
+                answer_scope=answer_scope,
             )
             if llm_result is not None:
                 return llm_result
-        return self.extract_evidence(
+        result = self.extract_evidence(
             EvidenceExtractionRequest(
                 paper=paper,
                 research_question=request.question,
@@ -2541,6 +2551,14 @@ class BiomedEvidenceService:
                 "fallback" if request.use_llm_extractor else "deterministic"
             ),
         )
+        return result.model_copy(
+            update={
+                "evidence": [
+                    _apply_scope_assessment(item, answer_scope)
+                    for item in result.evidence
+                ]
+            }
+        )
 
     async def _llm_extract_evidence_or_none(
         self,
@@ -2549,6 +2567,7 @@ class BiomedEvidenceService:
         research_question: str,
         retrieval_id: str | None,
         retrieval_intent: RetrievalIntent,
+        answer_scope: AnswerScope | None,
     ) -> EvidenceExtractionResult | None:
         if self.revision_provider is None or not self.revision_model:
             return None
@@ -2556,6 +2575,7 @@ class BiomedEvidenceService:
             paper=paper,
             research_question=research_question,
             retrieval_intent=retrieval_intent,
+            answer_scope=answer_scope,
         )
         prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
         prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
@@ -2596,7 +2616,7 @@ class BiomedEvidenceService:
                     retrieval_intent=retrieval_intent,
                 )
                 if item is not None:
-                    evidence.append(item)
+                    evidence.append(_apply_scope_assessment(item, answer_scope))
             if not evidence:
                 return None
             result = EvidenceExtractionResult(
@@ -2914,6 +2934,11 @@ class BiomedEvidenceService:
             )
         evidence: list[EvidenceItem] = []
         papers: dict[str, BiomedicalPaper] = {}
+        answer_scope = (
+            planning_result.query_plan.answer_scope
+            if planning_result is not None and planning_result.query_plan is not None
+            else _derive_answer_scope(active_request.question)
+        )
         for item in metadata:
             paper = await self.fetch(
                 FetchBiomedicalPaperRequest(
@@ -2931,6 +2956,7 @@ class BiomedEvidenceService:
                     retrieval_manifest.retrieval_id,
                 ),
                 retrieval_intent=paper_intents.get(item.paper_id, "unknown"),
+                answer_scope=answer_scope,
             )
             evidence.extend(extracted.evidence)
 
@@ -2952,14 +2978,27 @@ class BiomedEvidenceService:
                 papers=papers,
                 evidence=evidence,
                 project=project,
+                answer_scope=answer_scope,
             )
+        answer_evidence, off_scope_evidence = _split_scope_evidence(evidence)
+        project_context_trace.update(
+            {
+                "answer_scope": (
+                    answer_scope.model_dump(mode="json") if answer_scope else None
+                ),
+                "off_scope_evidence_ids": [
+                    item.evidence_id for item in off_scope_evidence
+                ],
+                "off_scope_evidence_count": len(off_scope_evidence),
+            }
+        )
         evidence_packet = _build_evidence_packet(
             request=active_request,
             planning_result=planning_result,
             retrieval_manifest=retrieval_manifest,
             retrieval_bundle=retrieval_bundle,
             metadata=metadata,
-            evidence=evidence,
+            evidence=answer_evidence,
         )
 
         citations = [
@@ -2982,13 +3021,13 @@ class BiomedEvidenceService:
                 url=papers[item.paper_id].url if item.paper_id in papers else None,
                 cited_claim=item.claim,
             )
-            for item in evidence
+            for item in answer_evidence
             if item.paper_id in papers
         ]
         conflicting = [
-            item for item in evidence if item.evidence_direction == "contradicts"
+            item for item in answer_evidence if item.evidence_direction == "contradicts"
         ]
-        limitations = _collect_limitations(evidence)
+        limitations = _collect_limitations(answer_evidence)
         if not citations and active_request.require_citations:
             answer = (
                 "I could not retrieve citation-backed evidence for this question in "
@@ -3005,11 +3044,11 @@ class BiomedEvidenceService:
         else:
             deterministic_answer = _compose_answer(
                 question=active_request.question,
-                evidence=evidence,
+                evidence=answer_evidence,
                 papers=papers,
                 project_context=active_request.project_context,
             )
-            uncertainty = _uncertainty(evidence)
+            uncertainty = _uncertainty(answer_evidence)
             synthesis_outcome = _SynthesisOutcome(
                 answer=deterministic_answer,
                 mode="deterministic",
@@ -3021,7 +3060,7 @@ class BiomedEvidenceService:
                     request=active_request,
                     deterministic_answer=deterministic_answer,
                     citations=citations,
-                    evidence=evidence,
+                    evidence=answer_evidence,
                     papers=papers,
                     retrieval_manifest=retrieval_manifest,
                     retrieval_bundle=retrieval_bundle,
@@ -3042,7 +3081,7 @@ class BiomedEvidenceService:
             limitations=limitations,
             uncertainty_level=uncertainty,
             suggested_next_steps=_suggest_next_steps(
-                evidence, bool(active_request.project_context)
+                answer_evidence, bool(active_request.project_context)
             ),
             not_medical_advice=True,
             disclaimer=RESEARCH_USE_DISCLAIMER,
@@ -3109,6 +3148,7 @@ class BiomedEvidenceService:
         )
         records: list[RetrievalBundleRecord] = []
         unique_items: list[PaperMetadata] = []
+        paper_budget = max(1, request.max_papers)
         seen_paper_ids: set[str] = set()
         duplicate_paper_ids: list[str] = []
         paper_intents: dict[str, RetrievalIntent] = {}
@@ -3152,19 +3192,23 @@ class BiomedEvidenceService:
                 if item.paper_id in seen_paper_ids:
                     duplicate_paper_ids.append(item.paper_id)
                     continue
+                if len(unique_items) >= paper_budget:
+                    break
                 seen_paper_ids.add(item.paper_id)
                 unique_items.append(item)
                 paper_intents[item.paper_id] = intent
                 paper_retrieval_ids[item.paper_id] = manifest.retrieval_id
+            if len(unique_items) >= paper_budget:
+                break
 
         if primary_manifest is None:
             primary_result = await self.search_with_manifest(search_request)
             primary_manifest = primary_result.retrieval_manifest
-            unique_items = primary_result.items
-            paper_intents = {item.paper_id: "primary" for item in primary_result.items}
+            unique_items = primary_result.items[:paper_budget]
+            paper_intents = {item.paper_id: "primary" for item in unique_items}
             paper_retrieval_ids = {
                 item.paper_id: primary_manifest.retrieval_id
-                for item in primary_result.items
+                for item in unique_items
             }
 
         bundle = RetrievalBundle(
@@ -3198,6 +3242,7 @@ class BiomedEvidenceService:
         papers: dict[str, BiomedicalPaper],
         evidence: list[EvidenceItem],
         project: BiomedProject | None,
+        answer_scope: AnswerScope | None,
     ) -> tuple[
         list[PaperMetadata],
         RetrievalBundle,
@@ -3232,6 +3277,21 @@ class BiomedEvidenceService:
             existing_queries={record.query.lower() for record in retrieval_bundle.records},
             max_decisions=2,
         )
+        if len(metadata) >= max(1, request.max_papers):
+            return (
+                metadata,
+                retrieval_bundle.model_copy(
+                    update={
+                        "coverage_matrix": coverage,
+                        "gap_decisions": [],
+                        "stop_reason": "paper_budget_reached",
+                    }
+                ),
+                paper_intents,
+                paper_retrieval_ids,
+                papers,
+                evidence,
+            )
         if not decisions:
             return (
                 metadata,
@@ -3329,6 +3389,7 @@ class BiomedEvidenceService:
                     paper=paper,
                     retrieval_id=manifest.retrieval_id,
                     retrieval_intent=decision.retrieval_intent,
+                    answer_scope=answer_scope,
                 )
                 evidence.extend(extracted.evidence)
             records.append(
@@ -3715,46 +3776,115 @@ class BiomedEvidenceService:
                     self.revision_model,
                 ),
             )
-        prompt_payload = _llm_claim_logic_payload(
-            claims=claims,
-            citations=citations,
-            evidence_items=evidence_items,
-        )
-        prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
-        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        prompt_hash = None
         try:
-            response = await self.revision_provider.chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Parse biomedical answer claims and evidence spans into "
-                            "logical frames. Return one valid JSON object only. Use "
-                            "only the supplied claims and evidence items. Do not decide "
-                            "the final audit verdict."
-                        ),
-                    },
-                    {"role": "user", "content": prompt_text},
-                ],
-                tools=[],
-                model=self.revision_model,
-                max_tokens=4200,
-                tool_choice="none",
-                disable_thinking=True,
-            )
-            parsed = _parse_json_object(str(getattr(response, "content", "") or ""))
-            claim_frames = _logic_claim_frames_from_llm(
-                parsed.get("claim_frames"),
+            claim_frames: dict[str, LogicalClaimFrame] = {}
+            evidence_frames: dict[str, LogicalEvidenceFrame] = {}
+            full_prompt_payload = _llm_claim_logic_payload(
                 claims=claims,
-                model=self.revision_model,
-                prompt_hash=prompt_hash,
-            )
-            evidence_frames = _logic_evidence_frames_from_llm(
-                parsed.get("evidence_frames"),
+                citations=citations,
                 evidence_items=evidence_items,
-                model=self.revision_model,
-                prompt_hash=prompt_hash,
             )
+            prompt_text = json.dumps(
+                full_prompt_payload, ensure_ascii=False, sort_keys=True
+            )
+            prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+
+            async def parse_chunk(
+                *,
+                claim_chunk: list[AtomicClaim],
+                evidence_chunk: list[EvidenceItem],
+            ) -> tuple[dict[str, LogicalClaimFrame], dict[str, LogicalEvidenceFrame]]:
+                chunk_payload = _llm_claim_logic_payload(
+                    claims=claim_chunk,
+                    citations=[],
+                    evidence_items=evidence_chunk,
+                )
+                chunk_text = json.dumps(
+                    chunk_payload, ensure_ascii=False, sort_keys=True
+                )
+                chunk_hash = hashlib.sha256(
+                    chunk_text.encode("utf-8")
+                ).hexdigest()[:16]
+                response = await self.revision_provider.chat(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Parse biomedical answer claims and evidence spans into "
+                                "logical frames. Return one valid JSON object only. Use "
+                                "only the supplied claims and evidence items. Do not decide "
+                                "the final audit verdict."
+                            ),
+                        },
+                        {"role": "user", "content": chunk_text},
+                    ],
+                    tools=[],
+                    model=self.revision_model,
+                    max_tokens=4200,
+                    tool_choice="none",
+                    disable_thinking=True,
+                )
+                parsed = _parse_json_object(
+                    str(getattr(response, "content", "") or "")
+                )
+                chunk_claim_frames = (
+                    _logic_claim_frames_from_llm(
+                        parsed.get("claim_frames"),
+                        claims=claim_chunk,
+                        model=self.revision_model,
+                        prompt_hash=chunk_hash,
+                    )
+                    if claim_chunk
+                    else {}
+                )
+                chunk_evidence_frames = (
+                    _logic_evidence_frames_from_llm(
+                        parsed.get("evidence_frames"),
+                        evidence_items=evidence_chunk,
+                        model=self.revision_model,
+                        prompt_hash=chunk_hash,
+                    )
+                    if evidence_chunk
+                    else {}
+                )
+                return chunk_claim_frames, chunk_evidence_frames
+
+            if (
+                len(claims) <= _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE
+                and len(evidence_items) <= _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE
+            ):
+                parsed_claims, parsed_evidence = await parse_chunk(
+                    claim_chunk=claims,
+                    evidence_chunk=evidence_items,
+                )
+                claim_frames.update(parsed_claims)
+                evidence_frames.update(parsed_evidence)
+            else:
+                for start in range(
+                    0, len(claims), _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE
+                ):
+                    chunk_claims = claims[
+                        start : start + _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE
+                    ]
+                    parsed_claims, _ = await parse_chunk(
+                        claim_chunk=chunk_claims,
+                        evidence_chunk=[],
+                    )
+                    claim_frames.update(parsed_claims)
+                for start in range(
+                    0,
+                    len(evidence_items),
+                    _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE,
+                ):
+                    chunk_evidence = evidence_items[
+                        start : start + _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE
+                    ]
+                    _, parsed_evidence = await parse_chunk(
+                        claim_chunk=[],
+                        evidence_chunk=chunk_evidence,
+                    )
+                    evidence_frames.update(parsed_evidence)
             if set(claim_frames) != {claim.claim_id for claim in claims}:
                 raise ValueError("LLM claim logic parser returned incomplete claims.")
             if set(evidence_frames) != {item.evidence_id for item in evidence_items}:
@@ -5481,15 +5611,32 @@ def _compile_query(
                 unsupported.append(f"mock:{key}")
         return normalized_query, filters, unsupported
 
-    parts = [normalized_query] if normalized_query else []
+    normalized_query = _pubmed_ready_query(normalized_query, [])
+    parts: list[str] = []
+    seen_parts: set[str] = set()
+
+    def add_part(part: str) -> None:
+        if part and part not in seen_parts:
+            seen_parts.add(part)
+            parts.append(part)
+
+    add_part(normalized_query)
     for term in cast(list[str], filters["mesh_terms"]):
-        parts.append(f'"{_pubmed_term(term)}"[MeSH Terms]')
+        publication_type = _pubmed_study_publication_type(term)
+        if publication_type:
+            add_part(f'"{_pubmed_term(publication_type)}"[Publication Type]')
+        else:
+            add_part(f'"{_pubmed_term(term)}"[MeSH Terms]')
     for term in cast(list[str], filters["species_terms"]):
-        parts.append(f'"{_pubmed_term(term)}"[MeSH Terms]')
+        add_part(f'"{_pubmed_term(term)}"[MeSH Terms]')
     for term in cast(list[str], filters["publication_types"]):
-        parts.append(f'"{_pubmed_term(term)}"[Publication Type]')
-    if filters["study_types"]:
-        unsupported.append("pubmed:study_types")
+        add_part(f'"{_pubmed_term(term)}"[Publication Type]')
+    for term in cast(list[str], filters["study_types"]):
+        publication_type = _pubmed_study_publication_type(term)
+        if publication_type:
+            add_part(f'"{_pubmed_term(publication_type)}"[Publication Type]')
+        elif term.lower() not in {"human", "humans", "animal", "animals"}:
+            unsupported.append(f"pubmed:study_types:{term}")
     compiled = " AND ".join(parts) if parts else ""
     exclude_terms = cast(list[str], filters["exclude_terms"])
     if exclude_terms:
@@ -5669,6 +5816,130 @@ def _classify_biomedical_question(
     )
 
 
+def _derive_answer_scope(question: str) -> AnswerScope:
+    lowered = question.lower()
+
+    def present(*terms: str) -> list[str]:
+        return [term for term in terms if term in lowered]
+
+    population = present(
+        "adult",
+        "adults",
+        "hospitalized",
+        "hospitalised",
+        "covid-19",
+        "covid",
+        "patients",
+    )
+    intervention = present("hydroxychloroquine", "hcq")
+    comparator = present("usual care", "placebo", "control")
+    outcomes = present(
+        "mortality",
+        "death",
+        "discharge",
+        "discharged",
+        "mechanical ventilation",
+        "clinical deterioration",
+        "clinical outcomes",
+    )
+    if "clinical outcomes" in outcomes:
+        outcomes.extend(
+            [
+                "mortality",
+                "discharge",
+                "mechanical ventilation",
+                "clinical deterioration",
+            ]
+        )
+    required_study = present(
+        "randomized trial",
+        "randomised trial",
+        "randomized controlled trial",
+        "randomised controlled trial",
+        "rct",
+    )
+    exclude: list[str] = []
+    if "hospital" in lowered or "covid" in lowered:
+        exclude.extend(
+            ["prophylaxis", "prevention", "prep", "non-covid", "pediatric", "childhood"]
+        )
+    if "hydroxychloroquine" in lowered or "hcq" in lowered:
+        exclude.append("hydroxychloroquine not intervention")
+
+    return AnswerScope(
+        population_terms=_merge_unique(population),
+        intervention_terms=_merge_unique(intervention),
+        comparator_terms=_merge_unique(comparator),
+        outcome_terms=_merge_unique(outcomes),
+        required_study_terms=_merge_unique(required_study),
+        exclude_terms=_merge_unique(exclude),
+        rationale="Derived from explicit question terms.",
+    )
+
+
+def _apply_scope_assessment(
+    item: EvidenceItem,
+    scope: AnswerScope | None,
+) -> EvidenceItem:
+    if scope is None:
+        return item
+    text = " ".join(
+        [
+            item.claim,
+            item.finding,
+            item.evidence_span or "",
+            " ".join(item.methods),
+            " ".join(item.datasets_or_cohorts),
+            " ".join(item.limitations),
+        ]
+    ).lower()
+    matched: list[str] = []
+    reasons: list[str] = []
+
+    for term in scope.exclude_terms:
+        if term and term.lower() in text:
+            reasons.append(f"Excluded term matched: {term}")
+
+    for label, terms in [
+        ("population", scope.population_terms),
+        ("intervention", scope.intervention_terms),
+    ]:
+        hits = [term for term in terms if term and term.lower() in text]
+        matched.extend(hits)
+        if terms and not hits:
+            reasons.append(f"Missing {label}: {', '.join(terms)}")
+
+    for terms in [
+        scope.comparator_terms,
+        scope.outcome_terms,
+        scope.required_study_terms,
+    ]:
+        matched.extend([term for term in terms if term and term.lower() in text])
+
+    if reasons:
+        scope_match: ScopeMatch = "false"
+    elif matched:
+        scope_match = "true"
+    else:
+        scope_match = "uncertain"
+
+    return item.model_copy(
+        update={
+            "scope_match": scope_match,
+            "scope_mismatch_reasons": _merge_unique(reasons),
+            "scope_matched_terms": _merge_unique(matched),
+        }
+    )
+
+
+def _split_scope_evidence(
+    evidence: list[EvidenceItem],
+) -> tuple[list[EvidenceItem], list[EvidenceItem]]:
+    accepted = [item for item in evidence if item.scope_match != "false"]
+    rejected = [item for item in evidence if item.scope_match == "false"]
+    return accepted, rejected
+
+
 def _deterministic_query_plan(
     *,
     request: PlanBiomedicalSearchRequest,
@@ -5725,6 +5996,7 @@ def _deterministic_query_plan(
         max_results=max_results,
         rationale="Deterministic query plan derived from biomedical terms in the question.",
         warnings=warnings,
+        answer_scope=_derive_answer_scope(request.question),
     )
 
 
@@ -6625,6 +6897,7 @@ def _llm_extraction_payload(
     paper: BiomedicalPaper,
     research_question: str,
     retrieval_intent: RetrievalIntent,
+    answer_scope: AnswerScope | None = None,
 ) -> dict[str, object]:
     return {
         "instructions": [
@@ -6633,9 +6906,11 @@ def _llm_extraction_payload(
             "Each evidence_span must be an exact substring of title or abstract after whitespace normalization.",
             "If no relevant evidence is present, return an empty evidence list.",
             "Do not infer beyond the paper text.",
+            "Mark scope_match=false when the paper is outside the supplied answer_scope.",
         ],
         "research_question": research_question,
         "retrieval_intent": retrieval_intent,
+        "answer_scope": answer_scope.model_dump(mode="json") if answer_scope else None,
         "paper": {
             "paper_id": paper.paper_id,
             "title": paper.title,
@@ -6661,6 +6936,11 @@ def _llm_extraction_payload(
                     "methods": ["method strings"],
                     "datasets_or_cohorts": ["dataset/cohort strings"],
                     "limitations": ["limitation strings"],
+                    "scope_match": "true|false|uncertain",
+                    "scope_mismatch_reasons": [
+                        "why this paper does not answer the question"
+                    ],
+                    "scope_matched_terms": ["matched scope term"],
                 }
             ]
         },
@@ -6704,6 +6984,11 @@ def _evidence_item_from_llm(
         extraction_mode="llm",
         extractor_model=model,
         extractor_prompt_hash=prompt_hash,
+        scope_match=_coerce_scope_match(value.get("scope_match")),
+        scope_mismatch_reasons=_coerce_string_list(
+            value.get("scope_mismatch_reasons")
+        ),
+        scope_matched_terms=_coerce_string_list(value.get("scope_matched_terms")),
         requires_expert_review=True,
     )
 
@@ -6722,12 +7007,14 @@ def _llm_claim_logic_payload(
             "Preserve claim_id, evidence_id, paper_id, claim_text, and evidence_text exactly.",
             "Return all frames; missing frames make the parser fail.",
             "Do not decide the final entailment verdict.",
+            "Use contributes_to for cofactor, risk-factor, contributor, or progression-promoting wording that is stronger than association but weaker than definitive causation.",
         ],
         "allowed_values": {
             "predicate": [
                 "associated_with",
                 "correlates_with",
                 "causes_or_drives",
+                "contributes_to",
                 "is_mechanistically_linked_to",
                 "increases",
                 "decreases",
@@ -6759,6 +7046,7 @@ def _llm_claim_logic_payload(
             "claim_strength": [
                 "causal",
                 "association",
+                "contribution",
                 "mechanistic",
                 "prognostic",
                 "diagnostic",
@@ -6890,17 +7178,117 @@ def _logic_claim_frames_from_llm(
         claim = claim_lookup.get(claim_id)
         if claim is None:
             raise ValueError(f"unknown claim_id: {claim_id}")
-        payload = {
-            **raw,
-            "claim_id": claim.claim_id,
-            "claim_text": claim.text,
-            "parser_mode": "llm",
-            "parser_model": model,
-            "parser_prompt_hash": prompt_hash,
-            "parser_warnings": _coerce_string_list(raw.get("parser_warnings")),
-        }
+        payload = _normalize_logic_payload(
+            {
+                **raw,
+                "claim_id": claim.claim_id,
+                "claim_text": claim.text,
+                "parser_mode": "llm",
+                "parser_model": model,
+                "parser_prompt_hash": prompt_hash,
+                "parser_warnings": _coerce_string_list(raw.get("parser_warnings")),
+            }
+        )
         frames[claim.claim_id] = LogicalClaimFrame.model_validate(payload)
     return frames
+
+
+def _normalize_logic_payload(raw: dict[str, object]) -> dict[str, object]:
+    payload = dict(raw)
+    warnings = _coerce_string_list(payload.get("parser_warnings"))
+    for field in ("subject", "object"):
+        entity = payload.get(field)
+        if not isinstance(entity, dict) or not str(entity.get("text") or "").strip():
+            payload[field] = {"text": "unspecified", "entity_type": "unspecified"}
+            warnings.append(f"Normalized missing {field} entity to unspecified.")
+    if payload.get("modality") == "uncertain":
+        payload["modality"] = "inconclusive"
+        warnings.append("Normalized modality 'uncertain' to 'inconclusive'.")
+    text = _logic_payload_text(payload).lower()
+    if (
+        _has_contribution_language(text)
+        and not _has_explicit_sufficient_cause(text)
+        and payload.get("predicate")
+        in {"causes_or_drives", "associated_with", "correlates_with"}
+    ):
+        original = payload.get("predicate")
+        payload["predicate"] = "contributes_to"
+        warnings.append(
+            f"Normalized contribution wording predicate '{original}' to 'contributes_to'."
+        )
+        if "claim_id" in payload:
+            payload["claim_strength"] = "contribution"
+            payload["modality"] = "moderate"
+            payload["qualifiers"] = _merge_unique(
+                _coerce_string_list(payload.get("qualifiers")),
+                _contribution_qualifiers(text),
+            )
+    payload["parser_warnings"] = _merge_unique(warnings)
+    return payload
+
+
+def _logic_payload_text(payload: dict[str, object]) -> str:
+    return " ".join(
+        [
+            str(payload.get("claim_text") or ""),
+            str(payload.get("evidence_text") or ""),
+            " ".join(_coerce_string_list(payload.get("source_spans"))),
+        ]
+    )
+
+
+def _has_contribution_language(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(co-?factors?|risk factors?|contributors?|contribut(?:e|es|ed|ing)|promotes? progression|involved in progression|facilitates? progression)\b",
+            lowered,
+        )
+    )
+
+
+def _has_explicit_sufficient_cause(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(sufficient (?:cause|causes)|necessary (?:cause|causes)|definitive(?:ly)? caus|independent(?:ly)? caus)\b",
+            lowered,
+        )
+    )
+
+
+def _contribution_qualifiers(lowered: str) -> list[str]:
+    qualifiers: list[str] = []
+    if re.search(r"\bco-?factors?\b", lowered):
+        qualifiers.append("cofactor")
+    if re.search(r"\brisk factors?\b", lowered):
+        qualifiers.append("risk_factor")
+    if "progression" in lowered:
+        qualifiers.append("progression")
+    return qualifiers
+
+
+def _normalize_evidence_model_system(
+    payload: dict[str, object],
+    item: EvidenceItem,
+) -> dict[str, object]:
+    text = " ".join(
+        [item.claim, item.finding, item.evidence_span or "", " ".join(item.methods)]
+    ).lower()
+    model_system = str(payload.get("model_system") or "").lower()
+    warnings = _coerce_string_list(payload.get("parser_warnings"))
+    if (
+        payload.get("population") == "human"
+        and payload.get("study_design") == "randomized_trial"
+        and model_system in {"rat", "mouse", "mouse model", "animal"}
+        and re.search(
+            r"\b(adult|adults|patients?|hospitalized|randomized trial)\b", text
+        )
+    ):
+        payload["model_system"] = "human cohort"
+        warnings.append(
+            "Normalized inconsistent animal model_system on human randomized trial evidence."
+        )
+    payload["parser_warnings"] = _merge_unique(warnings)
+    return payload
 
 
 def _logic_evidence_frames_from_llm(
@@ -6921,16 +7309,23 @@ def _logic_evidence_frames_from_llm(
         item = evidence_lookup.get(evidence_id)
         if item is None:
             raise ValueError(f"unknown evidence_id: {evidence_id}")
-        payload = {
-            **raw,
-            "evidence_id": item.evidence_id,
-            "paper_id": item.paper_id,
-            "evidence_text": item.evidence_span or item.finding or item.claim,
-            "parser_mode": "llm",
-            "parser_model": model,
-            "parser_prompt_hash": prompt_hash,
-            "parser_warnings": _coerce_string_list(raw.get("parser_warnings")),
-        }
+        payload = _normalize_evidence_model_system(
+            _normalize_logic_payload(
+                {
+                    **raw,
+                    "evidence_id": item.evidence_id,
+                    "paper_id": item.paper_id,
+                    "evidence_text": item.evidence_span or item.finding or item.claim,
+                    "parser_mode": "llm",
+                    "parser_model": model,
+                    "parser_prompt_hash": prompt_hash,
+                    "parser_warnings": _coerce_string_list(
+                        raw.get("parser_warnings")
+                    ),
+                }
+            ),
+            item,
+        )
         frames[item.evidence_id] = LogicalEvidenceFrame.model_validate(payload)
     return frames
 
@@ -7063,6 +7458,16 @@ def _coerce_confidence(value: object) -> Any:
     return "low"
 
 
+def _coerce_scope_match(value: object) -> ScopeMatch:
+    if value in {"true", "false", "uncertain"}:
+        return cast(ScopeMatch, value)
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "uncertain"
+
+
 def _coerce_entities(value: object) -> list[BiomedicalEntity]:
     if not isinstance(value, list):
         return []
@@ -7111,6 +7516,10 @@ def _llm_planner_payload(
             "Do not override deterministic clinical guardrails.",
             "Use only these intents: research_question, clinical_or_patient_specific, needs_clarification, out_of_scope.",
             "The query plan must include primary_query, mesh_terms, include_terms, exclude_terms, support_queries, refute_queries, subquestions, max_results, and rationale.",
+            "For PubMed, primary_query and subquestion queries must be compact keyword queries, not a restatement of the user's question.",
+            "Do not include intent words such as supports, refutes, hypothesis, improves outcomes, evidence, or question phrasing in PubMed queries.",
+            "Prefer intervention, disease, population, and study-design concepts, such as '<intervention> <disease> randomized controlled trial'.",
+            "Put PubMed-supported designs such as randomized controlled trial in publication_types when possible.",
             "Subquestions should use retrieval_intent values: background, support, refute, mechanism, limitation, recent.",
             "Keep queries concise and suitable for PubMed or deterministic mock retrieval.",
         ],
@@ -7258,6 +7667,7 @@ def _query_plan_from_llm(
         llm_model=model,
         llm_prompt_hash=prompt_hash,
         llm_raw_response=raw_response,
+        answer_scope=fallback.answer_scope or _derive_answer_scope(fallback.question),
     )
 
 
@@ -7384,6 +7794,8 @@ def _infer_include_terms(question: str) -> list[str]:
 def _infer_study_types(question: str) -> list[str]:
     lowered = question.lower()
     result: list[str] = []
+    if "randomized" in lowered or "trial" in lowered:
+        result.append("randomized_trial")
     if "longitudinal" in lowered or "progression" in lowered:
         result.append("longitudinal")
     if "human" in lowered or "patient" in lowered:
@@ -7416,6 +7828,13 @@ def _looks_biomedical(question: str) -> bool:
         "clinical",
         "biomedical",
         "cancer",
+        "trial",
+        "randomized",
+        "hospitalized",
+        "patient",
+        "patients",
+        "treatment",
+        "outcomes",
         "tumor",
         "cohort",
         "transcriptomics",
@@ -7427,12 +7846,73 @@ def _looks_biomedical(question: str) -> bool:
 
 
 def _executable_query(plan: BiomedicalQueryPlan) -> str:
-    return " ".join(
-        _merge_unique(
-            [plan.primary_query],
-            plan.include_terms,
-        )
-    ).strip()
+    return _pubmed_ready_query(plan.primary_query, plan.include_terms)
+
+
+_PUBMED_QUERY_STOPWORDS = {
+    "what",
+    "which",
+    "whether",
+    "does",
+    "that",
+    "this",
+    "these",
+    "those",
+    "question",
+    "evidence",
+    "supports",
+    "support",
+    "supporting",
+    "refutes",
+    "refute",
+    "refuting",
+    "hypothesis",
+    "hypotheses",
+    "improve",
+    "improves",
+    "improved",
+    "improving",
+    "outcome",
+    "outcomes",
+    "association",
+    "mechanism",
+    "mechanistic",
+    "background",
+    "limitations",
+}
+
+
+def _pubmed_ready_query(primary_query: str, include_terms: Iterable[str]) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in [primary_query, *include_terms]:
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9+-]{2,}", value or ""):
+            lowered = token.lower()
+            if lowered in _PUBMED_QUERY_STOPWORDS or lowered in seen:
+                continue
+            seen.add(lowered)
+            terms.append(token)
+    return " ".join(terms[:10]).strip()
+
+
+def _pubmed_study_publication_type(value: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    if normalized in {
+        "randomized",
+        "randomised",
+        "randomized_trial",
+        "randomised_trial",
+        "randomized_controlled_trial",
+        "randomised_controlled_trial",
+    }:
+        return "Randomized Controlled Trial"
+    if normalized in {"clinical_trial", "trial"}:
+        return "Clinical Trial"
+    if normalized in {"meta_analysis", "metaanalysis"}:
+        return "Meta-Analysis"
+    if normalized in {"review", "systematic_review"}:
+        return "Review"
+    return None
 
 
 def _planning_abstention(classification: BiomedicalQuestionClassification) -> str:

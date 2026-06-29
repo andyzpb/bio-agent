@@ -8,7 +8,7 @@ provider = "deepseek"
 
 [llm.main]
 # 主模型，必填。默认使用 DeepSeek。
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 enable_thinking = true
@@ -17,7 +17,7 @@ multimodal = false
 [llm.fast]
 # 轻量模型，用于 memory gate / query rewrite / HyDE。
 # 不填则退回主模型，但延迟会稍高。
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 

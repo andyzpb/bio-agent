@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from plugins.biomed_evidence import service as biomed_service_module
 from plugins.biomed_evidence.claim_logic import audit_claim_logic
 from plugins.biomed_evidence.claim_logic_export import normalize_symbol
 from plugins.biomed_evidence.citation_auditor import validate_citation_support
@@ -17,6 +18,12 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
+
+
+COFACTOR_TEXT = (
+    "Viral load and viral type are the main cofactors for progression from "
+    "infection to cervical intraepithelial lesions and cancer"
+)
 
 
 def _citation(paper_id: str = "PMID:123") -> Citation:
@@ -46,6 +53,21 @@ def _animal_association_evidence() -> EvidenceItem:
     )
 
 
+def _cofactor_evidence() -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id="ev_cofactor",
+        paper_id="PMID:28964706",
+        claim=COFACTOR_TEXT,
+        finding=COFACTOR_TEXT,
+        evidence_direction="supports",
+        entities=[],
+        methods=["review"],
+        limitations=["Review-level evidence."],
+        confidence="medium",
+        evidence_span=COFACTOR_TEXT,
+    )
+
+
 class _FakeLogicResponse:
     def __init__(self, content: str) -> None:
         self.content = content
@@ -65,6 +87,38 @@ class _FakeLogicParserProvider:
         messages = kwargs["messages"]
         payload = json.loads(str(messages[-1]["content"]))
         return _FakeLogicResponse(json.dumps(_logic_parser_payload_response(payload)))
+
+
+class _ChunkLimitedLogicParserProvider(_FakeLogicParserProvider):
+    def __init__(self, *, max_evidence_items: int, max_claims: int = 99) -> None:
+        super().__init__()
+        self.max_evidence_items = max_evidence_items
+        self.max_claims = max_claims
+        self.extra_claim_in_evidence_chunks = False
+        self.evidence_batch_sizes: list[int] = []
+        self.claim_batch_sizes: list[int] = []
+
+    async def chat(self, **kwargs: Any) -> _FakeLogicResponse:
+        messages = kwargs["messages"]
+        payload = json.loads(str(messages[-1]["content"]))
+        self.claim_batch_sizes.append(len(payload["claims"]))
+        self.evidence_batch_sizes.append(len(payload["evidence_items"]))
+        if len(payload["claims"]) > self.max_claims:
+            self.calls += 1
+            return _FakeLogicResponse('{"claim_frames": [{"claim_id": "truncated')
+        if len(payload["evidence_items"]) > self.max_evidence_items:
+            self.calls += 1
+            return _FakeLogicResponse('{"claim_frames": [{"claim_id": "truncated')
+        response = _logic_parser_payload_response(payload)
+        if self.extra_claim_in_evidence_chunks and not payload["claims"]:
+            response["claim_frames"] = [
+                {
+                    "claim_id": "extra-claim",
+                    "claim_text": "extra claim",
+                }
+            ]
+        self.calls += 1
+        return _FakeLogicResponse(json.dumps(response))
 
 
 def _logic_parser_payload_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -197,6 +251,215 @@ def test_logic_fact_export_is_deterministic_and_normalizes_symbols() -> None:
     )
 
 
+def test_deterministic_parser_maps_cofactor_progression_to_contribution() -> None:
+    claim = AtomicClaim(
+        claim_id="claim_cofactor",
+        text=COFACTOR_TEXT,
+        claim_type="background",
+    )
+
+    result = audit_claim_logic(claim, [_cofactor_evidence()], export_facts=True)
+
+    assert result.claim_frame.predicate == "contributes_to"
+    assert result.claim_frame.claim_strength == "contribution"
+    assert "cofactor" in result.claim_frame.qualifiers
+    assert result.evidence_frames[0].predicate == "contributes_to"
+    assert result.logic_verdict in {"entailed", "partially_entailed"}
+    assert "association_does_not_entail_causation" not in result.rules_triggered
+    assert result.logic_fact_export is not None
+    assert "claim_predicate(claim_cofactor, contributes_to)." in (
+        result.logic_fact_export.text or ""
+    )
+
+
+def test_contribution_evidence_partially_supports_causal_claim() -> None:
+    claim = AtomicClaim(
+        claim_id="claim_causal",
+        text=(
+            "Viral load and viral type drive progression from infection to "
+            "cervical intraepithelial lesions and cancer"
+        ),
+        claim_type="causal",
+    )
+
+    result = audit_claim_logic(claim, [_cofactor_evidence()])
+
+    assert result.claim_frame.predicate == "causes_or_drives"
+    assert result.evidence_frames[0].predicate == "contributes_to"
+    assert result.logic_verdict == "partially_entailed"
+    assert "contribution_partially_entails_causation" in result.rules_triggered
+
+
+def test_contribution_evidence_does_not_support_sufficient_cause_claim() -> None:
+    claim = AtomicClaim(
+        claim_id="claim_sufficient",
+        text=(
+            "Viral load and viral type are sufficient causes of progression from "
+            "infection to cervical intraepithelial lesions and cancer"
+        ),
+        claim_type="causal",
+    )
+
+    result = audit_claim_logic(claim, [_cofactor_evidence()])
+
+    assert result.logic_verdict == "overclaimed"
+    assert "contribution_does_not_entail_sufficient_causation" in (
+        result.rules_triggered
+    )
+
+
+def test_llm_logic_parser_normalizes_cofactor_predicate_drift() -> None:
+    raw_claim = {
+        "claim_id": "claim_cofactor",
+        "claim_text": COFACTOR_TEXT,
+        "subject": {"text": "viral load and viral type", "entity_type": "biological_process"},
+        "predicate": "causes_or_drives",
+        "object": {"text": "progression", "entity_type": "disease"},
+        "polarity": "positive",
+        "modality": "definitive",
+        "claim_strength": "causal",
+        "qualifiers": [],
+    }
+    raw_evidence = {
+        "evidence_id": "ev_cofactor",
+        "paper_id": "PMID:28964706",
+        "evidence_text": COFACTOR_TEXT,
+        "subject": {"text": "viral load and viral type", "entity_type": "biological_process"},
+        "predicate": "associated_with",
+        "object": {"text": "progression", "entity_type": "disease"},
+        "polarity": "positive",
+        "modality": "definitive",
+        "population": "human",
+        "study_design": "review",
+        "evidence_strength": "review_or_guideline",
+    }
+
+    claim_frames = biomed_service_module._logic_claim_frames_from_llm(
+        [raw_claim],
+        claims=[
+            AtomicClaim(
+                claim_id="claim_cofactor",
+                text=COFACTOR_TEXT,
+                claim_type="background",
+            )
+        ],
+        model="fake",
+        prompt_hash="hash",
+    )
+    evidence_frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [raw_evidence],
+        evidence_items=[_cofactor_evidence()],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    claim_frame = claim_frames["claim_cofactor"]
+    evidence_frame = evidence_frames["ev_cofactor"]
+    assert claim_frame.predicate == "contributes_to"
+    assert claim_frame.claim_strength == "contribution"
+    assert "cofactor" in claim_frame.qualifiers
+    assert any("contributes_to" in warning for warning in claim_frame.parser_warnings)
+    assert evidence_frame.predicate == "contributes_to"
+    assert any(
+        "contributes_to" in warning for warning in evidence_frame.parser_warnings
+    )
+
+
+def test_llm_logic_parser_normalizes_uncertain_modality() -> None:
+    raw = {
+        "claim_id": "claim_1",
+        "claim_text": "Evidence is uncertain.",
+        "subject": {"text": "evidence", "entity_type": "method"},
+        "predicate": "uncertain_or_inconclusive",
+        "object": {"text": "outcome", "entity_type": "disease"},
+        "polarity": "uncertain",
+        "modality": "uncertain",
+    }
+
+    frames = biomed_service_module._logic_claim_frames_from_llm(
+        [raw],
+        claims=[
+            AtomicClaim(
+                claim_id="claim_1",
+                text="Evidence is uncertain.",
+                claim_type="uncertainty",
+            )
+        ],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    frame = frames["claim_1"]
+    assert frame.modality == "inconclusive"
+    assert any("uncertain" in warning for warning in frame.parser_warnings)
+
+
+def test_llm_logic_parser_normalizes_null_entities() -> None:
+    evidence = _animal_association_evidence()
+    raw = {
+        "evidence_id": evidence.evidence_id,
+        "paper_id": evidence.paper_id,
+        "evidence_text": evidence.evidence_span,
+        "subject": None,
+        "predicate": "associated_with",
+        "object": None,
+        "population": "animal",
+        "study_design": "preclinical",
+        "evidence_strength": "animal_or_in_vitro",
+    }
+
+    frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [raw],
+        evidence_items=[evidence],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    frame = frames[evidence.evidence_id]
+    assert frame.parser_mode == "llm"
+    assert frame.subject.text == "unspecified"
+    assert frame.object.text == "unspecified"
+    assert any("missing subject" in warning for warning in frame.parser_warnings)
+    assert any("missing object" in warning for warning in frame.parser_warnings)
+
+
+def test_llm_logic_parser_flags_human_trial_rat_model_system() -> None:
+    evidence = EvidenceItem(
+        evidence_id="ev_human",
+        paper_id="PMID:1",
+        claim="Hospitalized adults were enrolled in a randomized trial.",
+        finding="Hospitalized adults were enrolled in a randomized trial.",
+        evidence_direction="supports",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=[],
+        confidence="high",
+        evidence_span="Hospitalized adults were enrolled in a randomized trial.",
+    )
+    raw = {
+        "evidence_id": "ev_human",
+        "paper_id": "PMID:1",
+        "evidence_text": evidence.evidence_span,
+        "subject": {"text": "adults", "entity_type": "organism"},
+        "predicate": "treats",
+        "object": {"text": "COVID-19", "entity_type": "disease"},
+        "population": "human",
+        "model_system": "rat",
+        "study_design": "randomized_trial",
+    }
+
+    frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [raw],
+        evidence_items=[evidence],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    frame = frames["ev_human"]
+    assert frame.model_system == "human cohort"
+    assert any("model_system" in warning for warning in frame.parser_warnings)
+
+
 def test_citation_audit_can_attach_logic_audit_and_fact_export() -> None:
     answer = (
         "Microglial activation increases Alzheimer's disease progression "
@@ -267,7 +530,7 @@ async def test_answer_with_audit_uses_provider_backed_logic_parser(
     finally:
         await service.aclose()
 
-    assert provider.calls == 1
+    assert provider.calls >= 1
     logic_audits = [
         item.logic_audit for item in result.audit.claim_audits if item.logic_audit
     ]
@@ -289,6 +552,48 @@ async def test_answer_with_audit_uses_provider_backed_logic_parser(
     assert isinstance(parser_modes, dict)
     assert parser_modes.get("llm", 0) >= len(logic_audits)
     assert logic_trace["parser_models"] == ["fake-logic-parser"]
+
+
+@pytest.mark.asyncio
+async def test_claim_logic_parser_splits_large_evidence_batches(
+    tmp_path: Path,
+) -> None:
+    provider = _ChunkLimitedLogicParserProvider(max_evidence_items=2, max_claims=2)
+    provider.extra_claim_in_evidence_chunks = True
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-logic-parser",
+    )
+    evidence = [
+        _animal_association_evidence().model_copy(
+            update={"evidence_id": f"ev_{index}", "paper_id": f"PMID:{index}"}
+        )
+        for index in range(17)
+    ]
+    answer = " ".join(
+        (
+            "Microglial activation increases Alzheimer's disease progression "
+            f"in cohort {index}. [PMID:{index}]"
+        )
+        for index in range(11)
+    )
+    try:
+        outcome = await service._llm_claim_logic_frames_or_fallback(
+            answer=answer,
+            citations=[_citation(f"PMID:{index}") for index in range(17)],
+            evidence_items=evidence,
+        )
+    finally:
+        await service.aclose()
+
+    assert outcome.fallback_reason is None
+    assert max(provider.claim_batch_sizes) <= 2
+    assert max(provider.evidence_batch_sizes) <= 2
+    assert sum(provider.claim_batch_sizes) == 11
+    assert sum(provider.evidence_batch_sizes) == 17
+    assert len(outcome.evidence_frames) == 17
+    assert len(outcome.claim_frames) == 11
 
 
 @pytest.mark.asyncio

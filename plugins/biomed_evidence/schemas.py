@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 BiomedicalSource = Literal["pubmed", "europe_pmc", "biorxiv", "mock"]
 EvidenceDirection = Literal["supports", "contradicts", "inconclusive", "background"]
 ConfidenceLevel = Literal["low", "medium", "high"]
+ScopeMatch = Literal["true", "false", "uncertain"]
 EntityType = Literal[
     "gene",
     "protein",
@@ -159,6 +160,7 @@ LogicPredicate = Literal[
     "associated_with",
     "correlates_with",
     "causes_or_drives",
+    "contributes_to",
     "increases",
     "decreases",
     "predicts",
@@ -188,6 +190,7 @@ LogicPopulation = Literal["human", "animal", "in_vitro", "mixed", "unspecified"]
 LogicClaimStrength = Literal[
     "background",
     "association",
+    "contribution",
     "mechanistic",
     "causal",
     "clinical",
@@ -690,6 +693,9 @@ class EvidenceItem(BaseModel):
     char_start: int | None = None
     char_end: int | None = None
     source_hash: str | None = None
+    scope_match: ScopeMatch = "uncertain"
+    scope_mismatch_reasons: list[str] = Field(default_factory=list)
+    scope_matched_terms: list[str] = Field(default_factory=list)
 
 
 class Citation(BaseModel):
@@ -1312,6 +1318,26 @@ class BiomedicalQuestionClassification(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class AnswerScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    population_terms: list[str] = Field(default_factory=list)
+    intervention_terms: list[str] = Field(default_factory=list)
+    comparator_terms: list[str] = Field(default_factory=list)
+    outcome_terms: list[str] = Field(default_factory=list)
+    required_study_terms: list[str] = Field(default_factory=list)
+    exclude_terms: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
+class EvidenceScopeAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_match: ScopeMatch = "uncertain"
+    mismatch_reasons: list[str] = Field(default_factory=list)
+    matched_terms: list[str] = Field(default_factory=list)
+
+
 class BiomedicalQueryPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1337,6 +1363,7 @@ class BiomedicalQueryPlan(BaseModel):
     llm_model: str | None = None
     llm_prompt_hash: str | None = None
     llm_raw_response: dict[str, object] | None = None
+    answer_scope: AnswerScope | None = None
 
 
 class QueryPlanValidation(BaseModel):

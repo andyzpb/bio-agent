@@ -369,6 +369,24 @@ def _audit_claim(
             logic_evidence_frames=logic_evidence_frames,
             logic_parser_fallback_reason=logic_parser_fallback_reason,
         )
+    off_scope = [item for item in candidates if item.scope_match == "false"]
+    in_scope = [item for item in candidates if item.scope_match != "false"]
+    if off_scope and not in_scope:
+        return _claim_audit(
+            claim,
+            cited_paper_ids=cited_ids,
+            evidence_items=off_scope[:1],
+            verdict="irrelevant_citation",
+            support_score=0.0,
+            reason="The claim cites off-scope evidence for this research question.",
+            use_claim_logic=use_claim_logic,
+            claim_logic_parser_mode=claim_logic_parser_mode,
+            export_logic_facts=export_logic_facts,
+            logic_claim_frames=logic_claim_frames,
+            logic_evidence_frames=logic_evidence_frames,
+            logic_parser_fallback_reason=logic_parser_fallback_reason,
+        )
+    candidates = in_scope
     ranked = sorted(
         ((item, _overlap(claim.text, _evidence_text(item))) for item in candidates),
         key=lambda pair: pair[1],
@@ -636,12 +654,102 @@ def _is_markdown_section_heading(line: str) -> bool:
     return bool(re.fullmatch(r"\*{1,3}\s*[^*][^.\n]{1,140}?\s*\*{1,3}", stripped))
 
 
+_SENTENCE_ABBREVIATIONS = {
+    "al",
+    "dr",
+    "e.g",
+    "fig",
+    "i.e",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "vs",
+}
+
+
 def _split_sentences(text: str) -> list[str]:
-    return [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
+    parts: list[str] = []
+    start = 0
+    paren_depth = 0
+    bracket_depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            paren_depth += 1
+            continue
+        if char == ")":
+            paren_depth = max(0, paren_depth - 1)
+            continue
+        if char == "[":
+            bracket_depth += 1
+            continue
+        if char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            continue
+        if char not in ".!?":
+            continue
+        if not _is_sentence_boundary(
+            text,
+            index,
+            paren_depth=paren_depth,
+            bracket_depth=bracket_depth,
+        ):
+            continue
+        end = index + 1
+        citation_start = end
+        while citation_start < len(text) and text[citation_start].isspace():
+            citation_start += 1
+        if citation_start < len(text) and text[citation_start] == "[":
+            citation_end = text.find("]", citation_start + 1)
+            if citation_end != -1:
+                end = citation_end + 1
+                if end < len(text) and text[end] in ".!?":
+                    end += 1
+        while end < len(text) and text[end] in ")]":
+            end += 1
+        part = text[start:end].strip()
+        if part:
+            parts.append(part)
+        start = end
+        while start < len(text) and text[start].isspace():
+            start += 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _is_sentence_boundary(
+    text: str,
+    index: int,
+    *,
+    paren_depth: int,
+    bracket_depth: int,
+) -> bool:
+    char = text[index]
+    previous = text[index - 1] if index > 0 else ""
+    next_char = text[index + 1] if index + 1 < len(text) else ""
+    if paren_depth or bracket_depth:
+        return False
+    if char == "." and previous.isdigit() and next_char.isdigit():
+        return False
+    token_match = re.search(r"([A-Za-z](?:[A-Za-z.]*)?)$", text[:index])
+    token = token_match.group(1).lower().rstrip(".") if token_match else ""
+    if char == "." and token in _SENTENCE_ABBREVIATIONS:
+        return False
+    lookahead = index + 1
+    while lookahead < len(text) and text[lookahead] in ")]":
+        lookahead += 1
+    while lookahead < len(text) and text[lookahead].isspace():
+        lookahead += 1
+    if lookahead >= len(text):
+        return True
+    return text[lookahead] == "[" or text[lookahead].isupper() or text[lookahead].isdigit()
 
 
 def _clean_claim_text(text: str) -> str:
     clean = re.sub(r"\[[^\]]*\]", "", text)
+    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
     clean = re.sub(r"\s+", " ", clean).strip(" -")
     return clean
 
