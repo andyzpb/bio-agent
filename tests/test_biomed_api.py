@@ -7,6 +7,7 @@ import sys
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal, cast
 
 import httpx
 import pytest
@@ -15,19 +16,78 @@ from fastapi.testclient import TestClient
 
 from plugins.biomed_evidence.dashboard import register
 from plugins.biomed_evidence.schemas import (
+    AnswerWithEvidenceResult,
     AnswerWithEvidenceRequest,
     BiomedicalPaper,
+    EvidenceExtractionResult,
+    EvidenceItem,
+    FetchBiomedicalPaperRequest,
     FullTextEnhancementRequest,
     FullTextIngestionRequest,
+    LiteraturePaperRecord,
+    LiteratureSearchCoverage,
+    LiteratureSearchRequest,
+    LiteratureSearchResult,
+    LiteratureSourceTrace,
+    PaperMetadata,
+    PlanBiomedicalSearchRequest,
+    RetrievalManifest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
-from plugins.biomed_evidence.service import _pubmed_cache_expires_at
+from plugins.biomed_evidence.service import (
+    _gather_limited,
+    _pdf_links_from_html,
+    _pubmed_cache_expires_at,
+)
 
 
 def _client(tmp_path: Path) -> TestClient:
     app = FastAPI()
     register(app, Path(__file__).parents[1] / "plugins" / "biomed_evidence", tmp_path)
     return TestClient(app)
+
+
+def _test_retrieval_manifest(
+    retrieval_id: str,
+    *,
+    source: str = "mock",
+    query: str = "test query",
+    returned_paper_ids: list[str] | None = None,
+) -> RetrievalManifest:
+    returned_paper_ids = returned_paper_ids or []
+    return RetrievalManifest(
+        retrieval_id=retrieval_id,
+        source=cast(Literal["pubmed", "mock"], source),
+        original_query=query,
+        compiled_query=query,
+        page_size=max(1, len(returned_paper_ids)),
+        pages_requested=1,
+        pages_completed=1,
+        raw_result_count=len(returned_paper_ids),
+        deduped_result_count=len(returned_paper_ids),
+        returned_paper_ids=returned_paper_ids,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_gather_limited_preserves_order_and_caps_concurrency() -> None:
+    active = 0
+    peak = 0
+
+    async def job(value: int) -> int:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return value
+
+    result = await _gather_limited(2, [job(1), job(2), job(3), job(4)])
+
+    assert result == [1, 2, 3, 4]
+    assert peak == 2
 
 
 def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
@@ -1035,6 +1095,173 @@ def test_biomed_api_answer_extract_graph_and_audit(tmp_path: Path) -> None:
         assert clinical_decision.json()["detail"]["error_code"] == "clinical_boundary"
 
 
+@pytest.mark.asyncio
+async def test_answer_with_evidence_extracts_retrieved_papers_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    active = 0
+    peak = 0
+    papers = [
+        BiomedicalPaper(
+            paper_id=f"PMID-{index}",
+            source="mock",
+            title=f"Paper {index}",
+            abstract="Smoking is associated with lung cancer.",
+        )
+        for index in range(4)
+    ]
+
+    async def fake_retrieve(**kwargs: object) -> object:
+        del kwargs
+        manifest = _test_retrieval_manifest(
+            "retrieval-concurrent",
+            returned_paper_ids=[paper.paper_id for paper in papers],
+        )
+        return (
+            [
+                PaperMetadata(
+                    paper_id=paper.paper_id,
+                    title=paper.title,
+                    source=paper.source,
+                    abstract_available=True,
+                )
+                for paper in papers
+            ],
+            manifest,
+            None,
+            {paper.paper_id: "primary" for paper in papers},
+            {paper.paper_id: manifest.retrieval_id for paper in papers},
+        )
+
+    async def fake_fetch(request: FetchBiomedicalPaperRequest) -> BiomedicalPaper | None:
+        return next(paper for paper in papers if paper.paper_id == request.paper_id)
+
+    async def fake_extract(**kwargs: object) -> EvidenceExtractionResult:
+        nonlocal active, peak
+        paper = cast(BiomedicalPaper, kwargs["paper"])
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return EvidenceExtractionResult(
+            paper_id=paper.paper_id,
+            evidence=[
+                EvidenceItem(
+                    evidence_id=f"ev-{paper.paper_id}",
+                    paper_id=paper.paper_id,
+                    claim="Smoking is associated with lung cancer.",
+                    evidence_direction="supports",
+                    finding="Smoking is associated with lung cancer.",
+                    confidence="medium",
+                    evidence_span="Smoking is associated with lung cancer.",
+                    source_scope="abstract",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(service, "_retrieve_answer_papers", fake_retrieve)
+    monkeypatch.setattr(service, "fetch", fake_fetch)
+    monkeypatch.setattr(service, "_extract_evidence_for_answer", fake_extract)
+
+    result = await service.answer_with_evidence(
+        AnswerWithEvidenceRequest(
+            question="What evidence supports that smoking causes lung cancer?",
+            source="mock",
+            max_papers=4,
+            use_llm_extractor=True,
+        )
+    )
+
+    assert [item.paper_id for item in result.evidence_summary] == [
+        paper.paper_id for paper in papers
+    ]
+    assert peak > 1
+
+
+@pytest.mark.asyncio
+async def test_multi_query_retrieval_passes_run_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    active = 0
+    peak = 0
+    planning_result = await service.plan_biomedical_search(
+        PlanBiomedicalSearchRequest(
+            question="Does hydroxychloroquine improve hospitalized COVID-19 outcomes?",
+            source="mock",
+            max_results=6,
+        )
+    )
+    assert planning_result.search_request is not None
+
+    async def fake_search_literature(
+        request: LiteratureSearchRequest,
+    ) -> LiteratureSearchResult:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        paper_id = f"PMID-{request.retrieval_intent}"
+        manifest = _test_retrieval_manifest(
+            f"retrieval-{request.retrieval_intent}",
+            query=request.query,
+            returned_paper_ids=[paper_id],
+        )
+        return LiteratureSearchResult(
+            source="mock",
+            query=request.query,
+            query_used=request.query,
+            retrieval_intent=request.retrieval_intent,
+            items=[
+                LiteraturePaperRecord(
+                    paper_id=paper_id,
+                    source="mock",
+                    title=paper_id,
+                    abstract="Hydroxychloroquine did not improve outcomes.",
+                    source_rank=1,
+                    abstract_available=True,
+                )
+            ],
+            retrieval_manifest=manifest,
+            coverage=LiteratureSearchCoverage(
+                item_count=1,
+                abstract_count=1,
+                abstract_coverage=1.0,
+                stored_paper_count=1,
+            ),
+            source_trace=LiteratureSourceTrace(
+                source="mock",
+                query_used=request.query,
+                compiled_query=request.query,
+                retrieval_intent=request.retrieval_intent,
+            ),
+        )
+
+    monkeypatch.setattr(service, "search_literature", fake_search_literature)
+
+    metadata, _manifest, bundle, _intents, _retrieval_ids = (
+        await service._retrieve_answer_papers(
+            request=AnswerWithEvidenceRequest(
+                question="Does hydroxychloroquine improve hospitalized COVID-19 outcomes?",
+                source="mock",
+                max_papers=6,
+                execute_support_refute=True,
+            ),
+            planning_result=planning_result,
+            search_request=planning_result.search_request,
+            run_id="biomed-run-concurrent-retrieval",
+        )
+    )
+
+    assert bundle is not None
+    assert len(metadata) >= 2
+    assert peak > 1
+
+
 def test_biomed_api_watch_crud_check_events(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         created = client.post(
@@ -1876,6 +2103,7 @@ def test_open_full_text_provider_falls_back_to_doi_landing_pdf_with_knowhere(
             if "api.unpaywall.org" in url:
                 return httpx.Response(404)
             if "doi.org" in url:
+                assert "Mozilla" in request.headers.get("user-agent", "")
                 return httpx.Response(
                     200,
                     headers={"content-type": "text/html"},
@@ -1904,6 +2132,278 @@ def test_open_full_text_provider_falls_back_to_doi_landing_pdf_with_knowhere(
     assert parsed_urls == ["https://publisher.test/paper.pdf"]
     assert content and "proinflammatory cytokine" in content
     assert license_or_rights is None
+
+
+@pytest.mark.asyncio
+async def test_full_text_enhancement_looks_up_papers_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    paper_ids = ["PMID-1", "PMID-2", "PMID-3"]
+    for paper_id in paper_ids:
+        service.storage.upsert_paper(
+            BiomedicalPaper(
+                paper_id=paper_id,
+                source="pubmed",
+                title=paper_id,
+                abstract="Hydroxychloroquine did not improve outcomes.",
+            )
+        )
+    run = AnswerWithEvidenceResult(
+        run_id="biomed-run-fulltext-concurrent",
+        retrieval_id="retrieval-fulltext-concurrent",
+        retrieval_manifest=_test_retrieval_manifest(
+            "retrieval-fulltext-concurrent",
+            source="pubmed",
+            query="hydroxychloroquine covid",
+            returned_paper_ids=paper_ids,
+        ),
+        answer="Question: hydroxychloroquine covid",
+        citations=[],
+        evidence_summary=[
+            EvidenceItem(
+                evidence_id=f"ev-{paper_id}",
+                paper_id=paper_id,
+                claim="Hydroxychloroquine did not improve outcomes.",
+                evidence_direction="supports",
+                finding="Hydroxychloroquine did not improve outcomes.",
+                confidence="medium",
+                evidence_span="Hydroxychloroquine did not improve outcomes.",
+                source_scope="abstract",
+            )
+            for paper_id in paper_ids
+        ],
+        conflicting_evidence=[],
+        limitations=[],
+        uncertainty_level="medium",
+        disclaimer="research-only",
+    )
+    service.storage.save_answer_run(run, question="hydroxychloroquine covid")
+    active = 0
+    peak = 0
+
+    async def fake_fetch_open_full_text_content(
+        *,
+        paper_id: str,
+        source: str,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return (
+            f"## Results\nFull-text result for {paper_id}.",
+            f"https://example.test/{paper_id}.txt",
+            None,
+            "cc-by",
+        )
+
+    monkeypatch.setattr(
+        service,
+        "_fetch_open_full_text_content",
+        fake_fetch_open_full_text_content,
+    )
+
+    result = await service.enhance_run_with_full_text(
+        FullTextEnhancementRequest(
+            run_id=run.run_id,
+            source="pubmed",
+            max_papers=3,
+            use_open_provider=True,
+        )
+    )
+
+    assert result.ok is True
+    assert peak > 1
+
+
+def test_open_full_text_provider_uses_crossref_tdm_pdf_with_knowhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeKnowhere:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["api_key"] == "sk-test"
+
+        def parse(self, *, url: str, parsing_params: dict[str, object]) -> object:
+            assert url == "https://publisher.test/crossref.pdf"
+            return SimpleNamespace(full_markdown="## Results\nCrossref PDF evidence.")
+
+    monkeypatch.setenv("KNOWHERE_API_KEY", "sk-test")
+    monkeypatch.setitem(sys.modules, "knowhere", SimpleNamespace(Knowhere=FakeKnowhere))
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="PMID-CROSSREF",
+            source="pubmed",
+            title="Crossref TDM paper",
+            doi="10.1234/crossref",
+        )
+    )
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(404)
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.crossref.org" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "message": {
+                            "link": [
+                                {
+                                    "URL": "https://publisher.test/crossref.pdf",
+                                    "content-type": "application/pdf",
+                                    "intended-application": "text-mining",
+                                }
+                            ],
+                            "license": [{"URL": "https://license.test/cc-by"}],
+                        }
+                    },
+                )
+            raise AssertionError(f"unexpected request: {url}")
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-CROSSREF",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert error is None
+    assert locator == "https://publisher.test/crossref.pdf"
+    assert content == "## Results\nCrossref PDF evidence."
+    assert license_or_rights == "https://license.test/cc-by"
+
+
+def test_open_full_text_provider_classifies_doi_landing_challenge(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="PMID-BLOCKED",
+            source="pubmed",
+            title="Blocked paper",
+            doi="10.1234/blocked",
+        )
+    )
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(404)
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.crossref.org" in url:
+                return httpx.Response(404)
+            if "doi.org" in url:
+                return httpx.Response(403, text="cloudflare challenge")
+            raise AssertionError(f"unexpected request: {url}")
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-BLOCKED",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert content is None
+    assert locator == "https://doi.org/10.1234/blocked"
+    assert error and "publisher_challenge_or_paywall:403" in error
+    assert "HTTPStatusError" not in error
+    assert license_or_rights is None
+
+
+def test_open_full_text_provider_caches_unavailable_lookup(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="PMID-UNAVAILABLE",
+            source="pubmed",
+            title="Unavailable full text",
+            doi="10.1234/unavailable",
+        )
+    )
+    request_count = 0
+
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(404)
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.crossref.org" in url:
+                return httpx.Response(404)
+            if "doi.org" in url:
+                return httpx.Response(403)
+            raise AssertionError(f"unexpected request: {url}")
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        first = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-UNAVAILABLE",
+                source="pubmed",
+            )
+        )
+        second = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-UNAVAILABLE",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert first[0] is None
+    assert second[0] is None
+    assert first[2] and "publisher_challenge_or_paywall:403" in first[2]
+    assert second[2] and "full_text_lookup_cache_hit" in second[2]
+    assert request_count == 4
+
+
+def test_pdf_links_from_html_finds_metadata_and_embedded_pdf_links() -> None:
+    links = _pdf_links_from_html(
+        """
+        <html><head>
+          <meta name="citation_pdf_url" content="/meta.pdf">
+        </head><body>
+          <object data="/object.pdf" type="application/pdf"></object>
+          <embed src="/embed.pdf" type="application/pdf">
+        </body></html>
+        """,
+        "https://publisher.test/article",
+    )
+
+    assert links == [
+        "https://publisher.test/meta.pdf",
+        "https://publisher.test/object.pdf",
+        "https://publisher.test/embed.pdf",
+    ]
 
 
 def test_biomed_run_full_text_enhance_blocks_pubmed_without_policy(

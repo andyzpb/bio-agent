@@ -10,11 +10,27 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal, cast
+from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast
 from urllib.parse import quote, urljoin
 
 from bs4 import BeautifulSoup
 import httpx
+
+_PUBLISHER_LANDING_HEADERS = {
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36 "
+        "bio-agent/1.0"
+    ),
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+_RETRIEVAL_CONCURRENCY = 3
+_PAPER_EXTRACTION_CONCURRENCY = 4
+_FULL_TEXT_LOOKUP_CONCURRENCY = 3
+_CLAIM_LOGIC_CHUNK_CONCURRENCY = 3
+
+_T = TypeVar("_T")
 
 from plugins.biomed_evidence.citation_auditor import (
     extract_atomic_claims,
@@ -215,6 +231,19 @@ class _LogicParserOutcome:
     prompt_hash: str | None
     model: str | None
     fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _FullTextLookupOutcome:
+    paper_id: str
+    stored: tuple[FullTextDocument, list[FullTextSection]] | None
+    provider: str | None
+    provider_status: str
+    source_locator: str | None
+    lookup_id_type: Literal["pmid", "pmcid"] | None
+    license_or_rights: str | None
+    content: str | None
+    warning: str | None
 
 
 _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE = 2
@@ -2289,6 +2318,34 @@ class BiomedEvidenceService:
         if source != "pubmed":
             return None, None, "open_full_text_provider_only_supports_pubmed", None
         assert self.pubmed_client.client is not None
+        paper = self.storage.get_paper(paper_id, source=source) or self.storage.get_paper(
+            paper_id
+        )
+        doi = paper.doi if paper is not None else None
+        cache_key = _full_text_lookup_cache_key(
+            source=source,
+            paper_id=paper_id,
+            doi=doi,
+            unpaywall_email_configured=bool(
+                os.getenv("UNPAYWALL_EMAIL") or self.pubmed_client.email
+            ),
+            knowhere_api_key_configured=bool(os.getenv("KNOWHERE_API_KEY")),
+        )
+        cached_entry = self.storage.get_artifact_cache_entry(cache_key)
+        if (
+            cached_entry is not None
+            and cached_entry.get("cache_kind") == "full_text_lookup"
+            and not _cache_entry_is_expired(cached_entry)
+        ):
+            artifact = cached_entry.get("artifact")
+            if isinstance(artifact, dict):
+                return (
+                    None,
+                    cast(str | None, artifact.get("locator")),
+                    "full_text_lookup_cache_hit:"
+                    + str(artifact.get("warning") or "unavailable"),
+                    cast(str | None, artifact.get("license_or_rights")),
+                )
         url = (
             "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/"
             f"pmcoa.cgi/BioC_json/{paper_id}/unicode"
@@ -2335,6 +2392,14 @@ class BiomedEvidenceService:
             return content, locator, None, license_or_rights
         if warning:
             warnings.append(warning)
+        content, locator, warning, license_or_rights = await self._fetch_crossref_tdm_full_text(
+            paper_id=paper_id,
+            source=source,
+        )
+        if content:
+            return content, locator, None, license_or_rights
+        if warning:
+            warnings.append(warning)
         content, locator, warning, license_or_rights = await self._fetch_doi_pdf_full_text(
             paper_id=paper_id,
             source=source,
@@ -2343,7 +2408,25 @@ class BiomedEvidenceService:
             return content, locator, None, license_or_rights
         if warning:
             warnings.append(warning)
-        return None, locator or europe_url or url, ";".join(warnings), None
+        final_locator = locator or europe_url or url
+        final_warning = ";".join(warnings)
+        self.storage.upsert_artifact_cache_entry(
+            cache_key=cache_key,
+            cache_kind="full_text_lookup",
+            source=source,
+            artifact_id=f"{source}:{paper_id}",
+            artifact={
+                "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+                "source": source,
+                "paper_id": paper_id,
+                "doi": doi,
+                "locator": final_locator,
+                "warning": final_warning,
+                "license_or_rights": None,
+            },
+            expires_at=_full_text_lookup_cache_expires_at(),
+        )
+        return None, final_locator, final_warning, None
 
     async def _fetch_unpaywall_full_text(
         self,
@@ -2411,6 +2494,58 @@ class BiomedEvidenceService:
         except Exception as exc:
             return None, api_url, f"unpaywall_failed:{exc.__class__.__name__}", None
 
+    async def _fetch_crossref_tdm_full_text(
+        self,
+        *,
+        paper_id: str,
+        source: str,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        assert self.pubmed_client.client is not None
+        paper = self.storage.get_paper(paper_id, source=source) or self.storage.get_paper(
+            paper_id
+        )
+        doi = paper.doi if paper is not None else None
+        if not doi:
+            return None, None, "missing_doi_for_crossref_lookup", None
+        api_url = f"https://api.crossref.org/works/{quote(doi, safe='')}"
+        params: dict[str, str] = {}
+        if email := (
+            os.getenv("CROSSREF_EMAIL")
+            or os.getenv("UNPAYWALL_EMAIL")
+            or self.pubmed_client.email
+        ):
+            params["mailto"] = email
+        try:
+            response = await self.pubmed_client.client.get(
+                api_url,
+                params=params or None,
+                headers={"user-agent": _PUBLISHER_LANDING_HEADERS["user-agent"]},
+            )
+            if response.status_code == 404:
+                return None, api_url, "crossref_no_record", None
+            response.raise_for_status()
+            message = response.json().get("message", {})
+            license_or_rights = _crossref_license_or_rights(message)
+            last_pdf_warning: str | None = None
+            for link in message.get("link") or []:
+                if not isinstance(link, dict):
+                    continue
+                full_text_url = str(link.get("URL") or link.get("url") or "").strip()
+                content_type = str(link.get("content-type") or "").lower()
+                if not full_text_url:
+                    continue
+                if "pdf" in content_type or full_text_url.lower().endswith(".pdf"):
+                    content, last_pdf_warning = await asyncio.to_thread(
+                        _parse_pdf_url_with_knowhere,
+                        full_text_url,
+                    )
+                    if content:
+                        return content, full_text_url, None, license_or_rights
+                    continue
+            return None, api_url, last_pdf_warning or "crossref_no_full_text_link", None
+        except Exception as exc:
+            return None, api_url, f"crossref_failed:{exc.__class__.__name__}", None
+
     async def _fetch_doi_pdf_full_text(
         self,
         *,
@@ -2429,7 +2564,15 @@ class BiomedEvidenceService:
             response = await self.pubmed_client.client.get(
                 landing_url,
                 follow_redirects=True,
+                headers=_PUBLISHER_LANDING_HEADERS,
             )
+            if response.status_code in {401, 403}:
+                return (
+                    None,
+                    str(response.url),
+                    f"publisher_challenge_or_paywall:{response.status_code}",
+                    None,
+                )
             response.raise_for_status()
             for pdf_url in _pdf_links_from_html(response.text, str(response.url)):
                 content, warning = await asyncio.to_thread(
@@ -2443,6 +2586,47 @@ class BiomedEvidenceService:
             return None, str(response.url), "doi_landing_pdf_link_not_found", None
         except Exception as exc:
             return None, landing_url, f"doi_landing_failed:{exc.__class__.__name__}", None
+
+    async def _lookup_full_text_for_enhancement(
+        self,
+        *,
+        paper_id: str,
+        source: Literal["pubmed", "mock"],
+        use_open_provider: bool,
+    ) -> _FullTextLookupOutcome:
+        stored = self.storage.get_full_text_document(paper_id, source=source)
+        provider = (
+            "open_provider_chain"
+            if source == "pubmed" and use_open_provider
+            else None
+        )
+        provider_status = "cached" if stored is not None else "not_requested"
+        source_locator: str | None = None
+        lookup_id_type = _full_text_lookup_id_type(paper_id) if source == "pubmed" else None
+        license_or_rights: str | None = None
+        content: str | None = None
+        warning: str | None = None
+        if stored is None and use_open_provider:
+            content, source_locator, provider_error, license_or_rights = (
+                await self._fetch_open_full_text_content(
+                    paper_id=paper_id,
+                    source=source,
+                )
+            )
+            provider = _full_text_provider_from_locator(source_locator) or provider
+            provider_status = "fetched" if content else provider_error or "unavailable"
+            warning = provider_error
+        return _FullTextLookupOutcome(
+            paper_id=paper_id,
+            stored=stored,
+            provider=provider,
+            provider_status=provider_status,
+            source_locator=source_locator,
+            lookup_id_type=lookup_id_type,
+            license_or_rights=license_or_rights,
+            content=content,
+            warning=warning,
+        )
 
     async def enhance_run_with_full_text(
         self,
@@ -2485,54 +2669,45 @@ class BiomedEvidenceService:
         seen_evidence_ids = {item.evidence_id for item in run.evidence_summary}
         document_ids: list[str] = []
 
-        for paper_id in candidate_ids:
-            stored = self.storage.get_full_text_document(paper_id, source=source)
-            provider_warning: str | None = None
-            provider = (
-                "open_provider_chain"
-                if source == "pubmed" and request.use_open_provider
-                else None
-            )
-            provider_status = "cached" if stored is not None else "not_requested"
-            source_locator: str | None = None
-            lookup_id_type = _full_text_lookup_id_type(paper_id) if source == "pubmed" else None
-            license_or_rights: str | None = None
-            if stored is None and request.use_open_provider:
-                (
-                    content,
-                    locator,
-                    provider_error,
-                    license_or_rights,
-                ) = await self._fetch_open_full_text_content(
+        lookup_outcomes = await _gather_limited(
+            _FULL_TEXT_LOOKUP_CONCURRENCY,
+            [
+                self._lookup_full_text_for_enhancement(
                     paper_id=paper_id,
                     source=source,
+                    use_open_provider=request.use_open_provider,
                 )
-                source_locator = locator
-                provider = _full_text_provider_from_locator(locator) or provider
-                provider_status = "fetched" if content else provider_error or "unavailable"
-                if content:
-                    ingested = self.ingest_full_text(
-                        FullTextIngestionRequest(
-                            paper_id=paper_id,
-                            source=source,
-                            content=content,
-                            content_type="text/plain",
-                            source_filename=locator,
-                            provider=provider,
-                            provider_status=provider_status,
-                            lookup_id_type=lookup_id_type,
-                            license_or_rights=license_or_rights,
-                            overwrite=request.overwrite_full_text,
-                        )
+                for paper_id in candidate_ids
+            ],
+        )
+        for outcome in lookup_outcomes:
+            paper_id = outcome.paper_id
+            stored = outcome.stored
+            provider_warning = outcome.warning
+            provider = outcome.provider
+            provider_status = outcome.provider_status
+            source_locator = outcome.source_locator
+            lookup_id_type = outcome.lookup_id_type
+            license_or_rights = outcome.license_or_rights
+            if outcome.content:
+                ingested = self.ingest_full_text(
+                    FullTextIngestionRequest(
+                        paper_id=paper_id,
+                        source=source,
+                        content=outcome.content,
+                        content_type="text/plain",
+                        source_filename=source_locator,
+                        provider=provider,
+                        provider_status=provider_status,
+                        lookup_id_type=lookup_id_type,
+                        license_or_rights=license_or_rights,
+                        overwrite=request.overwrite_full_text,
                     )
-                    if ingested.ok:
-                        stored = self.storage.get_full_text_document(
-                            paper_id, source=source
-                        )
-                    else:
-                        provider_warning = "full_text_ingestion_failed"
-                elif provider_error:
-                    provider_warning = provider_error
+                )
+                if ingested.ok:
+                    stored = self.storage.get_full_text_document(paper_id, source=source)
+                else:
+                    provider_warning = "full_text_ingestion_failed"
             if stored is None:
                 statuses.append(
                     FullTextEnhancementPaperStatus(
@@ -2870,6 +3045,30 @@ class BiomedEvidenceService:
                 ]
             }
         )
+
+    async def _fetch_and_extract_answer_paper(
+        self,
+        *,
+        request: AnswerWithEvidenceRequest,
+        paper_id: str,
+        source: Literal["pubmed", "mock"],
+        retrieval_id: str | None,
+        retrieval_intent: RetrievalIntent,
+        answer_scope: AnswerScope | None,
+    ) -> tuple[BiomedicalPaper | None, list[EvidenceItem]]:
+        paper = await self.fetch(
+            FetchBiomedicalPaperRequest(paper_id=paper_id, source=source)
+        )
+        if paper is None:
+            return None, []
+        extracted = await self._extract_evidence_for_answer(
+            request=request,
+            paper=paper,
+            retrieval_id=retrieval_id,
+            retrieval_intent=retrieval_intent,
+            answer_scope=answer_scope,
+        )
+        return paper, extracted.evidence
 
     async def _llm_extract_evidence_or_none(
         self,
@@ -3250,26 +3449,28 @@ class BiomedEvidenceService:
             if planning_result is not None and planning_result.query_plan is not None
             else _derive_answer_scope(active_request.question)
         )
-        for item in metadata:
-            paper = await self.fetch(
-                FetchBiomedicalPaperRequest(
-                    paper_id=item.paper_id, source=active_request.source
+        extracted_results = await _gather_limited(
+            _PAPER_EXTRACTION_CONCURRENCY,
+            [
+                self._fetch_and_extract_answer_paper(
+                    request=active_request,
+                    paper_id=item.paper_id,
+                    source=active_request.source,
+                    retrieval_id=paper_retrieval_ids.get(
+                        item.paper_id,
+                        retrieval_manifest.retrieval_id,
+                    ),
+                    retrieval_intent=paper_intents.get(item.paper_id, "unknown"),
+                    answer_scope=answer_scope,
                 )
-            )
+                for item in metadata
+            ],
+        )
+        for paper, extracted_evidence in extracted_results:
             if paper is None:
                 continue
             papers[paper.paper_id] = paper
-            extracted = await self._extract_evidence_for_answer(
-                request=active_request,
-                paper=paper,
-                retrieval_id=paper_retrieval_ids.get(
-                    item.paper_id,
-                    retrieval_manifest.retrieval_id,
-                ),
-                retrieval_intent=paper_intents.get(item.paper_id, "unknown"),
-                answer_scope=answer_scope,
-            )
-            evidence.extend(extracted.evidence)
+            evidence.extend(extracted_evidence)
 
         if retrieval_bundle is not None:
             (
@@ -3498,7 +3699,15 @@ class BiomedEvidenceService:
         paper_intents: dict[str, RetrievalIntent] = {}
         paper_retrieval_ids: dict[str, str] = {}
         primary_manifest: RetrievalManifest | None = None
-        for subquestion, retrieval_request in specs:
+
+        async def run_spec(
+            subquestion: RetrievalSubquestion,
+            retrieval_request: SearchBiomedicalLiteratureRequest,
+        ) -> tuple[
+            RetrievalSubquestion,
+            SearchBiomedicalLiteratureRequest,
+            LiteratureSearchResult,
+        ]:
             intent = subquestion.retrieval_intent
             literature_result = await self.search_literature(
                 _literature_request_from_search_request(
@@ -3508,6 +3717,17 @@ class BiomedEvidenceService:
                     require_abstract=True,
                 )
             )
+            return subquestion, retrieval_request, literature_result
+
+        retrieval_results = await _gather_limited(
+            _RETRIEVAL_CONCURRENCY,
+            [
+                run_spec(subquestion, retrieval_request)
+                for subquestion, retrieval_request in specs
+            ],
+        )
+        for subquestion, retrieval_request, literature_result in retrieval_results:
+            intent = subquestion.retrieval_intent
             search_items = [
                 _paper_metadata_from_literature_record(item)
                 for item in literature_result.items
@@ -3704,6 +3924,7 @@ class BiomedEvidenceService:
             manifest = literature_result.retrieval_manifest
             returned_ids = [item.paper_id for item in literature_result.items]
             added_ids: list[str] = []
+            candidate_items: list[PaperMetadata] = []
             for record in literature_result.items:
                 item = _paper_metadata_from_literature_record(record)
                 if item.paper_id in rejected_ids:
@@ -3716,26 +3937,29 @@ class BiomedEvidenceService:
                     continue
                 seen_paper_ids.add(item.paper_id)
                 metadata.append(item)
+                candidate_items.append(item)
                 added_ids.append(item.paper_id)
                 paper_intents[item.paper_id] = decision.retrieval_intent
                 paper_retrieval_ids[item.paper_id] = manifest.retrieval_id
-                paper = await self.fetch(
-                    FetchBiomedicalPaperRequest(
+            extracted_results = await _gather_limited(
+                _PAPER_EXTRACTION_CONCURRENCY,
+                [
+                    self._fetch_and_extract_answer_paper(
+                        request=request,
                         paper_id=item.paper_id,
                         source=request.source,
+                        retrieval_id=manifest.retrieval_id,
+                        retrieval_intent=decision.retrieval_intent,
+                        answer_scope=answer_scope,
                     )
-                )
+                    for item in candidate_items
+                ],
+            )
+            for paper, extracted_evidence in extracted_results:
                 if paper is None:
                     continue
                 papers[paper.paper_id] = paper
-                extracted = await self._extract_evidence_for_answer(
-                    request=request,
-                    paper=paper,
-                    retrieval_id=manifest.retrieval_id,
-                    retrieval_intent=decision.retrieval_intent,
-                    answer_scope=answer_scope,
-                )
-                evidence.extend(extracted.evidence)
+                evidence.extend(extracted_evidence)
             records.append(
                 RetrievalBundleRecord(
                     intent=decision.retrieval_intent,
@@ -4205,29 +4429,37 @@ class BiomedEvidenceService:
                 claim_frames.update(parsed_claims)
                 evidence_frames.update(parsed_evidence)
             else:
-                for start in range(
-                    0, len(claims), _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE
-                ):
-                    chunk_claims = claims[
-                        start : start + _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE
-                    ]
-                    parsed_claims, _ = await parse_chunk(
-                        claim_chunk=chunk_claims,
+                claim_jobs = [
+                    parse_chunk(
+                        claim_chunk=claims[
+                            start : start + _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE
+                        ],
                         evidence_chunk=[],
                     )
-                    claim_frames.update(parsed_claims)
-                for start in range(
-                    0,
-                    len(evidence_items),
-                    _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE,
-                ):
-                    chunk_evidence = evidence_items[
-                        start : start + _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE
-                    ]
-                    _, parsed_evidence = await parse_chunk(
-                        claim_chunk=[],
-                        evidence_chunk=chunk_evidence,
+                    for start in range(
+                        0,
+                        len(claims),
+                        _LLM_CLAIM_LOGIC_CLAIM_CHUNK_SIZE,
                     )
+                ]
+                evidence_jobs = [
+                    parse_chunk(
+                        claim_chunk=[],
+                        evidence_chunk=evidence_items[
+                            start : start + _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE
+                        ],
+                    )
+                    for start in range(
+                        0,
+                        len(evidence_items),
+                        _LLM_CLAIM_LOGIC_EVIDENCE_CHUNK_SIZE,
+                    )
+                ]
+                for parsed_claims, parsed_evidence in await _gather_limited(
+                    _CLAIM_LOGIC_CHUNK_CONCURRENCY,
+                    [*claim_jobs, *evidence_jobs],
+                ):
+                    claim_frames.update(parsed_claims)
                     evidence_frames.update(parsed_evidence)
             if set(claim_frames) != {claim.claim_id for claim in claims}:
                 raise ValueError("LLM claim logic parser returned incomplete claims.")
@@ -8424,6 +8656,10 @@ def _pubmed_cache_expires_at(source: str) -> str | None:
     return (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
 
 
+def _full_text_lookup_cache_expires_at() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
+
 def _artifact_cache_key(kind: str, payload: dict[str, object]) -> str:
     stable = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
@@ -8491,6 +8727,28 @@ def _full_text_cache_key(
             "source_locator": _normalize_cache_text(source_locator or ""),
             "source_hash": source_hash,
             "parser_version": parser_version,
+        },
+    )
+
+
+def _full_text_lookup_cache_key(
+    *,
+    source: str,
+    paper_id: str,
+    doi: str | None,
+    unpaywall_email_configured: bool,
+    knowhere_api_key_configured: bool,
+) -> str:
+    return _artifact_cache_key(
+        "full-text-lookup",
+        {
+            "schema": ARTIFACT_CACHE_SCHEMA_VERSION,
+            "source": source,
+            "paper_id": paper_id,
+            "doi": doi,
+            "provider_chain_version": "2026-06-29",
+            "unpaywall_email_configured": unpaywall_email_configured,
+            "knowhere_api_key_configured": knowhere_api_key_configured,
         },
     )
 
@@ -11597,16 +11855,51 @@ def _html_full_text_to_markdown(content: str) -> str:
     return "\n\n".join(sections).strip()
 
 
+async def _gather_limited(
+    limit: int,
+    jobs: Iterable[Awaitable[_T]],
+) -> list[_T]:
+    semaphore = asyncio.Semaphore(max(1, int(limit)))
+
+    async def run(job: Awaitable[_T]) -> _T:
+        async with semaphore:
+            return await job
+
+    return list(await asyncio.gather(*(run(job) for job in jobs)))
+
+
 def _pdf_links_from_html(content: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(content, "html.parser")
     links: list[str] = []
+    for meta in soup.find_all("meta"):
+        name = str(meta.get("name") or meta.get("property") or "").lower()
+        href = str(meta.get("content") or "").strip()
+        if name == "citation_pdf_url" and href:
+            links.append(urljoin(base_url, href))
+    for tag_name, attr in (("object", "data"), ("embed", "src"), ("iframe", "src")):
+        for node in soup.find_all(tag_name):
+            href = str(node.get(attr) or "").strip()
+            node_type = str(node.get("type") or "").lower()
+            if href and (".pdf" in href.lower() or "pdf" in node_type):
+                links.append(urljoin(base_url, href))
     for anchor in soup.find_all("a", href=True):
         href = str(anchor.get("href") or "").strip()
         label = anchor.get_text(" ", strip=True).lower()
         if ".pdf" not in href.lower() and "pdf" not in label:
             continue
         links.append(urljoin(base_url, href))
-    return links
+    return list(dict.fromkeys(links))
+
+
+def _crossref_license_or_rights(message: object) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    for item in message.get("license") or []:
+        if isinstance(item, dict):
+            value = str(item.get("URL") or item.get("url") or "").strip()
+            if value:
+                return value
+    return None
 
 
 def _parse_pdf_url_with_knowhere(pdf_url: str) -> tuple[str | None, str | None]:

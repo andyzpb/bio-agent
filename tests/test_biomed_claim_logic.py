@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -981,7 +983,7 @@ async def test_answer_with_audit_falls_back_when_logic_parser_schema_is_invalid(
     finally:
         await service.aclose()
 
-    assert provider.calls == 1
+    assert provider.calls >= 1
     logic_audits = [
         item.logic_audit for item in result.audit.claim_audits if item.logic_audit
     ]
@@ -1034,3 +1036,102 @@ async def test_clinical_answer_with_audit_skips_claim_logic(tmp_path: Path) -> N
     assert not result.answer_result.evidence_summary
     assert all(item.logic_audit is None for item in result.audit.claim_audits)
     assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_llm_claim_logic_chunk_parsing_runs_chunks_concurrently(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    active = 0
+    peak = 0
+
+    class FakeProvider:
+        async def chat(self, **kwargs: object) -> object:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            messages = cast(list[dict[str, str]], kwargs["messages"])
+            payload = json.loads(messages[1]["content"])
+            entity = {"text": "smoking", "entity_type": "other"}
+            claim_frames = [
+                {
+                    "claim_id": item["claim_id"],
+                    "claim_text": item["claim_text"],
+                    "subject": entity,
+                    "predicate": "causes_or_drives",
+                    "object": {"text": "lung cancer", "entity_type": "disease"},
+                    "population": "human",
+                    "modality": "strong",
+                    "polarity": "positive",
+                    "claim_strength": "background",
+                    "hedging": False,
+                }
+                for item in payload.get("claims", [])
+            ]
+            evidence_frames = [
+                {
+                    "evidence_id": item["evidence_id"],
+                    "paper_id": item["paper_id"],
+                    "evidence_text": item["evidence_text"],
+                    "subject": entity,
+                    "predicate": "causes_or_drives",
+                    "object": {"text": "lung cancer", "entity_type": "disease"},
+                    "population": "human",
+                    "modality": "strong",
+                    "polarity": "positive",
+                    "study_design": "review",
+                    "evidence_strength": "review_or_guideline",
+                }
+                for item in payload.get("evidence_items", [])
+            ]
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "claim_frames": claim_frames,
+                        "evidence_frames": evidence_frames,
+                    }
+                )
+            )
+
+    service.revision_provider = FakeProvider()
+    service.revision_model = "test-model"
+    answer = "\n".join(
+        f"Smoking causes lung cancer claim {index} [PMID-{index}]."
+        for index in range(8)
+    )
+    evidence = [
+        EvidenceItem(
+            evidence_id=f"ev-{index}",
+            paper_id=f"PMID-{index}",
+            claim=f"Smoking causes lung cancer claim {index}.",
+            evidence_direction="supports",
+            finding="Smoking causes lung cancer.",
+            confidence="medium",
+            evidence_span="Smoking causes lung cancer.",
+            source_scope="abstract",
+        )
+        for index in range(16)
+    ]
+    citations = [
+        Citation(
+            paper_id=f"PMID-{index}",
+            title=f"Paper {index}",
+            source="mock",
+            cited_claim=f"Smoking causes lung cancer claim {index}.",
+        )
+        for index in range(8)
+    ]
+    try:
+        outcome = await service._llm_claim_logic_frames_or_fallback(
+            answer=answer,
+            citations=citations,
+            evidence_items=evidence,
+        )
+    finally:
+        await service.aclose()
+
+    assert outcome.fallback_reason is None
+    assert peak > 1
