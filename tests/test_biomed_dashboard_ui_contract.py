@@ -17,3 +17,21 @@ def test_pubmed_audited_planner_uses_assisted_llm_chain() -> None:
     assert "use_llm_synthesis: useAssistedPubmedAudit ||" in source
     assert "use_llm_revision: useAssistedPubmedAudit ||" in source
     assert "use_llm_claim_logic: useAssistedPubmedAudit ||" in source
+
+
+def test_full_text_enhance_button_requests_open_provider() -> None:
+    source = Path("plugins/biomed_evidence/dashboard_panel.ts").read_text()
+
+    assert "use_open_provider: true" in source
+    assert "paper.provider_status" in source
+    assert "paper.source_locator" in source
+
+
+def test_full_text_reanalysis_button_calls_run_endpoint() -> None:
+    source = Path("plugins/biomed_evidence/dashboard_panel.ts").read_text()
+
+    assert "Re-analyze with Full Text" in source
+    assert "full-text-reanalysis" in source
+    assert "fullTextReanalysis" in source
+    assert "hasFullTextEvidence" in source
+    assert "paper.evidence_ids.length" in source

@@ -400,12 +400,9 @@ def parse_pubmed_articles(xml_text: str) -> list[BiomedicalPaper]:
     return papers
 
 
-def parse_bioc_json_full_text(payload: dict[str, object]) -> str:
+def parse_bioc_json_full_text(payload: dict[str, object] | list[object]) -> str:
     passages: list[str] = []
-    documents = payload.get("documents")
-    if not isinstance(documents, list):
-        return ""
-    for document in documents:
+    for document in _bioc_documents(payload):
         if not isinstance(document, dict):
             continue
         for passage in document.get("passages", []):
@@ -422,6 +419,33 @@ def parse_bioc_json_full_text(payload: dict[str, object]) -> str:
                 ).strip()
             passages.append(f"## {label or 'Full text'}\n{text}")
     return "\n\n".join(passages).strip()
+
+
+def parse_bioc_json_license_or_rights(payload: dict[str, object] | list[object]) -> str | None:
+    collections: list[object] = payload if isinstance(payload, list) else [payload]
+    for item in [*collections, *_bioc_documents(payload)]:
+        if not isinstance(item, dict):
+            continue
+        infons = item.get("infons")
+        if not isinstance(infons, dict):
+            continue
+        for key in ("license", "rights", "copyright"):
+            value = str(infons.get(key) or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _bioc_documents(payload: dict[str, object] | list[object]) -> list[object]:
+    collections: list[object] = payload if isinstance(payload, list) else [payload]
+    documents: list[object] = []
+    for collection in collections:
+        if not isinstance(collection, dict):
+            continue
+        collection_documents = collection.get("documents")
+        if isinstance(collection_documents, list):
+            documents.extend(collection_documents)
+    return documents
 
 
 def _paper_to_metadata(

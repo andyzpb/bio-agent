@@ -16,8 +16,11 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
     AnswerWithEvidenceResult,
     Citation,
+    CitationAuditResult,
     CitationAuditRequest,
+    ClaimAuditItem,
     EvidenceItem,
+    UncertaintyAudit,
 )
 from plugins.biomed_evidence.service import (
     BiomedEvidenceService,
@@ -158,6 +161,78 @@ def test_citation_audit_detects_association_to_causation_overclaim() -> None:
     assert result.recommended_action == "revise"
 
 
+def test_established_causal_risk_factor_review_is_not_overclaimed() -> None:
+    evidence = EvidenceItem(
+        evidence_id="ev-smoking-sclc",
+        paper_id="PMID:SMOKE",
+        claim=(
+            "IARC monograph and public health consensus evidence identify tobacco "
+            "smoking as an established causal risk factor and primary cause of lung cancer."
+        ),
+        finding=(
+            "IARC monograph and public health consensus evidence identify tobacco "
+            "smoking as an established causal risk factor and primary cause of lung cancer."
+        ),
+        evidence_direction="supports",
+        entities=[],
+        methods=["IARC monograph", "public health consensus review"],
+        limitations=["Abstract-level packet does not extract quantitative estimates."],
+        confidence="high",
+        evidence_span=(
+            "IARC monograph and public health consensus evidence identify tobacco "
+            "smoking as an established causal risk factor and primary cause of lung cancer."
+        ),
+    )
+
+    result = validate_citation_support(
+        answer=(
+            "Tobacco smoking is an established causal risk factor for lung cancer. "
+            "[PMID:SMOKE]"
+        ),
+        citations=[_citation("PMID:SMOKE")],
+        evidence_items=[evidence],
+        observed_uncertainty="low",
+    )
+
+    assert result.claim_audits[0].verdict == "supported"
+    assert result.recommended_action in {"pass", "pass_with_limitations"}
+
+
+def test_established_causal_risk_audit_ignores_off_topic_inconclusive_uncertainty() -> None:
+    direct = EvidenceItem(
+        evidence_id="ev-asbestos-direct",
+        paper_id="PMID:ASBESTOS",
+        claim="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        finding="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        evidence_direction="supports",
+        methods=["systematic review", "public health consensus"],
+        confidence="high",
+        evidence_span="Asbestos exposure is an established causal risk factor for mesothelioma.",
+    )
+    off_topic = EvidenceItem(
+        evidence_id="ev-cannabis-off-topic",
+        paper_id="PMID:CANNABIS",
+        claim="Cannabis smoking appeared to be associated with lung cancer at an earlier age.",
+        finding="Cannabis smoking appeared to be associated with lung cancer at an earlier age.",
+        evidence_direction="inconclusive",
+        confidence="high",
+        evidence_span="Cannabis smoking appeared to be associated with lung cancer at an earlier age.",
+    )
+
+    result = validate_citation_support(
+        answer=(
+            "Asbestos exposure is an established causal risk factor for "
+            "mesothelioma. [PMID:ASBESTOS]"
+        ),
+        citations=[_citation("PMID:ASBESTOS")],
+        evidence_items=[direct, off_topic],
+        observed_uncertainty="low",
+    )
+
+    assert result.uncertainty_audit.expected_uncertainty == "low"
+    assert result.uncertainty_calibrated is True
+
+
 def test_citation_audit_marks_uncited_claim() -> None:
     result = validate_citation_support(
         answer="Microglial activation is associated with disease progression.",
@@ -191,6 +266,34 @@ def test_post_audit_repair_removes_empty_markdown_section() -> None:
     assert "**Evidence**" in repaired
     assert "**Interpretation**" not in repaired
     assert "causes Alzheimer's disease progression" not in repaired
+
+
+def test_post_audit_repair_does_not_remove_support_lines_for_short_failed_claim() -> None:
+    answer = (
+        "Evidence supporting the hypothesis:\n"
+        "- Cigarette smoking is the primary risk factor for development of SCLC [40163214]\n"
+        "- A vast majority of lung cancer deaths are attributable to cigarette smoking [22054876]\n\n"
+        "Inconclusive evidence:\n"
+        "- Smoking and cancer. [6801462]\n"
+    )
+    failed = [
+        ClaimAuditItem(
+            claim_id="claim-short",
+            claim="Smoking and cancer.",
+            claim_type="association",
+            cited_paper_ids=["6801462"],
+            verdict="insufficient_evidence",
+            reason="Empty abstract.",
+        )
+    ]
+
+    repaired, removed = _remove_failed_claim_lines(answer, failed)
+
+    assert removed == ["Smoking and cancer."]
+    assert "Cigarette smoking is the primary risk factor" in repaired
+    assert "A vast majority of lung cancer deaths" in repaired
+    assert "Smoking and cancer." not in repaired
+    assert "Inconclusive evidence:" not in repaired
 
 
 def test_conflict_audit_returns_mixed_evidence() -> None:
@@ -311,6 +414,95 @@ def test_answer_revision_softens_overclaim() -> None:
     assert revision.softened_claims
     assert "causes Alzheimer's disease progression" not in revision.final_answer
     assert "is associated with Alzheimer's disease progression" in revision.final_answer
+
+
+def test_answer_revision_keeps_supported_lines_when_removing_short_failed_claim() -> None:
+    support = EvidenceItem(
+        evidence_id="ev-support",
+        paper_id="PMID:1",
+        claim="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        finding="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        evidence_direction="supports",
+        confidence="high",
+        evidence_span="Asbestos exposure is an established causal risk factor for mesothelioma.",
+    )
+    weak = EvidenceItem(
+        evidence_id="ev-weak",
+        paper_id="PMID:2",
+        claim="Asbestos and mesothelioma.",
+        finding="Asbestos and mesothelioma.",
+        evidence_direction="inconclusive",
+        confidence="low",
+        evidence_span="Asbestos and mesothelioma.",
+    )
+    draft = (
+        "Evidence supporting the hypothesis:\n"
+        "- Asbestos exposure is an established causal risk factor for mesothelioma [PMID:1]\n\n"
+        "Inconclusive evidence:\n"
+        "- Asbestos and mesothelioma. [PMID:2]\n"
+    )
+    failed = ClaimAuditItem(
+        claim_id="claim-short",
+        claim="Asbestos and mesothelioma.",
+        claim_type="association",
+        cited_paper_ids=["PMID:2"],
+        verdict="insufficient_evidence",
+        reason="Inconclusive evidence cannot support an unhedged positive claim.",
+    )
+    audit = CitationAuditResult(
+        audit_id="audit-short",
+        run_id="run-short-failed",
+        claim_audits=[
+            ClaimAuditItem(
+                claim_id="claim-supported",
+                claim=(
+                    "Asbestos exposure is an established causal risk factor for "
+                    "mesothelioma."
+                ),
+                claim_type="causal",
+                cited_paper_ids=["PMID:1"],
+                verdict="supported",
+                reason="Supported by cited evidence.",
+            ),
+            failed,
+        ],
+        uncertainty_audit=UncertaintyAudit(
+            expected_uncertainty="high",
+            observed_uncertainty="high",
+            calibrated=True,
+        ),
+        claim_support_rate=0.5,
+        citation_precision=1.0,
+        unsupported_claim_rate=0.5,
+        overclaim_rate=0.0,
+        conflict_awareness=False,
+        uncertainty_calibrated=True,
+        failed_claims=[failed],
+        recommended_action="revise",
+        created_at="2026-06-29T00:00:00+00:00",
+    )
+    result = AnswerWithEvidenceResult(
+        run_id="run-short-failed",
+        answer=draft,
+        citations=[_citation("PMID:1"), _citation("PMID:2")],
+        evidence_summary=[support, weak],
+        conflicting_evidence=[],
+        limitations=[],
+        uncertainty_level="high",
+        disclaimer=RESEARCH_USE_DISCLAIMER,
+    )
+
+    revision = _build_answer_revision(
+        draft_result=result,
+        audit=audit,
+        clinical_boundary=False,
+        use_llm_revision=True,
+        fallback_reason_override="test",
+    )
+
+    assert "Asbestos exposure is an established causal risk factor" in revision.final_answer
+    assert "- Asbestos and mesothelioma." not in revision.final_answer
+    assert "Inconclusive evidence:" not in revision.final_answer
 
 
 class _FakeRevisionResponse:

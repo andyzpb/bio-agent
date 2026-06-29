@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 BiomedicalSource = Literal["pubmed", "europe_pmc", "biorxiv", "mock"]
 EvidenceDirection = Literal["supports", "contradicts", "inconclusive", "background"]
 ConfidenceLevel = Literal["low", "medium", "high"]
+PacketLimitationLevel = Literal["low", "medium", "high"]
+ReviewPriority = Literal["low", "medium", "high"]
 ScopeMatch = Literal["true", "false", "uncertain"]
 EntityType = Literal[
     "gene",
@@ -76,6 +78,12 @@ EvidenceStrength = Literal[
     "interventional",
     "review_or_guideline",
     "not_assessed",
+]
+EvidenceMaturity = Literal[
+    "emerging_claim",
+    "established_association",
+    "established_causal_risk_factor",
+    "clinical_intervention_claim",
 ]
 AuditRecommendedAction = Literal[
     "pass",
@@ -1201,6 +1209,10 @@ class FullTextDocument(BaseModel):
     content_type: Literal["text/plain", "application/pdf"] = "text/plain"
     title: str | None = None
     source_filename: str | None = None
+    provider: str | None = None
+    provider_status: str | None = None
+    lookup_id_type: Literal["pmid", "pmcid"] | None = None
+    license_or_rights: str | None = None
     source_hash: str
     byte_size: int = 0
     section_count: int = 0
@@ -1218,6 +1230,10 @@ class FullTextIngestionRequest(BaseModel):
     content: str
     content_type: Literal["text/plain", "application/pdf"] = "text/plain"
     source_filename: str | None = None
+    provider: str | None = None
+    provider_status: str | None = None
+    lookup_id_type: Literal["pmid", "pmcid"] | None = None
+    license_or_rights: str | None = None
     title: str | None = None
     overwrite: bool = False
 
@@ -1259,6 +1275,11 @@ class FullTextEnhancementPaperStatus(BaseModel):
     document_id: str | None = None
     section_count: int = 0
     evidence_ids: list[str] = Field(default_factory=list)
+    provider: str | None = None
+    provider_status: str | None = None
+    source_locator: str | None = None
+    lookup_id_type: Literal["pmid", "pmcid"] | None = None
+    license_or_rights: str | None = None
     warning: str | None = None
     error: str | None = None
 
@@ -1278,6 +1299,16 @@ class FullTextEnhancementResult(BaseModel):
     paper_statuses: list[FullTextEnhancementPaperStatus] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+
+class FullTextReanalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    max_evidence_items: int = 20
+    use_llm_revision: bool = False
+    use_llm_claim_logic: bool = False
+    export_logic_facts: bool = False
 
 
 class FetchBiomedicalPaperRequest(BaseModel):
@@ -1431,6 +1462,10 @@ class AnswerWithEvidenceResult(BaseModel):
     conflicting_evidence: list[EvidenceItem] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     uncertainty_level: ConfidenceLevel
+    evidence_maturity: EvidenceMaturity = "emerging_claim"
+    scientific_confidence: ConfidenceLevel = "low"
+    packet_limitation_level: PacketLimitationLevel = "low"
+    review_priority: ReviewPriority = "low"
     suggested_next_steps: list[str] = Field(default_factory=list)
     not_medical_advice: bool = True
     disclaimer: str

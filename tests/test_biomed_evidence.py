@@ -40,6 +40,32 @@ from plugins.biomed_evidence.guardrails import RESEARCH_USE_DISCLAIMER
 from plugins.biomed_evidence.service import BiomedEvidenceService
 
 
+SMOKING_SCLC_EVIDENCE = EvidenceItem(
+    evidence_id="ev-smoking-sclc",
+    paper_id="PMID:SMOKE",
+    claim=(
+        "Public health consensus and IARC monograph reviews identify tobacco "
+        "smoking as an established causal risk factor and primary cause of lung "
+        "cancer; SCLC is strongly linked to smoking."
+    ),
+    finding=(
+        "IARC monograph and public health consensus evidence identify tobacco "
+        "smoking as an established causal risk factor and primary cause of lung "
+        "cancer, and report that most SCLC patients have a tobacco-use history."
+    ),
+    evidence_direction="supports",
+    entities=[],
+    methods=["IARC monograph", "public health consensus review"],
+    limitations=["Current packet does not extract dose-response effect sizes."],
+    confidence="high",
+    evidence_span=(
+        "IARC monograph and public health consensus evidence identify tobacco "
+        "smoking as an established causal risk factor and primary cause of lung "
+        "cancer, and report that most SCLC patients have a tobacco-use history."
+    ),
+)
+
+
 @pytest.mark.asyncio
 async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
@@ -66,6 +92,168 @@ async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
     assert any(
         item.evidence_direction == "supports" for item in result.evidence_summary
     )
+
+
+def test_established_causal_risk_factor_changes_interpretation_template() -> None:
+    maturity = service._derive_evidence_maturity(
+        question="Does smoking cause lung cancer and SCLC?",
+        evidence=[SMOKING_SCLC_EVIDENCE],
+    )
+    answer = service._compose_answer(
+        question="Does smoking cause lung cancer and SCLC?",
+        evidence=[SMOKING_SCLC_EVIDENCE],
+        papers={
+            "PMID:SMOKE": BiomedicalPaper(
+                paper_id="PMID:SMOKE",
+                title="Smoking and lung cancer",
+                source="mock",
+                abstract="",
+                authors=["Authority"],
+                publication_date="2024",
+            )
+        },
+        project_context=None,
+        evidence_maturity=maturity,
+    )
+
+    assert maturity == "established_causal_risk_factor"
+    assert "established causal risk-factor relationship" in answer
+    assert "not a clinical or causal conclusion" not in answer
+
+
+def test_causal_risk_maturity_ignores_secondary_cessation_outcomes() -> None:
+    evidence = [
+        EvidenceItem(
+            evidence_id="ev-1",
+            paper_id="PMID:1",
+            claim="Cigarette smoking causes lung cancer.",
+            finding="A vast majority of lung cancer deaths are attributable to cigarette smoking.",
+            evidence_direction="supports",
+            evidence_span=(
+                "A vast majority of lung cancer deaths are attributable to cigarette "
+                "smoking."
+            ),
+            confidence="high",
+        ),
+        EvidenceItem(
+            evidence_id="ev-2",
+            paper_id="PMID:2",
+            claim="Quitting smoking improves outcomes in lung cancer patients.",
+            finding="positive impact of quitting smoking in lung cancer patients",
+            evidence_direction="supports",
+            evidence_span="positive impact of quitting smoking in lung cancer patients",
+            confidence="medium",
+        ),
+        EvidenceItem(
+            evidence_id="ev-3",
+            paper_id="PMID:3",
+            claim="Smoking reduction from heavy to light smoking decreases lung cancer risk.",
+            finding=(
+                "Compared with continuing heavy smokers, reduced CPD decreased "
+                "lung cancer risk."
+            ),
+            evidence_direction="supports",
+            methods=["systematic review", "meta-analysis"],
+            confidence="high",
+        ),
+    ]
+
+    assert (
+        service._derive_evidence_maturity(
+            question=(
+                "What evidence supports or refutes that cigarette smoking causes "
+                "lung cancer?"
+            ),
+            evidence=evidence,
+        )
+        == "established_causal_risk_factor"
+    )
+
+
+def test_established_causal_risk_maturity_is_not_smoking_specific() -> None:
+    evidence = [
+        EvidenceItem(
+            evidence_id="ev-asbestos-1",
+            paper_id="PMID:ASBESTOS",
+            claim="Asbestos exposure is an established causal risk factor for mesothelioma.",
+            finding="Asbestos exposure is an established causal risk factor for mesothelioma.",
+            evidence_direction="supports",
+            evidence_span=(
+                "Public health consensus and systematic review evidence identify "
+                "asbestos exposure as an established causal risk factor for mesothelioma."
+            ),
+            methods=["systematic review", "public health consensus"],
+            confidence="high",
+        )
+    ]
+
+    assert (
+        service._derive_evidence_maturity(
+            question=(
+                "What evidence supports or refutes that asbestos exposure causes "
+                "mesothelioma?"
+            ),
+            evidence=evidence,
+        )
+        == "established_causal_risk_factor"
+    )
+
+
+def test_relevance_gate_keeps_off_topic_inconclusive_out_of_main_answer() -> None:
+    direct = EvidenceItem(
+        evidence_id="ev-asbestos-direct",
+        paper_id="PMID:ASBESTOS",
+        claim="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        finding="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        evidence_direction="supports",
+        evidence_span="Asbestos exposure is an established causal risk factor for mesothelioma.",
+        methods=["systematic review", "public health consensus"],
+        confidence="high",
+    )
+    off_topic = EvidenceItem(
+        evidence_id="ev-cannabis-off-topic",
+        paper_id="PMID:CANNABIS",
+        claim="Cannabis smoking is suspected to be a risk factor for lung cancer.",
+        finding="Cannabis smoking appeared to be associated with lung cancer at an earlier age.",
+        evidence_direction="inconclusive",
+        evidence_span="Cannabis smoking appeared to be associated with lung cancer at an earlier age.",
+        confidence="high",
+    )
+
+    split = service._split_answer_evidence(
+        question="What evidence supports or refutes that asbestos exposure causes mesothelioma?",
+        evidence=[direct, off_topic],
+    )
+    answer = service._compose_answer(
+        question="What evidence supports or refutes that asbestos exposure causes mesothelioma?",
+        evidence=split.direct,
+        papers={},
+        project_context=None,
+        evidence_maturity="established_causal_risk_factor",
+    )
+
+    assert split.direct == [direct]
+    assert split.contextual == [off_topic]
+    assert "Cannabis smoking" not in answer
+    assert (
+        service._uncertainty(split.direct, "established_causal_risk_factor") == "low"
+    )
+    assert service._packet_limitation_level([direct, off_topic]) == "medium"
+    assert service._review_priority([direct, off_topic]) == "medium"
+
+
+def test_unknown_answer_citations_are_detected() -> None:
+    assert service._unknown_answer_citations(
+        "Claim [MOCK-PMID-40163214] and supported claim [40163214].",
+        [
+            service.Citation(
+                paper_id="40163214",
+                title="Known paper",
+                source="pubmed",
+                cited_claim="Known claim",
+            )
+        ],
+    ) == ["MOCK-PMID-40163214"]
 
 
 @pytest.mark.asyncio
@@ -1501,6 +1689,52 @@ def test_full_text_evidence_prefers_results_sections(tmp_path: Path) -> None:
     assert extracted.evidence[0].section_label == "Results"
 
 
+def test_full_text_extraction_uses_question_terms_when_entities_are_unknown(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        paper = BiomedicalPaper(
+            paper_id="PMID-HCQ",
+            source="pubmed",
+            title="Hydroxychloroquine in hospitalized Covid-19",
+            abstract="Abstract-level summary only.",
+        )
+        service.storage.upsert_paper(paper)
+        ingested = service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper.paper_id,
+                source="pubmed",
+                content=(
+                    "## Results\n"
+                    "Among patients hospitalized with Covid-19, those who received "
+                    "hydroxychloroquine did not have a lower incidence of death at "
+                    "28 days than those who received usual care."
+                ),
+            )
+        )
+
+        extracted = service.extract_full_text_evidence(
+            paper_id=paper.paper_id,
+            source="pubmed",
+            research_question=(
+                "Does hydroxychloroquine improve outcomes in hospitalized Covid-19?"
+            ),
+        )
+    finally:
+        service.storage.close()
+
+    assert ingested.ok is True
+    assert extracted is not None
+    assert extracted.evidence
+    item = extracted.evidence[0]
+    assert item.source_scope == "full_text"
+    assert item.evidence_direction == "contradicts"
+    assert item.entities
+    assert item.entities[0].entity_type == "other"
+    assert "hydroxychloroquine" in item.finding.lower()
+
+
 def test_parse_bioc_json_full_text_extracts_passages() -> None:
     payload = {
         "documents": [
@@ -1524,6 +1758,29 @@ def test_parse_bioc_json_full_text_extracts_passages() -> None:
     assert "## Results" in text
     assert "Microglia were associated with pathology." in text
     assert "## Methods" in text
+
+
+def test_parse_bioc_json_full_text_accepts_live_collection_payload() -> None:
+    payload = [
+        {
+            "source": "PMC",
+            "documents": [
+                {
+                    "passages": [
+                        {
+                            "infons": {"section_type": "Results"},
+                            "text": "Open full text passage.",
+                        }
+                    ]
+                }
+            ],
+        }
+    ]
+
+    text = parse_bioc_json_full_text(payload)
+
+    assert "## Results" in text
+    assert "Open full text passage." in text
 
 
 def test_parse_bioc_json_full_text_skips_malformed_empty_passages() -> None:

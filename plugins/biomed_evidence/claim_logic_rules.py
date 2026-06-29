@@ -65,6 +65,16 @@ RULE_METADATA: dict[str, LogicRuleMetadata] = {
             "finding, but not a universal no-effect conclusion."
         ),
     ),
+    "trial_scoped_no_observed_benefit_allows_moderate_evidence": LogicRuleMetadata(
+        rule_id="trial_scoped_no_observed_benefit_allows_moderate_evidence",
+        category="modality_boundary",
+        severity="minor",
+        explanation=(
+            "A trial-scoped no-observed-benefit claim can be supported by aligned "
+            "trial evidence without treating moderate wording as a universal "
+            "no-effect claim."
+        ),
+    ),
     "animal_evidence_does_not_entail_human_claim": LogicRuleMetadata(
         rule_id="animal_evidence_does_not_entail_human_claim",
         category="population_mismatch",
@@ -282,8 +292,19 @@ def audit_logical_support(
             and claim_frame.predicate == "causes_or_drives"
             and not _claims_sufficient_causation(claim_frame)
         )
+        aligned_trial_no_observed_benefit = (
+            evidence.predicate == "no_observed_benefit"
+            and claim_frame.predicate == "no_observed_benefit"
+            and evidence.study_design in {"randomized_trial", "interventional"}
+        )
+        if aligned_trial_no_observed_benefit:
+            _add_rule(
+                rules,
+                "trial_scoped_no_observed_benefit_allows_moderate_evidence",
+            )
         if (
             not contribution_to_causation
+            and not aligned_trial_no_observed_benefit
             and claim_frame.modality in {"strong", "definitive"}
             and evidence.modality
             in {
@@ -374,6 +395,8 @@ def _logic_verdict(
     scope_mismatches: list[dict[str, object]],
 ) -> str:
     if not rules:
+        return "entailed"
+    if set(rules) <= {"trial_scoped_no_observed_benefit_allows_moderate_evidence"}:
         return "entailed"
     critical_rules = {
         rule

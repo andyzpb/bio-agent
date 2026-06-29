@@ -33,6 +33,20 @@ AZITHROMYCIN_EVIDENCE = (
     "treatment (which included hydroxychloroquine) did not improve clinical "
     "outcomes."
 )
+RECOVERY_CLAIM = (
+    "The RECOVERY trial demonstrated that hydroxychloroquine did not reduce "
+    "28-day mortality in hospitalized patients."
+)
+RECOVERY_EVIDENCE = (
+    "Among patients hospitalized with Covid-19, those who received "
+    "hydroxychloroquine did not have a lower incidence of death at 28 days "
+    "than those who received usual care."
+)
+IN_VITRO_MECHANISM_TEXT = (
+    "Cigarette smoke and e-cigs increase proinflammatory cytokine expression "
+    "in cells and affect protein regulation, leading to an increased lung "
+    "cancer risk."
+)
 
 
 def _citation(paper_id: str = "PMID:123") -> Citation:
@@ -89,6 +103,37 @@ def _azithromycin_evidence() -> EvidenceItem:
         limitations=["Trial-level evidence."],
         confidence="medium",
         evidence_span=AZITHROMYCIN_EVIDENCE,
+    )
+
+
+def _recovery_evidence() -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id="ev_recovery",
+        paper_id="33031652",
+        claim=RECOVERY_EVIDENCE,
+        finding=RECOVERY_EVIDENCE,
+        evidence_direction="supports",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=["Trial-level evidence."],
+        confidence="high",
+        evidence_span=RECOVERY_EVIDENCE,
+    )
+
+
+def _in_vitro_mechanism_evidence() -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id="ev_in_vitro",
+        paper_id="37458647",
+        claim=IN_VITRO_MECHANISM_TEXT,
+        finding=IN_VITRO_MECHANISM_TEXT,
+        evidence_direction="supports",
+        entities=[],
+        methods=["in vitro cell model"],
+        limitations=["Abstract-level cell-model evidence."],
+        confidence="medium",
+        evidence_span=IN_VITRO_MECHANISM_TEXT,
+        source_scope="abstract",
     )
 
 
@@ -532,6 +577,72 @@ def test_aligned_negative_trial_finding_is_not_overclaimed_from_modality_mismatc
     assert audit.logic_audit.logic_verdict == "entailed"
 
 
+def test_trial_scoped_no_observed_benefit_allows_moderate_evidence() -> None:
+    answer = f"{RECOVERY_CLAIM} [33031652]"
+    evidence = _recovery_evidence()
+    base = validate_citation_support(
+        answer=answer,
+        citations=[_citation("33031652")],
+        evidence_items=[evidence],
+    )
+    claim = base.claims[0]
+    claim_frames = biomed_service_module._logic_claim_frames_from_llm(
+        [
+            {
+                "claim_id": claim.claim_id,
+                "claim_text": RECOVERY_CLAIM,
+                "subject": {"text": "hydroxychloroquine", "entity_type": "drug"},
+                "predicate": "no_observed_benefit",
+                "object": {"text": "28-day mortality", "entity_type": "disease"},
+                "polarity": "negative",
+                "modality": "definitive",
+                "population": "human",
+                "claim_strength": "background",
+            }
+        ],
+        claims=[claim],
+        model="fake",
+        prompt_hash="hash",
+    )
+    evidence_frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [
+            {
+                "evidence_id": evidence.evidence_id,
+                "paper_id": evidence.paper_id,
+                "evidence_text": RECOVERY_EVIDENCE,
+                "subject": {"text": "hydroxychloroquine", "entity_type": "drug"},
+                "predicate": "no_observed_benefit",
+                "object": {"text": "28-day mortality", "entity_type": "disease"},
+                "polarity": "negative",
+                "modality": "moderate",
+                "population": "human",
+                "study_design": "randomized_trial",
+                "evidence_strength": "interventional",
+            }
+        ],
+        evidence_items=[evidence],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    result = validate_citation_support(
+        answer=answer,
+        citations=[_citation("33031652")],
+        evidence_items=[evidence],
+        use_llm_claim_logic=True,
+        logic_claim_frames=claim_frames,
+        logic_evidence_frames=evidence_frames,
+    )
+
+    audit = result.claim_audits[0]
+    assert audit.verdict == "supported"
+    assert audit.logic_audit is not None
+    assert audit.logic_audit.logic_verdict == "entailed"
+    assert "weak_evidence_does_not_support_definitive_claim" not in (
+        audit.logic_audit.rules_triggered
+    )
+
+
 def test_trial_no_observed_benefit_only_partially_supports_universal_no_effect() -> None:
     claim = AtomicClaim(
         claim_id="claim_no_effect",
@@ -548,6 +659,72 @@ def test_trial_no_observed_benefit_only_partially_supports_universal_no_effect()
     assert "trial_no_observed_benefit_partially_entails_no_effect" in (
         result.rules_triggered
     )
+
+
+def test_abstract_in_vitro_text_match_is_scope_limited_not_pure_overclaim() -> None:
+    answer = f"{IN_VITRO_MECHANISM_TEXT} [37458647]"
+    evidence = _in_vitro_mechanism_evidence()
+    base = validate_citation_support(
+        answer=answer,
+        citations=[_citation("37458647")],
+        evidence_items=[evidence],
+    )
+    claim = base.claims[0]
+    claim_frames = biomed_service_module._logic_claim_frames_from_llm(
+        [
+            {
+                "claim_id": claim.claim_id,
+                "claim_text": IN_VITRO_MECHANISM_TEXT,
+                "subject": {"text": "cigarette smoke and e-cigs", "entity_type": "other"},
+                "predicate": "causes_or_drives",
+                "object": {"text": "lung cancer risk", "entity_type": "disease"},
+                "polarity": "positive",
+                "modality": "strong",
+                "population": "human",
+                "claim_strength": "mechanistic",
+            }
+        ],
+        claims=[claim],
+        model="fake",
+        prompt_hash="hash",
+    )
+    evidence_frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [
+            {
+                "evidence_id": evidence.evidence_id,
+                "paper_id": evidence.paper_id,
+                "evidence_text": IN_VITRO_MECHANISM_TEXT,
+                "subject": {"text": "cigarette smoke and e-cigs", "entity_type": "other"},
+                "predicate": "causes_or_drives",
+                "object": {"text": "lung cancer risk", "entity_type": "disease"},
+                "polarity": "positive",
+                "modality": "definitive",
+                "population": "in_vitro",
+                "study_design": "in_vitro",
+                "evidence_strength": "animal_or_in_vitro",
+            }
+        ],
+        evidence_items=[evidence],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    result = validate_citation_support(
+        answer=answer,
+        citations=[_citation("37458647")],
+        evidence_items=[evidence],
+        use_llm_claim_logic=True,
+        logic_claim_frames=claim_frames,
+        logic_evidence_frames=evidence_frames,
+    )
+
+    audit = result.claim_audits[0]
+    assert audit.verdict == "partial_support"
+    assert audit.overclaim_reason is None
+    assert any("Full text or scope review" in note for note in audit.reviewer_notes)
+    assert audit.logic_audit is not None
+    assert audit.logic_audit.logic_verdict == "overclaimed"
+    assert "in_vitro_evidence_does_not_entail_human_claim" in audit.logic_audit.rules_triggered
 
 
 def test_llm_logic_parser_normalizes_uncertain_modality() -> None:

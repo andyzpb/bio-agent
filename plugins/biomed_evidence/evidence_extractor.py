@@ -87,7 +87,10 @@ class EvidenceExtractor:
                 reason="Abstract did not contain extractable sentences.",
             )
         candidate = _select_candidate_sentence(sentences, research_question)
-        entities = _detect_entities(f"{paper.title} {candidate}")
+        entities = _merge_entities(
+            _question_entities(candidate, research_question),
+            _detect_entities(f"{paper.title} {candidate}"),
+        )
         if not entities:
             return EvidenceExtractionResult(
                 paper_id=paper.paper_id,
@@ -134,8 +137,8 @@ def _select_candidate_sentence(
     for sentence in sentences:
         low = sentence.lower()
         score = sum(1 for term in question_terms if term in low)
-        score += sum(2 for marker in ("associated", "correlated", "linked", "identified", "enriched") if marker in low)
-        score += sum(1 for marker in ("limited", "inconclusive", "did not", "failed") if marker in low)
+        score += sum(2 for marker in ("associated", "correlated", "linked", "identified", "enriched", "reduced", "increased", "lower incidence", "mortality", "risk") if marker in low)
+        score += sum(1 for marker in ("limited", "inconclusive", "did not", "failed", "no benefit", "usual care") if marker in low)
         if score > best_score:
             best_score = score
             best_sentence = sentence
@@ -154,6 +157,35 @@ def _detect_entities(text: str) -> list[BiomedicalEntity]:
         seen.add(key)
         found.append(BiomedicalEntity(name=name, entity_type=entity_type))
     return found
+
+
+def _question_entities(sentence: str, research_question: str | None) -> list[BiomedicalEntity]:
+    terms = [
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", research_question or "")
+        if term.lower() in sentence.lower()
+    ]
+    seen: set[str] = set()
+    entities: list[BiomedicalEntity] = []
+    for term in terms[:4]:
+        if term in seen:
+            continue
+        seen.add(term)
+        entities.append(BiomedicalEntity(name=term, entity_type="other"))
+    return entities
+
+
+def _merge_entities(*groups: list[BiomedicalEntity]) -> list[BiomedicalEntity]:
+    seen: set[str] = set()
+    merged: list[BiomedicalEntity] = []
+    for group in groups:
+        for entity in group:
+            key = f"{entity.entity_type}:{entity.name.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entity)
+    return merged
 
 
 def _detect_methods(text: str) -> list[str]:
@@ -180,11 +212,11 @@ def _detect_strings(text: str, patterns: list[tuple[str, str]]) -> list[str]:
 
 def _classify_direction(sentence: str) -> EvidenceDirection:
     low = sentence.lower()
-    if any(marker in low for marker in ("did not", "failed to", "no association", "not associated", "contradict")):
+    if any(marker in low for marker in ("did not", "failed to", "no association", "not associated", "contradict", "no benefit", "not reduce", "not have a lower")):
         return "contradicts"
     if any(marker in low for marker in ("inconclusive", "weakened", "limited", "ambiguous")):
         return "inconclusive"
-    if any(marker in low for marker in ("associated", "correlated", "linked", "identified", "enriched", "suggest")):
+    if any(marker in low for marker in ("associated", "correlated", "linked", "identified", "enriched", "suggest", "reduced", "increased", "lower incidence", "risk")):
         return "supports"
     return "background"
 

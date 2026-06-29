@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Iterable, cast
 
 from plugins.biomed_evidence.claim_logic import audit_claim_logic
+from plugins.biomed_evidence.evidence_maturity import derive_evidence_maturity
 from plugins.biomed_evidence.schemas import (
     AtomicClaim,
     AuditRecommendedAction,
@@ -19,6 +20,7 @@ from plugins.biomed_evidence.schemas import (
     ConflictAuditResult,
     ConflictVerdict,
     EvidenceItem,
+    EvidenceMaturity,
     EvidenceStrength,
     LogicAuditResult,
     LogicParserMode,
@@ -84,6 +86,10 @@ def validate_citation_support(
 ) -> CitationAuditResult:
     claims = extract_atomic_claims(answer)
     citation_ids = {citation.paper_id for citation in citations}
+    evidence_maturity = derive_evidence_maturity(
+        question=answer,
+        evidence=evidence_items,
+    )
     logic_parser_mode: LogicParserMode = (
         "llm"
         if use_llm_claim_logic and logic_claim_frames and logic_evidence_frames
@@ -100,14 +106,16 @@ def validate_citation_support(
             logic_claim_frames=logic_claim_frames,
             logic_evidence_frames=logic_evidence_frames,
             logic_parser_fallback_reason=logic_parser_fallback_reason,
+            evidence_maturity=evidence_maturity,
         )
         for claim in claims
     ]
     uncertainty_audit = derive_uncertainty_audit(
         claim_audits=claim_audits,
-        evidence_items=evidence_items,
+        evidence_items=_audit_relevant_evidence(evidence_items, claim_audits, citation_ids),
         retrieval_manifest=retrieval_manifest,
         observed_uncertainty=observed_uncertainty,
+        evidence_maturity=evidence_maturity,
     )
     failed_claims = [item for item in claim_audits if item.verdict in _FAILED_VERDICTS]
     supported_claims = [
@@ -196,6 +204,7 @@ def derive_uncertainty_audit(
     evidence_items: list[EvidenceItem],
     retrieval_manifest: RetrievalManifest | None,
     observed_uncertainty: str | None,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
 ) -> UncertaintyAudit:
     reasons: list[str] = []
     expected: ConfidenceLevel = "low"
@@ -228,8 +237,10 @@ def derive_uncertainty_audit(
     ):
         expected = "medium"
         reasons.append("Evidence includes animal or in-vitro model limitations.")
-    if expected != "high" and any(
-        _evidence_strength(item) == "abstract_only" for item in evidence_items
+    if (
+        expected != "high"
+        and evidence_maturity != "established_causal_risk_factor"
+        and any(_evidence_strength(item) == "abstract_only" for item in evidence_items)
     ):
         expected = "medium"
         reasons.append("Evidence is abstract-level only.")
@@ -272,6 +283,23 @@ def derive_uncertainty_audit(
             "publication_bias": "not_assessed",
         },
     )
+
+
+def _audit_relevant_evidence(
+    evidence_items: list[EvidenceItem],
+    claim_audits: list[ClaimAuditItem],
+    citation_ids: set[str],
+) -> list[EvidenceItem]:
+    used_ids = {
+        paper_id
+        for audit in claim_audits
+        for paper_id in audit.cited_paper_ids
+        if paper_id
+    } or citation_ids
+    if not used_ids:
+        return evidence_items
+    relevant = [item for item in evidence_items if item.paper_id in used_ids]
+    return relevant or evidence_items
 
 
 def find_conflicting_evidence(
@@ -334,6 +362,7 @@ def _audit_claim(
     logic_claim_frames: Mapping[str, LogicalClaimFrame] | None = None,
     logic_evidence_frames: Mapping[str, LogicalEvidenceFrame] | None = None,
     logic_parser_fallback_reason: str | None = None,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
 ) -> ClaimAuditItem:
     cited_ids = claim.cited_paper_ids or _infer_cited_ids(
         claim.text, evidence_items, citation_ids
@@ -393,7 +422,7 @@ def _audit_claim(
         reverse=True,
     )
     best, score = ranked[0]
-    overclaim_reason = _overclaim_reason(claim.text, best)
+    overclaim_reason = _overclaim_reason(claim.text, best, evidence_maturity)
     if overclaim_reason:
         return _claim_audit(
             claim,
@@ -562,6 +591,28 @@ def _merge_logic_audit(
         "modality_mismatch",
         "insufficient_evidence",
     }:
+        if _logic_scope_limitation_text_match(audit_item, logic):
+            updates.update(
+                {
+                    "verdict": "partial_support",
+                    "support_score": min(audit_item.support_score, 0.65),
+                    "overclaim_reason": None,
+                    "reason": (
+                        f"{audit_item.reason} Logic entailment audit flagged "
+                        f"{logic.logic_verdict}: citation text is aligned, but "
+                        "the evidence model/source scope requires review."
+                    ),
+                    "reviewer_notes": _merge_unique(
+                        reviewer_notes,
+                        [
+                            "Full text or scope review needed: the cited abstract text "
+                            "supports the wording, but current extracted evidence is "
+                            "limited by model system or source scope."
+                        ],
+                    ),
+                }
+            )
+            return audit_item.model_copy(update=updates)
         new_verdict: CitationSupportVerdict = (
             "insufficient_evidence"
             if logic.logic_verdict == "insufficient_evidence"
@@ -579,6 +630,24 @@ def _merge_logic_audit(
             }
         )
     return audit_item.model_copy(update=updates)
+
+
+def _logic_scope_limitation_text_match(
+    audit_item: ClaimAuditItem,
+    logic: LogicAuditResult,
+) -> bool:
+    if not any(
+        rule
+        in {
+            "animal_evidence_does_not_entail_human_claim",
+            "in_vitro_evidence_does_not_entail_human_claim",
+        }
+        for rule in logic.rules_triggered
+    ):
+        return False
+    if not audit_item.evidence_span:
+        return False
+    return _overlap(audit_item.claim, audit_item.evidence_span) >= 0.75
 
 
 def _merge_unique(*groups: Iterable[str]) -> list[str]:
@@ -816,9 +885,22 @@ def _terms(text: str) -> list[str]:
     ]
 
 
-def _overclaim_reason(claim_text: str, evidence: EvidenceItem) -> str | None:
+def _overclaim_reason(
+    claim_text: str,
+    evidence: EvidenceItem,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
+) -> str | None:
     lowered = claim_text.lower()
     evidence_text = _evidence_text(evidence).lower()
+    if (
+        evidence_maturity == "established_causal_risk_factor"
+        and re.search(r"\b(established|causal|causes?|risk factor)\b", lowered)
+        and re.search(
+            r"\b(established|causal|causes?|risk factor|carcinogen)\b",
+            evidence_text,
+        )
+    ):
+        return None
     if re.search(r"\b(causes?|caused|causal|drives?|proves?|establishes?)\b", lowered):
         if _claim_reports_limiting_evidence(claim_text):
             return None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 import hashlib
 import json
@@ -10,7 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal, cast
+from urllib.parse import quote, urljoin
 
+from bs4 import BeautifulSoup
 import httpx
 
 from plugins.biomed_evidence.citation_auditor import (
@@ -19,6 +22,9 @@ from plugins.biomed_evidence.citation_auditor import (
     validate_citation_support,
 )
 from plugins.biomed_evidence.evidence_extractor import EvidenceExtractor
+from plugins.biomed_evidence.evidence_maturity import (
+    derive_evidence_maturity as _derive_evidence_maturity,
+)
 from plugins.biomed_evidence.errors import release_error, release_ok
 from plugins.biomed_evidence.guardrails import (
     RESEARCH_USE_DISCLAIMER,
@@ -30,6 +36,7 @@ from plugins.biomed_evidence.literature_client import (
     MockLiteratureClient,
     PubMedLiteratureClient,
     parse_bioc_json_full_text,
+    parse_bioc_json_license_or_rights,
 )
 from plugins.biomed_evidence.math_signals import (
     build_argument_graph,
@@ -99,6 +106,7 @@ from plugins.biomed_evidence.schemas import (
     ExtractionMode,
     EvidenceGraph,
     EvidenceItem,
+    EvidenceMaturity,
     ExportEvidenceReportRequest,
     FetchBiomedicalPaperRequest,
     FullTextDocument,
@@ -107,6 +115,7 @@ from plugins.biomed_evidence.schemas import (
     FullTextEnhancementResult,
     FullTextIngestionRequest,
     FullTextIngestionResult,
+    FullTextReanalysisRequest,
     FullTextSection,
     GapSearchDecision,
     GenerateProjectEvidenceBriefRequest,
@@ -128,6 +137,7 @@ from plugins.biomed_evidence.schemas import (
     ObsidianExportRequest,
     ObsidianExportResult,
     PaperMetadata,
+    PacketLimitationLevel,
     PilotReport,
     PilotReportObservability,
     PilotReportRoi,
@@ -165,6 +175,7 @@ from plugins.biomed_evidence.schemas import (
     SearchBiomedicalLiteratureRequest,
     SearchBiomedicalLiteratureResult,
     ScopeMatch,
+    ReviewPriority,
     WatchCheckResult,
     WatchDecisionDetail,
     WatchDriftChange,
@@ -189,6 +200,12 @@ class _SynthesisOutcome:
     model: str | None
     prompt_hash: str | None
     fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _AnswerEvidenceSplit:
+    direct: list[EvidenceItem]
+    contextual: list[EvidenceItem]
 
 
 @dataclass(frozen=True)
@@ -2157,6 +2174,10 @@ class BiomedEvidenceService:
             content_type=request.content_type,
             title=request.title or paper.title,
             source_filename=request.source_filename,
+            provider=request.provider,
+            provider_status=request.provider_status,
+            lookup_id_type=request.lookup_id_type,
+            license_or_rights=request.license_or_rights,
             source_hash=source_hash,
             byte_size=len(request.content.encode("utf-8")),
             section_count=len(sections),
@@ -2264,25 +2285,164 @@ class BiomedEvidenceService:
         *,
         paper_id: str,
         source: str,
-    ) -> tuple[str | None, str | None, str | None]:
+    ) -> tuple[str | None, str | None, str | None, str | None]:
         if source != "pubmed":
-            return None, None, "open_full_text_provider_only_supports_pubmed"
+            return None, None, "open_full_text_provider_only_supports_pubmed", None
         assert self.pubmed_client.client is not None
         url = (
             "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/"
             f"pmcoa.cgi/BioC_json/{paper_id}/unicode"
         )
+        warnings: list[str] = []
         try:
             response = await self.pubmed_client.client.get(url)
             if response.status_code == 404:
-                return None, url, "full_text_unavailable"
-            response.raise_for_status()
-            content = parse_bioc_json_full_text(response.json())
-            if not content:
-                return None, url, "full_text_empty"
-            return content, url, None
+                warnings.append("pmc_bioc_no_open_full_text")
+            elif "text/html" in response.headers.get("content-type", ""):
+                warnings.append("pmc_bioc_no_open_full_text")
+            else:
+                response.raise_for_status()
+                payload = response.json()
+                content = parse_bioc_json_full_text(payload)
+                if content:
+                    return content, url, None, parse_bioc_json_license_or_rights(payload)
+                warnings.append("pmc_bioc_full_text_empty")
         except Exception as exc:
-            return None, url, f"full_text_provider_failed:{exc.__class__.__name__}"
+            warnings.append(f"pmc_bioc_failed:{exc.__class__.__name__}")
+
+        europe_url = (
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/"
+            f"MED/{paper_id}/fullTextXML"
+        )
+        try:
+            response = await self.pubmed_client.client.get(europe_url)
+            if response.status_code == 404:
+                warnings.append("europe_pmc_no_full_text")
+            else:
+                response.raise_for_status()
+                content = _xml_full_text_to_markdown(response.text)
+                if content:
+                    return content, europe_url, None, None
+                warnings.append("europe_pmc_full_text_empty")
+        except Exception as exc:
+            warnings.append(f"europe_pmc_failed:{exc.__class__.__name__}")
+
+        content, locator, warning, license_or_rights = await self._fetch_unpaywall_full_text(
+            paper_id=paper_id,
+            source=source,
+        )
+        if content:
+            return content, locator, None, license_or_rights
+        if warning:
+            warnings.append(warning)
+        content, locator, warning, license_or_rights = await self._fetch_doi_pdf_full_text(
+            paper_id=paper_id,
+            source=source,
+        )
+        if content:
+            return content, locator, None, license_or_rights
+        if warning:
+            warnings.append(warning)
+        return None, locator or europe_url or url, ";".join(warnings), None
+
+    async def _fetch_unpaywall_full_text(
+        self,
+        *,
+        paper_id: str,
+        source: str,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        assert self.pubmed_client.client is not None
+        paper = self.storage.get_paper(paper_id, source=source) or self.storage.get_paper(
+            paper_id
+        )
+        doi = paper.doi if paper is not None else None
+        if not doi:
+            return None, None, "missing_doi_for_unpaywall_lookup", None
+        email = os.getenv("UNPAYWALL_EMAIL") or self.pubmed_client.email
+        if not email:
+            return None, None, "unpaywall_email_missing", None
+        api_url = f"https://api.unpaywall.org/v2/{quote(doi, safe='')}"
+        try:
+            response = await self.pubmed_client.client.get(api_url, params={"email": email})
+            if response.status_code == 404:
+                return None, api_url, "unpaywall_no_record", None
+            response.raise_for_status()
+            data = response.json()
+            raw_locations = [
+                data.get("best_oa_location"),
+                *(data.get("oa_locations") or []),
+            ]
+            locations = [item for item in raw_locations if isinstance(item, dict)]
+            last_pdf_warning: str | None = None
+            for location in locations:
+                full_text_url = str(
+                    location.get("url_for_pdf")
+                    or location.get("url_for_landing_page")
+                    or location.get("url")
+                    or ""
+                ).strip()
+                if not full_text_url:
+                    continue
+                fetched = await self.pubmed_client.client.get(full_text_url)
+                fetched.raise_for_status()
+                content_type = fetched.headers.get("content-type", "")
+                if "pdf" in content_type.lower() or full_text_url.lower().endswith(".pdf"):
+                    content, last_pdf_warning = await asyncio.to_thread(
+                        _parse_pdf_url_with_knowhere,
+                        full_text_url,
+                    )
+                    if content:
+                        return (
+                            content,
+                            full_text_url,
+                            None,
+                            str(location.get("license") or "").strip() or None,
+                        )
+                    continue
+                content = _html_full_text_to_markdown(fetched.text)
+                if content:
+                    return (
+                        content,
+                        full_text_url,
+                        None,
+                        str(location.get("license") or "").strip() or None,
+                    )
+            return None, api_url, last_pdf_warning or "unpaywall_no_text_location", None
+        except Exception as exc:
+            return None, api_url, f"unpaywall_failed:{exc.__class__.__name__}", None
+
+    async def _fetch_doi_pdf_full_text(
+        self,
+        *,
+        paper_id: str,
+        source: str,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        assert self.pubmed_client.client is not None
+        paper = self.storage.get_paper(paper_id, source=source) or self.storage.get_paper(
+            paper_id
+        )
+        doi = paper.doi if paper is not None else None
+        if not doi:
+            return None, None, "missing_doi_for_pdf_lookup", None
+        landing_url = f"https://doi.org/{quote(doi, safe='/')}"
+        try:
+            response = await self.pubmed_client.client.get(
+                landing_url,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            for pdf_url in _pdf_links_from_html(response.text, str(response.url)):
+                content, warning = await asyncio.to_thread(
+                    _parse_pdf_url_with_knowhere,
+                    pdf_url,
+                )
+                if content:
+                    return content, pdf_url, None, None
+                if warning:
+                    return None, pdf_url, warning, None
+            return None, str(response.url), "doi_landing_pdf_link_not_found", None
+        except Exception as exc:
+            return None, landing_url, f"doi_landing_failed:{exc.__class__.__name__}", None
 
     async def enhance_run_with_full_text(
         self,
@@ -2328,11 +2488,28 @@ class BiomedEvidenceService:
         for paper_id in candidate_ids:
             stored = self.storage.get_full_text_document(paper_id, source=source)
             provider_warning: str | None = None
+            provider = (
+                "open_provider_chain"
+                if source == "pubmed" and request.use_open_provider
+                else None
+            )
+            provider_status = "cached" if stored is not None else "not_requested"
+            source_locator: str | None = None
+            lookup_id_type = _full_text_lookup_id_type(paper_id) if source == "pubmed" else None
+            license_or_rights: str | None = None
             if stored is None and request.use_open_provider:
-                content, locator, provider_error = await self._fetch_open_full_text_content(
+                (
+                    content,
+                    locator,
+                    provider_error,
+                    license_or_rights,
+                ) = await self._fetch_open_full_text_content(
                     paper_id=paper_id,
                     source=source,
                 )
+                source_locator = locator
+                provider = _full_text_provider_from_locator(locator) or provider
+                provider_status = "fetched" if content else provider_error or "unavailable"
                 if content:
                     ingested = self.ingest_full_text(
                         FullTextIngestionRequest(
@@ -2341,6 +2518,10 @@ class BiomedEvidenceService:
                             content=content,
                             content_type="text/plain",
                             source_filename=locator,
+                            provider=provider,
+                            provider_status=provider_status,
+                            lookup_id_type=lookup_id_type,
+                            license_or_rights=license_or_rights,
                             overwrite=request.overwrite_full_text,
                         )
                     )
@@ -2358,6 +2539,11 @@ class BiomedEvidenceService:
                         paper_id=paper_id,
                         source=source,
                         status="unavailable",
+                        provider=provider,
+                        provider_status=provider_status,
+                        source_locator=source_locator,
+                        lookup_id_type=lookup_id_type,
+                        license_or_rights=license_or_rights,
                         warning=provider_warning or "full_text_unavailable",
                     )
                 )
@@ -2368,6 +2554,8 @@ class BiomedEvidenceService:
                 )
                 continue
             document, sections = stored
+            source_locator = source_locator or document.source_filename
+            provider = _full_text_provider_from_locator(source_locator) or provider
             extracted = self.extract_full_text_evidence(
                 paper_id=paper_id,
                 source=source,
@@ -2388,7 +2576,12 @@ class BiomedEvidenceService:
                     status="extracted" if paper_new_evidence else "cached",
                     document_id=document.document_id,
                     section_count=len(sections),
-                    evidence_ids=[item.evidence_id for item in paper_new_evidence],
+                    evidence_ids=[item.evidence_id for item in evidence],
+                    provider=provider,
+                    provider_status=provider_status,
+                    source_locator=source_locator,
+                    lookup_id_type=lookup_id_type,
+                    license_or_rights=license_or_rights,
                     warning=(
                         None
                         if paper_new_evidence
@@ -2484,6 +2677,124 @@ class BiomedEvidenceService:
             warnings=result.warnings,
             trace={"trace": [item.model_dump(mode="json") for item in trace]},
             metadata=metadata,
+        )
+
+    def reanalyze_run_with_full_text(
+        self,
+        request: FullTextReanalysisRequest,
+    ) -> AuditedAnswerResult | None:
+        run = self.storage.get_answer_run(request.run_id)
+        if run is None:
+            return None
+        evidence = [
+            item
+            for item in run.evidence_summary
+            if item.source_scope in {"full_text", "pdf"}
+        ][: max(1, request.max_evidence_items)]
+        if not evidence:
+            return None
+        question = _pilot_question(run) or run.answer[:240]
+        source = (
+            run.retrieval_manifest.source
+            if run.retrieval_manifest is not None
+            else run.citations[0].source
+            if run.citations
+            else "mock"
+        )
+        papers = {
+            item.paper_id: paper
+            for item in evidence
+            if (paper := self.storage.get_paper(item.paper_id, source=source))
+            is not None
+        }
+        citations = [
+            Citation(
+                paper_id=item.paper_id,
+                title=papers[item.paper_id].title
+                if item.paper_id in papers
+                else item.paper_id,
+                source=source,
+                doi=papers[item.paper_id].doi if item.paper_id in papers else None,
+                url=papers[item.paper_id].url if item.paper_id in papers else None,
+                cited_claim=item.claim,
+            )
+            for item in evidence
+        ]
+        evidence_maturity = _derive_evidence_maturity(
+            question=question,
+            evidence=evidence,
+        )
+        answer = _compose_answer(
+            question=question,
+            evidence=evidence,
+            papers=papers,
+            project_context=run.project_context_used,
+            evidence_maturity=evidence_maturity,
+        )
+        answer_result = run.model_copy(
+            update={
+                "run_id": f"{run.run_id}-fulltext",
+                "answer": answer,
+                "citations": citations,
+                "evidence_summary": evidence,
+                "conflicting_evidence": [
+                    item for item in evidence if item.evidence_direction == "contradicts"
+                ],
+                "limitations": _collect_limitations(evidence),
+                "uncertainty_level": _uncertainty(evidence, evidence_maturity),
+                "evidence_maturity": evidence_maturity,
+                "scientific_confidence": _scientific_confidence(
+                    evidence,
+                    evidence_maturity,
+                ),
+                "packet_limitation_level": _packet_limitation_level(evidence),
+                "review_priority": _review_priority(evidence),
+                "project_context_trace": {
+                    **run.project_context_trace,
+                    "full_text_reanalysis_of": run.run_id,
+                    "full_text_evidence_ids": [item.evidence_id for item in evidence],
+                },
+                "synthesis_mode": "deterministic",
+                "synthesis_model": None,
+                "synthesis_prompt_hash": None,
+                "synthesis_fallback_reason": None,
+            }
+        )
+        audit = self.audit_answer(
+            CitationAuditRequest(
+                answer=answer_result.answer,
+                citations=answer_result.citations,
+                evidence_items=answer_result.evidence_summary,
+                run_id=answer_result.run_id,
+                retrieval_id=answer_result.retrieval_id,
+                observed_uncertainty=answer_result.uncertainty_level,
+                retrieval_manifest=answer_result.retrieval_manifest,
+                use_llm_claim_logic=request.use_llm_claim_logic,
+                export_logic_facts=request.export_logic_facts,
+            )
+        )
+        revision = AnswerRevision(
+            revision_id=f"revision-{uuid.uuid4().hex[:12]}",
+            run_id=answer_result.run_id,
+            audit_id=audit.audit_id,
+            revision_mode="deterministic",
+            draft_answer=answer_result.answer,
+            final_answer=answer_result.answer,
+            revision_action=(
+                "revise"
+                if audit.recommended_action in {"revise", "refuse_or_abstain"}
+                else "pass"
+            ),
+            created_at=_now_iso(),
+        )
+        return AuditedAnswerResult(
+            answer_result=answer_result,
+            draft_answer=answer_result.answer,
+            final_answer=answer_result.answer,
+            audit=audit,
+            revision=revision,
+            trace=[],
+            final_action=revision.revision_action,
         )
 
     def extract_evidence(
@@ -3000,6 +3311,22 @@ class BiomedEvidenceService:
             metadata=metadata,
             evidence=answer_evidence,
         )
+        answer_split = _split_answer_evidence(
+            question=active_request.question,
+            evidence=answer_evidence,
+        )
+        direct_answer_evidence = answer_split.direct
+        project_context_trace.update(
+            {
+                "direct_answer_evidence_ids": [
+                    item.evidence_id for item in direct_answer_evidence
+                ],
+                "contextual_evidence_ids": [
+                    item.evidence_id for item in answer_split.contextual
+                ],
+                "contextual_evidence_count": len(answer_split.contextual),
+            }
+        )
 
         citations = [
             Citation(
@@ -3021,13 +3348,22 @@ class BiomedEvidenceService:
                 url=papers[item.paper_id].url if item.paper_id in papers else None,
                 cited_claim=item.claim,
             )
-            for item in answer_evidence
+            for item in direct_answer_evidence
             if item.paper_id in papers
         ]
         conflicting = [
-            item for item in answer_evidence if item.evidence_direction == "contradicts"
+            item
+            for item in direct_answer_evidence
+            if item.evidence_direction == "contradicts"
         ]
+        evidence_maturity = _derive_evidence_maturity(
+            question=active_request.question,
+            evidence=answer_evidence,
+        )
+        project_context_trace["evidence_maturity"] = evidence_maturity
         limitations = _collect_limitations(answer_evidence)
+        packet_limitation_level = _packet_limitation_level(answer_evidence)
+        review_priority = _review_priority(answer_evidence)
         if not citations and active_request.require_citations:
             answer = (
                 "I could not retrieve citation-backed evidence for this question in "
@@ -3044,11 +3380,12 @@ class BiomedEvidenceService:
         else:
             deterministic_answer = _compose_answer(
                 question=active_request.question,
-                evidence=answer_evidence,
+                evidence=direct_answer_evidence,
                 papers=papers,
                 project_context=active_request.project_context,
+                evidence_maturity=evidence_maturity,
             )
-            uncertainty = _uncertainty(answer_evidence)
+            uncertainty = _uncertainty(direct_answer_evidence, evidence_maturity)
             synthesis_outcome = _SynthesisOutcome(
                 answer=deterministic_answer,
                 mode="deterministic",
@@ -3060,12 +3397,13 @@ class BiomedEvidenceService:
                     request=active_request,
                     deterministic_answer=deterministic_answer,
                     citations=citations,
-                    evidence=answer_evidence,
+                    evidence=direct_answer_evidence,
                     papers=papers,
                     retrieval_manifest=retrieval_manifest,
                     retrieval_bundle=retrieval_bundle,
                     evidence_packet=evidence_packet,
                     uncertainty=uncertainty,
+                    evidence_maturity=evidence_maturity,
                     run_id=run_id,
                 )
             answer = synthesis_outcome.answer
@@ -3080,6 +3418,12 @@ class BiomedEvidenceService:
             conflicting_evidence=conflicting,
             limitations=limitations,
             uncertainty_level=uncertainty,
+            evidence_maturity=evidence_maturity,
+            scientific_confidence=_scientific_confidence(
+                direct_answer_evidence, evidence_maturity
+            ),
+            packet_limitation_level=packet_limitation_level,
+            review_priority=review_priority,
             suggested_next_steps=_suggest_next_steps(
                 answer_evidence, bool(active_request.project_context)
             ),
@@ -4271,6 +4615,7 @@ class BiomedEvidenceService:
         retrieval_bundle: RetrievalBundle | None,
         evidence_packet: EvidencePacketSummary | None,
         uncertainty: ConfidenceLevel,
+        evidence_maturity: EvidenceMaturity,
         run_id: str,
     ) -> _SynthesisOutcome:
         if self.revision_provider is None or not self.revision_model:
@@ -4293,6 +4638,7 @@ class BiomedEvidenceService:
             retrieval_bundle=retrieval_bundle,
             evidence_packet=evidence_packet,
             uncertainty=uncertainty,
+            evidence_maturity=evidence_maturity,
         )
         prompt_text = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
         prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
@@ -4307,10 +4653,11 @@ class BiomedEvidenceService:
                             "only with final_answer. Every biomedical claim, limitation, "
                             "uncertainty statement, comparison, or interpretation must "
                             "include at least one supplied bracket citation such as "
-                            "[MOCK-PMID-1001]. Do not add clinical advice or uncited "
-                            "future-work claims. Do not include the research-use "
-                            "disclaimer in final_answer; the application displays that "
-                            "boundary separately."
+                            "[12345678]. Use only paper_id values present in the "
+                            "provided citations and evidence. Do not add clinical advice "
+                            "or uncited future-work claims. Do not include the "
+                            "research-use disclaimer in final_answer; the application "
+                            "displays that boundary separately."
                         ),
                     },
                     {"role": "user", "content": prompt_text},
@@ -4327,6 +4674,18 @@ class BiomedEvidenceService:
             )
             if not final_answer:
                 raise ValueError("LLM synthesis returned empty final_answer.")
+            unknown_citations = _unknown_answer_citations(final_answer, citations)
+            if unknown_citations:
+                return _SynthesisOutcome(
+                    answer=deterministic_answer,
+                    mode="fallback",
+                    model=self.revision_model,
+                    prompt_hash=prompt_hash,
+                    fallback_reason=(
+                        "LLM synthesis cited unknown paper IDs: "
+                        f"{', '.join(unknown_citations)}."
+                    ),
+                )
             synthesis_audit = self.audit_answer(
                 CitationAuditRequest(
                     answer=final_answer,
@@ -6606,10 +6965,9 @@ def _obsidian_export_ok(
             "source_of_truth": result.source_of_truth,
             "imported_as_evidence": result.imported_as_evidence,
             "notes": [note.model_dump(mode="json") for note in result.notes],
-        },
-        metadata=metadata,
-    )
-
+            },
+            metadata=metadata,
+        )
 
 def _paper_metadata_from_literature_record(record: LiteraturePaperRecord) -> PaperMetadata:
     return PaperMetadata(
@@ -7398,6 +7756,7 @@ def _llm_synthesis_payload(
     retrieval_bundle: RetrievalBundle | None,
     evidence_packet: EvidencePacketSummary | None,
     uncertainty: ConfidenceLevel,
+    evidence_maturity: EvidenceMaturity,
 ) -> dict[str, object]:
     return {
         "instructions": [
@@ -7413,6 +7772,7 @@ def _llm_synthesis_payload(
         "project_context": request.project_context,
         "research_only_boundary": RESEARCH_USE_DISCLAIMER,
         "observed_uncertainty": uncertainty,
+        "evidence_maturity": evidence_maturity,
         "retrieval": {
             "retrieval_id": retrieval_manifest.retrieval_id,
             "source": retrieval_manifest.source,
@@ -8294,6 +8654,7 @@ def _compose_answer(
     evidence: list[EvidenceItem],
     papers: dict[str, BiomedicalPaper],
     project_context: str | None,
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
 ) -> str:
     groups: dict[str, list[EvidenceItem]] = {
         "supports": [],
@@ -8324,11 +8685,18 @@ def _compose_answer(
         for item in groups["inconclusive"][:5]:
             lines.append(_evidence_bullet(item, papers))
     lines.append("")
-    lines.append(
-        "Interpretation: the retrieved evidence supports a research association, "
-        "not a clinical or causal conclusion. Limitations and uncertainty should be "
-        "reviewed by a domain expert."
-    )
+    if evidence_maturity == "established_causal_risk_factor":
+        lines.append(
+            "Interpretation: the retrieved evidence supports an established causal "
+            "risk-factor relationship. Limitations apply to quantitative estimates "
+            "and packet completeness, not to the existence of the causal relationship."
+        )
+    else:
+        lines.append(
+            "Interpretation: the retrieved evidence supports a research association, "
+            "not a clinical or causal conclusion. Limitations and uncertainty should be "
+            "reviewed by a domain expert."
+        )
     return "\n".join(lines)
 
 
@@ -8346,6 +8714,12 @@ def _citation_label(paper: BiomedicalPaper | None) -> str:
     return f"{author} et al., {year}; {paper.paper_id}"
 
 
+def _unknown_answer_citations(answer: str, citations: list[Citation]) -> list[str]:
+    known = {citation.paper_id for citation in citations}
+    cited = re.findall(r"(MOCK-PMID-\d+|PMID:\d+|\b\d{5,}\b)", answer)
+    return [paper_id for paper_id in _merge_unique(cited) if paper_id not in known]
+
+
 def _collect_limitations(evidence: list[EvidenceItem]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -8361,14 +8735,120 @@ def _collect_limitations(evidence: list[EvidenceItem]) -> list[str]:
     return result
 
 
-def _uncertainty(evidence: list[EvidenceItem]) -> ConfidenceLevel:
+def _split_answer_evidence(
+    *,
+    question: str,
+    evidence: list[EvidenceItem],
+) -> _AnswerEvidenceSplit:
+    focus_terms = _question_focus_terms(question)
+    direct: list[EvidenceItem] = []
+    contextual: list[EvidenceItem] = []
+    for item in evidence:
+        if item.scope_match == "false":
+            contextual.append(item)
+            continue
+        if focus_terms and not _evidence_mentions_any(item, focus_terms):
+            contextual.append(item)
+            continue
+        direct.append(item)
+    return _AnswerEvidenceSplit(direct=direct or evidence, contextual=contextual)
+
+
+def _question_focus_terms(question: str) -> set[str]:
+    lowered = question.lower()
+    match = re.search(
+        r"\b(?:that|whether|does|do|did)\s+(.+?)\s+"
+        r"(?:causes?|caused|causing|drives?|increase[sd]? risk|risk factor)",
+        lowered,
+    )
+    if match is None:
+        return set()
+    return {
+        term
+        for term in _terms(match.group(1))
+        if term
+        not in {
+            "exposure",
+            "smoking",
+            "use",
+            "using",
+            "consumption",
+            "risk",
+            "factor",
+            "history",
+        }
+    }
+
+
+def _evidence_mentions_any(item: EvidenceItem, terms: set[str]) -> bool:
+    text = " ".join(
+        [
+            item.claim,
+            item.finding,
+            item.evidence_span or "",
+            " ".join(item.methods),
+            " ".join(item.datasets_or_cohorts),
+        ]
+    ).lower()
+    return any(term in text for term in terms)
+
+
+def _uncertainty(
+    evidence: list[EvidenceItem],
+    evidence_maturity: EvidenceMaturity = "emerging_claim",
+) -> ConfidenceLevel:
     if not evidence:
         return "high"
+    if evidence_maturity == "established_causal_risk_factor" and not any(
+        item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence
+    ):
+        return "low"
     if any(
         item.evidence_direction in {"contradicts", "inconclusive"} for item in evidence
     ):
         return "high"
     if any(item.confidence == "low" for item in evidence):
+        return "medium"
+    return "low"
+
+
+def _scientific_confidence(
+    evidence: list[EvidenceItem],
+    evidence_maturity: EvidenceMaturity,
+) -> ConfidenceLevel:
+    if not evidence:
+        return "low"
+    uncertainty = _uncertainty(evidence, evidence_maturity)
+    if uncertainty == "low":
+        return "high"
+    if uncertainty == "medium":
+        return "medium"
+    return "low"
+
+
+def _packet_limitation_level(evidence: list[EvidenceItem]) -> PacketLimitationLevel:
+    if not evidence:
+        return "high"
+    if any(item.evidence_direction == "contradicts" for item in evidence):
+        return "high"
+    if any(item.evidence_direction == "inconclusive" for item in evidence):
+        return "medium"
+    if any(item.confidence == "low" for item in evidence):
+        return "medium"
+    if any(item.limitations for item in evidence):
+        return "medium"
+    return "low"
+
+
+def _review_priority(evidence: list[EvidenceItem]) -> ReviewPriority:
+    if not evidence:
+        return "high"
+    if any(item.evidence_direction == "contradicts" for item in evidence):
+        return "high"
+    if any(
+        item.evidence_direction == "inconclusive" or item.requires_expert_review
+        for item in evidence
+    ):
         return "medium"
     return "low"
 
@@ -8799,7 +9279,7 @@ def _build_answer_revision(
             continue
         revised_lines.append(raw_line)
 
-    final_answer = "\n".join(revised_lines).strip()
+    final_answer = _drop_empty_markdown_sections("\n".join(revised_lines).strip())
     if not final_answer or _only_policy_text(final_answer):
         final_answer = (
             "After claim-level audit, the draft did not contain enough "
@@ -8929,7 +9409,7 @@ def _drop_empty_markdown_sections(answer: str) -> str:
             continue
 
         next_index = index + 1
-        while next_index < len(lines) and not _is_markdown_section_heading(
+        while next_index < len(lines) and not _is_answer_section_boundary(
             lines[next_index]
         ):
             next_index += 1
@@ -8947,11 +9427,30 @@ def _is_markdown_section_heading(line: str) -> bool:
     stripped = line.strip()
     if re.match(r"^#{1,6}\s+\S", stripped):
         return True
+    if _normalized_plain_section_heading(stripped) in {
+        "evidence supporting the hypothesis",
+        "evidence refuting the hypothesis",
+        "evidence against the hypothesis",
+        "inconclusive evidence",
+        "audit limitations",
+    }:
+        return True
     return (
         stripped.startswith("**")
         and stripped.endswith("**")
         and stripped.count("**") == 2
     )
+
+
+def _is_answer_section_boundary(line: str) -> bool:
+    stripped = line.strip().lower()
+    return _is_markdown_section_heading(line) or stripped.startswith(
+        ("interpretation:", "research question:")
+    )
+
+
+def _normalized_plain_section_heading(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip().strip(":").lower())
 
 
 def _build_trace_steps(
@@ -9578,7 +10077,21 @@ def _claim_match_score(line: str, claim: str) -> float:
     claim_terms = set(_terms(claim))
     if not line_terms or not claim_terms:
         return 0.0
+    if len(claim_terms) <= 4:
+        return (
+            1.0
+            if _norm_claim(_answer_claim_body(line)) == _norm_claim(claim)
+            else 0.0
+        )
     return len(line_terms & claim_terms) / len(claim_terms)
+
+
+def _answer_claim_body(line: str) -> str:
+    body = line.strip()
+    if body.startswith("- "):
+        body = body[2:].strip()
+    body = re.sub(r"\s*\[[^\]]+\]\s*$", "", body).strip()
+    return body.strip(" .;:")
 
 
 def _soften_claim_line(line: str, claim: ClaimAuditItem) -> str:
@@ -11042,6 +11555,101 @@ def _normalize_full_text_content(content: str, *, content_type: str) -> str:
     return text.strip()
 
 
+def _xml_full_text_to_markdown(content: str) -> str:
+    soup = BeautifulSoup(content, "xml")
+    sections: list[str] = []
+    for section in soup.find_all("sec"):
+        title_node = section.find("title", recursive=False)
+        title = title_node.get_text(" ", strip=True) if title_node else "Full text"
+        paragraphs = [
+            paragraph.get_text(" ", strip=True)
+            for paragraph in section.find_all("p")
+            if paragraph.get_text(" ", strip=True)
+        ]
+        if paragraphs:
+            sections.append(f"## {title}\n" + "\n\n".join(paragraphs))
+    if sections:
+        return "\n\n".join(sections).strip()
+    text = soup.get_text("\n", strip=True)
+    return f"## Full text\n{text}" if text else ""
+
+
+def _html_full_text_to_markdown(content: str) -> str:
+    soup = BeautifulSoup(content, "html.parser")
+    for node in soup(["script", "style", "nav", "header", "footer"]):
+        node.decompose()
+    sections: list[str] = []
+    title = "Full text"
+    paragraphs: list[str] = []
+    for node in soup.find_all(["h1", "h2", "h3", "p"]):
+        text = node.get_text(" ", strip=True)
+        if not text:
+            continue
+        if node.name in {"h1", "h2", "h3"}:
+            if paragraphs:
+                sections.append(f"## {title}\n" + "\n\n".join(paragraphs))
+                paragraphs = []
+            title = text
+        else:
+            paragraphs.append(text)
+    if paragraphs:
+        sections.append(f"## {title}\n" + "\n\n".join(paragraphs))
+    return "\n\n".join(sections).strip()
+
+
+def _pdf_links_from_html(content: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(content, "html.parser")
+    links: list[str] = []
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        label = anchor.get_text(" ", strip=True).lower()
+        if ".pdf" not in href.lower() and "pdf" not in label:
+            continue
+        links.append(urljoin(base_url, href))
+    return links
+
+
+def _parse_pdf_url_with_knowhere(pdf_url: str) -> tuple[str | None, str | None]:
+    api_key = os.getenv("KNOWHERE_API_KEY")
+    if not api_key:
+        return None, "knowhere_api_key_missing"
+    try:
+        import knowhere  # type: ignore[import-not-found]
+
+        if base_url := os.getenv("KNOWHERE_BASE_URL"):
+            client = knowhere.Knowhere(api_key=api_key, base_url=base_url)
+        else:
+            client = knowhere.Knowhere(api_key=api_key)
+        result = client.parse(
+            url=pdf_url,
+            parsing_params={
+                "model": os.getenv("KNOWHERE_PARSE_MODEL", "advanced"),
+                "ocr_enabled": True,
+            },
+        )
+        markdown = str(getattr(result, "full_markdown", "") or "").strip()
+        if markdown:
+            return markdown, None
+        return None, "knowhere_empty_result"
+    except ImportError:
+        return None, "knowhere_sdk_unavailable"
+    except Exception as exc:
+        return None, f"knowhere_parse_failed:{exc.__class__.__name__}"
+
+
+def _full_text_provider_from_locator(locator: str | None) -> str | None:
+    if not locator:
+        return None
+    lowered = locator.lower()
+    if "pmcoa.cgi" in lowered:
+        return "pmc_bioc"
+    if "europepmc" in lowered:
+        return "europe_pmc"
+    if lowered.endswith(".pdf"):
+        return "knowhere_pdf"
+    return "oa_html"
+
+
 def _full_text_document_id(*, paper_id: str, source: str, source_hash: str) -> str:
     digest = hashlib.sha256(
         f"{source}:{paper_id}:{source_hash}".encode("utf-8")
@@ -11052,6 +11660,10 @@ def _full_text_document_id(*, paper_id: str, source: str, source_hash: str) -> s
 def _full_text_evidence_id(section_id: str, span: str) -> str:
     digest = hashlib.sha256(f"{section_id}:{span}".encode("utf-8")).hexdigest()[:16]
     return f"ev-fulltext-{digest}"
+
+
+def _full_text_lookup_id_type(paper_id: str) -> Literal["pmid", "pmcid"]:
+    return "pmcid" if paper_id.upper().startswith("PMC") else "pmid"
 
 
 def _full_text_sections(

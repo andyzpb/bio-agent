@@ -3,17 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import sys
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from plugins.biomed_evidence.dashboard import register
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    BiomedicalPaper,
     FullTextEnhancementRequest,
+    FullTextIngestionRequest,
 )
 from plugins.biomed_evidence.service import BiomedEvidenceService
 from plugins.biomed_evidence.service import _pubmed_cache_expires_at
@@ -1214,7 +1219,7 @@ def test_biomed_run_full_text_enhance_reuses_stored_document(tmp_path: Path) -> 
         assert second_result["extracted_evidence_ids"] == []
         assert second_result["packet_id"] in {None, ""}
         assert second_result["paper_statuses"][0]["status"] == "cached"
-        assert second_result["paper_statuses"][0]["evidence_ids"] == []
+        assert second_result["paper_statuses"][0]["evidence_ids"]
 
         trace = client.get(f"/api/biomed/answer-runs/{run_id}/trace")
         assert trace.status_code == 200
@@ -1414,7 +1419,9 @@ def test_full_text_enhance_pubmed_requires_open_provider_flag(tmp_path: Path) ->
         )
         service.storage.save_answer_run(pubmed_run, question="pubmed fixture")
 
-        async def fail_fetch(*, paper_id: str, source: str) -> tuple[str | None, str | None, str | None]:
+        async def fail_fetch(
+            *, paper_id: str, source: str
+        ) -> tuple[str | None, str | None, str | None, str | None]:
             raise AssertionError("open provider should not be called when use_open_provider is false")
 
         service._fetch_open_full_text_content = fail_fetch  # type: ignore[method-assign]
@@ -1433,6 +1440,7 @@ def test_full_text_enhance_pubmed_requires_open_provider_flag(tmp_path: Path) ->
     assert result.ok is True
     assert result.result["source"] == "pubmed"
     assert result.result["extracted_evidence_ids"] == []
+    assert result.result["paper_statuses"][0]["provider_status"] == "not_requested"
 
 
 def test_full_text_enhance_pubmed_open_provider_ingests_normalized_text(
@@ -1469,25 +1477,29 @@ def test_full_text_enhance_pubmed_open_provider_ingests_normalized_text(
             assert paper_id in str(request.url)
             return httpx.Response(
                 200,
-                json={
-                    "documents": [
-                        {
-                            "passages": [
-                                {
-                                    "infons": {"section_type": "Results"},
-                                    "text": (
-                                        "Microglial activation was associated with "
-                                        "Alzheimer's disease progression."
-                                    ),
-                                },
-                                {
-                                    "infons": {"section_type": "Methods"},
-                                    "text": "A longitudinal human cohort was used.",
-                                },
-                            ]
-                        }
-                    ]
-                },
+                json=[
+                    {
+                        "source": "PMC",
+                        "infons": {"license": "CC BY"},
+                        "documents": [
+                            {
+                                "passages": [
+                                    {
+                                        "infons": {"section_type": "Results"},
+                                        "text": (
+                                            "Microglial activation was associated with "
+                                            "Alzheimer's disease progression."
+                                        ),
+                                    },
+                                    {
+                                        "infons": {"section_type": "Methods"},
+                                        "text": "A longitudinal human cohort was used.",
+                                    },
+                                ]
+                            }
+                        ],
+                    }
+                ],
             )
 
         service.pubmed_client.client = httpx.AsyncClient(
@@ -1509,6 +1521,12 @@ def test_full_text_enhance_pubmed_open_provider_ingests_normalized_text(
     assert result.ok is True
     assert result.result["extracted_evidence_ids"]
     assert result.result["document_ids"]
+    status = result.result["paper_statuses"][0]
+    assert status["provider"] == "pmc_bioc"
+    assert status["provider_status"] == "fetched"
+    assert status["lookup_id_type"] == "pmid"
+    assert status["source_locator"].endswith(f"/{paper_id}/unicode")
+    assert status["license_or_rights"] == "CC BY"
     assert stored is not None
     document, sections = stored
     assert paper_id in (document.source_filename or "")
@@ -1522,6 +1540,370 @@ def test_full_text_enhance_pubmed_open_provider_ingests_normalized_text(
     )
     assert '"documents"' not in stored_payload
     assert '"passages"' not in stored_payload
+
+
+def test_open_provider_metadata_is_stored_on_full_text_document(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    try:
+        paper = BiomedicalPaper(
+            paper_id="PMID-META",
+            source="pubmed",
+            title="Open provider metadata paper",
+        )
+        service.storage.upsert_paper(paper)
+        ingested = service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper.paper_id,
+                source="pubmed",
+                content="## Results\nOpen full text evidence was available.",
+                source_filename="https://example.org/full-text",
+                provider="pmc_bioc",
+                provider_status="fetched",
+                lookup_id_type="pmid",
+                license_or_rights="CC BY",
+            )
+        )
+        stored = service.storage.get_full_text_document(paper.paper_id, source="pubmed")
+    finally:
+        asyncio.run(service.aclose())
+
+    assert ingested.ok is True
+    assert stored is not None
+    document, _sections = stored
+    assert document.provider == "pmc_bioc"
+    assert document.provider_status == "fetched"
+    assert document.lookup_id_type == "pmid"
+    assert document.license_or_rights == "CC BY"
+
+
+def test_full_text_reanalysis_uses_full_text_evidence_without_overwriting_run(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        answer = client.post(
+            "/api/biomed/answer/audited",
+            json={
+                "question": (
+                    "Does hydroxychloroquine improve outcomes in hospitalized Covid-19?"
+                ),
+                "source": "mock",
+                "max_papers": 1,
+            },
+        )
+        assert answer.status_code == 200
+        original = answer.json()["answer_result"]
+        run_id = original["run_id"]
+        paper_id = original["retrieval_manifest"]["returned_paper_ids"][0]
+        full_text = client.post(
+            f"/api/biomed/papers/{paper_id}/full-text",
+            json={
+                "source": "mock",
+                "content": (
+                    "## Results\n"
+                    "Among patients hospitalized with Covid-19, those who received "
+                    "hydroxychloroquine did not have a lower incidence of death at "
+                    "28 days than those who received usual care."
+                ),
+            },
+        )
+        assert full_text.status_code == 200
+        enhanced = client.post(f"/api/biomed/answer-runs/{run_id}/full-text-enhance")
+        assert enhanced.status_code == 200
+        assert enhanced.json()["result"]["extracted_evidence_ids"]
+
+        response = client.post(f"/api/biomed/answer-runs/{run_id}/full-text-reanalysis")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["answer_result"]["run_id"] != run_id
+    assert payload["answer_result"]["project_context_trace"]["full_text_reanalysis_of"] == run_id
+    assert payload["answer_result"]["evidence_summary"]
+    assert all(
+        item["source_scope"] == "full_text"
+        for item in payload["answer_result"]["evidence_summary"]
+    )
+    assert "hydroxychloroquine" in payload["final_answer"].lower()
+    assert original["run_id"] == run_id
+
+
+def test_open_full_text_provider_treats_html_no_result_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    try:
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text="[Error] : No result can be found.",
+                )
+            )
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="32803250",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert content is None
+    assert locator and "32803250" in locator
+    assert error and "pmc_bioc_no_open_full_text" in error
+    assert license_or_rights is None
+
+
+def test_open_full_text_provider_falls_back_to_europe_pmc_xml(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text="[Error] : No result can be found.",
+                )
+            assert "europepmc" in url
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/xml"},
+                text=(
+                    "<article><body><sec><title>Results</title>"
+                    "<p>Hydroxychloroquine did not reduce mortality.</p>"
+                    "</sec></body></article>"
+                ),
+            )
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="33031652",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert error is None
+    assert locator and "europepmc" in locator
+    assert content and "## Results" in content
+    assert "did not reduce mortality" in content
+    assert license_or_rights is None
+
+
+def test_open_full_text_provider_falls_back_to_unpaywall_html(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.pubmed_client.email = "test@example.org"
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="PMID-DOI",
+            source="pubmed",
+            title="OA paper",
+            doi="10.1234/example",
+        )
+    )
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text="[Error] : No result can be found.",
+                )
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.unpaywall.org" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "best_oa_location": {
+                            "url_for_landing_page": "https://publisher.test/full",
+                            "license": "cc-by",
+                        }
+                    },
+                )
+            assert "publisher.test/full" in url
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=(
+                    "<html><body><h1>Results</h1>"
+                    "<p>Cigarette smoking is a causal risk factor for lung cancer.</p>"
+                    "</body></html>"
+                ),
+            )
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-DOI",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert error is None
+    assert locator == "https://publisher.test/full"
+    assert content and "## Results" in content
+    assert "causal risk factor" in content
+    assert license_or_rights == "cc-by"
+
+
+def test_open_full_text_provider_parses_unpaywall_pdf_with_knowhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeKnowhere:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["api_key"] == "sk-test"
+
+        def parse(self, *, url: str, parsing_params: dict[str, object]) -> object:
+            assert url == "https://publisher.test/open.pdf"
+            return SimpleNamespace(full_markdown="## Results\nOpen PDF evidence.")
+
+    monkeypatch.setenv("KNOWHERE_API_KEY", "sk-test")
+    monkeypatch.setitem(sys.modules, "knowhere", SimpleNamespace(Knowhere=FakeKnowhere))
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.pubmed_client.email = "test@example.org"
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="PMID-PDF",
+            source="pubmed",
+            title="OA PDF paper",
+            doi="10.1234/pdf",
+        )
+    )
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(404)
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.unpaywall.org" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "best_oa_location": {
+                            "url_for_pdf": "https://publisher.test/open.pdf",
+                            "license": "cc-by",
+                        }
+                    },
+                )
+            assert "publisher.test/open.pdf" in url
+            return httpx.Response(200, headers={"content-type": "application/pdf"})
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-PDF",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert error is None
+    assert locator == "https://publisher.test/open.pdf"
+    assert content == "## Results\nOpen PDF evidence."
+    assert license_or_rights == "cc-by"
+
+
+def test_open_full_text_provider_falls_back_to_doi_landing_pdf_with_knowhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parsed_urls: list[str] = []
+
+    class FakeKnowhere:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["api_key"] == "sk-test"
+
+        def parse(self, *, url: str, parsing_params: dict[str, object]) -> object:
+            parsed_urls.append(url)
+            assert parsing_params["ocr_enabled"] is True
+            return SimpleNamespace(
+                full_markdown=(
+                    "## Results\n"
+                    "Cigarette smoke and e-cigs increase proinflammatory cytokine expression."
+                )
+            )
+
+    monkeypatch.setenv("KNOWHERE_API_KEY", "sk-test")
+    monkeypatch.setitem(sys.modules, "knowhere", SimpleNamespace(Knowhere=FakeKnowhere))
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.pubmed_client.email = "test@example.org"
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="37458647",
+            source="pubmed",
+            title="Publisher PDF paper",
+            doi="10.26355/eurrev_202307_32990",
+        )
+    )
+    try:
+        def fake_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text="[Error] : No result can be found.",
+                )
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.unpaywall.org" in url:
+                return httpx.Response(404)
+            if "doi.org" in url:
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text=(
+                        '<html><body><a href="https://publisher.test/paper.pdf">'
+                        "Free PDF Download</a></body></html>"
+                    ),
+                )
+            raise AssertionError(f"unexpected request: {url}")
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake_provider)
+        )
+
+        content, locator, error, license_or_rights = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="37458647",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert error is None
+    assert locator == "https://publisher.test/paper.pdf"
+    assert parsed_urls == ["https://publisher.test/paper.pdf"]
+    assert content and "proinflammatory cytokine" in content
+    assert license_or_rights is None
 
 
 def test_biomed_run_full_text_enhance_blocks_pubmed_without_policy(
