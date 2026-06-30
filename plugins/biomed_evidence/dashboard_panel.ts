@@ -1199,11 +1199,8 @@ function pill(value: string): string {
 }
 
 function answerQualityPills(answer: AnswerResult): string {
-  return [
-    pill(`scientific confidence:${answer.scientific_confidence || "unknown"}`),
-    pill(`packet limitations:${answer.packet_limitation_level || answer.uncertainty_level}`),
-    pill(`review priority:${answer.review_priority || answer.uncertainty_level}`),
-  ].join("");
+  void answer;
+  return "";
 }
 
 function renderList(items: unknown[] | undefined): string {
@@ -2285,16 +2282,50 @@ function answerStatusLabel(
   audit: CitationAuditResult | null,
   revision: AnswerRevision | null | undefined,
 ): string {
+  if (auditAcceptsDisplayedClaims(audit)) return "Answer accepted by audit";
+  if (revision?.final_answer && revision.revision_action === "pass") return "Answer accepted by audit";
+  if (revision?.final_answer && revision.revision_action === "revise") return "Answer revised after audit";
+  if (revision?.revision_action === "refuse" || revision?.revision_action === "abstain") return "No supported answer";
   const action = audit?.recommended_action || revision?.revision_action || "answer";
   if (action === "pass") return "Answer accepted by audit";
-  if (action === "pass_with_limitations") return "Answer accepted with caveats";
+  if (action === "pass_with_limitations") return "Answer passed; inspect packet limits";
   if (action === "revise") return revision?.final_answer ? "Answer revised after audit" : "Revision needed";
   if (action === "refuse_or_abstain" || action === "refuse" || action === "abstain") return "No supported answer";
   return "Answer generated";
 }
 
+function auditAcceptsDisplayedClaims(audit: CitationAuditResult | null): boolean {
+  if (!audit) return false;
+  return (
+    audit.claim_support_rate >= 0.995 &&
+    audit.citation_precision >= 0.995 &&
+    audit.overclaim_rate <= 0 &&
+    audit.failed_claims.length === 0
+  );
+}
+
+function answerTraceStringArray(answer: AnswerResult, key: string): string[] {
+  const value = answer.project_context_trace?.[key];
+  return Array.isArray(value) ? value.map((item) => String(item || "").trim()).filter(Boolean) : [];
+}
+
+function directAnswerEvidenceRows(answer: AnswerResult): EvidenceRow[] {
+  const directEvidenceIds = new Set(answerTraceStringArray(answer, "direct_answer_evidence_ids"));
+  if (directEvidenceIds.size) {
+    const rows = answer.evidence_summary.filter((item) => directEvidenceIds.has(item.evidence_id));
+    if (rows.length) return rows;
+  }
+  const offScopeEvidenceIds = new Set(answerTraceStringArray(answer, "off_scope_evidence_ids"));
+  if (offScopeEvidenceIds.size) {
+    const rows = answer.evidence_summary.filter((item) => !offScopeEvidenceIds.has(item.evidence_id));
+    if (rows.length) return rows;
+  }
+  return answer.evidence_summary;
+}
+
 function evidenceConclusionLabel(answer: AnswerResult): string {
-  const counts = answer.evidence_summary.reduce<Record<string, number>>((acc, item) => {
+  const rows = directAnswerEvidenceRows(answer);
+  const counts = rows.reduce<Record<string, number>>((acc, item) => {
     const key = item.evidence_direction || "unknown";
     acc[key] = (acc[key] || 0) + 1;
     return acc;
@@ -2366,10 +2397,11 @@ function renderTrustSignals(answer: AnswerResult, audit: CitationAuditResult | n
 }
 
 function renderEvidenceThatMatters(answer: AnswerResult): string {
-  const items = answer.evidence_summary
+  const rows = directAnswerEvidenceRows(answer);
+  const items = rows
     .filter((item) => item.evidence_direction !== "inconclusive")
     .slice(0, 4);
-  const fallback = answer.evidence_summary.slice(0, 4);
+  const fallback = rows.slice(0, 4);
   const selected = items.length ? items : fallback;
   return `
     <section class="biomed-output-band">

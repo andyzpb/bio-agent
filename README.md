@@ -1,57 +1,47 @@
-# Akashic Biomedical Evidence Agent
+# bio-agent
 
-Read more about the design: https://andyzpb.github.io/blog/biomedical-evidence-agent/
+`bio-agent` is a research-only biomedical evidence workspace. The interesting
+path is not a chatbot with citations at the end. It is a live PubMed run where
+LLM stages plan, extract, synthesize, verify, revise, and parse claim logic, and
+then the system audits every biomedical claim after the model writes it.
+
+Read the design essay: https://andyzpb.github.io/blog/biomedical-evidence-agent/
 
 Detailed manual: https://andyzpb.github.io/blog/bio-agent-deployment-guide/
 
-Akashic is a plugin-based AI agent framework with memory, tools, background
-workflows, channel integrations, and a FastAPI dashboard. This repository shows
-how that framework can power a **research-only biomedical evidence agent**:
-search papers, extract evidence, audit claims, and make every answer
-inspectable.
+The project is built on the Akashic plugin framework, but the biomedical layer
+has its own safety boundary, retrieval policy, tool contracts, storage, audit
+trail, and dashboard workspace. It is for literature research and review, not
+clinical advice.
 
-Current biomedical baseline: **Release 2.0: Full-Text Evidence Review**, with
-deterministic full-text/PDF ingestion, Research Watch graph drift, Argument
-Graph v2, generic Dashboard Chat, and run-centric Trace/Audit/Export/Review
-workspaces.
+Current biomedical baseline: **Release 2.0: Full-Text Evidence Review**. The
+strongest demo path is live PubMed plus DeepSeek/OpenAI-compatible LLM calls
+with planner, extractor, synthesis, verifier, revision, support/refute search,
+and claim-logic parsing enabled.
 
 ## Highlights
 
-- **Evidence-first answers**: retrieval, extraction, evidence packets,
-  synthesis, citation audit, logic audit, and revision are separate,
-  inspectable steps.
-- **Reviewable claims**: Evidence Graph v1 and Run Evidence Review turn each
-  answer run into claim cards with support/refute/limitation links, reviewer
-  decisions, trace, provenance, and graph hash.
-- **Immutable graph snapshots**: answer runs can be backfilled into persisted
-  Evidence Graph snapshots, stale snapshots are detected from newer audits,
-  snapshot diffs are inspectable, and risky graph states are captured in the
-  project review queue.
-- **Full-text evidence locators**: known papers can store deterministic
-  full-text/PDF parser output as document sections, source hashes, and
-  section/page/character-offset locators. Parser output is not evidence until
-  extracted `EvidenceItem` records pass through packet, audit, graph,
-  provenance, and review contracts.
-- **Release 2.0 reviewer signals**: Research Watch graph drift compares paper,
-  claim, method, limitation, entity, and support-shift changes across
-  snapshots; Argument Graph v2 links support/attack/qualifier relationships
-  back to Evidence Graph node IDs. Both are advisory QA context, not evidence.
-- **Codex-style Biomed workspace**: the plugin is organized around Chat, Runs,
-  Review Queue, Library, and Settings. Runs are the main inspector surface for
-  review, diff, trace, evidence packet, audit, logic, argument, math, and
-  provenance artifacts; Library includes Watch drift and full-text inspection.
-- **Framework-native Dashboard Chat**: chat runs through the shared `dashboard`
-  channel, agent loop, session history, event stream, and tool hooks; biomedical
-  policy stays in the plugin. Dashboard chat replies default to English unless
-  the user asks for another language.
-- **Research-only safety**: clinical or patient-specific prompts are refused
-  before memory, retrieval, LLM calls, export, or provenance work.
-- **Toolized workflow**: retrieval, batch extraction, gap analysis, packet
-  building, trace lookup, provenance export, Obsidian export, and release smoke
-  are exposed as structured tools.
-- **Works offline by default**: demos and evals use deterministic mock
-  literature data. Live PubMed and DeepSeek/OpenAI-compatible LLM calls are
-  opt-in and covered by release smoke artifacts.
+- **Live PubMed, not a fake demo**: the live path checks source readiness,
+  stores retrieval manifests, persists papers, and keeps warnings visible
+  before an LLM drafts anything.
+- **All-LLM chain, narrow jobs**: planner, extractor, synthesis, advisory
+  verifier, revision, and claim-logic parser can all run in one audited path.
+  Each stage records mode, model, prompt hash, fallback reason, and trace data.
+- **Post-synthesis citation audit**: the answer is parsed back into atomic
+  claims after synthesis. Citations are checked against the evidence packet,
+  producing claim support rate, citation precision, overclaim rate,
+  uncertainty calibration, failed claims, and a recommended action.
+- **LLM logic parser, deterministic judge**: the LLM can parse claim and
+  evidence frames, but deterministic rules decide whether association,
+  mechanism, animal or in-vitro evidence, weak evidence, or biomarker evidence
+  actually entails the generated claim.
+- **Review cockpit**: the dashboard keeps the final answer, audit checks,
+  evidence items, packet limitations, scientific confidence, review priority,
+  trace, full text, and review actions together.
+- **Research-only boundary**: patient-specific or clinical requests are refused
+  before memory, retrieval, LLM calls, export, or provenance work can run.
+- **Offline by default**: deterministic mock literature keeps demos and evals
+  repeatable. Live PubMed and provider-backed LLM calls are explicit opt-ins.
 
 ## Dashboard
 
@@ -63,9 +53,9 @@ uv run python main.py dashboard
 
 Open `http://127.0.0.1:2236` and select **Biomedical Evidence**. The panel is
 organized as Chat, Runs, Review Queue, Library, and Settings. Use Runs as the
-main workbench: create or open an answer run, inspect review/snapshot status,
-compare graph snapshots, trace the evidence packet, audit claim support, and
-export redacted provenance when needed.
+main workbench: create or open an answer run, inspect the evidence packet,
+audit claim support, compare pre/post-revision audit state, inspect claim logic,
+and export redacted provenance when needed.
 
 Try:
 
@@ -74,8 +64,8 @@ What recent evidence links microglial activation to Alzheimer's disease progress
 ```
 
 Patient-specific clinical requests are refused by design. Dashboard Chat is a
-generic framework channel, with Biomedical Evidence policy, source readiness,
-tool contracts, and command previews surfaced before execution.
+generic framework channel, but Biomedical Evidence keeps the source policy,
+tool contracts, LLM options, and command previews in the plugin.
 
 ### Dashboard Chat and `/biomed` commands
 
@@ -98,10 +88,11 @@ Useful commands:
 /biomed export provenance biomed-run-...
 ```
 
-The composer keeps the common Biomedical Evidence actions visible as compact
-chips: Help, Status, Mock audit, and Live audit. Type `/` for the full command
-palette, then preview readiness, setup needs, run IDs, or confirmation
-requirements before anything is sent.
+The live audit command is the main high-signal path: live PubMed retrieval,
+LLM planner, LLM extractor, LLM synthesis, LLM advisory verifier, LLM revision,
+support/refute search, claim-logic parsing, post-revision audit, and trace
+metadata in one run. The composer keeps common actions visible as compact
+chips: Help, Status, Mock audit, and Live audit.
 
 Dashboard screenshots and demo recordings are generated as release artifacts,
 not committed to the source tree.

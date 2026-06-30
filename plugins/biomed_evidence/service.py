@@ -3071,17 +3071,6 @@ class BiomedEvidenceService:
         run = self.storage.get_answer_run(request.run_id)
         if run is None:
             return None
-        available_evidence = [
-            item
-            for item in run.evidence_summary
-            if item.source_scope in {"full_text", "pdf"}
-        ]
-        evidence = _select_full_text_reanalysis_evidence(
-            available_evidence,
-            max_items=max(1, request.max_evidence_items),
-        )
-        if not evidence:
-            return None
         question = _pilot_question(run) or run.answer[:240]
         source = (
             run.retrieval_manifest.source
@@ -3090,6 +3079,17 @@ class BiomedEvidenceService:
             if run.citations
             else "mock"
         )
+        available_evidence = self._full_text_reanalysis_candidates(
+            run,
+            source=source,
+            research_question=question,
+        )
+        evidence = _select_full_text_reanalysis_evidence(
+            available_evidence,
+            max_items=max(1, request.max_evidence_items),
+        )
+        if not evidence:
+            return None
         papers = {
             item.paper_id: paper
             for item in evidence
@@ -3219,6 +3219,42 @@ class BiomedEvidenceService:
             trace=trace,
             final_action=revision.revision_action,
         )
+
+    def _full_text_reanalysis_candidates(
+        self,
+        run: AnswerWithEvidenceResult,
+        *,
+        source: str,
+        research_question: str,
+    ) -> list[EvidenceItem]:
+        candidates = _unique_evidence_items(
+            item
+            for item in run.evidence_summary
+            if item.source_scope in {"full_text", "pdf"}
+        )
+        seen = {item.evidence_id for item in candidates}
+        for paper_id in _full_text_reanalysis_paper_ids(run):
+            stored = [
+                item
+                for item in self.storage.get_evidence_for_paper(paper_id)
+                if item.source_scope in {"full_text", "pdf"}
+            ]
+            if not stored and self.storage.get_full_text_document(
+                paper_id,
+                source=source,
+            ):
+                extracted = self.extract_full_text_evidence(
+                    paper_id=paper_id,
+                    source=source,
+                    research_question=research_question,
+                )
+                stored = extracted.evidence if extracted is not None else []
+            for item in stored:
+                if item.evidence_id in seen:
+                    continue
+                candidates.append(item)
+                seen.add(item.evidence_id)
+        return candidates
 
     def extract_evidence(
         self,
@@ -4994,7 +5030,7 @@ class BiomedEvidenceService:
                 model=self.revision_model,
                 prompt_hash=prompt_hash,
             )
-        except Exception:
+        except Exception as exc:
             return _fallback_advisory_verifier(
                 draft_result=draft_result,
                 audit=audit,
@@ -5003,7 +5039,8 @@ class BiomedEvidenceService:
                 prompt_hash=prompt_hash,
                 fallback_reason=(
                     "LLM verifier was requested, but the advisory verifier adapter "
-                    "fell back to deterministic audit only."
+                    "fell back to deterministic audit only. "
+                    f"{type(exc).__name__}: {_normalize_space(str(exc))[:300]}"
                 ),
             )
 
@@ -9350,15 +9387,15 @@ def _compose_answer(
         lines.append("Inconclusive evidence:")
         for item in groups["inconclusive"][:5]:
             lines.append(_evidence_bullet(item, papers))
-    if groups["background"]:
+    direct_evidence_count = (
+        len(groups["supports"]) + len(groups["contradicts"]) + len(groups["inconclusive"])
+    )
+    if groups["background"] and direct_evidence_count == 0:
         lines.append("")
         lines.append("Background or contextual evidence:")
         for item in groups["background"][:5]:
             lines.append(_evidence_bullet(item, papers))
     lines.append("")
-    direct_evidence_count = (
-        len(groups["supports"]) + len(groups["contradicts"]) + len(groups["inconclusive"])
-    )
     if direct_evidence_count == 0:
         lines.append(
             "Interpretation: the retrieved evidence is contextual and does not "
@@ -9580,7 +9617,7 @@ def _llm_advisory_verifier_payload(
             if draft_result.retrieval_manifest is not None
             else None
         ),
-        "deterministic_audit": audit.model_dump(mode="json"),
+        "deterministic_audit": _slim_advisory_audit(audit),
         "output_schema": {
             "advisory_action": "pass|pass_with_limitations|revise|refuse_or_abstain|needs_expert_review",
             "claim_reviews": [
@@ -9599,6 +9636,54 @@ def _llm_advisory_verifier_payload(
             "errors": ["optional errors"],
         },
     }
+
+
+def _slim_advisory_audit(audit: CitationAuditResult) -> dict[str, object]:
+    return {
+        "audit_id": audit.audit_id,
+        "run_id": audit.run_id,
+        "retrieval_id": audit.retrieval_id,
+        "recommended_action": audit.recommended_action,
+        "claim_support_rate": audit.claim_support_rate,
+        "citation_precision": audit.citation_precision,
+        "unsupported_claim_rate": audit.unsupported_claim_rate,
+        "overclaim_rate": audit.overclaim_rate,
+        "conflict_awareness": audit.conflict_awareness,
+        "uncertainty_calibrated": audit.uncertainty_calibrated,
+        "uncertainty_audit": audit.uncertainty_audit.model_dump(mode="json"),
+        "claim_audits": [
+            _slim_advisory_claim_audit(item) for item in audit.claim_audits[:20]
+        ],
+        "failed_claim_ids": [item.claim_id for item in audit.failed_claims[:20]],
+        "warnings": audit.warnings[:10],
+        "errors": audit.errors[:10],
+    }
+
+
+def _slim_advisory_claim_audit(item: ClaimAuditItem) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "claim_id": item.claim_id,
+        "claim": item.claim,
+        "claim_type": item.claim_type,
+        "claim_role": item.claim_role,
+        "cited_paper_ids": item.cited_paper_ids,
+        "evidence_ids": item.evidence_ids,
+        "verdict": item.verdict,
+        "support_score": item.support_score,
+        "evidence_strength": item.evidence_strength,
+        "overclaim_reason": item.overclaim_reason,
+        "reason": item.reason,
+        "reviewer_notes": item.reviewer_notes[:5],
+    }
+    if item.logic_audit is not None:
+        payload["logic_summary"] = {
+            "logic_verdict": item.logic_audit.logic_verdict,
+            "entailment_score": item.logic_audit.entailment_score,
+            "rules_triggered": item.logic_audit.rules_triggered[:10],
+            "reason": item.logic_audit.reason,
+            "warnings": item.logic_audit.warnings[:5],
+        }
+    return payload
 
 
 def _fallback_advisory_verifier(
@@ -9886,7 +9971,7 @@ def _build_answer_revision(
         if use_llm_revision
         else None
     )
-    if clinical_boundary or audit.recommended_action == "refuse_or_abstain":
+    if clinical_boundary:
         final_answer = clinical_refusal()
         return AnswerRevision(
             revision_id=_revision_id(draft_result.run_id, audit.audit_id),
@@ -9972,12 +10057,10 @@ def _build_answer_revision(
                     f"Removed uncited audited claim: {match.claim}"
                 )
                 continue
-            softened = _core_overclaim_rewrite(raw_line, match)
-            revised_lines.append(softened)
-            softened_claims.append(match.claim)
+            removed_claims.append(match.claim)
             changed_claims.append(match.claim)
             reason = match.overclaim_reason or match.reason
-            added_limitations.append(f"Softened audited claim: {reason}")
+            added_limitations.append(f"Removed overclaimed audited claim: {reason}")
             continue
         revised_lines.append(raw_line)
 
@@ -10002,13 +10085,6 @@ def _build_answer_revision(
             if removed_claims
             else "unchanged"
         )
-    conflict_or_uncertainty = (
-        not audit.conflict_awareness
-        or not audit.uncertainty_calibrated
-        or any(item.verdict == "contradicted" for item in audit.failed_claims)
-    )
-    if added_limitations or conflict_or_uncertainty:
-        final_answer = _append_audit_limitations(final_answer, added_limitations, audit)
     final_answer = _strip_research_disclaimer(final_answer)
     return AnswerRevision(
         revision_id=_revision_id(draft_result.run_id, audit.audit_id),
@@ -10836,16 +10912,6 @@ def _soften_claim_line(line: str, claim: ClaimAuditItem) -> str:
     elif claim.overclaim_reason:
         softened = f"Audit-softened claim: {softened}"
     return f"{prefix}{softened}"
-
-
-def _core_overclaim_rewrite(line: str, claim: ClaimAuditItem) -> str:
-    prefix = "- " if line.strip().startswith("- ") else ""
-    citations = " ".join(f"[{paper_id}]" for paper_id in claim.cited_paper_ids)
-    citation_suffix = f" {citations}" if citations else ""
-    return (
-        f"{prefix}The cited evidence supports a narrower claim, but not the "
-        f"stronger audited wording.{citation_suffix}"
-    )
 
 
 def _append_audit_limitations(
@@ -12606,6 +12672,28 @@ def _select_full_text_reanalysis_evidence(
         if not added:
             break
     return selected
+
+
+def _unique_evidence_items(items: Iterable[EvidenceItem]) -> list[EvidenceItem]:
+    selected: list[EvidenceItem] = []
+    seen: set[str] = set()
+    for item in items:
+        if item.evidence_id in seen:
+            continue
+        selected.append(item)
+        seen.add(item.evidence_id)
+    return selected
+
+
+def _full_text_reanalysis_paper_ids(run: AnswerWithEvidenceResult) -> list[str]:
+    paper_ids: list[str] = []
+    paper_ids.extend(item.paper_id for item in run.evidence_summary)
+    paper_ids.extend(item.paper_id for item in run.citations)
+    if run.retrieval_manifest is not None:
+        paper_ids.extend(run.retrieval_manifest.returned_paper_ids)
+    if run.retrieval_bundle is not None:
+        paper_ids.extend(run.retrieval_bundle.deduped_paper_ids)
+    return _merge_unique(paper_ids)
 
 
 def _full_text_reanalysis_item_score(item: EvidenceItem) -> int:

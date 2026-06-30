@@ -53,10 +53,22 @@ def test_run_result_label_prefers_post_revision_audit_action() -> None:
     source = Path("plugins/biomed_evidence/dashboard_panel.ts").read_text()
 
     assert "function answerStatusLabel(" in source
-    assert "Answer accepted with caveats" in source
+    assert 'revision.revision_action === "revise"' in source
+    assert "auditAcceptsDisplayedClaims" in source
+    assert "Answer accepted by audit" in source
+    assert "Answer accepted with caveats" not in source
     assert "Evidence conclusion:" in source
     assert "Audit action" in source
     assert "final_action: activeTrace.latest_citation_audit.recommended_action || activeTrace.revision.revision_action || \"pass\"" in source
+
+
+def test_run_summary_uses_direct_answer_evidence_for_conclusion() -> None:
+    source = Path("plugins/biomed_evidence/dashboard_panel.ts").read_text()
+
+    assert "direct_answer_evidence_ids" in source
+    assert "directAnswerEvidenceRows" in source
+    assert "function evidenceConclusionLabel(answer: AnswerResult): string" in source
+    assert "const rows = directAnswerEvidenceRows(answer);" in source
 
 
 def test_pubmed_audited_planner_uses_assisted_llm_chain() -> None:
@@ -146,9 +158,6 @@ def test_biomed_pills_have_high_coverage_tooltips() -> None:
     ]:
         assert f'"{tag}"' in source
     for dynamic_prefix in [
-        'value.startsWith("scientific confidence:")',
-        'value.startsWith("packet limitations:")',
-        'value.startsWith("review priority:")',
         'value.match(/^claim citation support ',
         'value.match(/^citation alignment ',
         'value.match(/^\\d+ evidence$/)',

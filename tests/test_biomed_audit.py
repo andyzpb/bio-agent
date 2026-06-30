@@ -21,11 +21,14 @@ from plugins.biomed_evidence.schemas import (
     CitationAuditRequest,
     ClaimAuditItem,
     EvidenceItem,
+    LogicAuditResult,
+    LogicFactExport,
     UncertaintyAudit,
 )
 from plugins.biomed_evidence.service import (
     BiomedEvidenceService,
     _build_answer_revision,
+    _llm_advisory_verifier_payload,
     _normalize_llm_answer_text,
     _remove_failed_claim_lines,
 )
@@ -339,7 +342,7 @@ def test_revision_removes_peripheral_and_search_meta_failed_claims() -> None:
     assert revision.revision_action_detail == "removed_peripheral_claims"
 
 
-def test_revision_uses_fixed_template_for_core_overclaim() -> None:
+def test_revision_removes_core_overclaim_instead_of_emitting_template_claim() -> None:
     draft = "Persistent high-risk HPV infection causes cervical cancer. [PMID:1]"
     failed = [
         _failed_claim(
@@ -358,9 +361,63 @@ def test_revision_uses_fixed_template_for_core_overclaim() -> None:
         fallback_reason_override="test",
     )
 
-    assert "The cited evidence supports a narrower claim" in revision.final_answer
+    assert "The cited evidence supports a narrower claim" not in revision.final_answer
     assert "is the is associated with of" not in revision.final_answer
-    assert revision.revision_action_detail == "rewritten_core_claims"
+    assert revision.revision_action == "abstain"
+
+
+def test_revision_keeps_audit_operation_notes_out_of_final_answer() -> None:
+    draft = (
+        "Smoking causes lung cancer. [PMID:1]\n"
+        "Background or contextual evidence:"
+    )
+    failed = [
+        _failed_claim(
+            "Background or contextual evidence:",
+            role="core_answer",
+            verdict="not_cited",
+        )
+    ]
+
+    revision = _build_answer_revision(
+        draft_result=_answer_result(draft),
+        audit=_audit_with_failed_claims(failed, action="revise"),
+        clinical_boundary=False,
+        use_llm_revision=True,
+        fallback_reason_override="test",
+    )
+
+    assert "Background or contextual evidence" not in revision.final_answer
+    assert "Audit limitations:" not in revision.final_answer
+    assert "Removed unsupported claim:" not in revision.final_answer
+    assert revision.added_limitations
+
+
+def test_nonclinical_refuse_or_abstain_keeps_supported_revised_answer() -> None:
+    draft = (
+        "Hydroxychloroquine did not reduce 28-day mortality in hospitalized COVID-19 patients. [PMID:1]\n"
+        "Background or contextual evidence:"
+    )
+    failed = [
+        _failed_claim(
+            "Background or contextual evidence:",
+            role="core_answer",
+            verdict="not_cited",
+        )
+    ]
+
+    revision = _build_answer_revision(
+        draft_result=_answer_result(draft),
+        audit=_audit_with_failed_claims(failed, action="refuse_or_abstain"),
+        clinical_boundary=False,
+        use_llm_revision=True,
+        fallback_reason_override="test",
+    )
+
+    assert revision.revision_action == "revise"
+    assert revision.refusal_reason is None
+    assert "Hydroxychloroquine did not reduce 28-day mortality" in revision.final_answer
+    assert "I cannot help diagnose a patient" not in revision.final_answer
 
 
 def test_established_causal_risk_factor_review_is_not_overclaimed() -> None:
@@ -581,7 +638,7 @@ async def test_answer_with_audit_persists_revision_and_trace(tmp_path: Path) -> 
     assert len(trace_again) == 11
 
 
-def test_answer_revision_softens_overclaim() -> None:
+def test_answer_revision_removes_overclaim_without_template_claim() -> None:
     evidence = MOCK_EVIDENCE["MOCK-PMID-1001"]
     draft = (
         f"{RESEARCH_USE_DISCLAIMER}\n\n"
@@ -612,11 +669,9 @@ def test_answer_revision_softens_overclaim() -> None:
     )
 
     assert isinstance(revision, AnswerRevision)
-    assert revision.revision_action == "revise"
-    assert revision.softened_claims
+    assert revision.revision_action == "abstain"
     assert "causes Alzheimer's disease progression" not in revision.final_answer
-    assert "The cited evidence supports a narrower claim" in revision.final_answer
-    assert revision.revision_action_detail == "rewritten_core_claims"
+    assert "The cited evidence supports a narrower claim" not in revision.final_answer
 
 
 def test_answer_revision_keeps_supported_lines_when_removing_short_failed_claim() -> None:
@@ -824,6 +879,42 @@ class _FakeAdvisoryVerifierProvider:
         )
 
 
+class _FailingAdvisoryVerifierProvider:
+    async def chat(
+        self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False
+    ):
+        raise RuntimeError("verifier kaboom")
+
+
+def test_advisory_verifier_payload_sends_slim_audit_summary() -> None:
+    claim = _failed_claim("Smoking causes lung cancer.", role="core_answer")
+    claim = claim.model_copy(
+        update={
+            "logic_audit": LogicAuditResult(
+                claim_id=claim.claim_id,
+                evidence_ids=claim.evidence_ids,
+                logic_verdict="overclaimed",
+                entailment_score=0.35,
+                reason="long logic details",
+                logic_fact_export=LogicFactExport(
+                    export_id="facts-heavy",
+                    claim_id=claim.claim_id,
+                    text="x" * 10000,
+                ),
+            )
+        }
+    )
+    payload = _llm_advisory_verifier_payload(
+        request=AnswerWithEvidenceRequest(question="Does smoking cause lung cancer?"),
+        draft_result=_answer_result("Smoking causes lung cancer. [PMID:1]"),
+        audit=_audit_with_failed_claims([claim]),
+    )
+
+    claim_payload = payload["deterministic_audit"]["claim_audits"][0]
+    assert "logic_audit" not in claim_payload
+    assert len(json.dumps(payload)) < 5000
+
+
 @pytest.mark.asyncio
 async def test_answer_with_audit_records_verifier_fallback_without_provider(
     tmp_path: Path,
@@ -852,6 +943,34 @@ async def test_answer_with_audit_records_verifier_fallback_without_provider(
     assert any(
         step.step == "advisory_verify" and step.status == "completed"
         for step in audited.trace
+    )
+
+
+@pytest.mark.asyncio
+async def test_advisory_verifier_fallback_records_exception_detail(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=_FailingAdvisoryVerifierProvider(),
+        revision_model="fake-advisory-verifier",
+    )
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_verifier=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert audited.advisory_verifier is not None
+    assert audited.advisory_verifier.verifier_mode == "fallback"
+    assert "RuntimeError: verifier kaboom" in (
+        audited.advisory_verifier.fallback_reason or ""
     )
 
 

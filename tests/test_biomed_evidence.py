@@ -19,7 +19,9 @@ from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceResult,
     AnswerRevision,
     BiomedProjectCreateRequest,
+    BiomedicalQueryPlan,
     BiomedicalPaper,
+    Citation,
     EvidenceExtractionRequest,
     EvidenceItem,
     FullTextEnhancementRequest,
@@ -261,6 +263,37 @@ def test_causal_risk_maturity_ignores_secondary_cessation_outcomes() -> None:
         )
         == "established_causal_risk_factor"
     )
+
+
+def test_compose_answer_omits_contextual_background_when_direct_evidence_exists() -> None:
+    direct = EvidenceItem(
+        evidence_id="ev-direct",
+        paper_id="PMID:DIRECT",
+        claim="Cigarette smoking is a major risk factor for lung cancer.",
+        finding="Cigarette smoking is a major risk factor for lung cancer.",
+        evidence_direction="supports",
+        confidence="high",
+    )
+    context = EvidenceItem(
+        evidence_id="ev-context",
+        paper_id="PMID:CONTEXT",
+        claim="Current smoking is associated with emotional problems after diagnosis.",
+        finding="Current smoking is associated with emotional problems after diagnosis.",
+        evidence_direction="background",
+        confidence="medium",
+    )
+
+    answer = service._compose_answer(
+        question="What evidence supports that cigarette smoking causes lung cancer?",
+        evidence=[direct, context],
+        papers={},
+        project_context=None,
+    )
+
+    assert "Evidence supporting the hypothesis:" in answer
+    assert "Cigarette smoking is a major risk factor" in answer
+    assert "Background or contextual evidence:" not in answer
+    assert "emotional problems after diagnosis" not in answer
 
 
 def test_background_only_evidence_is_not_described_as_supporting_association() -> None:
@@ -2487,6 +2520,76 @@ async def test_full_text_reanalysis_balances_evidence_across_papers(
     assert trace["full_text_reanalysis_available_paper_count"] == 3
     assert trace["full_text_reanalysis_used_paper_count"] == 3
     assert "single paper" not in str(trace.get("full_text_reanalysis_coverage_warning", ""))
+
+
+@pytest.mark.asyncio
+async def test_full_text_reanalysis_extracts_cached_documents_for_related_papers(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        for paper_id in ["PAPER-A", "PAPER-B"]:
+            service.storage.upsert_paper(
+                BiomedicalPaper(
+                    paper_id=paper_id,
+                    source="mock",
+                    title=f"{paper_id} smoking lung cancer study",
+                    abstract="Abstract.",
+                )
+            )
+        initial = _full_text_reanalysis_item("PAPER-A", 0)
+        service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id="PAPER-B",
+                source="mock",
+                content=(
+                    "## Results\n"
+                    "PAPER-B smoking exposure was associated with increased lung cancer risk."
+                ),
+            )
+        )
+        run = AnswerWithEvidenceResult(
+            run_id="biomed-run-cached-fulltext",
+            answer="Draft answer.",
+            citations=[
+                Citation(
+                    paper_id="PAPER-B",
+                    title="PAPER-B",
+                    source="mock",
+                    cited_claim="PAPER-B cached full text.",
+                )
+            ],
+            evidence_summary=[initial],
+            conflicting_evidence=[],
+            limitations=[],
+            uncertainty_level="medium",
+            disclaimer=RESEARCH_USE_DISCLAIMER,
+            query_plan=BiomedicalQueryPlan(
+                plan_id="plan-cached-fulltext",
+                question="Does smoking cause lung cancer?",
+                source="mock",
+                primary_query="smoking lung cancer",
+            ),
+        )
+        service.storage.save_answer_run(
+            run,
+            question="Does smoking cause lung cancer?",
+        )
+
+        reanalyzed = await service.reanalyze_run_with_full_text(
+            FullTextReanalysisRequest(
+                run_id=run.run_id,
+                max_evidence_items=4,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert reanalyzed is not None
+    selected_papers = {
+        item.paper_id for item in reanalyzed.answer_result.evidence_summary
+    }
+    assert {"PAPER-A", "PAPER-B"}.issubset(selected_papers)
 
 
 def test_full_text_evidence_prefers_results_sections(tmp_path: Path) -> None:
