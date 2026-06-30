@@ -11,9 +11,8 @@ def derive_evidence_maturity(
     evidence: list[EvidenceItem],
 ) -> EvidenceMaturity:
     question_text = question.lower()
-    text = " ".join(
+    evidence_text = " ".join(
         [
-            question,
             *[
                 " ".join(
                     [
@@ -30,11 +29,32 @@ def derive_evidence_maturity(
     ).lower()
     if _has_clinical_intervention_language(question_text):
         return "clinical_intervention_claim"
-    if _has_causal_risk_language(text) and _has_authority_language(text):
+    if _has_authority_language(evidence_text) and any(
+        _is_positive_causal_evidence(item) for item in evidence
+    ):
         return "established_causal_risk_factor"
-    if _has_association_language(text) and _has_authority_language(text):
+    if _has_association_language(evidence_text) and _has_authority_language(evidence_text):
         return "established_association"
     return "emerging_claim"
+
+
+def _is_positive_causal_evidence(item: EvidenceItem) -> bool:
+    if item.evidence_direction != "supports":
+        return False
+    text = _evidence_text(item)
+    return _has_causal_risk_language(text) and not _has_negated_causal_language(text)
+
+
+def _evidence_text(item: EvidenceItem) -> str:
+    return " ".join(
+        [
+            item.claim,
+            item.finding,
+            item.evidence_span or "",
+            " ".join(item.methods),
+            " ".join(item.limitations),
+        ]
+    ).lower()
 
 
 def _has_causal_risk_language(text: str) -> bool:
@@ -45,6 +65,18 @@ def _has_causal_risk_language(text: str) -> bool:
             r"primary cause|aetiological factor|etiological factor|carcinogen|"
             r"causes?|attributable to|dose[- ]response|cessation reduces risk"
             r")\b",
+            text,
+        )
+    )
+
+
+def _has_negated_causal_language(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b("
+            r"no evidence|no convincing evidence|insufficient evidence|"
+            r"does not|did not|cannot|fails? to|not clearly|not establish(?:ed)?"
+            r").{0,100}\b(caus|causal|link|associated|association)",
             text,
         )
     )

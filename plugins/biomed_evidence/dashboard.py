@@ -189,14 +189,14 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> list[object]:
         return result.model_dump(mode="json")
 
     @app.post("/api/biomed/answer-runs/{run_id}/full-text-reanalysis")
-    def reanalyze_run_with_full_text(
+    async def reanalyze_run_with_full_text(
         run_id: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request = FullTextReanalysisRequest.model_validate(
             {**(payload or {}), "run_id": run_id}
         )
-        result = service.reanalyze_run_with_full_text(request)
+        result = await service.reanalyze_run_with_full_text(request)
         if result is None:
             raise HTTPException(status_code=404, detail="full text evidence not found")
         return result.model_dump(mode="json")

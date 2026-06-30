@@ -16,11 +16,15 @@ from plugins.biomed_evidence.literature_client import (
 )
 from plugins.biomed_evidence.schemas import (
     AnswerWithEvidenceRequest,
+    AnswerWithEvidenceResult,
+    AnswerRevision,
     BiomedProjectCreateRequest,
     BiomedicalPaper,
     EvidenceExtractionRequest,
     EvidenceItem,
+    FullTextEnhancementRequest,
     FullTextIngestionRequest,
+    FullTextReanalysisRequest,
     GenerateProjectEvidenceBriefRequest,
     LiteratureAccessCheckRequest,
     LiteraturePaperRecord,
@@ -66,6 +70,63 @@ SMOKING_SCLC_EVIDENCE = EvidenceItem(
 )
 
 
+class _FakeLogicResponse:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _FakeFullTextLogicProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, **kwargs: Any) -> _FakeLogicResponse:
+        self.calls += 1
+        payload = json.loads(str(kwargs["messages"][-1]["content"]))
+        return _FakeLogicResponse(json.dumps(_logic_parser_payload_response(payload)))
+
+
+def _logic_parser_payload_response(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_frames": [
+            {
+                "claim_id": claim["claim_id"],
+                "claim_text": claim["claim_text"],
+                "subject": {"text": "hydroxychloroquine", "entity_type": "drug"},
+                "predicate": "associated_with",
+                "object": {"text": "clinical outcomes", "entity_type": "disease"},
+                "polarity": "negative",
+                "modality": "suggestive",
+                "population": "human",
+                "claim_strength": "association",
+                "scope": [],
+                "qualifiers": [],
+                "hedging": True,
+                "source_spans": [claim["claim_text"]],
+            }
+            for claim in payload["claims"]
+        ],
+        "evidence_frames": [
+            {
+                "evidence_id": item["evidence_id"],
+                "paper_id": item["paper_id"],
+                "evidence_text": item["evidence_text"],
+                "subject": {"text": "hydroxychloroquine", "entity_type": "drug"},
+                "predicate": "associated_with",
+                "object": {"text": "clinical outcomes", "entity_type": "disease"},
+                "polarity": "negative",
+                "modality": "suggestive",
+                "population": "human",
+                "model_system": None,
+                "study_design": "randomized_trial",
+                "evidence_strength": "interventional",
+                "limitations": item.get("limitations", []),
+                "source_spans": [item["evidence_text"]],
+            }
+            for item in payload["evidence_items"]
+        ],
+    }
+
+
 @pytest.mark.asyncio
 async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
     service = BiomedEvidenceService(tmp_path)
@@ -92,6 +153,38 @@ async def test_mock_answer_is_citation_grounded(tmp_path: Path) -> None:
     assert any(
         item.evidence_direction == "supports" for item in result.evidence_summary
     )
+
+
+@pytest.mark.asyncio
+async def test_mock_answer_abstains_when_retrieved_evidence_is_off_topic(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.answer_with_evidence(
+            AnswerWithEvidenceRequest(
+                question=(
+                    "What evidence supports or refutes that persistent high-risk "
+                    "human papillomavirus infection causes cervical cancer?"
+                ),
+                source="mock",
+                max_papers=5,
+                use_llm_planner=True,
+                execute_support_refute=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.evidence_summary
+    assert not result.citations
+    assert "could not retrieve citation-backed evidence" in result.answer
+    assert "microglia" not in result.answer.lower()
+    assert "alzheimer" not in result.answer.lower()
+    assert result.project_context_trace is not None
+    assert result.project_context_trace["direct_answer_evidence_ids"] == []
+    assert result.evidence_packet is not None
+    assert result.evidence_packet.stop_reason == "no_relevant_evidence"
 
 
 def test_established_causal_risk_factor_changes_interpretation_template() -> None:
@@ -170,6 +263,42 @@ def test_causal_risk_maturity_ignores_secondary_cessation_outcomes() -> None:
     )
 
 
+def test_background_only_evidence_is_not_described_as_supporting_association() -> None:
+    item = EvidenceItem(
+        evidence_id="ev-background",
+        paper_id="PMID:BACKGROUND",
+        claim="Background reproductive biology evidence.",
+        finding=(
+            "The paper reports pregnancies in hermaphrodites but does not establish "
+            "self-fertilisation."
+        ),
+        evidence_direction="background",
+        entities=[],
+        methods=[],
+        limitations=["Does not address self-fertilisation directly."],
+        confidence="medium",
+    )
+    answer = service._compose_answer(
+        question="Would a hermaphrodite become pregnant through self-fertilisation?",
+        evidence=[item],
+        papers={
+            "PMID:BACKGROUND": BiomedicalPaper(
+                paper_id="PMID:BACKGROUND",
+                title="Background paper",
+                source="pubmed",
+                abstract="",
+                authors=["Researcher"],
+                publication_date="2024",
+            )
+        },
+        project_context=None,
+    )
+
+    assert "Background or contextual evidence:" in answer
+    assert "supports a research association" not in answer
+    assert "does not directly answer" in answer
+
+
 def test_established_causal_risk_maturity_is_not_smoking_specific() -> None:
     evidence = [
         EvidenceItem(
@@ -197,6 +326,58 @@ def test_established_causal_risk_maturity_is_not_smoking_specific() -> None:
         )
         == "established_causal_risk_factor"
     )
+
+
+def test_causal_risk_maturity_requires_established_causal_evidence_not_question_wording() -> None:
+    evidence = [
+        EvidenceItem(
+            evidence_id="ev-apap-association",
+            paper_id="PMID:APAP",
+            claim=(
+                "Prenatal paracetamol exposure is associated with ADHD and ASD "
+                "in observational studies."
+            ),
+            finding=(
+                "Systematic review and meta-analysis evidence reports observational "
+                "associations, but sibling analyses attenuate estimates toward null."
+            ),
+            evidence_direction="inconclusive",
+            evidence_span=(
+                "Existing evidence does not clearly link maternal paracetamol use "
+                "during pregnancy with autism or ADHD in offspring."
+            ),
+            methods=["systematic review", "meta-analysis", "sibling analysis"],
+            limitations=["observational confounding", "familial confounding"],
+            confidence="high",
+        ),
+        EvidenceItem(
+            evidence_id="ev-apap-negated-causal",
+            paper_id="PMID:APAP-REG",
+            claim="Regulatory summaries do not establish that paracetamol causes autism.",
+            finding=(
+                "Public health guidance states that there is no evidence paracetamol "
+                "use in pregnancy causes autism in children."
+            ),
+            evidence_direction="supports",
+            evidence_span=(
+                "There is no evidence paracetamol use in pregnancy causes autism "
+                "in children."
+            ),
+            methods=["public health guidance"],
+            confidence="high",
+        ),
+    ]
+
+    maturity = service._derive_evidence_maturity(
+        question=(
+            "What evidence supports or refutes the hypothesis that prenatal "
+            "acetaminophen exposure causes autism or ADHD in offspring?"
+        ),
+        evidence=evidence,
+    )
+
+    assert maturity != "established_causal_risk_factor"
+    assert maturity == "established_association"
 
 
 def test_relevance_gate_keeps_off_topic_inconclusive_out_of_main_answer() -> None:
@@ -240,6 +421,41 @@ def test_relevance_gate_keeps_off_topic_inconclusive_out_of_main_answer() -> Non
     )
     assert service._packet_limitation_level([direct, off_topic]) == "medium"
     assert service._review_priority([direct, off_topic]) == "medium"
+
+
+def test_trace_answer_run_uses_latest_revision_as_display_answer(tmp_path: Path) -> None:
+    service_instance = BiomedEvidenceService(tmp_path)
+    try:
+        run = AnswerWithEvidenceResult(
+            run_id="biomed-run-revised-display",
+            answer="Draft answer with an overclaimed causal interpretation.",
+            citations=[],
+            evidence_summary=[],
+            conflicting_evidence=[],
+            limitations=[],
+            uncertainty_level="high",
+            disclaimer=RESEARCH_USE_DISCLAIMER,
+        )
+        service_instance.storage.save_answer_run(run, question="Does exposure cause outcome?")
+        revision = AnswerRevision(
+            revision_id="revision-revised-display",
+            run_id=run.run_id,
+            audit_id="audit-revised-display",
+            revision_mode="llm",
+            draft_answer=run.answer,
+            final_answer="Revised answer: evidence does not establish causality.",
+            revision_action="revise",
+            created_at="2026-06-29T00:00:00+00:00",
+        )
+        service_instance.storage.save_answer_revision(revision)
+
+        trace = service_instance.get_answer_trace(run.run_id)
+    finally:
+        service_instance.storage.close()
+
+    assert trace is not None
+    answer_run = cast(dict[str, Any], trace["answer_run"])
+    assert answer_run["answer"] == revision.final_answer
 
 
 def test_unknown_answer_citations_are_detected() -> None:
@@ -469,6 +685,55 @@ async def test_plan_biomedical_search_accepts_covid_randomized_trial_query(
     assert '"Randomized Controlled Trial"[Publication Type]' in (
         result.validation.compiled_query
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_accepts_exposure_outcome_research_question(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question=(
+                    "What evidence supports or refutes the hypothesis that prenatal "
+                    "acetaminophen/paracetamol exposure causes autism spectrum "
+                    "disorder or ADHD in offspring?"
+                ),
+                source="pubmed",
+                max_results=5,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.classification.intent == "research_question"
+    assert result.classification.allowed_next_step == "plan_retrieval"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+    assert result.search_request.query
+
+
+@pytest.mark.asyncio
+async def test_plan_biomedical_search_keeps_non_research_question_out_of_scope(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What evidence supports that my laptop battery is draining quickly?",
+                source="pubmed",
+                max_results=5,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert result.classification.intent == "out_of_scope"
+    assert result.classification.allowed_next_step == "abstain"
+    assert result.query_plan is None
+    assert result.validation.valid is False
 
 
 @pytest.mark.asyncio
@@ -929,6 +1194,70 @@ class _FakePlannerResponse:
         self.content = content
 
 
+class _FakeFalseAbstainRecoveryProvider:
+    def __init__(self) -> None:
+        self.planner_calls = 0
+        self.verifier_calls = 0
+
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
+        system = str(messages[0]["content"])
+        payload = json.loads(messages[-1]["content"])
+        if "classify biomedical user questions" in system:
+            self.planner_calls += 1
+            return _FakePlannerResponse(
+                json.dumps(
+                    {
+                        "classification": {
+                            "intent": "out_of_scope",
+                            "normalized_question": payload["question"],
+                            "clinical_boundary": False,
+                            "needs_clarification": False,
+                            "risk_flags": ["non_biomedical"],
+                            "allowed_next_step": "abstain",
+                            "rationale": "mistaken non-biomedical classification",
+                        },
+                        "query_plan": payload["deterministic_query_plan"],
+                    }
+                )
+            )
+        if "advisory biomedical claim verifier" in system:
+            self.verifier_calls += 1
+            return _FakePlannerResponse(
+                json.dumps(
+                    {
+                        "advisory_action": "pass_with_limitations",
+                        "claim_reviews": [
+                            {
+                                "claim": payload["answer"],
+                                "advisory_verdict": "not_cited",
+                                "advisory_action": "pass_with_limitations",
+                                "risk_level": "medium",
+                                "cited_paper_ids": [],
+                                "rationale": (
+                                    "The question is a biomedical literature question "
+                                    "about reproductive biology and could be supported "
+                                    "by evidence."
+                                ),
+                            }
+                        ],
+                        "warnings": [
+                            "The answer incorrectly categorizes the user's question as not a biomedical literature research question."
+                        ],
+                        "errors": [],
+                    }
+                )
+            )
+        raise AssertionError(f"Unexpected fake provider call: {system}")
+
+
 class _FakePlannerProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -1111,6 +1440,46 @@ class _FakeExtractorProvider:
         )
 
 
+class _FakeFullTextEvidenceReaderProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages,
+        tools,
+        model,
+        max_tokens,
+        tool_choice="auto",
+        disable_thinking=False,
+    ):
+        self.calls += 1
+        payload = json.loads(messages[-1]["content"])
+        chunk = payload["chunk"]["text"]
+        span = (
+            "Hydroxychloroquine did not reduce 28-day mortality in hospitalized "
+            "COVID-19 patients."
+        )
+        assert span in chunk
+        return _FakePlannerResponse(
+            json.dumps(
+                {
+                    "spans": [
+                        {
+                            "span": span,
+                            "direction": "contradicts",
+                            "claim_type": "treatment",
+                            "population": "human",
+                            "outcome": "28-day mortality",
+                            "why_relevant": "Direct trial outcome in the requested population.",
+                            "limitations": ["Open-label trial."],
+                        }
+                    ]
+                }
+            )
+        )
+
+
 class _FakeSynthesisProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -1172,6 +1541,97 @@ async def test_plan_biomedical_search_can_use_injected_llm_planner(
     assert result.query_plan.llm_model == "fake-light-router"
     assert result.validation.valid is True
     assert result.search_request is not None
+
+
+@pytest.mark.asyncio
+async def test_llm_planner_can_rescue_nonclinical_out_of_scope_classification(
+    tmp_path: Path,
+) -> None:
+    provider = _FakePlannerProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-light-router",
+    )
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="What evidence supports that quantum entanglement changes memory?",
+                source="mock",
+                max_results=5,
+                use_llm_planner=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.calls == 1
+    assert result.classification.intent == "research_question"
+    assert result.classification.classifier_mode == "llm"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+
+
+@pytest.mark.asyncio
+async def test_llm_planner_cannot_downgrade_biomedical_question_to_abstain(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeFalseAbstainRecoveryProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-light-router",
+    )
+    try:
+        result = await service.plan_biomedical_search(
+            PlanBiomedicalSearchRequest(
+                question="Would a hermaphrodite become pregnant through self-fertilisation?",
+                source="pubmed",
+                max_results=5,
+                use_llm_planner=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.planner_calls == 1
+    assert result.classification.intent == "research_question"
+    assert result.classification.allowed_next_step == "plan_retrieval"
+    assert result.validation.valid is True
+    assert result.search_request is not None
+
+
+@pytest.mark.asyncio
+async def test_answer_audit_runs_retrieval_when_llm_planner_attempts_false_abstain(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeFalseAbstainRecoveryProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-router-verifier",
+    )
+    try:
+        result = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="Would a hermaphrodite become pregnant through self-fertilisation?",
+                source="mock",
+                max_papers=3,
+                use_llm_planner=True,
+                use_llm_verifier=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert provider.planner_calls == 1
+    assert provider.verifier_calls >= 1
+    assert result.answer_result.retrieval_id is not None
+    assert result.answer_result.question_classification is not None
+    assert result.answer_result.question_classification.intent == "research_question"
+    assert "not appear to be a biomedical literature research question" not in (
+        result.final_answer
+    )
 
 
 @pytest.mark.asyncio
@@ -1378,6 +1838,94 @@ class _FlakyPubMedClient(_FakePubMedClient):
         return await super().get(url, params=params)
 
 
+class _RateLimitedPubMedClient(_FakePubMedClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rate_limited_once = False
+
+    async def get(self, url: str, *, params: dict[str, Any]):
+        self.calls.append((url, dict(params)))
+        if url.endswith("esearch.fcgi") and not self.rate_limited_once:
+            self.rate_limited_once = True
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"Retry-After": "2"},
+                text="too many requests",
+            )
+        return await super().get(url, params=params)
+
+
+class _ZeroThenRelaxedPubMedClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def get(self, url: str, *, params: dict[str, Any]):
+        self.calls.append((url, dict(params)))
+        if url.endswith("esearch.fcgi"):
+            term = str(params.get("term") or "")
+            if "[MeSH Terms]" in term or " NOT " in term:
+                return _FakePubMedResponse("""
+                    <eSearchResult>
+                      <Count>0</Count>
+                      <IdList></IdList>
+                    </eSearchResult>
+                    """)
+            return _FakePubMedResponse("""
+                <eSearchResult>
+                  <Count>1</Count>
+                  <IdList><Id>9101</Id></IdList>
+                </eSearchResult>
+                """)
+        return _FakePubMedResponse("""
+            <PubmedArticleSet>
+              <PubmedArticle>
+                <MedlineCitation>
+                  <PMID>9101</PMID>
+                  <Article>
+                    <ArticleTitle>Fertility in ovotesticular disorder of sex development</ArticleTitle>
+                    <Abstract><AbstractText>Pregnancy and fertility questions are discussed in ovotesticular disorder of sex development.</AbstractText></Abstract>
+                  </Article>
+                </MedlineCitation>
+              </PubmedArticle>
+            </PubmedArticleSet>
+            """)
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_relaxes_overconstrained_zero_result_query(
+    tmp_path: Path,
+) -> None:
+    fake = _ZeroThenRelaxedPubMedClient()
+    service = BiomedEvidenceService(
+        tmp_path,
+        http_client=cast(httpx.AsyncClient, fake),
+    )
+    try:
+        result = await service.search_with_manifest(
+            SearchBiomedicalLiteratureRequest(
+                query="intersex ovotesticular self fertilization pregnancy",
+                source="pubmed",
+                max_results=3,
+                mesh_terms=["Hermaphroditism", "Fertilization", "Pregnancy"],
+                exclude_terms=["case report"],
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert [item.paper_id for item in result.items] == ["9101"]
+    manifest = result.retrieval_manifest
+    assert manifest.deduped_result_count == 1
+    assert any("relaxed" in warning for warning in manifest.warnings)
+    esearch_terms = [
+        str(params["term"]) for url, params in fake.calls if url.endswith("esearch.fcgi")
+    ]
+    assert "[MeSH Terms]" in esearch_terms[0]
+    assert "[MeSH Terms]" not in esearch_terms[1]
+
+
 @pytest.mark.asyncio
 async def test_pubmed_search_trace_records_pagination_with_fake_http() -> None:
     fake = _FakePubMedClient()
@@ -1418,6 +1966,52 @@ async def test_pubmed_search_trace_records_retry_and_redacts_api_key() -> None:
     assert any("ConnectError" in item for item in warnings)
     params = cast(list[dict[str, object]], result.trace["request_parameters"])
     assert params[0]["api_key"] == "***redacted***"
+
+
+@pytest.mark.asyncio
+async def test_pubmed_client_respects_retry_after_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _RateLimitedPubMedClient()
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("plugins.biomed_evidence.literature_client.asyncio.sleep", fake_sleep)
+    client = PubMedLiteratureClient(
+        client=cast(httpx.AsyncClient, fake),
+        retry_backoff_seconds=0.0,
+        rate_limit_requests_per_second=0.0,
+    )
+
+    result = await client.search_with_trace("microglia", max_results=1, page_size=1)
+
+    assert result.items
+    assert 2.0 in sleeps
+    warnings = cast(list[str], result.trace["warnings"])
+    assert any("status=429" in item and "retrying" in item for item in warnings)
+
+
+@pytest.mark.asyncio
+async def test_pubmed_client_rate_limits_sequential_eutils_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakePubMedClient()
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("plugins.biomed_evidence.literature_client.asyncio.sleep", fake_sleep)
+    client = PubMedLiteratureClient(
+        client=cast(httpx.AsyncClient, fake),
+        rate_limit_requests_per_second=2.0,
+    )
+
+    await client.search_with_trace("microglia", max_results=1, page_size=1)
+
+    assert any(delay >= 0.45 for delay in sleeps)
 
 
 @pytest.mark.asyncio
@@ -1641,6 +2235,8 @@ def test_full_text_ingestion_extracts_locator_backed_evidence(tmp_path: Path) ->
     assert extracted.evidence
     item = extracted.evidence[0]
     assert item.source_scope == "full_text"
+    assert not any("abstract" in limitation.lower() for limitation in item.limitations)
+    assert item.confidence == "medium"
     assert item.document_id == ingested.document.document_id
     assert item.section_id == ingested.sections[0].section_id
     assert item.section_label == "Results"
@@ -1650,6 +2246,247 @@ def test_full_text_ingestion_extracts_locator_backed_evidence(tmp_path: Path) ->
     assert graph is not None
     evidence_nodes = [node for node in graph.nodes if node.type == "EvidenceSpan"]
     assert any(node.properties.get("source_scope") == "full_text" for node in evidence_nodes)
+
+
+def test_full_text_evidence_sentence_splitter_keeps_vs_statistics(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        paper = BiomedicalPaper(
+            paper_id="MOCK-FULLTEXT-STATS",
+            source="mock",
+            title="Hydroxychloroquine hospitalized COVID-19 trial",
+            abstract="Abstract-level summary only.",
+        )
+        service.storage.upsert_paper(paper)
+        service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper.paper_id,
+                source="mock",
+                content=(
+                    "## Results\n"
+                    "Allocation to hydroxychloroquine was associated with a longer "
+                    "time until discharge alive from hospital than usual care "
+                    "(median 16 days vs. 13 days)."
+                ),
+            )
+        )
+        extracted = service.extract_full_text_evidence(
+            paper_id=paper.paper_id,
+            source="mock",
+            research_question="hydroxychloroquine hospitalized COVID-19 outcomes",
+        )
+    finally:
+        service.storage.close()
+
+    assert extracted is not None
+    assert extracted.evidence
+    span = extracted.evidence[0].evidence_span
+    assert span is not None
+    assert "vs. 13 days" in span
+    assert span.endswith("(median 16 days vs. 13 days).")
+
+
+@pytest.mark.asyncio
+async def test_full_text_reanalysis_uses_provider_backed_logic_parser(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeFullTextLogicProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-fulltext-logic",
+    )
+    try:
+        run = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="Does hydroxychloroquine improve hospitalized COVID-19 outcomes?",
+                source="mock",
+                max_papers=1,
+            )
+        )
+        paper_id = run.answer_result.retrieval_manifest.returned_paper_ids[0]
+        service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper_id,
+                source="mock",
+                content=(
+                    "## Results\n"
+                    "Among patients hospitalized with Covid-19, those who received "
+                    "hydroxychloroquine did not have a lower incidence of death at "
+                    "28 days than those who received usual care."
+                ),
+            )
+        )
+        await service.enhance_run_with_full_text(
+            FullTextEnhancementRequest(run_id=run.answer_result.run_id)
+        )
+        reanalyzed = await service.reanalyze_run_with_full_text(
+            FullTextReanalysisRequest(
+                run_id=run.answer_result.run_id,
+                use_llm_claim_logic=True,
+                export_logic_facts=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert reanalyzed is not None
+    assert provider.calls >= 1
+    audit_step = next(step for step in reanalyzed.trace if step.step == "audit")
+    logic_trace = audit_step.metadata["logic_audit"]
+    assert isinstance(logic_trace, dict)
+    assert logic_trace["parser_models"] == ["fake-fulltext-logic"]
+    assert logic_trace["parser_mode_counts"]["llm"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_full_text_enhancement_uses_llm_span_reader(
+    tmp_path: Path,
+) -> None:
+    provider = _FakeFullTextEvidenceReaderProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-fulltext-reader",
+    )
+    try:
+        run = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question=(
+                    "What randomized trial evidence supports or refutes that "
+                    "hydroxychloroquine improves outcomes in hospitalized COVID-19?"
+                ),
+                source="mock",
+                max_papers=1,
+            )
+        )
+        paper_id = run.answer_result.retrieval_manifest.returned_paper_ids[0]
+        service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper_id,
+                source="mock",
+                content=(
+                    "## Methods\n"
+                    "Patients were randomized in an open-label platform trial.\n\n"
+                    "## Results\n"
+                    "Hydroxychloroquine did not reduce 28-day mortality in hospitalized "
+                    "COVID-19 patients. The study stopped early for lack of efficacy.\n\n"
+                    "## References\n"
+                    "Hydroxychloroquine trials and COVID-19 review articles."
+                ),
+            )
+        )
+        await service.enhance_run_with_full_text(
+            FullTextEnhancementRequest(run_id=run.answer_result.run_id)
+        )
+        stored = service.storage.get_answer_run(run.answer_result.run_id)
+    finally:
+        await service.aclose()
+
+    assert provider.calls >= 1
+    assert stored is not None
+    full_text_items = [
+        item for item in stored.evidence_summary if item.source_scope == "full_text"
+    ]
+    assert full_text_items
+    item = full_text_items[0]
+    assert item.extraction_mode == "llm_span"
+    assert item.evidence_direction == "contradicts"
+    assert item.extractor_model == "fake-fulltext-reader"
+    assert item.evidence_span == (
+        "Hydroxychloroquine did not reduce 28-day mortality in hospitalized "
+        "COVID-19 patients."
+    )
+    assert item.char_start is not None and item.char_start >= 0
+    assert item.char_end is not None and item.char_end > item.char_start
+    assert "References" not in item.finding
+
+
+def _full_text_reanalysis_item(
+    paper_id: str,
+    index: int,
+    *,
+    direction: str = "supports",
+) -> EvidenceItem:
+    return EvidenceItem(
+        evidence_id=f"ev-{paper_id}-{index}",
+        paper_id=paper_id,
+        claim=f"{paper_id} full-text claim {index}",
+        finding=f"{paper_id} full-text finding {index}",
+        evidence_direction=cast(Any, direction),
+        entities=[],
+        methods=[],
+        datasets_or_cohorts=[],
+        limitations=[],
+        confidence="medium",
+        evidence_span=f"{paper_id} full-text finding {index}",
+        source_scope="full_text",
+        section_id=f"section-{paper_id}-{index}",
+        section_label="Results",
+        char_start=0,
+        char_end=20,
+        source_hash=f"hash-{paper_id}-{index}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_text_reanalysis_balances_evidence_across_papers(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        papers = ["PAPER-A", "PAPER-B", "PAPER-C"]
+        for paper_id in papers:
+            service.storage.upsert_paper(
+                BiomedicalPaper(
+                    paper_id=paper_id,
+                    source="mock",
+                    title=f"{paper_id} trial",
+                    abstract="Abstract.",
+                )
+            )
+        evidence = [
+            *[
+                _full_text_reanalysis_item("PAPER-A", index)
+                for index in range(12)
+            ],
+            _full_text_reanalysis_item("PAPER-B", 0, direction="contradicts"),
+            _full_text_reanalysis_item("PAPER-C", 0),
+        ]
+        run = AnswerWithEvidenceResult(
+            run_id="biomed-run-balanced-fulltext",
+            answer="Draft answer.",
+            citations=[],
+            evidence_summary=evidence,
+            conflicting_evidence=[
+                item for item in evidence if item.evidence_direction == "contradicts"
+            ],
+            limitations=[],
+            uncertainty_level="medium",
+            disclaimer=RESEARCH_USE_DISCLAIMER,
+        )
+        service.storage.save_answer_run(run, question="Does treatment improve outcomes?")
+
+        reanalyzed = await service.reanalyze_run_with_full_text(
+            FullTextReanalysisRequest(
+                run_id=run.run_id,
+                max_evidence_items=4,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert reanalyzed is not None
+    selected_papers = {
+        item.paper_id for item in reanalyzed.answer_result.evidence_summary
+    }
+    assert selected_papers == {"PAPER-A", "PAPER-B", "PAPER-C"}
+    trace = reanalyzed.answer_result.project_context_trace
+    assert trace["full_text_reanalysis_available_paper_count"] == 3
+    assert trace["full_text_reanalysis_used_paper_count"] == 3
+    assert "single paper" not in str(trace.get("full_text_reanalysis_coverage_warning", ""))
 
 
 def test_full_text_evidence_prefers_results_sections(tmp_path: Path) -> None:
@@ -1687,6 +2524,52 @@ def test_full_text_evidence_prefers_results_sections(tmp_path: Path) -> None:
     assert extracted is not None
     assert extracted.evidence
     assert extracted.evidence[0].section_label == "Results"
+
+
+def test_full_text_evidence_skips_non_finding_sections(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        paper = BiomedicalPaper(
+            paper_id="PMID-FULLTEXT-NOISE",
+            source="pubmed",
+            title="Paracetamol pregnancy neurodevelopment umbrella review",
+            abstract="Abstract-level summary only.",
+        )
+        service.storage.upsert_paper(paper)
+        service.ingest_full_text(
+            FullTextIngestionRequest(
+                paper_id=paper.paper_id,
+                source="pubmed",
+                content=(
+                    "## Results\n"
+                    "Existing evidence does not clearly link maternal paracetamol use "
+                    "during pregnancy with autism or ADHD in offspring.\n\n"
+                    "## References\n"
+                    "Prenatal Exposure to Acetaminophen and Risk for Attention Deficit "
+                    "Hyperactivity Disorder and Autistic Spectrum Disorder: A Systematic "
+                    "Review, Meta-Analysis, and Meta-Regression Analysis of Cohort Studies.\n\n"
+                    "## Competing interests\n"
+                    "All authors completed the ICMJE disclosure form and report no "
+                    "financial relationships with organisations related to this work."
+                ),
+            )
+        )
+        extracted = service.extract_full_text_evidence(
+            paper_id=paper.paper_id,
+            source="pubmed",
+            research_question=(
+                "Does prenatal acetaminophen exposure cause autism or ADHD?"
+            ),
+        )
+    finally:
+        service.storage.close()
+
+    assert extracted is not None
+    assert extracted.evidence
+    labels = {item.section_label for item in extracted.evidence}
+    assert "Results" in labels
+    assert "References" not in labels
+    assert "Competing interests" not in labels
 
 
 def test_full_text_extraction_uses_question_terms_when_entities_are_unknown(

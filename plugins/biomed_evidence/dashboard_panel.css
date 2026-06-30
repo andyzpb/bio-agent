@@ -112,6 +112,14 @@
   gap: 2px;
 }
 
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .sessions-pane {
+  width: 52px;
+}
+
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .explorer-nav {
+  padding: 10px 6px;
+}
+
 .biomed-plugin-nav-item {
   width: 100%;
   border: 0;
@@ -146,6 +154,22 @@
   display: none;
   color: var(--text-soft, #5f6664);
   font-size: 11px;
+}
+
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .biomed-plugin-nav-item {
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .biomed-plugin-nav-item span,
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .biomed-plugin-nav-item small {
+  display: none;
+}
+
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .biomed-plugin-nav-item::before {
+  content: attr(data-biomed-short);
+  font-size: 13px;
+  font-weight: 760;
 }
 
 .biomed-section {
@@ -390,6 +414,7 @@
 .biomed-pill {
   display: inline-flex;
   align-items: center;
+  position: relative;
   border-radius: 999px;
   padding: 2px 8px;
   font-size: 11px;
@@ -398,6 +423,38 @@
   background: var(--neutral-soft, #ece6db);
   color: var(--text, #141413);
   white-space: nowrap;
+}
+
+.biomed-pill[data-biomed-tooltip] {
+  cursor: help;
+}
+
+.biomed-pill[data-biomed-tooltip]::after {
+  content: attr(data-biomed-tooltip);
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 50;
+  display: none;
+  width: max-content;
+  max-width: min(280px, 80vw);
+  padding: 7px 9px;
+  border: 1px solid var(--line-strong, #a8a8a2);
+  border-radius: 6px;
+  background: var(--paper-strong, #fff);
+  color: var(--text, #171717);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.biomed-pill[data-biomed-tooltip]:hover::after,
+.biomed-pill[data-biomed-tooltip]:focus-visible::after {
+  display: block;
 }
 
 .biomed-pill-supports,
@@ -729,6 +786,15 @@
   color: #991b1b;
 }
 
+.biomed-warning {
+  color: #7c2d12;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  padding: 10px;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 720px) {
   .biomed-two-col {
     grid-template-columns: 1fr;
@@ -769,8 +835,9 @@
 }
 
 .biomed-workspace {
+  --biomed-inspector-width: 420px;
   display: grid;
-  grid-template-columns: minmax(220px, 280px) minmax(440px, 1fr) minmax(340px, 430px);
+  grid-template-columns: minmax(0, 1fr) var(--biomed-inspector-width, 420px);
   height: 100%;
   max-height: calc(100vh - 52px);
   min-height: 720px;
@@ -799,6 +866,29 @@
   min-height: 0;
   overflow: hidden;
   border-right: 1px solid var(--line, #dfe3e2);
+}
+
+.biomed-agent-rail-toggle {
+  align-self: flex-end;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line, #dfe3e2);
+  border-radius: 999px;
+  background: var(--paper-strong, #fff);
+  color: var(--text, #171717);
+  cursor: pointer;
+  font-size: 18px;
+  font-weight: 760;
+  line-height: 1;
+}
+
+.workspace.plugin-workbench-mode.biomed-rail-collapsed:has(.biomed-plugin-nav) .biomed-agent-rail-toggle {
+  align-self: center;
+}
+
+.biomed-agent-rail-toggle:hover {
+  border-color: var(--line-strong, #b8c1bf);
+  background: #e7eceb;
 }
 
 .biomed-agent-brand {
@@ -863,6 +953,15 @@
   color: var(--text-soft, #5f6664);
   font-size: 12px;
   line-height: 1.4;
+}
+
+.biomed-breakable,
+.biomed-breakable-list li {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 
 .biomed-rail-actions {
@@ -1109,9 +1208,7 @@
   padding: 16px 18px;
   border-bottom: 1px solid var(--line, #deded8);
   background: var(--paper-strong, #fff);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  display: block;
 }
 
 .biomed-composer-head {
@@ -1119,6 +1216,34 @@
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.biomed-composer-head::-webkit-details-marker {
+  display: none;
+}
+
+.biomed-composer-head::before {
+  content: "▾";
+  color: var(--text-soft, #62645f);
+  font-weight: 820;
+  margin-top: 2px;
+}
+
+.biomed-composer:not([open]) .biomed-composer-head::before {
+  content: "▸";
+}
+
+.biomed-composer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.biomed-composer:not([open]) .biomed-composer-body {
+  display: none;
 }
 
 .biomed-composer-title {
@@ -1162,6 +1287,45 @@
   display: grid;
   grid-template-columns: minmax(140px, 1fr) 130px 92px;
   gap: 8px;
+}
+
+.biomed-run-setup-bar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto minmax(160px, 0.8fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.biomed-run-setup-bar label:not(.biomed-live-toggle) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-soft, #62645f);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.biomed-run-setup-bar button {
+  border: 1px solid var(--line, #deded8);
+  background: var(--paper-strong, #fff);
+  color: var(--text, #171717);
+  border-radius: 7px;
+  padding: 8px 11px;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.biomed-run-setup-bar button:hover {
+  border-color: var(--line-strong, #b9bab3);
+  background: #f2f3ef;
+}
+
+.biomed-recent-drawer summary {
+  cursor: pointer;
+  color: var(--text-soft, #62645f);
+  font-size: 12px;
+  font-weight: 740;
 }
 
 .biomed-command-row label {
@@ -1598,9 +1762,57 @@
 .biomed-run-hero,
 .biomed-output-band {
   border: 1px solid var(--line, #deded8);
-  border-radius: 8px;
+  border-radius: 16px;
   background: var(--paper-strong, #fff);
-  padding: 13px;
+  padding: 18px;
+}
+
+.biomed-cockpit-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+}
+
+.biomed-cockpit-hero h2 {
+  margin: 5px 0 4px;
+  font-size: 28px;
+  line-height: 1.1;
+  text-transform: capitalize;
+}
+
+.biomed-cockpit-hero p {
+  margin: 0;
+  color: var(--text-soft, #62645f);
+  font-size: 14px;
+  line-height: 1.45;
+  max-width: 760px;
+}
+
+.biomed-answer-trust-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.85fr);
+  gap: 14px;
+}
+
+.biomed-final-answer-panel {
+  min-width: 0;
+}
+
+.biomed-answer-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.biomed-section-title {
+  color: var(--text, #171717);
+  font-size: 12px;
+  font-weight: 840;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-bottom: 9px;
 }
 
 .biomed-run-kicker,
@@ -1652,6 +1864,107 @@
   overflow-wrap: anywhere;
 }
 
+.biomed-trust-panel {
+  border-radius: 16px;
+  padding: 18px;
+  background: #111111;
+  color: #ffffff;
+}
+
+.biomed-trust-panel .biomed-section-title {
+  color: #c9ccc6;
+}
+
+.biomed-trust-copy {
+  display: grid;
+  gap: 13px;
+}
+
+.biomed-trust-copy div {
+  min-width: 0;
+}
+
+.biomed-trust-copy strong,
+.biomed-trust-copy span {
+  display: block;
+  line-height: 1.45;
+}
+
+.biomed-trust-copy strong {
+  color: #ffffff;
+}
+
+.biomed-trust-copy span {
+  color: #cfd2cc;
+  margin-top: 2px;
+}
+
+.biomed-stat-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.biomed-stat-strip div {
+  min-width: 0;
+  border: 1px solid var(--line, #deded8);
+  border-radius: 14px;
+  padding: 14px;
+  background: var(--paper-strong, #fff);
+}
+
+.biomed-stat-strip span,
+.biomed-stat-strip small {
+  display: block;
+  color: var(--text-soft, #62645f);
+}
+
+.biomed-stat-strip span {
+  font-size: 11px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.biomed-stat-strip strong {
+  display: block;
+  margin: 6px 0 3px;
+  font-size: 22px;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.biomed-important-evidence-list {
+  display: grid;
+  gap: 8px;
+}
+
+.biomed-important-evidence-list article {
+  display: grid;
+  grid-template-columns: minmax(82px, 0.35fr) minmax(0, 1fr) minmax(70px, 0.25fr);
+  gap: 12px;
+  align-items: center;
+  border-radius: 12px;
+  padding: 12px;
+  background: #f8f9f7;
+}
+
+.biomed-important-evidence-list code,
+.biomed-important-evidence-list strong,
+.biomed-important-evidence-list span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.biomed-important-evidence-list span {
+  color: #0f766e;
+  font-weight: 820;
+  text-align: right;
+}
+
+.biomed-important-evidence-list span.is-contradicting {
+  color: #991b1b;
+}
+
 .biomed-answer-large {
   border: 0;
   padding: 0;
@@ -1660,12 +1973,32 @@
 }
 
 .biomed-agent-inspector {
+  position: relative;
   min-width: 0;
   min-height: 0;
   background: #fbfbfa;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
+}
+
+.biomed-inspector-resizer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 3;
+  width: 8px;
+  border: 0;
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+  background: transparent;
+  cursor: col-resize;
+  padding: 0;
+}
+
+.biomed-inspector-resizer:hover,
+.biomed-inspector-resizer:focus-visible {
+  background: rgba(23, 23, 23, 0.06);
+  outline: none;
 }
 
 .biomed-inspector-empty,
@@ -1717,6 +2050,28 @@
   background: var(--paper-strong, #fff);
   border-color: var(--line, #deded8);
   color: var(--text, #171717);
+}
+
+.biomed-advanced-artifacts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.biomed-advanced-artifacts button {
+  border: 1px solid var(--line, #deded8);
+  border-radius: 7px;
+  background: var(--paper-strong, #fff);
+  color: var(--text, #171717);
+  cursor: pointer;
+  font-weight: 720;
+  padding: 8px;
+  text-align: left;
+}
+
+.biomed-advanced-artifacts button:hover {
+  background: #f2f3ef;
+  border-color: var(--line-strong, #b9bab3);
 }
 
 .biomed-inspector-content {
@@ -2123,7 +2478,7 @@
 
 @media (max-width: 1180px) {
   .biomed-workspace {
-    grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
+    grid-template-columns: 1fr;
   }
 
   .biomed-chat-workspace {
@@ -2164,6 +2519,19 @@
     grid-column: 1 / -1;
     min-height: 420px;
     border-top: 1px solid var(--line, #deded8);
+  }
+
+  .biomed-inspector-resizer {
+    display: none;
+  }
+
+  .biomed-answer-trust-layout,
+  .biomed-stat-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .biomed-cockpit-hero {
+    flex-direction: column;
   }
 }
 
@@ -2275,12 +2643,24 @@
     grid-template-columns: 1fr;
   }
 
+  .biomed-run-setup-bar {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .biomed-primary-actions {
     justify-content: stretch;
   }
 
   .biomed-primary-actions button {
     flex: 1 1 140px;
+  }
+
+  .biomed-important-evidence-list article {
+    grid-template-columns: 1fr;
+  }
+
+  .biomed-important-evidence-list span {
+    text-align: left;
   }
 
   .biomed-review-workspace {

@@ -12,6 +12,7 @@ from plugins.biomed_evidence.schemas import (
     EvidenceExtractionResult,
     EvidenceItem,
 )
+from plugins.biomed_evidence.text_utils import split_sentences
 
 
 _ENTITY_PATTERNS: list[tuple[str, str, EntityType]] = [
@@ -119,7 +120,7 @@ class EvidenceExtractor:
 def _sentences(text: str) -> list[str]:
     return [
         sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        for sentence in split_sentences(text)
         if len(sentence.strip()) >= 25
     ]
 

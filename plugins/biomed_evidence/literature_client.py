@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Protocol
@@ -93,11 +94,16 @@ class PubMedLiteratureClient:
     api_key: str | None = None
     max_retries: int = 2
     retry_backoff_seconds: float = 0.25
+    rate_limit_requests_per_second: float | None = None
 
     def __post_init__(self) -> None:
         self._owns_client = self.client is None
         if self.client is None:
             self.client = httpx.AsyncClient(timeout=20.0)
+        if self.rate_limit_requests_per_second is None:
+            self.rate_limit_requests_per_second = 8.0 if self.api_key else 2.5
+        self._rate_limit_lock = asyncio.Lock()
+        self._last_request_at = 0.0
 
     async def close(self) -> None:
         if self._owns_client and self.client is not None:
@@ -293,6 +299,7 @@ class PubMedLiteratureClient:
         attempts = max(0, int(self.max_retries)) + 1
         for attempt in range(1, attempts + 1):
             try:
+                await self._wait_for_rate_slot()
                 response = await self.client.get(url, params=params)
                 response.raise_for_status()
                 if request_events is not None and attempt > 1:
@@ -318,6 +325,7 @@ class PubMedLiteratureClient:
                 if not retryable or attempt >= attempts:
                     logger.warning("PubMed request failed: %s", exc)
                     raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
+                retry_delay = _retry_after_seconds(exc.response.headers.get("Retry-After"))
             except httpx.TransportError as exc:
                 _record_request_failure(
                     request_events,
@@ -330,6 +338,7 @@ class PubMedLiteratureClient:
                 if attempt >= attempts:
                     logger.warning("PubMed request failed: %s", exc)
                     raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
+                retry_delay = None
             except httpx.HTTPError as exc:
                 _record_request_failure(
                     request_events,
@@ -341,8 +350,24 @@ class PubMedLiteratureClient:
                 )
                 logger.warning("PubMed request failed: %s", exc)
                 raise LiteratureClientError(f"PubMed request failed: {exc}") from exc
-            await asyncio.sleep(self.retry_backoff_seconds * (2 ** (attempt - 1)))
+            await asyncio.sleep(
+                retry_delay
+                if retry_delay is not None
+                else self.retry_backoff_seconds * (2 ** (attempt - 1))
+            )
         raise LiteratureClientError("PubMed request failed after retry exhaustion")
+
+    async def _wait_for_rate_slot(self) -> None:
+        rate = float(self.rate_limit_requests_per_second or 0.0)
+        if rate <= 0:
+            return
+        interval = 1.0 / rate
+        async with self._rate_limit_lock:
+            now = time.monotonic()
+            delay = self._last_request_at + interval - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request_at = time.monotonic()
 
     def _add_identity_params(self, params: dict[str, ParamValue]) -> None:
         if self.email:
@@ -508,6 +533,16 @@ def _record_request_failure(
     if status_code is not None:
         event["status_code"] = status_code
     events.append(event)
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        delay = float(value.strip())
+    except ValueError:
+        return None
+    return delay if delay >= 0 else None
 
 
 def _retry_warnings(events: list[dict[str, object]]) -> list[str]:

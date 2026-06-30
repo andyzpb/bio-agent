@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from plugins.biomed_evidence.citation_auditor import (
+    _recommended_action,
     extract_atomic_claims,
     find_conflicting_evidence,
     validate_citation_support,
@@ -29,6 +30,70 @@ from plugins.biomed_evidence.service import (
     _remove_failed_claim_lines,
 )
 from plugins.biomed_evidence.guardrails import RESEARCH_USE_DISCLAIMER
+
+
+def _uncertainty(calibrated: bool = True) -> UncertaintyAudit:
+    return UncertaintyAudit(
+        expected_uncertainty="medium",
+        observed_uncertainty="medium",
+        calibrated=calibrated,
+    )
+
+
+def _failed_claim(
+    text: str,
+    *,
+    role: str,
+    verdict: str = "overclaimed",
+    claim_type: str = "association",
+    paper_id: str = "PMID:1",
+) -> ClaimAuditItem:
+    return ClaimAuditItem(
+        claim_id=f"claim-{abs(hash((text, role))) % 100000}",
+        claim=text,
+        claim_type=claim_type,
+        claim_role=role,
+        cited_paper_ids=[paper_id],
+        evidence_ids=[f"ev-{paper_id}"],
+        verdict=verdict,
+        support_score=0.55,
+        reason="Suggestive evidence does not support definitive wording.",
+    )
+
+
+def _audit_with_failed_claims(
+    failed_claims: list[ClaimAuditItem],
+    *,
+    action: str = "revise",
+) -> CitationAuditResult:
+    return CitationAuditResult(
+        audit_id="audit-role-test",
+        run_id="run-role-test",
+        claim_audits=failed_claims,
+        uncertainty_audit=_uncertainty(calibrated=False),
+        claim_support_rate=0.5,
+        citation_precision=1.0,
+        unsupported_claim_rate=0.0,
+        overclaim_rate=1.0 if failed_claims else 0.0,
+        conflict_awareness=True,
+        uncertainty_calibrated=False,
+        failed_claims=failed_claims,
+        recommended_action=action,
+        created_at="2026-06-30T00:00:00+00:00",
+    )
+
+
+def _answer_result(answer: str) -> AnswerWithEvidenceResult:
+    return AnswerWithEvidenceResult(
+        run_id="run-role-test",
+        answer=answer,
+        citations=[_citation("PMID:1")],
+        evidence_summary=[],
+        conflicting_evidence=[],
+        limitations=[],
+        uncertainty_level="high",
+        disclaimer=RESEARCH_USE_DISCLAIMER,
+    )
 
 
 def _citation(paper_id: str) -> Citation:
@@ -55,6 +120,42 @@ def test_citation_audit_marks_supported_claim() -> None:
     assert result.claim_support_rate == 1.0
     assert result.citation_precision == 1.0
     assert result.claim_audits[0].verdict == "supported"
+    assert result.recommended_action == "pass"
+
+
+def test_citation_precision_uses_answer_citations_not_full_packet() -> None:
+    result = validate_citation_support(
+        answer=(
+            "- Disease-associated microglia were enriched in higher Braak stage "
+            "samples and correlated with amyloid pathology. [MOCK-PMID-1001]"
+        ),
+        citations=[_citation("MOCK-PMID-1001"), _citation("MOCK-PMID-1002")],
+        evidence_items=[
+            *MOCK_EVIDENCE["MOCK-PMID-1001"],
+            *MOCK_EVIDENCE["MOCK-PMID-1002"],
+        ],
+        observed_uncertainty="low",
+    )
+
+    assert result.citation_precision == 1.0
+    assert result.packet_citation_utilization == 0.5
+
+
+def test_conflict_awareness_ignores_unreferenced_packet_evidence() -> None:
+    inconclusive = MOCK_EVIDENCE["MOCK-PMID-1003"][0].model_copy(
+        update={"evidence_direction": "inconclusive"}
+    )
+    result = validate_citation_support(
+        answer=(
+            "- Disease-associated microglia were enriched in higher Braak stage "
+            "samples and correlated with amyloid pathology. [MOCK-PMID-1001]"
+        ),
+        citations=[_citation("MOCK-PMID-1001")],
+        evidence_items=[*MOCK_EVIDENCE["MOCK-PMID-1001"], inconclusive],
+        observed_uncertainty="low",
+    )
+
+    assert result.conflict_awareness is True
     assert result.recommended_action == "pass"
 
 
@@ -159,6 +260,107 @@ def test_citation_audit_detects_association_to_causation_overclaim() -> None:
     assert result.claim_audits[0].verdict == "overclaimed"
     assert "causality" in (result.claim_audits[0].overclaim_reason or "")
     assert result.recommended_action == "revise"
+
+
+def test_peripheral_logic_failures_do_not_force_revise() -> None:
+    failed = [
+        _failed_claim(
+            "The vaginal microbiome is associated with higher odds of high-risk HPV.",
+            role="supporting_context",
+        ),
+        _failed_claim(
+            "No refuting evidence was identified in the supplied search.",
+            role="search_meta",
+            verdict="insufficient_evidence",
+        ),
+    ]
+
+    action = _recommended_action(
+        failed_claims=failed,
+        uncertainty_audit=_uncertainty(calibrated=True),
+        conflict_awareness=True,
+        evidence_items=[],
+    )
+
+    assert action == "pass_with_limitations"
+
+
+def test_core_overclaim_still_forces_revise() -> None:
+    failed = [
+        _failed_claim(
+            "Persistent high-risk HPV infection causes cervical cancer.",
+            role="core_answer",
+            verdict="overclaimed",
+            claim_type="causal",
+        )
+    ]
+
+    action = _recommended_action(
+        failed_claims=failed,
+        uncertainty_audit=_uncertainty(calibrated=True),
+        conflict_awareness=True,
+        evidence_items=[],
+    )
+
+    assert action == "revise"
+
+
+def test_revision_removes_peripheral_and_search_meta_failed_claims() -> None:
+    draft = (
+        "Persistent high-risk HPV infection causes cervical cancer. [PMID:1]\n"
+        "The vaginal microbiome is associated with higher odds of high-risk HPV. [PMID:1]\n"
+        "No refuting evidence was identified in the supplied search. [PMID:1]"
+    )
+    failed = [
+        _failed_claim(
+            "The vaginal microbiome is associated with higher odds of high-risk HPV.",
+            role="supporting_context",
+        ),
+        _failed_claim(
+            "No refuting evidence was identified in the supplied search.",
+            role="search_meta",
+            verdict="insufficient_evidence",
+        ),
+    ]
+
+    revision = _build_answer_revision(
+        draft_result=_answer_result(draft),
+        audit=_audit_with_failed_claims(failed, action="pass_with_limitations"),
+        clinical_boundary=False,
+        use_llm_revision=True,
+        fallback_reason_override="test",
+    )
+
+    assert "Persistent high-risk HPV infection causes cervical cancer" in revision.final_answer
+    assert "vaginal microbiome" not in revision.final_answer
+    assert "No refuting evidence" not in revision.final_answer
+    assert "is the is associated with of" not in revision.final_answer
+    assert revision.revision_action == "revise"
+    assert revision.revision_action_detail == "removed_peripheral_claims"
+
+
+def test_revision_uses_fixed_template_for_core_overclaim() -> None:
+    draft = "Persistent high-risk HPV infection causes cervical cancer. [PMID:1]"
+    failed = [
+        _failed_claim(
+            "Persistent high-risk HPV infection causes cervical cancer.",
+            role="core_answer",
+            verdict="overclaimed",
+            claim_type="causal",
+        )
+    ]
+
+    revision = _build_answer_revision(
+        draft_result=_answer_result(draft),
+        audit=_audit_with_failed_claims(failed, action="revise"),
+        clinical_boundary=False,
+        use_llm_revision=True,
+        fallback_reason_override="test",
+    )
+
+    assert "The cited evidence supports a narrower claim" in revision.final_answer
+    assert "is the is associated with of" not in revision.final_answer
+    assert revision.revision_action_detail == "rewritten_core_claims"
 
 
 def test_established_causal_risk_factor_review_is_not_overclaimed() -> None:
@@ -413,7 +615,8 @@ def test_answer_revision_softens_overclaim() -> None:
     assert revision.revision_action == "revise"
     assert revision.softened_claims
     assert "causes Alzheimer's disease progression" not in revision.final_answer
-    assert "is associated with Alzheimer's disease progression" in revision.final_answer
+    assert "The cited evidence supports a narrower claim" in revision.final_answer
+    assert revision.revision_action_detail == "rewritten_core_claims"
 
 
 def test_answer_revision_keeps_supported_lines_when_removing_short_failed_claim() -> None:
@@ -550,6 +753,30 @@ class _FakeUncitedRevisionProvider:
                     "softened_claims": [],
                     "added_limitations": [],
                     "uncertainty_level": "high",
+                }
+            )
+        )
+
+
+class _FakeChangedSupportedRevisionProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools, model, max_tokens, tool_choice="auto", disable_thinking=False):
+        self.calls += 1
+        return _FakeRevisionResponse(
+            json.dumps(
+                {
+                    "final_answer": (
+                        "The abundance of activated microglia correlated with "
+                        "Braak stage and amyloid pathology. [A. Jensen et al., "
+                        "2025; MOCK-PMID-1001]"
+                    ),
+                    "changed_claims": ["Focused answer on the directly supported claim."],
+                    "removed_claims": [],
+                    "softened_claims": [],
+                    "added_limitations": [],
+                    "uncertainty_level": "medium",
                 }
             )
         )
@@ -715,6 +942,7 @@ async def test_answer_with_audit_can_use_injected_revision_provider(tmp_path: Pa
     assert audited.revision.llm_model == "fake-biomed-reviser"
     assert audited.revision.llm_prompt_hash
     assert audited.revision.post_revision_audit_id
+    assert audited.audit.audit_id == audited.revision.post_revision_audit_id
     assert any(step.step == "post_audit" and step.status == "completed" for step in audited.trace)
 
 
@@ -742,3 +970,31 @@ async def test_llm_revision_repairs_uncited_model_sentence(tmp_path: Path) -> No
     assert audited.revision.revision_mode == "llm"
     assert "causes Alzheimer's disease progression" not in audited.final_answer
     assert audited.audit.recommended_action in {"pass", "pass_with_limitations"}
+
+
+@pytest.mark.asyncio
+async def test_changed_final_answer_returns_post_revision_audit(tmp_path: Path) -> None:
+    provider = _FakeChangedSupportedRevisionProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-biomed-reviser",
+    )
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglia to Alzheimer's disease?",
+                source="mock",
+                max_papers=5,
+                use_llm_revision=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    assert audited.final_answer != audited.draft_answer
+    assert audited.revision.post_revision_audit_id
+    assert audited.audit.audit_id == audited.revision.post_revision_audit_id
+    assert [item.claim for item in audited.audit.claim_audits] == [
+        "The abundance of activated microglia correlated with Braak stage and amyloid pathology."
+    ]

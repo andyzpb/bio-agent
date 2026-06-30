@@ -9,7 +9,7 @@ from typing import Any, cast
 import pytest
 
 from plugins.biomed_evidence import service as biomed_service_module
-from plugins.biomed_evidence.claim_logic import audit_claim_logic
+from plugins.biomed_evidence.claim_logic import audit_claim_logic, parse_logical_evidence
 from plugins.biomed_evidence.claim_logic_export import normalize_symbol
 from plugins.biomed_evidence.citation_auditor import validate_citation_support
 from plugins.biomed_evidence.schemas import (
@@ -189,6 +189,22 @@ class _ChunkLimitedLogicParserProvider(_FakeLogicParserProvider):
                 }
             ]
         self.calls += 1
+        return _FakeLogicResponse(json.dumps(response))
+
+
+class _TypoLogicParserProvider(_FakeLogicParserProvider):
+    async def chat(self, **kwargs: Any) -> _FakeLogicResponse:
+        response = json.loads((await super().chat(**kwargs)).content)
+        for frame in response.get("evidence_frames", []):
+            frame["polearity"] = frame.pop("polarity")
+        return _FakeLogicResponse(json.dumps(response))
+
+
+class _MetadataCopyLogicParserProvider(_FakeLogicParserProvider):
+    async def chat(self, **kwargs: Any) -> _FakeLogicResponse:
+        response = json.loads((await super().chat(**kwargs)).content)
+        for frame in response.get("claim_frames", []):
+            frame["claim_type"] = "background"
         return _FakeLogicResponse(json.dumps(response))
 
 
@@ -824,6 +840,35 @@ def test_llm_logic_parser_flags_human_trial_rat_model_system() -> None:
     assert any("model_system" in warning for warning in frame.parser_warnings)
 
 
+def test_deterministic_logic_does_not_treat_rate_ratio_as_rat_model() -> None:
+    evidence = EvidenceItem(
+        evidence_id="ev_rate_ratio",
+        paper_id="PMID:1",
+        claim=(
+            "Patients allocated to hydroxychloroquine had a lower probability "
+            "of discharge alive within 28 days."
+        ),
+        finding=(
+            "Patients allocated to hydroxychloroquine had a lower probability "
+            "of discharge alive within 28 days (rate ratio 0.90; 95% CI 0.84 to 0.98)."
+        ),
+        evidence_direction="supports",
+        entities=[],
+        methods=["randomized trial"],
+        limitations=[],
+        confidence="medium",
+        evidence_span=(
+            "Patients allocated to hydroxychloroquine had a lower probability "
+            "of discharge alive within 28 days (rate ratio 0.90; 95% CI 0.84 to 0.98)."
+        ),
+    )
+
+    frame = parse_logical_evidence(evidence)
+
+    assert frame.model_system is None
+    assert frame.population == "human"
+
+
 def test_citation_audit_can_attach_logic_audit_and_fact_export() -> None:
     answer = (
         "Microglial activation increases Alzheimer's disease progression "
@@ -916,6 +961,68 @@ async def test_answer_with_audit_uses_provider_backed_logic_parser(
     assert isinstance(parser_modes, dict)
     assert parser_modes.get("llm", 0) >= len(logic_audits)
     assert logic_trace["parser_models"] == ["fake-logic-parser"]
+
+
+@pytest.mark.asyncio
+async def test_llm_claim_logic_accepts_common_field_typos(tmp_path: Path) -> None:
+    provider = _TypoLogicParserProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-logic-parser",
+    )
+    try:
+        result = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                source="mock",
+                max_papers=3,
+                use_llm_claim_logic=True,
+                export_logic_facts=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    logic_audits = [
+        item.logic_audit for item in result.audit.claim_audits if item.logic_audit
+    ]
+    assert logic_audits
+    assert all(
+        logic.claim_frame is not None and logic.claim_frame.parser_mode == "llm"
+        for logic in logic_audits
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_claim_logic_drops_non_frame_metadata(tmp_path: Path) -> None:
+    provider = _MetadataCopyLogicParserProvider()
+    service = BiomedEvidenceService(
+        tmp_path,
+        revision_provider=provider,
+        revision_model="fake-logic-parser",
+    )
+    try:
+        result = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links microglial activation to Alzheimer's disease progression?",
+                source="mock",
+                max_papers=3,
+                use_llm_claim_logic=True,
+                export_logic_facts=True,
+            )
+        )
+    finally:
+        await service.aclose()
+
+    logic_audits = [
+        item.logic_audit for item in result.audit.claim_audits if item.logic_audit
+    ]
+    assert logic_audits
+    assert all(
+        logic.claim_frame is not None and logic.claim_frame.parser_mode == "llm"
+        for logic in logic_audits
+    )
 
 
 @pytest.mark.asyncio

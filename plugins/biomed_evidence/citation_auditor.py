@@ -15,6 +15,7 @@ from plugins.biomed_evidence.schemas import (
     CitationAuditResult,
     CitationSupportVerdict,
     ClaimAuditItem,
+    ClaimRole,
     ClaimType,
     ConfidenceLevel,
     ConflictAuditResult,
@@ -29,6 +30,7 @@ from plugins.biomed_evidence.schemas import (
     RetrievalManifest,
     UncertaintyAudit,
 )
+from plugins.biomed_evidence.text_utils import split_sentences as _split_sentences
 
 _STOPWORDS = {
     "about",
@@ -110,9 +112,14 @@ def validate_citation_support(
         )
         for claim in claims
     ]
+    relevant_evidence = _audit_relevant_evidence(
+        evidence_items,
+        claim_audits,
+        citation_ids,
+    )
     uncertainty_audit = derive_uncertainty_audit(
         claim_audits=claim_audits,
-        evidence_items=_audit_relevant_evidence(evidence_items, claim_audits, citation_ids),
+        evidence_items=relevant_evidence,
         retrieval_manifest=retrieval_manifest,
         observed_uncertainty=observed_uncertainty,
         evidence_maturity=evidence_maturity,
@@ -141,12 +148,12 @@ def validate_citation_support(
         if supported_claims
         else set()
     )
-    conflict_awareness = _conflict_awareness(answer, evidence_items)
+    conflict_awareness = _conflict_awareness(answer, relevant_evidence)
     recommended_action = _recommended_action(
         failed_claims=failed_claims,
         uncertainty_audit=uncertainty_audit,
         conflict_awareness=conflict_awareness,
-        evidence_items=evidence_items,
+        evidence_items=relevant_evidence,
     )
     return CitationAuditResult(
         audit_id=_audit_id(run_id, answer, evidence_items),
@@ -156,8 +163,10 @@ def validate_citation_support(
         claim_audits=claim_audits,
         uncertainty_audit=uncertainty_audit,
         claim_support_rate=_rate(len(supported_claims), len(claim_audits)),
-        citation_precision=_rate(
-            len(supported_citation_ids), len(citation_ids or cited_ids)
+        citation_precision=_rate(len(supported_citation_ids), len(cited_ids)),
+        packet_citation_utilization=_rate(
+            len(supported_citation_ids),
+            len(citation_ids or cited_ids),
         ),
         unsupported_claim_rate=_rate(len(unsupported_claims), len(claim_audits)),
         overclaim_rate=_rate(len(overclaimed_claims), len(claim_audits)),
@@ -186,10 +195,12 @@ def extract_atomic_claims(answer: str) -> list[AtomicClaim]:
             text = _clean_claim_text(candidate)
             if not text or _skip_line(text):
                 continue
+            claim_type = _claim_type(text)
             claim = AtomicClaim(
                 claim_id=_claim_id(text, index),
                 text=text,
-                claim_type=_claim_type(text),
+                claim_type=claim_type,
+                claim_role=_claim_role(text, claim_type, index),
                 sentence_index=index,
                 cited_paper_ids=_paper_ids(candidate),
             )
@@ -539,6 +550,7 @@ def _claim_audit(
         claim_id=claim.claim_id,
         claim=claim.text,
         claim_type=claim.claim_type,
+        claim_role=claim.claim_role,
         cited_paper_ids=_unique(cited_paper_ids),
         evidence_ids=[item.evidence_id for item in evidence_items],
         evidence_span=best.evidence_span if best is not None else None,
@@ -723,99 +735,6 @@ def _is_markdown_section_heading(line: str) -> bool:
     return bool(re.fullmatch(r"\*{1,3}\s*[^*][^.\n]{1,140}?\s*\*{1,3}", stripped))
 
 
-_SENTENCE_ABBREVIATIONS = {
-    "al",
-    "dr",
-    "e.g",
-    "fig",
-    "i.e",
-    "mr",
-    "mrs",
-    "ms",
-    "prof",
-    "vs",
-}
-
-
-def _split_sentences(text: str) -> list[str]:
-    parts: list[str] = []
-    start = 0
-    paren_depth = 0
-    bracket_depth = 0
-    for index, char in enumerate(text):
-        if char == "(":
-            paren_depth += 1
-            continue
-        if char == ")":
-            paren_depth = max(0, paren_depth - 1)
-            continue
-        if char == "[":
-            bracket_depth += 1
-            continue
-        if char == "]":
-            bracket_depth = max(0, bracket_depth - 1)
-            continue
-        if char not in ".!?":
-            continue
-        if not _is_sentence_boundary(
-            text,
-            index,
-            paren_depth=paren_depth,
-            bracket_depth=bracket_depth,
-        ):
-            continue
-        end = index + 1
-        citation_start = end
-        while citation_start < len(text) and text[citation_start].isspace():
-            citation_start += 1
-        if citation_start < len(text) and text[citation_start] == "[":
-            citation_end = text.find("]", citation_start + 1)
-            if citation_end != -1:
-                end = citation_end + 1
-                if end < len(text) and text[end] in ".!?":
-                    end += 1
-        while end < len(text) and text[end] in ")]":
-            end += 1
-        part = text[start:end].strip()
-        if part:
-            parts.append(part)
-        start = end
-        while start < len(text) and text[start].isspace():
-            start += 1
-    tail = text[start:].strip()
-    if tail:
-        parts.append(tail)
-    return parts
-
-
-def _is_sentence_boundary(
-    text: str,
-    index: int,
-    *,
-    paren_depth: int,
-    bracket_depth: int,
-) -> bool:
-    char = text[index]
-    previous = text[index - 1] if index > 0 else ""
-    next_char = text[index + 1] if index + 1 < len(text) else ""
-    if paren_depth or bracket_depth:
-        return False
-    if char == "." and previous.isdigit() and next_char.isdigit():
-        return False
-    token_match = re.search(r"([A-Za-z](?:[A-Za-z.]*)?)$", text[:index])
-    token = token_match.group(1).lower().rstrip(".") if token_match else ""
-    if char == "." and token in _SENTENCE_ABBREVIATIONS:
-        return False
-    lookahead = index + 1
-    while lookahead < len(text) and text[lookahead] in ")]":
-        lookahead += 1
-    while lookahead < len(text) and text[lookahead].isspace():
-        lookahead += 1
-    if lookahead >= len(text):
-        return True
-    return text[lookahead] == "[" or text[lookahead].isupper() or text[lookahead].isdigit()
-
-
 def _clean_claim_text(text: str) -> str:
     clean = re.sub(r"\[[^\]]*\]", "", text)
     clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
@@ -854,6 +773,28 @@ def _claim_type(text: str) -> ClaimType:
     if re.search(r"\b(uncertain|inconclusive|limited|limitation)\b", lowered):
         return "uncertainty"
     return "background"
+
+
+def _claim_role(text: str, claim_type: ClaimType, sentence_index: int) -> ClaimRole:
+    lowered = text.lower()
+    if claim_type == "uncertainty" or re.search(
+        r"\b(limitations?|uncertainty|caveat|cannot establish|does not establish)\b",
+        lowered,
+    ):
+        return "limitation"
+    if re.search(
+        r"\b(no refut|no contradict|no conflicting|not identify|not identified|supplied search|searches? for)\b",
+        lowered,
+    ):
+        return "search_meta"
+    if re.search(
+        r"\b(microbiome|microbiota|lactobacillus|gardnerella|screening|test[s]? are|co-?factor|oxidative stress|mechanism|pathway)\b",
+        lowered,
+    ):
+        return "supporting_context"
+    if sentence_index == 0 or claim_type in {"causal", "clinical_implication", "treatment_recommendation"}:
+        return "core_answer"
+    return "supporting_context" if claim_type in {"mechanistic_hypothesis", "methodological"} else "core_answer"
 
 
 def _evidence_text(item: EvidenceItem) -> str:
@@ -967,6 +908,8 @@ def _evidence_strength(item: EvidenceItem | None) -> EvidenceStrength:
         return "review_or_guideline"
     if re.search(r"\b(cohort|cross-sectional|post-mortem|observational)\b", text):
         return "observational"
+    if item.source_scope in {"full_text", "pdf"}:
+        return "not_assessed"
     return "abstract_only"
 
 
@@ -1005,13 +948,21 @@ def _recommended_action(
         for item in failed_claims
     ):
         return "refuse_or_abstain"
-    if any(item.verdict in {"overclaimed", "contradicted"} for item in failed_claims):
+    core_failures = [
+        item
+        for item in failed_claims
+        if item.claim_role == "core_answer"
+        or item.verdict == "contradicted"
+    ]
+    if any(item.verdict in {"overclaimed", "contradicted"} for item in core_failures):
         return "revise"
     if any(
         item.verdict in {"insufficient_evidence", "irrelevant_citation", "not_cited"}
-        for item in failed_claims
+        for item in core_failures
     ):
         return "revise"
+    if failed_claims:
+        return "pass_with_limitations"
     if not uncertainty_audit.calibrated or not conflict_awareness:
         return "pass_with_limitations"
     if any(

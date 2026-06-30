@@ -37,6 +37,7 @@ from plugins.biomed_evidence.service import BiomedEvidenceService
 from plugins.biomed_evidence.service import (
     _gather_limited,
     _pdf_links_from_html,
+    _parse_pdf_url_with_local_fallback,
     _pubmed_cache_expires_at,
 )
 
@@ -1840,11 +1841,30 @@ def test_full_text_reanalysis_uses_full_text_evidence_without_overwriting_run(
         assert enhanced.status_code == 200
         assert enhanced.json()["result"]["extracted_evidence_ids"]
 
-        response = client.post(f"/api/biomed/answer-runs/{run_id}/full-text-reanalysis")
+        response = client.post(
+            f"/api/biomed/answer-runs/{run_id}/full-text-reanalysis",
+            json={"use_llm_claim_logic": True, "export_logic_facts": True},
+        )
+        repeated = client.post(
+            f"/api/biomed/answer-runs/{run_id}/full-text-reanalysis",
+            json={"use_llm_claim_logic": True, "export_logic_facts": True},
+        )
+        persisted = client.get(f"/api/biomed/answer-runs/{run_id}-fulltext/trace")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["answer_result"]["run_id"] != run_id
+    assert payload["answer_result"]["run_id"] == f"{run_id}-fulltext"
+    assert repeated.status_code == 200
+    assert repeated.json()["answer_result"]["run_id"] == f"{run_id}-fulltext"
+    assert persisted.status_code == 200
+    persisted_payload = persisted.json()
+    assert persisted_payload["answer_run"]["run_id"] == f"{run_id}-fulltext"
+    audit_steps = [
+        item for item in persisted_payload["trace"] if item["step"] == "audit"
+    ]
+    assert audit_steps
+    assert audit_steps[0]["metadata"]["logic_audit"]["enabled"] is True
+    assert audit_steps[0]["metadata"]["logic_audit"]["claim_count"] >= 1
     assert payload["answer_result"]["project_context_trace"]["full_text_reanalysis_of"] == run_id
     assert payload["answer_result"]["evidence_summary"]
     assert all(
@@ -2335,6 +2355,7 @@ def test_open_full_text_provider_caches_unavailable_lookup(
     tmp_path: Path,
 ) -> None:
     service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.pubmed_client.email = "test@example.org"
     service.storage.upsert_paper(
         BiomedicalPaper(
             paper_id="PMID-UNAVAILABLE",
@@ -2354,10 +2375,16 @@ def test_open_full_text_provider_caches_unavailable_lookup(
                 return httpx.Response(404)
             if "europepmc" in url:
                 return httpx.Response(404)
+            if "api.unpaywall.org" in url:
+                return httpx.Response(404)
             if "api.crossref.org" in url:
                 return httpx.Response(404)
             if "doi.org" in url:
-                return httpx.Response(403)
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text="<html><body>No PDF here.</body></html>",
+                )
             raise AssertionError(f"unexpected request: {url}")
 
         service.pubmed_client.client = httpx.AsyncClient(
@@ -2381,9 +2408,105 @@ def test_open_full_text_provider_caches_unavailable_lookup(
 
     assert first[0] is None
     assert second[0] is None
-    assert first[2] and "publisher_challenge_or_paywall:403" in first[2]
+    assert first[2] and "doi_landing_no_full_text_link" in first[2]
     assert second[2] and "full_text_lookup_cache_hit" in second[2]
-    assert request_count == 4
+    assert request_count == 5
+
+
+def test_open_full_text_provider_does_not_cache_recoverable_lookup_failure(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path, allow_live_pubmed_tools=True)
+    service.storage.upsert_paper(
+        BiomedicalPaper(
+            paper_id="PMID-RECOVERABLE",
+            source="pubmed",
+            title="Recoverable full text",
+            doi="10.1234/recoverable",
+        )
+    )
+    try:
+        def failing_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                raise httpx.ConnectError("temporary outage", request=request)
+            if "europepmc" in url:
+                return httpx.Response(404)
+            if "api.crossref.org" in url:
+                return httpx.Response(404)
+            if "doi.org" in url:
+                return httpx.Response(404)
+            raise AssertionError(f"unexpected request: {url}")
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(failing_provider)
+        )
+        first = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-RECOVERABLE",
+                source="pubmed",
+            )
+        )
+
+        def recovered_provider(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pmcoa.cgi" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "documents": [
+                            {
+                                "passages": [
+                                    {
+                                        "infons": {"section_type": "Results"},
+                                        "text": "Recovered full-text evidence.",
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )
+            raise AssertionError(f"cached failure should not block retry: {url}")
+
+        service.pubmed_client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(recovered_provider)
+        )
+        second = asyncio.run(
+            service._fetch_open_full_text_content(
+                paper_id="PMID-RECOVERABLE",
+                source="pubmed",
+            )
+        )
+    finally:
+        asyncio.run(service.aclose())
+
+    assert first[0] is None
+    assert first[2] and "pmc_bioc_failed:ConnectError" in first[2]
+    assert second[2] is None
+    assert second[0] and "Recovered full-text evidence" in second[0]
+
+
+def test_pdf_url_parser_uses_local_fallback_without_knowhere_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def extract_text(self) -> str:
+            return "Plain PDF evidence from local parser."
+
+    class FakePdfReader:
+        def __init__(self, file_obj: object) -> None:
+            self.pages = [FakePage()]
+
+    monkeypatch.delenv("KNOWHERE_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=FakePdfReader))
+
+    content, warning = _parse_pdf_url_with_local_fallback(
+        "https://publisher.test/paper.pdf",
+        b"%PDF test",
+    )
+
+    assert warning is None
+    assert content == "Plain PDF evidence from local parser."
 
 
 def test_pdf_links_from_html_finds_metadata_and_embedded_pdf_links() -> None:

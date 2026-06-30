@@ -534,7 +534,7 @@ def _model_system(evidence: EvidenceItem, text: str) -> str | None:
     ).lower()
     if "mouse" in lowered or "mice" in lowered or "murine" in lowered:
         return "mouse"
-    if "rat" in lowered:
+    if re.search(r"\brats?\b", lowered):
         return "rat"
     if "organoid" in lowered:
         return "organoid"

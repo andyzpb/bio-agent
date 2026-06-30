@@ -61,6 +61,7 @@ ClaimType = Literal[
     "methodological",
     "uncertainty",
 ]
+ClaimRole = Literal["core_answer", "supporting_context", "search_meta", "limitation"]
 CitationSupportVerdict = Literal[
     "supported",
     "partial_support",
@@ -134,9 +135,15 @@ TraceStepName = Literal[
 ]
 TraceStepStatus = Literal["started", "completed", "skipped", "failed"]
 RevisionAction = Literal["pass", "revise", "refuse", "abstain"]
+RevisionActionDetail = Literal[
+    "unchanged",
+    "removed_peripheral_claims",
+    "rewritten_core_claims",
+    "abstained",
+]
 RevisionMode = Literal["deterministic", "llm", "fallback"]
 PlannerMode = Literal["deterministic", "llm", "fallback"]
-ExtractionMode = Literal["deterministic", "llm", "fallback"]
+ExtractionMode = Literal["deterministic", "llm", "llm_span", "fallback"]
 SynthesisMode = Literal["deterministic", "llm", "fallback"]
 RetrievalIntent = Literal[
     "primary",
@@ -1516,6 +1523,7 @@ class AnswerRevision(BaseModel):
     fallback_reason: str | None = None
     refusal_reason: str | None = None
     revision_action: RevisionAction
+    revision_action_detail: RevisionActionDetail = "unchanged"
     created_at: str
 
 
@@ -1525,6 +1533,7 @@ class AtomicClaim(BaseModel):
     claim_id: str
     text: str
     claim_type: ClaimType
+    claim_role: ClaimRole = "core_answer"
     sentence_index: int | None = None
     cited_paper_ids: list[str] = Field(default_factory=list)
 
@@ -1629,6 +1638,7 @@ class ClaimAuditItem(BaseModel):
     claim_id: str
     claim: str
     claim_type: ClaimType
+    claim_role: ClaimRole = "core_answer"
     cited_paper_ids: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     evidence_span: str | None = None
@@ -1662,6 +1672,7 @@ class CitationAuditResult(BaseModel):
     uncertainty_audit: UncertaintyAudit
     claim_support_rate: float
     citation_precision: float
+    packet_citation_utilization: float = 0.0
     unsupported_claim_rate: float
     overclaim_rate: float
     conflict_awareness: bool
