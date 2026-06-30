@@ -1,0 +1,7 @@
+# Optional channel and local TUI dependencies.
+lark-oapi>=1.6.8
+ncatbot>=4.4.0
+python-telegram-bot>=22.7
+rich>=14.0.0
+telegramify-markdown
+textual>=8.0.0

@@ -18,6 +18,7 @@ __pycache__/
 # Node.js
 node_modules/
 frontend/dashboard/static/
+static/dashboard/app.js
 
 # Compiled plugin panel JS (auto-built from .ts at dashboard startup)
 plugins/*/dashboard_panel*.js
@@ -58,7 +59,8 @@ lme_error_log_*.txt
 # Local AI assistant docs
 /CLAUDE.md
 /AGENTS.md
-/docs/superpowers/specs/
+/docs/superpowers/
+/.superpowers/
 /docs/biomedical_evidence_agent_requirements.md
 /memory_annotation_from_*.json
 .squad/

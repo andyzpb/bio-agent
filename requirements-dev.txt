@@ -1,5 +1,6 @@
 # 开发与测试依赖
 -r requirements.txt
+-r requirements-optional.txt
 
 black>=26.0.0
 pyright>=1.1.403

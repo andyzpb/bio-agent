@@ -5,6 +5,8 @@
 ```bash
 uv venv
 uv pip install -r requirements.txt
+# Optional Telegram/QQ/Feishu/Textual support:
+# uv pip install -r requirements-optional.txt
 uv pip install -r requirements-dev.txt
 uv run python main.py init
 uv run python main.py dashboard

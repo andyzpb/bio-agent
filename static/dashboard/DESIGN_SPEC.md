@@ -249,8 +249,8 @@ Screenshot validation should cover:
 - Edit Biomedical Evidence application UI in
   `plugins/biomed_evidence/dashboard_panel.ts` and
   `plugins/biomed_evidence/dashboard_panel.css`.
-- Keep generated `static/dashboard/app.js` and `static/dashboard/styles.css`
-  in sync when committing frontend changes.
+- Build generated dashboard assets with `npm run build`; do not commit
+  `static/dashboard/app.js`.
 - Run `npm run typecheck` and `npm run build` before committing UI changes.
 - For substantial UI changes, rebuild the Docker dashboard and take Browser
   screenshots at desktop and mobile widths.

@@ -103,9 +103,8 @@ chips: Help, Status, Mock audit, and Live audit. Type `/` for the full command
 palette, then preview readiness, setup needs, run IDs, or confirmation
 requirements before anything is sent.
 
-![Dashboard chat to review workflow](./assets/biomed-dashboard-chat-workflow.gif)
-
-![Dashboard audit summary and table output](./assets/biomed-dashboard-audit-summary.gif)
+Dashboard screenshots and demo recordings are generated as release artifacts,
+not committed to the source tree.
 
 `/biomed status` separates PubMed command policy from network reachability, so
 the UI can explain whether live PubMed is disabled by configuration or simply
@@ -131,6 +130,7 @@ git clone <this-repo>
 cd bio-agent
 uv venv
 uv pip install -r requirements.txt
+# Optional Telegram/QQ/Feishu/Textual support: uv pip install -r requirements-optional.txt
 npm ci
 uv run python main.py setup
 uv run python main.py init
