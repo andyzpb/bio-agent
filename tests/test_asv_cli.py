@@ -153,3 +153,128 @@ def test_cli_evaluate_applies_belief_fixture(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["mean_realized_entropy_reduction"] > 0
+
+
+def test_cli_evaluate_missing_beliefs_explains_evaluator_options(tmp_path) -> None:
+    input_path = tmp_path / "missing-beliefs.jsonl"
+    output_dir = tmp_path / "report"
+    input_path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "traj-1",
+                "task": {
+                    "task_id": "task-1",
+                    "question": "Does alpha improve beta?",
+                    "candidate_space": {
+                        "candidates": [
+                            {"id": "supported", "label": "A", "text": "supported"},
+                            {"id": "refuted", "label": "B", "text": "refuted"},
+                        ],
+                        "gold_candidate_id": "supported",
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "index": 0,
+                        "action": {"type": "read"},
+                        "state_before": {"evidence": "baseline beta"},
+                        "state_after": {"evidence": "alpha improved beta"},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "asv_eval",
+            "evaluate",
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "--belief-fixture" in result.stderr
+    assert "--evaluator deepseek-chat-logprob" in result.stderr
+
+
+def test_cli_evaluate_writes_evaluated_trajectories_with_runtime(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from asv_eval import __main__ as cli
+
+    class FakeEvaluator:
+        def score_state(self, *, question, evidence_text, labels):
+            _ = question, labels
+            if "alpha improved beta" in evidence_text:
+                return {"supported": 0.0, "refuted": -5.0}, []
+            return {"supported": -1.0, "refuted": -1.0}, []
+
+    input_path = tmp_path / "missing-beliefs.jsonl"
+    output_dir = tmp_path / "report"
+    evaluated_path = tmp_path / "evaluated" / "trajectories.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "traj-1",
+                "task": {
+                    "task_id": "task-1",
+                    "question": "Does alpha improve beta?",
+                    "candidate_space": {
+                        "candidates": [
+                            {"id": "supported", "label": "A", "text": "supported"},
+                            {"id": "refuted", "label": "B", "text": "refuted"},
+                        ],
+                        "gold_candidate_id": "supported",
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "index": 0,
+                        "action": {"type": "read"},
+                        "state_before": {"evidence": "baseline beta"},
+                        "state_after": {"evidence": "alpha improved beta"},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_build_deepseek_evaluator", lambda config: FakeEvaluator())
+
+    exit_code = cli.main(
+        [
+            "evaluate",
+            "--input",
+            str(input_path),
+            "--evaluator",
+            "deepseek-chat-logprob",
+            "--write-evaluated-trajectories",
+            str(evaluated_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    [evaluated] = [
+        json.loads(line) for line in evaluated_path.read_text(encoding="utf-8").splitlines()
+    ]
+    step = evaluated["steps"][0]
+    assert step["belief_before"] is not None
+    assert step["belief_after"]["supported"] > 0.9
+    assert (output_dir / "summary.json").exists()

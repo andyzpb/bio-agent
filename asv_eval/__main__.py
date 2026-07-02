@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import asdict
+import sys
 from pathlib import Path
 
 from asv_eval.adapters import (
@@ -11,16 +10,33 @@ from asv_eval.adapters import (
     load_belief_fixture,
     load_standard_jsonl,
     react_transcript_to_trajectory,
+    write_standard_jsonl,
 )
 from asv_eval.core import ASVConfig, CostConfig
+from asv_eval.evaluators import DeepSeekLogprobBeliefEvaluator, DeepSeekLogprobConfig
 from asv_eval.reporting import write_report_bundle
+from asv_eval.runtime import (
+    EvaluatorRuntimeConfig,
+    StateScoreCache,
+    fill_missing_beliefs,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "evaluate":
-        return _evaluate(args)
+        try:
+            return _evaluate(args)
+        except ValueError as exc:
+            message = str(exc)
+            if "missing belief_before/belief_after" in message:
+                message = (
+                    f"{message}. Provide beliefs with --belief-fixture or evaluate "
+                    "states with --evaluator deepseek-chat-logprob."
+                )
+            print(message, file=sys.stderr)
+            return 1
     if args.command == "adapt-react":
         return _adapt_react(args)
     if args.command == "adapt-bio-agent":
@@ -46,6 +62,27 @@ def _evaluate(args: argparse.Namespace) -> int:
             trajectories,
             load_belief_fixture(Path(args.belief_fixture)),
         )
+    evaluator_mode = args.evaluator or "provided-belief"
+    runtime_config = EvaluatorRuntimeConfig(
+        mode=evaluator_mode,
+        model=args.model,
+        api_key_env=args.api_key_env,
+        fallback_policy=args.fallback_policy,
+        state_text_max_chars=args.state_text_max_chars,
+    )
+    runtime_evaluator = (
+        _build_deepseek_evaluator(runtime_config)
+        if evaluator_mode == "deepseek-chat-logprob"
+        else None
+    )
+    trajectories = fill_missing_beliefs(
+        trajectories,
+        config=runtime_config,
+        evaluator=runtime_evaluator,
+        cache=StateScoreCache(Path(args.cache)) if args.cache else None,
+    )
+    if args.write_evaluated_trajectories:
+        write_standard_jsonl(Path(args.write_evaluated_trajectories), trajectories)
     summary = write_report_bundle(
         trajectories,
         Path(args.output_dir),
@@ -93,6 +130,16 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate = subparsers.add_parser("evaluate", help="score standard ASV JSONL")
     evaluate.add_argument("--input", required=True)
     evaluate.add_argument("--belief-fixture")
+    evaluate.add_argument(
+        "--evaluator",
+        choices=["provided-belief", "deepseek-chat-logprob"],
+    )
+    evaluate.add_argument("--model", default="deepseek-v4-flash")
+    evaluate.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    evaluate.add_argument("--cache")
+    evaluate.add_argument("--fallback-policy", choices=["error", "floor"], default="error")
+    evaluate.add_argument("--state-text-max-chars", type=int, default=6000)
+    evaluate.add_argument("--write-evaluated-trajectories")
     evaluate.add_argument("--output-dir", required=True)
     evaluate.add_argument("--lambda-cost", type=float, default=0.0)
     evaluate.add_argument("--prompt-token-weight", type=float, default=0.0)
@@ -134,10 +181,22 @@ def _parse_candidate_args(values: list[str]) -> dict[str, str]:
 
 
 def _write_trajectory_jsonl(path: Path, trajectory) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(asdict(trajectory), ensure_ascii=False, sort_keys=True) + "\n",
-        encoding="utf-8",
+    write_standard_jsonl(path, [trajectory])
+
+
+def _build_deepseek_evaluator(
+    config: EvaluatorRuntimeConfig,
+) -> DeepSeekLogprobBeliefEvaluator:
+    return DeepSeekLogprobBeliefEvaluator(
+        DeepSeekLogprobConfig(
+            model=config.model,
+            api_key_env=config.api_key_env,
+            top_logprobs=config.top_logprobs,
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+            max_logprob_candidates=config.max_logprob_candidates,
+            floor_score=config.floor_score,
+        )
     )
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -26,6 +26,17 @@ def load_standard_jsonl(path: Path) -> list[TrajectoryRecord]:
         except Exception as exc:
             raise ValueError(f"{path}:{line_no}: invalid ASV trajectory: {exc}") from exc
     return trajectories
+
+
+def write_standard_jsonl(path: Path, trajectories: list[TrajectoryRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            json.dumps(asdict(trajectory), ensure_ascii=False, sort_keys=True) + "\n"
+            for trajectory in trajectories
+        ),
+        encoding="utf-8",
+    )
 
 
 def load_belief_fixture(
