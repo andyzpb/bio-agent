@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from asv_eval.adapters import write_standard_jsonl
 from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
 from eval.asv.live_pubmed.analyze import (
     aggregate_step_type_rows,
@@ -657,14 +656,36 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
                     {
                         "trajectory_id": "t1-permutation-0",
                         "step_id": "retrieve",
-                        "asv_components": {"net_asv": 0.2},
+                        "state_before_hash": "before-retrieve",
+                        "state_after_hash": "after-retrieve",
+                        "asv_components": {"net_asv": 0.20},
                     }
                 ),
                 json.dumps(
                     {
                         "trajectory_id": "t1-permutation-1",
                         "step_id": "retrieve",
-                        "asv_components": {"net_asv": 0.1},
+                        "state_before_hash": "before-retrieve",
+                        "state_after_hash": "after-retrieve",
+                        "asv_components": {"net_asv": 0.15},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trajectory_id": "t1-permutation-0",
+                        "step_id": "synthesize",
+                        "state_before_hash": "before-synthesize",
+                        "state_after_hash": "after-synthesize",
+                        "asv_components": {"net_asv": 2.00},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trajectory_id": "t1-permutation-1",
+                        "step_id": "synthesize",
+                        "state_before_hash": "before-synthesize",
+                        "state_after_hash": "after-synthesize",
+                        "asv_components": {"net_asv": 2.10},
                     }
                 ),
             ]
@@ -676,9 +697,11 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
     summary = summarize_permutation_stability(report_dir)
 
     assert summary == {
-        "step_count": 2,
-        "mean_net_asv": 0.15,
-        "min_net_asv": 0.1,
-        "max_net_asv": 0.2,
-        "range_net_asv": 0.1,
+        "step_count": 4,
+        "permutation_group_count": 2,
+        "mean_net_asv": 1.1125,
+        "min_net_asv": 0.15,
+        "max_net_asv": 2.1,
+        "mean_group_range_net_asv": 0.075,
+        "max_group_range_net_asv": 0.1,
     }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -49,28 +50,47 @@ def build_label_permuted_trajectories(
 
 
 def summarize_permutation_stability(report_dir: Path) -> dict[str, float | int]:
-    values = [
-        float(row["asv_components"]["net_asv"])
-        for row in _read_jsonl(report_dir / "steps.jsonl")
-    ]
+    rows = _read_jsonl(report_dir / "steps.jsonl")
+    values = [float(row["asv_components"]["net_asv"]) for row in rows]
     if not values:
         return {
             "step_count": 0,
+            "permutation_group_count": 0,
             "mean_net_asv": 0.0,
             "min_net_asv": 0.0,
             "max_net_asv": 0.0,
-            "range_net_asv": 0.0,
+            "mean_group_range_net_asv": 0.0,
+            "max_group_range_net_asv": 0.0,
         }
 
+    groups: dict[tuple[str, str, str, str], list[float]] = defaultdict(list)
+    for row in rows:
+        groups[_permutation_group_key(row)].append(
+            float(row["asv_components"]["net_asv"])
+        )
+    ranges = [max(group_values) - min(group_values) for group_values in groups.values()]
     min_value = min(values)
     max_value = max(values)
     return {
         "step_count": len(values),
+        "permutation_group_count": len(groups),
         "mean_net_asv": round(sum(values) / len(values), 6),
         "min_net_asv": min_value,
         "max_net_asv": max_value,
-        "range_net_asv": round(max_value - min_value, 6),
+        "mean_group_range_net_asv": round(sum(ranges) / len(ranges), 6),
+        "max_group_range_net_asv": round(max(ranges), 6),
     }
+
+
+def _permutation_group_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    trajectory_id = str(row.get("trajectory_id") or "")
+    base_trajectory_id = trajectory_id.split("-permutation-", 1)[0]
+    return (
+        base_trajectory_id,
+        str(row.get("step_id") or ""),
+        str(row.get("state_before_hash") or ""),
+        str(row.get("state_after_hash") or ""),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
