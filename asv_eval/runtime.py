@@ -231,9 +231,9 @@ def _state_for_position(step: StepRecord, position: StatePosition) -> dict[str, 
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: _SECRET_REDACTION if _is_secret_key(str(key)) else _redact(item)
+            key: _redact(item)
             for key, item in value.items()
-            if str(key) not in _LEAKY_KEYS
+            if str(key) not in _LEAKY_KEYS and not _is_secret_key(str(key))
         }
     if isinstance(value, list):
         return [_redact(item) for item in value]
@@ -256,7 +256,7 @@ def _is_secret_key(key: str) -> bool:
 def _redact_secret_strings(value: str) -> str:
     redacted = value
     for pattern in _SECRET_STRING_PATTERNS:
-        redacted = pattern.sub(rf"\1{_SECRET_REDACTION}", redacted)
+        redacted = pattern.sub(_SECRET_REDACTION, redacted)
     return redacted
 
 

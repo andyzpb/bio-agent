@@ -139,6 +139,15 @@ def test_render_state_for_evaluator_redacts_secret_like_state_keys_and_strings()
     )
     rendered_text = rendered.state_text + "\n" + rendered.prompt
 
+    for artifact in (rendered.state_text, rendered.prompt):
+        for key in (
+            "api_key",
+            "Authorization",
+            "token",
+            "password",
+            "raw_provider_response",
+        ):
+            assert key not in artifact
     for secret in (
         "sk-live-api-key",
         "live-authorization",
@@ -203,15 +212,21 @@ def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
     assert "prompt" not in row
     assert "state_text" not in row
     assert "rendered" not in row
-    assert "provider raw secret" not in cache_path.read_text(encoding="utf-8")
+    cache_text = cache_path.read_text(encoding="utf-8")
+    for secret_text in (
+        "provider raw secret",
+        "api_key",
+        "Authorization",
+        "token",
+        "password",
+        "raw_provider_response",
+    ):
+        assert secret_text not in cache_text
     expected_score = StateScore(
         scores=score.scores,
         belief=score.belief,
         warnings=score.warnings,
-        quality_flags={
-            "evaluator_mode": "deepseek-chat-logprob",
-            "raw_provider_response": "[REDACTED]",
-        },
+        quality_flags={"evaluator_mode": "deepseek-chat-logprob"},
     )
     assert cache.get("cache-1") == expected_score
     assert StateScoreCache(cache_path).get("cache-1") == expected_score
