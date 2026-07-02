@@ -19,6 +19,7 @@ from eval.asv.live_pubmed.collect import (
 )
 from eval.asv.live_pubmed.evaluate import (
     EvaluationRun,
+    SECRET_MARKERS,
     build_evaluate_command,
     scan_for_secret_markers,
 )
@@ -39,14 +40,31 @@ from eval.asv.live_pubmed.claims import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LIVE_EXPERIMENT_DIR = ROOT / "eval" / "asv" / "experiments" / "live_pubmed_step_value"
 CLAIMS_PATH = (
-    ROOT
-    / "eval"
-    / "asv"
-    / "experiments"
-    / "live_pubmed_step_value"
-    / "claims.pilot.jsonl"
+    LIVE_EXPERIMENT_DIR / "claims.pilot.jsonl"
 )
+
+
+def test_live_pubmed_experiment_readme_documents_real_run_commands() -> None:
+    readme = (LIVE_EXPERIMENT_DIR / "README.md").read_text(encoding="utf-8")
+
+    assert "Live PubMed Step Value Experiment" in readme
+    assert "--ack-live" in readme
+    assert "answer_with_audit" in readme
+    assert "deepseek-chat-logprob" in readme
+    assert "claims.pilot.jsonl" in readme
+    assert "/tmp/asv-live-pubmed-step-value" in readme
+    assert "gold labels are used only after belief estimation" in readme
+
+
+def test_live_pubmed_experiment_committed_files_are_secret_safe() -> None:
+    for path in LIVE_EXPERIMENT_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for marker in SECRET_MARKERS:
+            assert marker not in text, f"{marker!r} leaked in {path}"
 
 
 def test_live_pubmed_claim_loader_reads_pilot_set() -> None:
