@@ -13,6 +13,7 @@ def write_report_bundle(
     output_dir: Path,
     *,
     config: ASVConfig | None = None,
+    evaluator_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     tables_dir = output_dir / "tables"
@@ -22,7 +23,7 @@ def write_report_bundle(
     for trajectory in trajectories:
         rows.extend(evaluate_trajectory(trajectory, config=config))
 
-    summary = build_summary(trajectories, rows)
+    summary = build_summary(trajectories, rows, evaluator_config=evaluator_config)
     _write_jsonl(output_dir / "steps.jsonl", rows)
     _write_jsonl(output_dir / "states.jsonl", _state_rows(rows))
     _write_json(output_dir / "summary.json", summary)
@@ -35,6 +36,8 @@ def write_report_bundle(
 def build_summary(
     trajectories: list[TrajectoryRecord],
     rows: list[dict[str, Any]],
+    *,
+    evaluator_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reductions = [
         float(row["asv_components"]["realized_entropy_reduction"]) for row in rows
@@ -52,6 +55,7 @@ def build_summary(
         "positive_net_asv_steps": sum(value > 0 for value in net_values),
         "negative_net_asv_steps": sum(value < 0 for value in net_values),
         "zero_net_asv_steps": sum(value == 0 for value in net_values),
+        "evaluator": evaluator_config or {"mode": "provided-belief"},
     }
 
 

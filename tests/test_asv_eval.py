@@ -154,3 +154,38 @@ def test_step_quality_flags_are_optional_and_preserved() -> None:
     )
 
     assert step.quality_flags == {"evaluator_mode": "deepseek_chat_logprob"}
+
+
+def test_evaluate_trajectory_passes_through_quality_flags() -> None:
+    task = TaskRecord(
+        task_id="task-quality",
+        question="Does X help?",
+        candidate_space=CandidateSpace(
+            candidates=[
+                Candidate(id="yes", label="A", text="yes"),
+                Candidate(id="no", label="B", text="no"),
+            ],
+        ),
+    )
+    trajectory = TrajectoryRecord(
+        trajectory_id="traj-quality",
+        task=task,
+        steps=[
+            StepRecord(
+                step_id="s1",
+                index=0,
+                action={"type": "evaluate"},
+                belief_before={"yes": 0.5, "no": 0.5},
+                belief_after={"yes": 0.9, "no": 0.1},
+                quality_flags={
+                    "evaluator_mode": "deepseek_chat_logprob",
+                    "used_cache": True,
+                },
+            )
+        ],
+    )
+
+    [row] = evaluate_trajectory(trajectory)
+
+    assert row["quality_flags"]["evaluator_mode"] == "deepseek_chat_logprob"
+    assert row["quality_flags"]["used_cache"] is True

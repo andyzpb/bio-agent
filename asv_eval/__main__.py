@@ -87,6 +87,7 @@ def _evaluate(args: argparse.Namespace) -> int:
         trajectories,
         Path(args.output_dir),
         config=config,
+        evaluator_config=runtime_config.cache_identity(),
     )
     print(
         " ".join(

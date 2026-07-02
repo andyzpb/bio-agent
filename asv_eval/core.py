@@ -203,6 +203,7 @@ def evaluate_trajectory(
                     "floor_score": active_config.floor_score,
                     "used_fallback": False,
                     "candidate_count": candidate_count,
+                    **step.quality_flags,
                 },
                 "label": step.label,
                 "warnings": [],
