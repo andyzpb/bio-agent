@@ -66,6 +66,7 @@ def test_workflow_trace_step_projects_state_action_observation_and_cost() -> Non
     rendered = json.dumps(step.observation, sort_keys=True)
     assert "Bearer secret" not in rendered
     assert "raw_provider_response" in rendered
+    assert step.observation["metadata"]["raw_provider_response"] == "[REDACTED]"
     assert "sha256:abc" in rendered
 
 
@@ -137,6 +138,7 @@ def test_redact_for_asv_masks_secret_bearing_strings_without_hiding_prompt_metri
             "debug_log": "POST /v1 Authorization: Bearer sk-test-secret",
             "request_url": "https://example.test?api_key=sk-test-secret&mode=test",
             "raw_provider_response": "api_key=sk-test-secret",
+            "llm_raw_response": {"content": "plain llm body"},
             "synthesis_prompt_hash": "sha256:abc",
             "observability": {"prompt_tokens": 321},
         }
@@ -144,9 +146,10 @@ def test_redact_for_asv_masks_secret_bearing_strings_without_hiding_prompt_metri
 
     rendered = json.dumps(redacted, sort_keys=True)
     assert "sk-test-secret" not in rendered
+    assert "plain llm body" not in rendered
     assert "Authorization: Bearer [REDACTED]" in rendered
-    assert "api_key=[REDACTED]" in rendered
-    assert "raw_provider_response" in rendered
+    assert redacted["raw_provider_response"] == "[REDACTED]"
+    assert redacted["llm_raw_response"] == "[REDACTED]"
     assert "sha256:abc" in rendered
     assert redacted["observability"]["prompt_tokens"] == 321
 
@@ -252,7 +255,7 @@ async def test_service_export_asv_trajectory_redacts_full_serialized_payload(
                         "metadata": {
                             "debug_log": "Authorization: Bearer secret-token",
                             "raw_provider_response": {
-                                "authorization": "Bearer secret-token",
+                                "content": "plain provider body",
                             },
                         },
                     }
@@ -269,8 +272,49 @@ async def test_service_export_asv_trajectory_redacts_full_serialized_payload(
     rendered = json.dumps(asdict(trajectory), default=str, sort_keys=True).lower()
     assert "secret-token" not in rendered
     assert "bearer secret" not in rendered
+    assert "plain provider body" not in rendered
     assert "agenttracestep" not in rendered
     assert "raw_provider_response" not in rendered or "[redacted]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_service_export_asv_revised_high_score_run_counts_as_success(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links neuroinflammation to memory decline?",
+                source="mock",
+                max_papers=5,
+            )
+        )
+        run_id = audited.answer_result.run_id
+        audit = service.storage.get_latest_citation_audit_for_run(run_id)
+        revision = service.storage.get_answer_revision(run_id)
+        assert audit is not None
+        assert revision is not None
+        service.storage.save_citation_audit(
+            audit.model_copy(
+                update={
+                    "claim_support_rate": 1.0,
+                    "citation_precision": 1.0,
+                    "overclaim_rate": 0.0,
+                }
+            )
+        )
+        service.storage.save_answer_revision(
+            revision.model_copy(update={"revision_action": "revise"})
+        )
+
+        trajectory = service.export_answer_run_asv_trajectory(run_id)
+    finally:
+        await service.aclose()
+
+    assert trajectory.final_score is not None
+    assert trajectory.final_score >= 0.8
+    assert trajectory.success is True
 
 
 def test_service_export_asv_trajectory_reports_missing_run(tmp_path: Path) -> None:

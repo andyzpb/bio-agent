@@ -33,6 +33,12 @@ _SECRET_KEY_PARTS = (
     "secret",
     "token",
 )
+_SENSITIVE_CONTAINER_KEYS = (
+    "llm_raw_response",
+    "provider_raw_response",
+    "raw_llm_response",
+    "raw_provider_response",
+)
 _SAFE_SECRET_KEY_EXCEPTIONS = (
     "prompt_hash",
     "prompt_tokens",
@@ -231,6 +237,8 @@ def _is_secret_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     if any(part in normalized for part in _SAFE_SECRET_KEY_EXCEPTIONS):
         return False
+    if normalized in _SENSITIVE_CONTAINER_KEYS:
+        return True
     return any(part in normalized for part in _SECRET_KEY_PARTS)
 
 
@@ -289,7 +297,11 @@ def _final_score_from_run(run: Any) -> float | None:
 def _success_from_run(run: Any) -> bool | None:
     final_action = _attribute_or_mapping(run, "final_action")
     if final_action is not None:
-        return str(final_action) in {"accept", "pass", "pass_with_limitations"}
+        action = str(final_action)
+        if action in {"refuse", "abstain"}:
+            return False
+        if action in {"accept", "pass", "pass_with_limitations"}:
+            return True
     score = _final_score_from_run(run)
     if score is None:
         return None
