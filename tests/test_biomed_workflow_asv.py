@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -324,3 +326,80 @@ def test_service_export_asv_trajectory_reports_missing_run(tmp_path: Path) -> No
             service.export_answer_run_asv_trajectory("missing-run")
     finally:
         service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exported_biomed_asv_trajectory_can_be_evaluated_with_fixture(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question=(
+                    "What recent evidence links microglial activation to "
+                    "Alzheimer's disease progression?"
+                ),
+                source="mock",
+                max_papers=5,
+            )
+        )
+        trajectory = service.export_answer_run_asv_trajectory(
+            audited.answer_result.run_id
+        )
+    finally:
+        await service.aclose()
+
+    input_path = tmp_path / "biomed-asv.jsonl"
+    fixture_path = tmp_path / "beliefs.jsonl"
+    output_dir = tmp_path / "asv-report"
+    input_path.write_text(
+        json.dumps(asdict(trajectory), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    fixture_rows = []
+    for step in trajectory.steps:
+        fixture_rows.append(
+            {
+                "trajectory_id": trajectory.trajectory_id,
+                "step_id": step.step_id,
+                "belief_before": {
+                    "supported": 0.34,
+                    "refuted": 0.33,
+                    "not_enough_information": 0.33,
+                },
+                "belief_after": {
+                    "supported": 0.70,
+                    "refuted": 0.15,
+                    "not_enough_information": 0.15,
+                },
+            }
+        )
+    fixture_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in fixture_rows),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "asv_eval",
+            "evaluate",
+            "--input",
+            str(input_path),
+            "--belief-fixture",
+            str(fixture_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["trajectory_count"] == 1
+    assert summary["step_count"] == len(trajectory.steps)
+    assert summary["mean_realized_entropy_reduction"] > 0
