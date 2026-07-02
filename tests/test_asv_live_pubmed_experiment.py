@@ -22,6 +22,10 @@ from eval.asv.live_pubmed.evaluate import (
     build_evaluate_command,
     scan_for_secret_markers,
 )
+from eval.asv.live_pubmed.external import (
+    load_public_validation_rows,
+    public_row_to_claim,
+)
 from eval.asv.live_pubmed.robustness import (
     build_label_permuted_trajectories,
     summarize_permutation_stability,
@@ -119,6 +123,88 @@ def test_live_pubmed_claim_loader_reports_non_object_rows(
 
     with pytest.raises(ValueError, match="claim row must be a JSON object"):
         load_claims_jsonl(path)
+
+
+def test_pubmedqa_rows_map_yes_no_maybe_to_asv_labels(tmp_path: Path) -> None:
+    path = tmp_path / "pubmedqa.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "pqa-1",
+                        "question": "Does treatment alpha improve beta?",
+                        "final_decision": "yes",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "pqa-2",
+                        "question": "Does treatment gamma improve delta?",
+                        "final_decision": "no",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "pqa-3",
+                        "question": "Does biomarker epsilon predict zeta?",
+                        "final_decision": "maybe",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    claims = load_public_validation_rows(path, dataset="pubmedqa", max_papers=4)
+
+    assert [claim.claim_id for claim in claims] == [
+        "pubmedqa-pqa-1",
+        "pubmedqa-pqa-2",
+        "pubmedqa-pqa-3",
+    ]
+    assert [claim.gold_label for claim in claims] == [
+        "supported",
+        "refuted",
+        "not_enough_information",
+    ]
+    assert all(claim.max_papers == 4 for claim in claims)
+
+
+def test_bioasq_yes_no_rows_map_to_asv_labels() -> None:
+    yes = public_row_to_claim(
+        {
+            "id": "bioasq-1",
+            "body": "Does alpha improve beta?",
+            "exact_answer": "yes",
+        },
+        dataset="bioasq",
+    )
+    no = public_row_to_claim(
+        {
+            "id": "bioasq-2",
+            "body": "Does gamma improve delta?",
+            "exact_answer": "no",
+        },
+        dataset="bioasq",
+    )
+
+    assert yes.gold_label == "supported"
+    assert no.gold_label == "refuted"
+    assert yes.question == "Does alpha improve beta?"
+
+
+def test_public_validation_mapper_rejects_unknown_label() -> None:
+    with pytest.raises(ValueError, match="unsupported pubmedqa label"):
+        public_row_to_claim(
+            {
+                "id": "bad-label",
+                "question": "Does alpha improve beta?",
+                "final_decision": "unclear",
+            },
+            dataset="pubmedqa",
+        )
 
 
 def test_claim_record_to_answer_request_payload_uses_live_flags() -> None:
