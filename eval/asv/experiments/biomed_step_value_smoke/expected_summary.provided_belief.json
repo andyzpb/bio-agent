@@ -1,0 +1,10 @@
+{
+  "trajectory_count": 1,
+  "step_count": 3,
+  "source_adapters": [
+    "standard_jsonl"
+  ],
+  "positive_net_asv_steps": 3,
+  "negative_net_asv_steps": 0,
+  "zero_net_asv_steps": 0
+}
