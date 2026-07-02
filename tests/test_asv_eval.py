@@ -103,6 +103,39 @@ def test_evaluate_trajectory_computes_realized_entropy_reduction_and_gold_gain()
     assert row["state_after_hash"].startswith("sha256:")
 
 
+def test_evaluate_trajectory_skips_gold_gain_for_zero_probability_gold() -> None:
+    task = TaskRecord(
+        task_id="task-zero-gold",
+        question="Does X help?",
+        candidate_space=CandidateSpace(
+            candidates=[
+                Candidate(id="supported", label="A", text="supported"),
+                Candidate(id="not_enough_information", label="C", text="not enough"),
+            ],
+            gold_candidate_id="supported",
+        ),
+    )
+    trajectory = TrajectoryRecord(
+        trajectory_id="traj-zero-gold",
+        task=task,
+        steps=[
+            StepRecord(
+                step_id="s1",
+                index=0,
+                action={"type": "classify"},
+                belief_before={"supported": 0.0, "not_enough_information": 1.0},
+                belief_after={"supported": 0.0, "not_enough_information": 1.0},
+            )
+        ],
+    )
+
+    [row] = evaluate_trajectory(trajectory)
+
+    assert row["gold_metrics"]["gold_log_likelihood_gain"] is None
+    assert row["gold_metrics"]["gold_rank_before"] == 2
+    assert row["gold_metrics"]["gold_rank_after"] == 2
+
+
 def test_mock_belief_evaluator_reads_fixture_beliefs() -> None:
     evaluator = MockBeliefEvaluator()
     step = StepRecord(

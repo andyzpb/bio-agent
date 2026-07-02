@@ -154,13 +154,14 @@ def evaluate_trajectory(
         gold_rank_before = None
         gold_rank_after = None
         if gold_id and gold_id in step.belief_before and gold_id in step.belief_after:
-            gold_gain = round(
-                math.log(step.belief_after[gold_id])
-                - math.log(step.belief_before[gold_id]),
-                6,
-            )
             gold_rank_before = _rank(step.belief_before, gold_id)
             gold_rank_after = _rank(step.belief_after, gold_id)
+            if step.belief_before[gold_id] > 0 and step.belief_after[gold_id] > 0:
+                gold_gain = round(
+                    math.log(step.belief_after[gold_id])
+                    - math.log(step.belief_before[gold_id]),
+                    6,
+                )
         rows.append(
             {
                 "trajectory_id": trajectory.trajectory_id,
