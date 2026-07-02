@@ -468,3 +468,110 @@ def test_retrieve_step_fails_without_research_classification_marker() -> None:
         "artifact_cache_hit_count": 0,
         "tool_calls": 0,
     }
+
+
+def test_stateless_classify_retrieve_slice_evaluates_with_provided_beliefs(
+    tmp_path: Path,
+) -> None:
+    question = "Does microglial activation track Alzheimer's progression?"
+    classify_output = classify_step(
+        StepInput(
+            run_id="stateless-run-6",
+            question=question,
+            source_policy="mock_only",
+            source="mock",
+        )
+    )
+    retrieve_output = retrieve_step(
+        StepInput(
+            run_id="stateless-run-6",
+            question=question,
+            source_policy="mock_only",
+            source="mock",
+            completed_steps=classify_output.output_state["completed_steps"],
+            available_artifacts=classify_output.output_state["available_artifacts"],
+            artifact_payloads=[
+                MockRetrievalArtifact(
+                    paper_id="MOCK-PMID-1001",
+                    title="Microglial activation signatures track disease progression",
+                    abstract="Activated microglia correlated with Braak stage.",
+                )
+            ],
+        )
+    )
+    workflow_steps = [
+        step_output_to_workflow_step("stateless-run-6", classify_output),
+        step_output_to_workflow_step("stateless-run-6", retrieve_output),
+    ]
+    trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-6",
+        question=question,
+        steps=workflow_steps,
+    )
+
+    input_path = tmp_path / "stateless-asv.jsonl"
+    fixture_path = tmp_path / "beliefs.jsonl"
+    output_dir = tmp_path / "asv-report"
+    input_path.write_text(
+        json.dumps(asdict(trajectory), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    fixture_rows = [
+        {
+            "trajectory_id": trajectory.trajectory_id,
+            "step_id": "classify",
+            "belief_before": {
+                "supported": 0.34,
+                "refuted": 0.33,
+                "not_enough_information": 0.33,
+            },
+            "belief_after": {
+                "supported": 0.36,
+                "refuted": 0.31,
+                "not_enough_information": 0.33,
+            },
+        },
+        {
+            "trajectory_id": trajectory.trajectory_id,
+            "step_id": "retrieve",
+            "belief_before": {
+                "supported": 0.36,
+                "refuted": 0.31,
+                "not_enough_information": 0.33,
+            },
+            "belief_after": {
+                "supported": 0.78,
+                "refuted": 0.08,
+                "not_enough_information": 0.14,
+            },
+        },
+    ]
+    fixture_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in fixture_rows),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "asv_eval",
+            "evaluate",
+            "--input",
+            str(input_path),
+            "--belief-fixture",
+            str(fixture_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["trajectory_count"] == 1
+    assert summary["step_count"] == 2
+    assert summary["positive_net_asv_steps"] == 2
+    assert summary["evaluator"]["mode"] == "provided-belief"
