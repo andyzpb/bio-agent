@@ -22,6 +22,8 @@ class ClaimRecord:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any], *, path: Path, line_no: int) -> "ClaimRecord":
+        if not isinstance(payload, dict):
+            raise ValueError(f"{path}:{line_no}: claim row must be a JSON object")
         label = str(payload.get("gold_label") or "")
         if label not in CLAIM_LABELS:
             raise ValueError(f"{path}:{line_no}: invalid gold_label: {label}")
@@ -34,12 +36,15 @@ class ClaimRecord:
         claim_id = str(payload.get("claim_id") or "").strip()
         if not claim_id:
             raise ValueError(f"{path}:{line_no}: claim_id is required")
+        max_papers = int(payload.get("max_papers", 5))
+        if max_papers <= 0:
+            raise ValueError(f"{path}:{line_no}: max_papers must be positive")
         return cls(
             claim_id=claim_id,
             question=question,
             gold_label=label,  # pyright: ignore[reportArgumentType]
             source="pubmed",
-            max_papers=max(1, int(payload.get("max_papers") or 5)),
+            max_papers=max_papers,
             topic=str(payload["topic"]).strip() if payload.get("topic") else None,
             rationale=str(payload["rationale"]).strip() if payload.get("rationale") else None,
         )
@@ -65,7 +70,11 @@ def load_claims_jsonl(path: Path) -> list[ClaimRecord]:
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
-        claims.append(ClaimRecord.from_json(json.loads(line), path=path, line_no=line_no))
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_no}: invalid JSON: {exc.msg}") from exc
+        claims.append(ClaimRecord.from_json(payload, path=path, line_no=line_no))
     validate_claim_set(claims, min_per_label=1)
     return claims
 

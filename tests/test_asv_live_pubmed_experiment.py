@@ -68,6 +68,38 @@ def test_live_pubmed_claim_loader_rejects_invalid_label(tmp_path: Path) -> None:
         load_claims_jsonl(path)
 
 
+def test_live_pubmed_claim_loader_rejects_non_positive_max_papers(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "claims.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "claim_id": "bad-max-papers",
+                "question": "Does alpha improve beta?",
+                "gold_label": "supported",
+                "source": "pubmed",
+                "max_papers": 0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_papers must be positive"):
+        load_claims_jsonl(path)
+
+
+def test_live_pubmed_claim_loader_reports_non_object_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "claims.jsonl"
+    path.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="claim row must be a JSON object"):
+        load_claims_jsonl(path)
+
+
 def test_claim_record_to_answer_request_payload_uses_live_flags() -> None:
     claim = ClaimRecord(
         claim_id="claim-test",
