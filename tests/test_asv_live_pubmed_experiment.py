@@ -508,7 +508,8 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
     rows = [
         {
             "trajectory_id": "t1",
-            "step_id": "retrieve",
+            "step_id": "retrieve-1",
+            "action": {"type": "retrieve"},
             "asv_components": {
                 "realized_entropy_reduction": 0.4,
                 "net_asv": 0.3,
@@ -519,13 +520,14 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
         },
         {
             "trajectory_id": "t2",
-            "step_id": "retrieve",
+            "step_id": "retrieve-2",
+            "action": {"type": "retrieve"},
             "asv_components": {
                 "realized_entropy_reduction": 0.2,
                 "net_asv": 0.1,
                 "cost_scalar": 0.1,
             },
-            "gold_metrics": {"gold_log_likelihood_gain": -0.1},
+            "gold_metrics": {"gold_log_likelihood_gain": None},
             "quality_flags": {"used_floor_score": True, "used_cache": False},
         },
     ]
@@ -539,7 +541,9 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
             "mean_realized_entropy_reduction": 0.3,
             "mean_net_asv": 0.2,
             "mean_cost_scalar": 0.1,
-            "mean_gold_log_likelihood_gain": 0.2,
+            "mean_gold_log_likelihood_gain": 0.5,
+            "gold_metric_step_count": 1,
+            "missing_gold_metric_step_count": 1,
             "floor_score_step_count": 1,
             "cache_hit_step_count": 1,
         }
@@ -553,7 +557,8 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
         json.dumps(
             {
                 "trajectory_id": "t1",
-                "step_id": "classify",
+                "step_id": "classify-1",
+                "action": {"type": "classify"},
                 "asv_components": {
                     "realized_entropy_reduction": 0.0,
                     "net_asv": 0.0,
@@ -569,5 +574,10 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
 
     write_analysis_tables(report_dir)
 
-    assert (report_dir / "tables" / "step_type_summary.csv").exists()
-    assert (report_dir / "analysis_summary.json").exists()
+    csv_text = (report_dir / "tables" / "step_type_summary.csv").read_text(
+        encoding="utf-8"
+    )
+    summary = json.loads((report_dir / "analysis_summary.json").read_text(encoding="utf-8"))
+    assert "classify" in csv_text
+    assert summary["step_type_summary"][0]["step_type"] == "classify"
+    assert summary["step_type_summary"][0]["gold_metric_step_count"] == 1
