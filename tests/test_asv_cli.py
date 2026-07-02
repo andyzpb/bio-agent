@@ -86,3 +86,70 @@ def test_cli_evaluate_smoke(tmp_path) -> None:
     assert "trajectory_count=1" in result.stdout
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["mean_realized_entropy_reduction"] > 0
+
+
+def test_cli_evaluate_applies_belief_fixture(tmp_path) -> None:
+    input_path = tmp_path / "sample.jsonl"
+    output_dir = tmp_path / "out"
+    fixture_path = tmp_path / "beliefs.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "traj-1",
+                "task": {
+                    "task_id": "task-1",
+                    "question": "Does the evidence support alpha?",
+                    "candidate_space": {
+                        "candidates": [
+                            {"id": "supported", "label": "A", "text": "supported"},
+                            {"id": "refuted", "label": "B", "text": "refuted"},
+                        ]
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "index": 0,
+                        "action": {"type": "retrieve"},
+                        "observation": {"text": "trial found benefit"},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "traj-1",
+                "step_id": "s1",
+                "belief_before": {"supported": 0.5, "refuted": 0.5},
+                "belief_after": {"supported": 0.8, "refuted": 0.2},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "asv_eval",
+            "evaluate",
+            "--input",
+            str(input_path),
+            "--belief-fixture",
+            str(fixture_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["mean_realized_entropy_reduction"] > 0

@@ -7,6 +7,8 @@ from pathlib import Path
 
 from asv_eval.adapters import (
     adapt_bio_agent_workspace,
+    apply_belief_fixture,
+    load_belief_fixture,
     load_standard_jsonl,
     react_transcript_to_trajectory,
 )
@@ -39,6 +41,11 @@ def _evaluate(args: argparse.Namespace) -> int:
         lambda_cost=args.lambda_cost,
     )
     trajectories = load_standard_jsonl(Path(args.input))
+    if args.belief_fixture:
+        trajectories = apply_belief_fixture(
+            trajectories,
+            load_belief_fixture(Path(args.belief_fixture)),
+        )
     summary = write_report_bundle(
         trajectories,
         Path(args.output_dir),
@@ -85,6 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     evaluate = subparsers.add_parser("evaluate", help="score standard ASV JSONL")
     evaluate.add_argument("--input", required=True)
+    evaluate.add_argument("--belief-fixture")
     evaluate.add_argument("--output-dir", required=True)
     evaluate.add_argument("--lambda-cost", type=float, default=0.0)
     evaluate.add_argument("--prompt-token-weight", type=float, default=0.0)

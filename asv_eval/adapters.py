@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 from asv_eval.core import (
@@ -24,6 +26,57 @@ def load_standard_jsonl(path: Path) -> list[TrajectoryRecord]:
         except Exception as exc:
             raise ValueError(f"{path}:{line_no}: invalid ASV trajectory: {exc}") from exc
     return trajectories
+
+
+def load_belief_fixture(
+    path: Path,
+) -> dict[tuple[str, str], dict[str, dict[str, float]]]:
+    fixture: dict[tuple[str, str], dict[str, dict[str, float]]] = {}
+    for line_no, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        try:
+            key = (str(payload["trajectory_id"]), str(payload["step_id"]))
+            fixture[key] = {
+                "belief_before": {
+                    str(k): float(v)
+                    for k, v in dict(payload["belief_before"]).items()
+                },
+                "belief_after": {
+                    str(k): float(v)
+                    for k, v in dict(payload["belief_after"]).items()
+                },
+            }
+        except Exception as exc:
+            raise ValueError(f"{path}:{line_no}: invalid belief fixture: {exc}") from exc
+    return fixture
+
+
+def apply_belief_fixture(
+    trajectories: list[TrajectoryRecord],
+    fixture: dict[tuple[str, str], dict[str, dict[str, float]]],
+) -> list[TrajectoryRecord]:
+    updated: list[TrajectoryRecord] = []
+    for trajectory in trajectories:
+        steps: list[StepRecord] = []
+        for step in trajectory.steps:
+            beliefs = fixture.get((trajectory.trajectory_id, step.step_id))
+            if beliefs is None:
+                steps.append(step)
+                continue
+            steps.append(
+                replace(
+                    step,
+                    belief_before=beliefs["belief_before"],
+                    belief_after=beliefs["belief_after"],
+                )
+            )
+        updated.append(replace(trajectory, steps=steps))
+    return updated
 
 
 def trajectory_from_dict(payload: dict[str, Any]) -> TrajectoryRecord:
@@ -133,47 +186,28 @@ def react_transcript_to_trajectory(
 
 
 def adapt_bio_agent_run_from_storage(storage: Any, run_id: str) -> TrajectoryRecord:
+    from plugins.biomed_evidence.workflow.asv import trajectory_from_answer_run
+
     run = storage.get_answer_run(run_id)
     if run is None:
         raise ValueError(f"bio-agent run not found: {run_id}")
-    candidates = [
-        Candidate(id="supported", label="A", text="supported"),
-        Candidate(id="refuted", label="B", text="refuted"),
-        Candidate(
-            id="not_enough_information",
-            label="C",
-            text="not enough information",
-        ),
-    ]
-    task = TaskRecord(
-        task_id=run_id,
-        question=getattr(run, "answer", "")[:240] or run_id,
-        candidate_space=CandidateSpace(candidates=candidates),
-        domain="biomedical",
+    question_getter = getattr(storage, "get_answer_run_question", None)
+    stored_question = question_getter(run_id) if callable(question_getter) else None
+    question = (
+        str(stored_question)
+        if stored_question
+        else getattr(run, "answer", "")[:240] or run_id
     )
-    steps: list[StepRecord] = []
-    for trace in storage.list_agent_trace_steps(run_id):
-        step_name = str(getattr(trace, "step", ""))
-        if step_name not in {"retrieve", "extract", "audit"}:
-            continue
-        metadata = dict(getattr(trace, "metadata", {}) or {})
-        steps.append(
-            StepRecord(
-                step_id=str(getattr(trace, "step_id", f"{run_id}-{len(steps)}")),
-                index=len(steps),
-                action={"type": step_name, "is_external_observation": True},
-                observation={
-                    "summary": getattr(trace, "output_summary", ""),
-                    "metadata": metadata,
-                },
-            )
+    return trajectory_from_answer_run(
+        SimpleNamespace(
+            run_id=run_id,
+            answer_result=run,
+            question=question,
+            trace=list(storage.list_agent_trace_steps(run_id)),
+            created_at=getattr(run, "created_at", None),
+            audit=getattr(run, "audit", None),
+            final_action=getattr(run, "final_action", None),
         )
-    return TrajectoryRecord(
-        trajectory_id=f"bio-agent-{run_id}",
-        source_adapter="bio_agent",
-        run_id=run_id,
-        task=task,
-        steps=steps,
     )
 
 
