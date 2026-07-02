@@ -38,8 +38,8 @@ def load_belief_fixture(
     ):
         if not line.strip():
             continue
-        payload = json.loads(line)
         try:
+            payload = json.loads(line)
             key = (str(payload["trajectory_id"]), str(payload["step_id"]))
             fixture[key] = {
                 "belief_before": {

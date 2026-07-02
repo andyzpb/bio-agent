@@ -8,6 +8,7 @@ import pytest
 from asv_eval.adapters import (
     adapt_bio_agent_workspace,
     adapt_bio_agent_run_from_storage,
+    load_belief_fixture,
     load_standard_jsonl,
     react_transcript_to_trajectory,
 )
@@ -49,6 +50,14 @@ def test_standard_jsonl_loader_builds_trajectory(tmp_path) -> None:
 
     assert trajectories[0].trajectory_id == "traj-1"
     assert trajectories[0].task.candidate_space.candidates[0].label == "A"
+
+
+def test_belief_fixture_loader_reports_malformed_json_with_context(tmp_path) -> None:
+    path = tmp_path / "beliefs.jsonl"
+    path.write_text("{not-json}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid belief fixture"):
+        load_belief_fixture(path)
 
 
 def test_react_adapter_scores_only_observation_steps() -> None:
