@@ -207,6 +207,40 @@ def test_public_validation_mapper_rejects_unknown_label() -> None:
         )
 
 
+def test_public_validation_loader_rejects_non_object_rows(tmp_path: Path) -> None:
+    path = tmp_path / "pubmedqa.jsonl"
+    path.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="row must be a JSON object"):
+        load_public_validation_rows(path, dataset="pubmedqa")
+
+
+def test_public_validation_mapper_rejects_non_positive_max_papers() -> None:
+    with pytest.raises(ValueError, match="max_papers must be positive"):
+        public_row_to_claim(
+            {
+                "id": "pqa-bad-max",
+                "question": "Does alpha improve beta?",
+                "final_decision": "yes",
+            },
+            dataset="pubmedqa",
+            max_papers=0,
+        )
+
+
+def test_bioasq_nested_exact_answer_maps_to_asv_label() -> None:
+    claim = public_row_to_claim(
+        {
+            "id": "bioasq-nested",
+            "body": "Does alpha improve beta?",
+            "exact_answer": [["yes"]],
+        },
+        dataset="bioasq",
+    )
+
+    assert claim.gold_label == "supported"
+
+
 def test_claim_record_to_answer_request_payload_uses_live_flags() -> None:
     claim = ClaimRecord(
         claim_id="claim-test",

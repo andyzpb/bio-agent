@@ -25,6 +25,10 @@ def public_row_to_claim(
     dataset: str,
     max_papers: int = 5,
 ) -> ClaimRecord:
+    if not isinstance(row, dict):
+        raise ValueError("row must be a JSON object")
+    if max_papers <= 0:
+        raise ValueError("max_papers must be positive")
     dataset_key = dataset.lower()
     if dataset_key == "pubmedqa":
         raw_id = str(row.get("id") or row.get("pubid") or row.get("pmid") or "").strip()
@@ -37,10 +41,7 @@ def public_row_to_claim(
         raw_id = str(row.get("id") or row.get("qid") or "").strip()
         question = str(row.get("body") or row.get("question") or "").strip()
         exact_answer = row.get("exact_answer")
-        if isinstance(exact_answer, list):
-            raw_label = str(exact_answer[0] if exact_answer else "").strip().lower()
-        else:
-            raw_label = str(exact_answer or row.get("label") or "").strip().lower()
+        raw_label = str(_first_scalar(exact_answer) or row.get("label") or "").strip().lower()
         label = BIOASQ_LABEL_MAP.get(raw_label)
         if label is None:
             raise ValueError(f"unsupported bioasq label: {raw_label!r}")
@@ -59,6 +60,12 @@ def public_row_to_claim(
         topic=f"external:{dataset_key}",
         rationale="Mapped from a public biomedical QA benchmark label.",
     )
+
+
+def _first_scalar(value: Any) -> Any:
+    while isinstance(value, list):
+        value = value[0] if value else ""
+    return value
 
 
 def load_public_validation_rows(
