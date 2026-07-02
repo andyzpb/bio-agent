@@ -4,6 +4,7 @@ import json
 
 from plugins.biomed_evidence.schemas import AgentTraceStep
 from plugins.biomed_evidence.workflow.asv import (
+    redact_for_asv,
     trajectory_from_workflow_steps,
     workflow_step_from_trace,
 )
@@ -122,3 +123,54 @@ def test_workflow_steps_convert_to_standard_asv_trajectory() -> None:
     assert trajectory.steps[1].cost["prompt_tokens"] == 222
     assert trajectory.steps[1].belief_before is None
     assert trajectory.steps[1].belief_after is None
+
+
+def test_redact_for_asv_masks_secret_bearing_strings_without_hiding_prompt_metrics() -> None:
+    redacted = redact_for_asv(
+        {
+            "debug_log": "POST /v1 Authorization: Bearer sk-test-secret",
+            "request_url": "https://example.test?api_key=sk-test-secret&mode=test",
+            "raw_provider_response": "api_key=sk-test-secret",
+            "synthesis_prompt_hash": "sha256:abc",
+            "observability": {"prompt_tokens": 321},
+        }
+    )
+
+    rendered = json.dumps(redacted, sort_keys=True)
+    assert "sk-test-secret" not in rendered
+    assert "Authorization: Bearer [REDACTED]" in rendered
+    assert "api_key=[REDACTED]" in rendered
+    assert "raw_provider_response" in rendered
+    assert "sha256:abc" in rendered
+    assert redacted["observability"]["prompt_tokens"] == 321
+
+
+def test_workflow_trace_cost_derives_tool_calls_from_llm_and_source_calls() -> None:
+    step = workflow_step_from_trace(
+        AgentTraceStep(
+            step_id="trace-retrieve",
+            run_id="run-1",
+            step="retrieve",
+            status="completed",
+            input_summary="Does alpha improve beta?",
+            output_summary="retrieval-1",
+            metadata={
+                "observability": {
+                    "llm_call_count": 1,
+                    "source_call_count": 2,
+                    "prompt_tokens": 321,
+                },
+            },
+            created_at="2026-07-02T12:00:00Z",
+        ),
+        state_before={
+            "run_id": "run-1",
+            "question": "Does alpha improve beta?",
+            "completed_steps": [],
+            "available_artifacts": [],
+        },
+    )
+
+    assert step.cost["llm_call_count"] == 1
+    assert step.cost["source_call_count"] == 2
+    assert step.cost["tool_calls"] == 3

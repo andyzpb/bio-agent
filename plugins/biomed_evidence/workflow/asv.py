@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -17,6 +18,10 @@ from plugins.biomed_evidence.workflow.types import (
 )
 
 _SECRET_REDACTION = "[REDACTED]"
+_SECRET_STRING_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)([^\s,;&]+)"),
+    re.compile(r"(?i)(api[_-]?key\s*=\s*)([^&\s,;]+)"),
+)
 _SECRET_KEY_PARTS = (
     "api_key",
     "apikey",
@@ -210,6 +215,8 @@ def redact_for_asv(value: Any) -> Any:
         return [redact_for_asv(item) for item in value]
     if isinstance(value, tuple):
         return [redact_for_asv(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secret_strings(value)
     return value
 
 
@@ -240,7 +247,19 @@ def _cost_from_metadata(metadata: dict[str, Any]) -> dict[str, float]:
         value = metadata.get(key)
         if isinstance(value, (int, float)):
             cost[key] = value
+    if "tool_calls" not in cost:
+        llm_calls = cost.get("llm_call_count")
+        source_calls = cost.get("source_call_count")
+        if isinstance(llm_calls, (int, float)) and isinstance(source_calls, (int, float)):
+            cost["tool_calls"] = llm_calls + source_calls
     return cost
+
+
+def _redact_secret_strings(value: str) -> str:
+    redacted = value
+    for pattern in _SECRET_STRING_PATTERNS:
+        redacted = pattern.sub(rf"\1{_SECRET_REDACTION}", redacted)
+    return redacted
 
 
 def _final_score_from_run(run: Any) -> float | None:
