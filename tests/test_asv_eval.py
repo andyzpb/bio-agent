@@ -143,3 +143,14 @@ def test_logprob_candidate_limit_fails_before_provider_call() -> None:
 def test_prompt_leakage_guard_rejects_gold_and_success_fields() -> None:
     with pytest.raises(ValueError, match="gold_candidate_id"):
         ensure_no_gold_leakage("Question plus gold_candidate_id=yes")
+
+
+def test_step_quality_flags_are_optional_and_preserved() -> None:
+    step = StepRecord(
+        step_id="s-quality",
+        index=0,
+        action={"type": "evaluate"},
+        quality_flags={"evaluator_mode": "deepseek_chat_logprob"},
+    )
+
+    assert step.quality_flags == {"evaluator_mode": "deepseek_chat_logprob"}

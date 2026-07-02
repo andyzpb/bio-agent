@@ -50,6 +50,7 @@ class StepRecord:
     label: str | None = None
     label_source: str | None = None
     label_confidence: float | None = None
+    quality_flags: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
