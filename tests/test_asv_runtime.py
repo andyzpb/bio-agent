@@ -176,6 +176,44 @@ def test_render_state_for_evaluator_truncates_long_state_text() -> None:
     assert "[truncated]" in rendered.state_text
 
 
+def test_render_state_for_evaluator_adds_current_observation_only_after() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    step = StepRecord(
+        step_id="retrieve",
+        index=1,
+        action={"type": "retrieve"},
+        observation={
+            "summary": "retrieved evidence",
+            "metadata": {
+                "evidence_packet": {
+                    "supported_claims": [
+                        "Alpha reduced beta in a randomized trial."
+                    ]
+                }
+            },
+        },
+        state_before={"completed_steps": ["plan"]},
+        state_after={"completed_steps": ["plan", "retrieve"]},
+    )
+
+    before = render_state_for_evaluator(
+        trajectory.task,
+        step,
+        position="before",
+        config=EvaluatorRuntimeConfig(state_text_max_chars=2000),
+    )
+    after = render_state_for_evaluator(
+        trajectory.task,
+        step,
+        position="after",
+        config=EvaluatorRuntimeConfig(state_text_max_chars=2000),
+    )
+
+    assert "Alpha reduced beta" not in before.state_text
+    assert "last_observation" in after.state_text
+    assert "Alpha reduced beta" in after.state_text
+
+
 def test_render_state_for_evaluator_redacts_secret_like_state_keys_and_strings() -> None:
     trajectory = _trajectory_with_missing_beliefs()
     step = StepRecord(

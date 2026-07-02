@@ -439,9 +439,16 @@ def _deepseek_config_from_runtime(
 
 def _state_for_position(step: StepRecord, position: StatePosition) -> dict[str, Any]:
     if position == "before":
-        return step.state_before if step.state_before is not None else step.observation
+        return step.state_before if step.state_before is not None else {}
     if position == "after":
-        return step.state_after if step.state_after is not None else step.observation
+        if step.state_after is None:
+            return step.observation
+        if not step.observation:
+            return step.state_after
+        return {
+            **step.state_after,
+            "last_observation": step.observation,
+        }
     raise ValueError(f"unsupported state position: {position}")
 
 
