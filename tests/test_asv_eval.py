@@ -22,6 +22,7 @@ from asv_eval.evaluators import (
     candidate_scores_from_top_logprobs,
     ensure_no_gold_leakage,
     normalize_label_token,
+    render_forced_choice_prompt,
 )
 from asv_eval.reporting import build_summary
 
@@ -145,6 +146,22 @@ def test_logprob_candidate_limit_fails_before_provider_call() -> None:
 def test_prompt_leakage_guard_rejects_gold_and_success_fields() -> None:
     with pytest.raises(ValueError, match="gold_candidate_id"):
         ensure_no_gold_leakage("Question plus gold_candidate_id=yes")
+
+
+def test_forced_choice_prompt_is_state_grounded() -> None:
+    prompt = render_forced_choice_prompt(
+        question="Does APOE e4 increase Alzheimer's disease risk?",
+        evidence_text='{"completed_steps":[]}',
+        labels={
+            "A": "supported",
+            "B": "refuted",
+            "C": "not_enough_information",
+        },
+    )
+
+    assert "Use only information inside the evidence block" in prompt
+    assert "Do not use outside biomedical knowledge" in prompt
+    assert "choose the not_enough_information option" in prompt
 
 
 def test_step_quality_flags_are_optional_and_preserved() -> None:
