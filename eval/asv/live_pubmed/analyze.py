@@ -33,7 +33,7 @@ def aggregate_step_type_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 ),
                 "mean_net_asv": _mean(float(item["asv_components"]["net_asv"]) for item in items),
                 "mean_cost_scalar": _mean(float(item["asv_components"]["cost_scalar"]) for item in items),
-                "mean_gold_log_likelihood_gain": _mean(gold_values),
+                "mean_gold_log_likelihood_gain": _mean(gold_values) if gold_values else None,
                 "gold_metric_step_count": len(gold_values),
                 "missing_gold_metric_step_count": len(items) - len(gold_values),
                 "floor_score_step_count": sum(

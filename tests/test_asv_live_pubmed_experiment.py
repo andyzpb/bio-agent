@@ -581,3 +581,26 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
     assert "classify" in csv_text
     assert summary["step_type_summary"][0]["step_type"] == "classify"
     assert summary["step_type_summary"][0]["gold_metric_step_count"] == 1
+
+
+def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> None:
+    summary = aggregate_step_type_rows(
+        [
+            {
+                "trajectory_id": "t1",
+                "step_id": "retrieve-1",
+                "action": {"type": "retrieve"},
+                "asv_components": {
+                    "realized_entropy_reduction": 0.1,
+                    "net_asv": 0.1,
+                    "cost_scalar": 0.0,
+                },
+                "gold_metrics": {"gold_log_likelihood_gain": None},
+                "quality_flags": {},
+            }
+        ]
+    )
+
+    assert summary[0]["mean_gold_log_likelihood_gain"] is None
+    assert summary[0]["gold_metric_step_count"] == 0
+    assert summary[0]["missing_gold_metric_step_count"] == 1
