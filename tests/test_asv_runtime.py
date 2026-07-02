@@ -111,6 +111,48 @@ def test_render_state_for_evaluator_truncates_long_state_text() -> None:
     assert "[truncated]" in rendered.state_text
 
 
+def test_render_state_for_evaluator_redacts_secret_like_state_keys_and_strings() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    step = StepRecord(
+        step_id="secret-state",
+        index=1,
+        action={"type": "inspect"},
+        state_after={
+            "api_key": "sk-live-api-key",
+            "Authorization": "Bearer live-authorization",
+            "token": "live-token-value",
+            "password": "correct-horse",
+            "raw_provider_response": {"body": "provider raw secret"},
+            "notes": [
+                "Authorization: Bearer live-token",
+                "api_key=inline-live-key",
+                "safe clinical evidence",
+            ],
+        },
+    )
+
+    rendered = render_state_for_evaluator(
+        trajectory.task,
+        step,
+        position="after",
+        config=EvaluatorRuntimeConfig(state_text_max_chars=2000),
+    )
+    rendered_text = rendered.state_text + "\n" + rendered.prompt
+
+    for secret in (
+        "sk-live-api-key",
+        "live-authorization",
+        "live-token-value",
+        "correct-horse",
+        "provider raw secret",
+        "Bearer live-token",
+        "inline-live-key",
+    ):
+        assert secret not in rendered_text
+    assert "safe clinical evidence" in rendered_text
+    assert "[REDACTED]" in rendered_text
+
+
 def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
     tmp_path,
 ) -> None:
@@ -127,7 +169,10 @@ def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
         scores={"supported": -0.1, "refuted": -2.0},
         belief={"supported": 0.87, "refuted": 0.13},
         warnings=["low_margin"],
-        quality_flags={"evaluator_mode": "deepseek-chat-logprob"},
+        quality_flags={
+            "evaluator_mode": "deepseek-chat-logprob",
+            "raw_provider_response": "provider raw secret",
+        },
     )
 
     cache.put(
@@ -158,7 +203,18 @@ def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
     assert "prompt" not in row
     assert "state_text" not in row
     assert "rendered" not in row
-    assert StateScoreCache(cache_path).get("cache-1") == score
+    assert "provider raw secret" not in cache_path.read_text(encoding="utf-8")
+    expected_score = StateScore(
+        scores=score.scores,
+        belief=score.belief,
+        warnings=score.warnings,
+        quality_flags={
+            "evaluator_mode": "deepseek-chat-logprob",
+            "raw_provider_response": "[REDACTED]",
+        },
+    )
+    assert cache.get("cache-1") == expected_score
+    assert StateScoreCache(cache_path).get("cache-1") == expected_score
 
 
 def test_fill_missing_beliefs_accepts_optional_evaluator_and_cache() -> None:

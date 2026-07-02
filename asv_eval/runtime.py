@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -19,6 +20,36 @@ _LEAKY_KEYS = {
     "label",
     "label_source",
     "label_confidence",
+}
+_SECRET_REDACTION = "[REDACTED]"
+_SECRET_STRING_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)([^\s,;&]+)"),
+    re.compile(r"(?i)(bearer\s+)([^\s,;&]+)"),
+    re.compile(r"(?i)(api[_-]?key\s*=\s*)([^&\s,;]+)"),
+)
+_SECRET_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+)
+_SENSITIVE_CONTAINER_KEYS = {
+    "llm_raw_response",
+    "provider_raw_response",
+    "raw_llm_response",
+    "raw_provider_response",
+}
+_SAFE_SECRET_KEY_EXCEPTIONS = {
+    "prompt_hash",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
 }
 
 
@@ -97,7 +128,13 @@ class StateScoreCache:
         score: StateScore,
         config: EvaluatorRuntimeConfig,
     ) -> None:
-        self._rows[key] = score
+        sanitized_score = StateScore(
+            scores=score.scores,
+            belief=score.belief,
+            warnings=_redact(score.warnings),
+            quality_flags=_redact(score.quality_flags),
+        )
+        self._rows[key] = sanitized_score
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,10 +146,10 @@ class StateScoreCache:
             "state_hash": rendered.state_hash,
             "prompt_hash": rendered.prompt_hash,
             "candidate_ids": list(rendered.labels.values()),
-            "scores": score.scores,
-            "belief": score.belief,
-            "warnings": score.warnings,
-            "quality_flags": score.quality_flags,
+            "scores": sanitized_score.scores,
+            "belief": sanitized_score.belief,
+            "warnings": sanitized_score.warnings,
+            "quality_flags": sanitized_score.quality_flags,
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
@@ -194,13 +231,33 @@ def _state_for_position(step: StepRecord, position: StatePosition) -> dict[str, 
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: _redact(item)
+            key: _SECRET_REDACTION if _is_secret_key(str(key)) else _redact(item)
             for key, item in value.items()
-            if key not in _LEAKY_KEYS
+            if str(key) not in _LEAKY_KEYS
         }
     if isinstance(value, list):
         return [_redact(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secret_strings(value)
     return value
+
+
+def _is_secret_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    if any(part in normalized for part in _SAFE_SECRET_KEY_EXCEPTIONS):
+        return False
+    if normalized in _SENSITIVE_CONTAINER_KEYS:
+        return True
+    return any(part in normalized for part in _SECRET_KEY_PARTS)
+
+
+def _redact_secret_strings(value: str) -> str:
+    redacted = value
+    for pattern in _SECRET_STRING_PATTERNS:
+        redacted = pattern.sub(rf"\1{_SECRET_REDACTION}", redacted)
+    return redacted
 
 
 def _bounded_json(value: Any, max_chars: int) -> str:
