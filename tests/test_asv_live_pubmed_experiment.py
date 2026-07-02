@@ -12,6 +12,11 @@ from eval.asv.live_pubmed.collect import (
     collect_claims,
     write_collection_outputs,
 )
+from eval.asv.live_pubmed.evaluate import (
+    EvaluationRun,
+    build_evaluate_command,
+    scan_for_secret_markers,
+)
 from eval.asv.live_pubmed.claims import (
     CLAIM_LABELS,
     ClaimRecord,
@@ -367,3 +372,51 @@ def test_collect_main_returns_nonzero_on_partial_failure(
         for line in (output_dir / "collection.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert [row["status"] for row in rows] == ["completed", "failed", "completed"]
+
+
+def test_build_evaluate_command_uses_deepseek_cache_and_frozen_input(
+    tmp_path: Path,
+) -> None:
+    run = EvaluationRun(
+        input_path=tmp_path / "trajectory.jsonl",
+        output_dir=tmp_path / "report",
+        cache_path=tmp_path / "cache.jsonl",
+        evaluated_path=tmp_path / "evaluated.jsonl",
+        fallback_policy="floor",
+        floor_score=-20.0,
+    )
+
+    command = build_evaluate_command(run)
+
+    assert command[:4] == [".venv/bin/python", "-m", "asv_eval", "evaluate"]
+    assert "--evaluator" in command
+    assert "deepseek-chat-logprob" in command
+    assert "--cache" in command
+    assert str(run.cache_path) in command
+    assert "--write-evaluated-trajectories" in command
+    assert str(run.evaluated_path) in command
+    assert "--fallback-policy" in command
+    assert "floor" in command
+    assert "--floor-score" in command
+    assert "-20.0" in command
+
+
+def test_secret_scan_allows_safe_env_var_name(tmp_path: Path) -> None:
+    path = tmp_path / "summary.json"
+    path.write_text('{"credential_env": "DEEPSEEK_API_KEY"}', encoding="utf-8")
+
+    assert scan_for_secret_markers([path]) == []
+
+
+def test_secret_scan_flags_raw_provider_payload(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(
+        '{"raw_provider_response": {"Authorization": "Bearer abc"}}',
+        encoding="utf-8",
+    )
+
+    assert scan_for_secret_markers([path]) == [
+        f"raw_provider_response found in {path}",
+        f"Authorization found in {path}",
+        f"Bearer  found in {path}",
+    ]

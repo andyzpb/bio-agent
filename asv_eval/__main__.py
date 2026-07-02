@@ -68,6 +68,7 @@ def _evaluate(args: argparse.Namespace) -> int:
         model=args.model,
         api_key_env=args.api_key_env,
         fallback_policy=args.fallback_policy,
+        floor_score=args.floor_score,
         state_text_max_chars=args.state_text_max_chars,
     )
     runtime_evaluator = (
@@ -139,6 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     evaluate.add_argument("--cache")
     evaluate.add_argument("--fallback-policy", choices=["error", "floor"], default="error")
+    evaluate.add_argument("--floor-score", type=float, default=-20.0)
     evaluate.add_argument("--state-text-max-chars", type=int, default=6000)
     evaluate.add_argument("--write-evaluated-trajectories")
     evaluate.add_argument("--output-dir", required=True)

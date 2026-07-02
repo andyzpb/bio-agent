@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 from asv_eval.adapters import load_standard_jsonl
 from asv_eval.reporting import write_report_bundle
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write_sample(path) -> None:
@@ -294,3 +298,88 @@ def test_cli_evaluate_writes_evaluated_trajectories_with_runtime(
     assert summary["evaluator_coverage"]["evaluated_state_count"] == 2
     for path in [output_dir / "summary.json", output_dir / "steps.jsonl"]:
         assert "api_key" not in path.read_text(encoding="utf-8")
+
+
+def test_evaluate_accepts_floor_score_runtime_config(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    beliefs_path = tmp_path / "beliefs.jsonl"
+    output_dir = tmp_path / "report"
+    input_path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "floor-score-cli",
+                "task": {
+                    "task_id": "floor-score-cli-task",
+                    "question": "Does alpha improve beta?",
+                    "candidate_space": {
+                        "candidates": [
+                            {"id": "supported", "label": "A", "text": "supported"},
+                            {"id": "refuted", "label": "B", "text": "refuted"},
+                            {
+                                "id": "not_enough_information",
+                                "label": "C",
+                                "text": "not enough information",
+                            },
+                        ]
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "retrieve",
+                        "index": 0,
+                        "action": {"type": "retrieve"},
+                        "observation": {"summary": "evidence"},
+                        "state_before": {"question": "Does alpha improve beta?"},
+                        "state_after": {"evidence": "alpha improved beta"},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    beliefs_path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "floor-score-cli",
+                "step_id": "retrieve",
+                "belief_before": {
+                    "supported": 0.34,
+                    "refuted": 0.33,
+                    "not_enough_information": 0.33,
+                },
+                "belief_after": {
+                    "supported": 0.70,
+                    "refuted": 0.15,
+                    "not_enough_information": 0.15,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "asv_eval",
+            "evaluate",
+            "--input",
+            str(input_path),
+            "--belief-fixture",
+            str(beliefs_path),
+            "--floor-score",
+            "-15",
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["evaluator"]["floor_score"] == -15.0
