@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from asv_eval.core import (
     ASVConfig,
     Candidate,
@@ -13,6 +15,13 @@ from asv_eval.core import (
     entropy_nats,
     evaluate_trajectory,
     normalize_log_scores,
+)
+from asv_eval.evaluators import (
+    DeepSeekLogprobConfig,
+    MockBeliefEvaluator,
+    candidate_scores_from_top_logprobs,
+    ensure_no_gold_leakage,
+    normalize_label_token,
 )
 
 
@@ -89,3 +98,48 @@ def test_evaluate_trajectory_computes_realized_entropy_reduction_and_gold_gain()
     )
     assert row["state_before_hash"].startswith("sha256:")
     assert row["state_after_hash"].startswith("sha256:")
+
+
+def test_mock_belief_evaluator_reads_fixture_beliefs() -> None:
+    evaluator = MockBeliefEvaluator()
+    step = StepRecord(
+        step_id="s1",
+        index=0,
+        action={"type": "search"},
+        belief_before={"yes": 0.25, "no": 0.75},
+        belief_after={"yes": 0.9, "no": 0.1},
+    )
+
+    before, after = evaluator.evaluate_step(step, ["yes", "no"])
+
+    assert before["yes"] == 0.25
+    assert after["yes"] == 0.9
+
+
+def test_logprob_label_mapping_normalizes_variants_and_logsumexp() -> None:
+    scores, warnings = candidate_scores_from_top_logprobs(
+        [
+            {"token": " A", "logprob": -0.2},
+            {"token": "A.", "logprob": -1.2},
+            {"token": "\nB", "logprob": -2.0},
+        ],
+        label_to_candidate={"A": "yes", "B": "no"},
+        floor_score=-20.0,
+    )
+
+    assert normalize_label_token("\nA.") == "A"
+    assert scores["yes"] == pytest.approx(-0.2 + math.log1p(math.exp(-1.0)))
+    assert scores["no"] == -2.0
+    assert warnings == []
+
+
+def test_logprob_candidate_limit_fails_before_provider_call() -> None:
+    config = DeepSeekLogprobConfig(top_logprobs=20, max_logprob_candidates=10)
+
+    with pytest.raises(ValueError, match="candidate_count"):
+        config.validate_candidate_count(11)
+
+
+def test_prompt_leakage_guard_rejects_gold_and_success_fields() -> None:
+    with pytest.raises(ValueError, match="gold_candidate_id"):
+        ensure_no_gold_leakage("Question plus gold_candidate_id=yes")
