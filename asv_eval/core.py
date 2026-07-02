@@ -165,6 +165,7 @@ def evaluate_trajectory(
             {
                 "trajectory_id": trajectory.trajectory_id,
                 "step_id": step.step_id,
+                "action": step.action,
                 "state_before_id": f"state-{trajectory.trajectory_id}-{index}",
                 "state_after_id": f"state-{trajectory.trajectory_id}-{index + 1}",
                 "state_before_hash": state_hash(state_before),

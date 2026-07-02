@@ -97,6 +97,7 @@ def test_evaluate_trajectory_computes_realized_entropy_reduction_and_gold_gain()
         math.log(0.83) - math.log(0.34),
         6,
     )
+    assert row["action"] == {"type": "search", "is_external_observation": True}
     assert row["state_before_hash"].startswith("sha256:")
     assert row["state_after_hash"].startswith("sha256:")
 
