@@ -227,12 +227,17 @@ def test_build_summary_reports_evaluator_coverage_from_quality_flags() -> None:
     rows[0]["quality_flags"].update(
         {
             "used_cache": True,
+            "before_used_cache": True,
+            "after_used_cache": True,
             "used_floor_score": True,
             "missing_labels": ["B"],
         }
     )
     rows[1]["quality_flags"].update(
         {
+            "before_used_cache": True,
+            "after_used_cache": False,
+            "used_cache": False,
             "used_fallback": True,
             "missing_labels": [],
         }
@@ -241,6 +246,7 @@ def test_build_summary_reports_evaluator_coverage_from_quality_flags() -> None:
     summary = build_summary([trajectory], rows)
 
     assert summary["evaluator_coverage"]["evaluated_state_count"] == len(rows) * 2
+    assert summary["evaluator_coverage"]["cache_hit_state_count"] == 3
     assert summary["evaluator_coverage"]["cache_hit_step_count"] == 1
     assert summary["evaluator_coverage"]["floor_score_step_count"] == 1
     assert summary["evaluator_coverage"]["fallback_step_count"] == 1

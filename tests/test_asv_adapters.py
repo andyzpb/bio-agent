@@ -11,6 +11,14 @@ from asv_eval.adapters import (
     load_belief_fixture,
     load_standard_jsonl,
     react_transcript_to_trajectory,
+    write_standard_jsonl,
+)
+from asv_eval.core import (
+    Candidate,
+    CandidateSpace,
+    StepRecord,
+    TaskRecord,
+    TrajectoryRecord,
 )
 
 
@@ -50,6 +58,46 @@ def test_standard_jsonl_loader_builds_trajectory(tmp_path) -> None:
 
     assert trajectories[0].trajectory_id == "traj-1"
     assert trajectories[0].task.candidate_space.candidates[0].label == "A"
+
+
+def test_standard_jsonl_roundtrip_preserves_step_quality_flags(tmp_path) -> None:
+    path = tmp_path / "trajectories.jsonl"
+    trajectory = TrajectoryRecord(
+        trajectory_id="traj-quality-flags",
+        task=TaskRecord(
+            task_id="task-quality-flags",
+            question="Does X help?",
+            candidate_space=CandidateSpace(
+                candidates=[
+                    Candidate(id="yes", label="A", text="yes"),
+                    Candidate(id="no", label="B", text="no"),
+                ],
+            ),
+        ),
+        steps=[
+            StepRecord(
+                step_id="s1",
+                index=0,
+                action={"type": "evaluate"},
+                belief_before={"yes": 0.5, "no": 0.5},
+                belief_after={"yes": 0.8, "no": 0.2},
+                quality_flags={
+                    "evaluator_mode": "deepseek_chat_logprob",
+                    "prompt_before_hash": "sha256:before",
+                    "used_cache": True,
+                },
+            )
+        ],
+    )
+
+    write_standard_jsonl(path, [trajectory])
+    [loaded] = load_standard_jsonl(path)
+
+    assert loaded.steps[0].quality_flags == {
+        "evaluator_mode": "deepseek_chat_logprob",
+        "prompt_before_hash": "sha256:before",
+        "used_cache": True,
+    }
 
 
 def test_belief_fixture_loader_reports_malformed_json_with_context(tmp_path) -> None:

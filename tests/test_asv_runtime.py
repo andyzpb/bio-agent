@@ -396,6 +396,66 @@ def test_state_score_cache_reuses_identical_rendered_state(tmp_path) -> None:
     assert "Bearer" not in cache_text
 
 
+def test_fill_missing_beliefs_records_state_level_cache_hits() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    config = EvaluatorRuntimeConfig(mode="deepseek-chat-logprob")
+    fake = _FakeEvaluator()
+    cache = StateScoreCache()
+    rendered_before = render_state_for_evaluator(
+        trajectory.task,
+        trajectory.steps[0],
+        position="before",
+        config=config,
+    )
+    before_score = StateScore(
+        scores={
+            "supported": -1.1,
+            "refuted": -1.0,
+            "not_enough_information": -1.2,
+        },
+        belief={
+            "supported": 0.33,
+            "refuted": 0.37,
+            "not_enough_information": 0.30,
+        },
+        quality_flags={"prompt_hash": "sha256:cached-before"},
+    )
+    provider_prompt = render_forced_choice_prompt(
+        question=trajectory.task.question,
+        evidence_text=rendered_before.state_text,
+        labels=rendered_before.labels,
+    )
+    cache.put(
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "config": config.cache_identity(),
+                    "prompt": provider_prompt,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        rendered_before,
+        before_score,
+        config,
+    )
+
+    [filled] = fill_missing_beliefs(
+        [trajectory],
+        config=config,
+        evaluator=fake,
+        cache=cache,
+    )
+
+    flags = filled.steps[0].quality_flags
+    assert flags["before_used_cache"] is True
+    assert flags["after_used_cache"] is False
+    assert flags["used_cache"] is False
+    assert len(fake.calls) == 1
+
+
 def test_deepseek_missing_label_warning_raises_with_context_by_default() -> None:
     trajectory = _trajectory_with_missing_beliefs()
 

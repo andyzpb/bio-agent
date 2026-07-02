@@ -134,6 +134,7 @@ def trajectory_from_dict(payload: dict[str, Any]) -> TrajectoryRecord:
             label=item.get("label"),
             label_source=item.get("label_source"),
             label_confidence=item.get("label_confidence"),
+            quality_flags=dict(item.get("quality_flags") or {}),
         )
         for idx, item in enumerate(payload.get("steps") or [])
     ]

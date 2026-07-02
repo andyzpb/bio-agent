@@ -105,6 +105,9 @@ def _evaluator_coverage(rows: list[dict[str, Any]]) -> dict[str, int]:
     quality_flags = [row.get("quality_flags") or {} for row in rows]
     return {
         "evaluated_state_count": len(rows) * 2,
+        "cache_hit_state_count": sum(
+            _cache_hit_state_count(flags) for flags in quality_flags
+        ),
         "cache_hit_step_count": sum(
             flags.get("used_cache") is True for flags in quality_flags
         ),
@@ -118,6 +121,14 @@ def _evaluator_coverage(rows: list[dict[str, Any]]) -> dict[str, int]:
             bool(flags.get("missing_labels")) for flags in quality_flags
         ),
     }
+
+
+def _cache_hit_state_count(flags: dict[str, Any]) -> int:
+    if "before_used_cache" in flags or "after_used_cache" in flags:
+        return int(flags.get("before_used_cache") is True) + int(
+            flags.get("after_used_cache") is True
+        )
+    return 2 if flags.get("used_cache") is True else 0
 
 
 def _state_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

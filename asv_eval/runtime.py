@@ -283,6 +283,8 @@ def fill_missing_beliefs(
                 "candidate_count": len(rendered_after.labels),
                 "top_logprobs": config.top_logprobs,
                 "floor_score": config.floor_score,
+                "before_used_cache": before_cache_hit,
+                "after_used_cache": after_cache_hit,
                 "used_cache": before_cache_hit and after_cache_hit,
                 "used_fallback": missing_label_flags["used_floor_score"],
                 "state_before_hash": rendered_before.state_hash,
