@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from asv_eval.core import StepRecord, TaskRecord, TrajectoryRecord
+from asv_eval.core import StepRecord, TaskRecord, TrajectoryRecord, normalize_log_scores
+from asv_eval.evaluators import DeepSeekLogprobBeliefEvaluator, DeepSeekLogprobConfig
 
 EvaluatorMode = Literal["provided-belief", "deepseek-chat-logprob"]
 FallbackPolicy = Literal["error", "floor"]
@@ -49,10 +50,14 @@ _SENSITIVE_CONTAINER_KEYS = {
 }
 _SECRET_STRING_MARKERS = _SECRET_KEY_PARTS + tuple(_SENSITIVE_CONTAINER_KEYS)
 _SAFE_SECRET_KEY_EXCEPTIONS = {
+    "api_key_env",
     "prompt_hash",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+}
+_SAFE_SECRET_STRING_EXCEPTIONS = {
+    "DEEPSEEK_API_KEY",
 }
 
 
@@ -209,18 +214,142 @@ def fill_missing_beliefs(
     evaluator: Any | None = None,
     cache: StateScoreCache | None = None,
 ) -> list[TrajectoryRecord]:
-    _ = evaluator, cache
-    if config.mode == "deepseek-chat-logprob":
-        raise NotImplementedError(
-            "deepseek-chat-logprob belief filling is added in Task 2"
-        )
+    if config.mode == "provided-belief":
+        for trajectory in trajectories:
+            for step in trajectory.steps:
+                if step.belief_before is None or step.belief_after is None:
+                    raise ValueError(
+                        f"step {step.step_id} is missing belief_before/belief_after"
+                    )
+        return trajectories
+
+    active_evaluator = evaluator or DeepSeekLogprobBeliefEvaluator(
+        _deepseek_config_from_runtime(config)
+    )
+    active_cache = cache or StateScoreCache()
+    filled_trajectories: list[TrajectoryRecord] = []
     for trajectory in trajectories:
+        filled_steps: list[StepRecord] = []
         for step in trajectory.steps:
-            if step.belief_before is None or step.belief_after is None:
-                raise ValueError(
-                    f"step {step.step_id} is missing belief_before/belief_after"
+            rendered_before = render_state_for_evaluator(
+                trajectory.task,
+                step,
+                position="before",
+                config=config,
+            )
+            rendered_after = render_state_for_evaluator(
+                trajectory.task,
+                step,
+                position="after",
+                config=config,
+            )
+            before_score, before_cache_hit = _score_rendered_state(
+                trajectory.task,
+                rendered_before,
+                config,
+                active_evaluator,
+                active_cache,
+            )
+            after_score, after_cache_hit = _score_rendered_state(
+                trajectory.task,
+                rendered_after,
+                config,
+                active_evaluator,
+                active_cache,
+            )
+            quality_flags = {
+                **step.quality_flags,
+                "evaluator_mode": "deepseek_chat_logprob",
+                "provider": config.provider,
+                "model": config.model,
+                "api_key_env": config.api_key_env,
+                "candidate_count": len(rendered_after.labels),
+                "top_logprobs": config.top_logprobs,
+                "floor_score": config.floor_score,
+                "used_cache": before_cache_hit and after_cache_hit,
+                "used_fallback": False,
+                "state_before_hash": rendered_before.state_hash,
+                "state_after_hash": rendered_after.state_hash,
+                "prompt_before_hash": rendered_before.prompt_hash,
+                "prompt_after_hash": rendered_after.prompt_hash,
+                "before_warnings": before_score.warnings,
+                "after_warnings": after_score.warnings,
+            }
+            filled_steps.append(
+                replace(
+                    step,
+                    belief_before=before_score.belief,
+                    belief_after=after_score.belief,
+                    quality_flags=quality_flags,
                 )
-    return trajectories
+            )
+        filled_trajectories.append(replace(trajectory, steps=filled_steps))
+    return filled_trajectories
+
+
+def _score_rendered_state(
+    task: TaskRecord,
+    rendered: RenderedState,
+    config: EvaluatorRuntimeConfig,
+    evaluator: Any,
+    cache: StateScoreCache,
+) -> tuple[StateScore, bool]:
+    key = _cache_key(config, rendered.prompt)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached, True
+
+    scores, warnings = evaluator.score_state(
+        question=task.question,
+        evidence_text=rendered.state_text,
+        labels=rendered.labels,
+    )
+    score = StateScore(
+        scores=scores,
+        belief=normalize_log_scores(scores),
+        warnings=list(warnings),
+        quality_flags={
+            "evaluator_mode": "deepseek_chat_logprob",
+            "provider": config.provider,
+            "model": config.model,
+            "api_key_env": config.api_key_env,
+            "candidate_count": len(rendered.labels),
+            "top_logprobs": config.top_logprobs,
+            "floor_score": config.floor_score,
+            "used_cache": False,
+            "used_fallback": False,
+            "state_hash": rendered.state_hash,
+            "prompt_hash": rendered.prompt_hash,
+        },
+    )
+    cache.put(key, rendered, score, config)
+    return score, False
+
+
+def _cache_key(config: EvaluatorRuntimeConfig, prompt: str) -> str:
+    payload = json.dumps(
+        {
+            "config": config.cache_identity(),
+            "prompt": prompt,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return _sha256(payload)
+
+
+def _deepseek_config_from_runtime(
+    config: EvaluatorRuntimeConfig,
+) -> DeepSeekLogprobConfig:
+    return DeepSeekLogprobConfig(
+        model=config.model,
+        api_key_env=config.api_key_env,
+        top_logprobs=config.top_logprobs,
+        max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        max_logprob_candidates=config.max_logprob_candidates,
+        floor_score=config.floor_score,
+    )
 
 
 def _state_for_position(step: StepRecord, position: StatePosition) -> dict[str, Any]:
@@ -257,6 +386,8 @@ def _is_secret_key(key: str) -> bool:
 
 
 def _redact_secret_strings(value: str) -> str:
+    if value in _SAFE_SECRET_STRING_EXCEPTIONS:
+        return value
     normalized = value.lower().replace("-", "_")
     if any(marker in normalized for marker in _SECRET_STRING_MARKERS):
         return _SECRET_REDACTION

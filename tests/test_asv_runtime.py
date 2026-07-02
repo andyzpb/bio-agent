@@ -20,6 +20,43 @@ from asv_eval.runtime import (
 )
 
 
+class _FakeEvaluator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def score_state(
+        self,
+        *,
+        question: str,
+        evidence_text: str,
+        labels: dict[str, str],
+    ) -> tuple[dict[str, float], list[str]]:
+        self.calls.append(
+            {
+                "question": question,
+                "evidence_text": evidence_text,
+                "labels": labels,
+            }
+        )
+        if "completed_steps" in evidence_text or "alpha-improved evidence" in evidence_text:
+            return (
+                {
+                    "supported": -0.05,
+                    "refuted": -4.0,
+                    "not_enough_information": -4.5,
+                },
+                [],
+            )
+        return (
+            {
+                "supported": -1.1,
+                "refuted": -1.0,
+                "not_enough_information": -1.2,
+            },
+            ["low_signal"],
+        )
+
+
 def _trajectory_with_missing_beliefs() -> TrajectoryRecord:
     task = TaskRecord(
         task_id="task-runtime-1",
@@ -51,7 +88,10 @@ def _trajectory_with_missing_beliefs() -> TrajectoryRecord:
                 state_before={"gold_candidate_id": "supported", "success": True},
                 state_after={
                     "final_score": 1.0,
-                    "evidence": "Trial evidence supports the intervention.",
+                    "evidence": (
+                        "Trial evidence supports the intervention. "
+                        "completed_steps include alpha-improved evidence."
+                    ),
                 },
                 label="useful",
                 label_source="human",
@@ -259,10 +299,9 @@ def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
 
 
 def test_fill_missing_beliefs_accepts_optional_evaluator_and_cache() -> None:
-    trajectory = _trajectory_with_missing_beliefs()
     complete = TrajectoryRecord(
-        trajectory_id=trajectory.trajectory_id,
-        task=trajectory.task,
+        trajectory_id="traj-runtime-complete",
+        task=_trajectory_with_missing_beliefs().task,
         steps=[
             StepRecord(
                 step_id="s1",
@@ -280,10 +319,54 @@ def test_fill_missing_beliefs_accepts_optional_evaluator_and_cache() -> None:
         evaluator=None,
         cache=None,
     ) == [complete]
-    with pytest.raises(NotImplementedError, match="Task 2"):
-        fill_missing_beliefs(
-            [trajectory],
-            config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
-            evaluator=None,
-            cache=None,
-        )
+
+
+def test_fill_missing_beliefs_with_deepseek_mode_scores_before_and_after() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    fake = _FakeEvaluator()
+
+    [filled] = fill_missing_beliefs(
+        [trajectory],
+        config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+        evaluator=fake,
+    )
+
+    step = filled.steps[0]
+    assert step.belief_before is not None
+    assert step.belief_after is not None
+    assert step.belief_after["supported"] > step.belief_before["supported"]
+    assert len(fake.calls) == 2
+    assert step.quality_flags["evaluator_mode"] == "deepseek_chat_logprob"
+    assert step.quality_flags["provider"] == "deepseek"
+    assert step.quality_flags["used_cache"] is False
+    assert step.quality_flags["state_before_hash"].startswith("sha256:")
+    assert step.quality_flags["state_after_hash"].startswith("sha256:")
+
+
+def test_state_score_cache_reuses_identical_rendered_state(tmp_path) -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    fake = _FakeEvaluator()
+    cache_path = tmp_path / "scores.jsonl"
+
+    fill_missing_beliefs(
+        [trajectory],
+        config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+        evaluator=fake,
+        cache=StateScoreCache(cache_path),
+    )
+    fill_missing_beliefs(
+        [trajectory],
+        config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+        evaluator=fake,
+        cache=StateScoreCache(cache_path),
+    )
+
+    assert len(fake.calls) == 2
+    cache_text = cache_path.read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in cache_text.splitlines()]
+    assert len(rows) == 2
+    assert {row["quality_flags"]["provider"] for row in rows} == {"deepseek"}
+    assert {
+        row["quality_flags"]["api_key_env"] for row in rows
+    } == {"DEEPSEEK_API_KEY"}
+    assert "Bearer" not in cache_text
