@@ -6327,6 +6327,14 @@ class BiomedEvidenceService:
             or result.answer[:240]
             or run_id
         )
+        audit = self.storage.get_latest_citation_audit_for_run(run_id)
+        revision = self.storage.get_answer_revision(run_id)
+        if revision is not None and revision.post_revision_audit_id:
+            audit = (
+                self.storage.get_citation_audit(revision.post_revision_audit_id)
+                or audit
+            )
+        final_action = revision.revision_action if revision is not None else None
         return trajectory_from_answer_run(
             {
                 "run_id": result.run_id,
@@ -6334,6 +6342,8 @@ class BiomedEvidenceService:
                 "trace": trace,
                 "answer": result.answer,
                 "answer_result": result.model_dump(mode="json"),
+                "audit": audit,
+                "final_action": final_action,
             }
         )
 

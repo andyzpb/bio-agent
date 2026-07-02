@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from pathlib import Path
 
@@ -206,6 +207,8 @@ async def test_service_exports_saved_audited_run_as_asv_trajectory(
 
     assert trajectory.run_id == audited.answer_result.run_id
     assert trajectory.task.question.startswith("What recent evidence")
+    assert trajectory.final_score is not None
+    assert trajectory.success is not None
     step_types = [step.action["type"] for step in trajectory.steps]
     assert {"classify", "retrieve", "extract", "audit", "revise", "finalize"} <= set(
         step_types
@@ -219,6 +222,54 @@ async def test_service_exports_saved_audited_run_as_asv_trajectory(
     ).lower()
     assert "authorization" not in rendered
     assert "bearer secret" not in rendered
+    assert "raw_provider_response" not in rendered or "[redacted]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_service_export_asv_trajectory_redacts_full_serialized_payload(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question="What evidence links tau pathology to synaptic loss?",
+                source="mock",
+                max_papers=3,
+            )
+        )
+        extract_step = next(
+            step
+            for step in service.storage.list_agent_trace_steps(
+                audited.answer_result.run_id
+            )
+            if step.step == "extract"
+        )
+        service.storage.save_agent_trace_steps(
+            [
+                extract_step.model_copy(
+                    update={
+                        "metadata": {
+                            "debug_log": "Authorization: Bearer secret-token",
+                            "raw_provider_response": {
+                                "authorization": "Bearer secret-token",
+                            },
+                        },
+                    }
+                )
+            ]
+        )
+
+        trajectory = service.export_answer_run_asv_trajectory(
+            audited.answer_result.run_id
+        )
+    finally:
+        await service.aclose()
+
+    rendered = json.dumps(asdict(trajectory), default=str, sort_keys=True).lower()
+    assert "secret-token" not in rendered
+    assert "bearer secret" not in rendered
+    assert "agenttracestep" not in rendered
     assert "raw_provider_response" not in rendered or "[redacted]" in rendered
 
 

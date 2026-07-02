@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from asv_eval.core import (
@@ -131,6 +130,14 @@ def trajectory_from_answer_run(run: Any) -> TrajectoryRecord:
         or run_id
     )
     trace = list(getattr(run, "trace", None) or _value_from_mapping(run, "trace") or [])
+    final_action = _attribute_or_mapping(run, "final_action")
+    source_run = {
+        "run_id": run_id,
+        "question": question,
+        "trace_step_count": len(trace),
+    }
+    if final_action is not None:
+        source_run["final_action"] = str(final_action)
     state: dict[str, Any] = {
         "run_id": run_id,
         "question": question,
@@ -149,7 +156,7 @@ def trajectory_from_answer_run(run: Any) -> TrajectoryRecord:
         created_at=getattr(run, "created_at", None),
         final_score=_final_score_from_run(run),
         success=_success_from_run(run),
-        metadata={"source_run": redact_for_asv(_object_to_mapping(run))},
+        metadata={"source_run": redact_for_asv(source_run)},
     )
 
 
@@ -308,16 +315,3 @@ def _attribute_or_mapping(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         return value.get(key)
     return getattr(value, key, None)
-
-
-def _object_to_mapping(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return dict(model_dump(mode="json"))
-    if hasattr(value, "__dict__"):
-        return dict(vars(value))
-    return {}
