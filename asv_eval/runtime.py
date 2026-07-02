@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -80,7 +80,12 @@ class StateScoreCache:
                     if not line.strip():
                         continue
                     row = json.loads(line)
-                    self._rows[row["key"]] = StateScore(**row["score"])
+                    self._rows[row["cache_key"]] = StateScore(
+                        scores=row["scores"],
+                        belief=row["belief"],
+                        warnings=row["warnings"],
+                        quality_flags=row["quality_flags"],
+                    )
 
     def get(self, key: str) -> StateScore | None:
         return self._rows.get(key)
@@ -97,10 +102,17 @@ class StateScoreCache:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         row = {
-            "key": key,
-            "rendered": asdict(rendered),
-            "score": asdict(score),
-            "config": config.cache_identity(),
+            "cache_key": key,
+            "provider": config.provider,
+            "model": config.model,
+            "mode": config.mode,
+            "state_hash": rendered.state_hash,
+            "prompt_hash": rendered.prompt_hash,
+            "candidate_ids": list(rendered.labels.values()),
+            "scores": score.scores,
+            "belief": score.belief,
+            "warnings": score.warnings,
+            "quality_flags": score.quality_flags,
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
@@ -121,7 +133,7 @@ def render_state_for_evaluator(
         for candidate in task.candidate_space.candidates
     }
     options = "\n".join(
-        f"{candidate.label}. {candidate.text}"
+        f"{candidate.label}: {candidate.id}"
         for candidate in task.candidate_space.candidates
     )
     prompt = "\n".join(
@@ -153,10 +165,12 @@ def render_state_for_evaluator(
 def fill_missing_beliefs(
     trajectories: list[TrajectoryRecord],
     *,
-    config: EvaluatorRuntimeConfig | None = None,
+    config: EvaluatorRuntimeConfig,
+    evaluator: Any | None = None,
+    cache: StateScoreCache | None = None,
 ) -> list[TrajectoryRecord]:
-    active_config = config or EvaluatorRuntimeConfig()
-    if active_config.mode == "deepseek-chat-logprob":
+    _ = evaluator, cache
+    if config.mode == "deepseek-chat-logprob":
         raise NotImplementedError(
             "deepseek-chat-logprob belief filling is added in Task 2"
         )

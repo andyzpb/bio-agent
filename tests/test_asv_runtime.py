@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from asv_eval.core import (
     Candidate,
     CandidateSpace,
@@ -7,21 +11,27 @@ from asv_eval.core import (
     TaskRecord,
     TrajectoryRecord,
 )
-from asv_eval.runtime import EvaluatorRuntimeConfig, render_state_for_evaluator
+from asv_eval.runtime import (
+    EvaluatorRuntimeConfig,
+    StateScore,
+    StateScoreCache,
+    fill_missing_beliefs,
+    render_state_for_evaluator,
+)
 
 
 def _trajectory_with_missing_beliefs() -> TrajectoryRecord:
     task = TaskRecord(
         task_id="task-runtime-1",
-        question="Which claim is best supported?",
+        question="Does alpha improve beta?",
         candidate_space=CandidateSpace(
             candidates=[
-                Candidate(id="supported", label="A", text="supported"),
-                Candidate(id="refuted", label="B", text="refuted"),
+                Candidate(id="supported", label="A", text="Supported by evidence"),
+                Candidate(id="refuted", label="B", text="Refuted by evidence"),
                 Candidate(
                     id="not_enough_information",
                     label="C",
-                    text="not enough information",
+                    text="Insufficient evidence",
                 ),
             ],
             gold_candidate_id="supported",
@@ -63,10 +73,13 @@ def test_render_state_for_evaluator_uses_candidates_and_redacts_leaky_fields() -
         config=EvaluatorRuntimeConfig(state_text_max_chars=2000),
     )
 
-    assert "Which claim is best supported?" in rendered.prompt
-    assert "A. supported" in rendered.prompt
-    assert "B. refuted" in rendered.prompt
-    assert "C. not enough information" in rendered.prompt
+    assert "Does alpha improve beta?" in rendered.prompt
+    assert "A: supported" in rendered.prompt
+    assert "B: refuted" in rendered.prompt
+    assert "C: not_enough_information" in rendered.prompt
+    assert "A. Supported by evidence" not in rendered.prompt
+    assert "B. Refuted by evidence" not in rendered.prompt
+    assert "C. Insufficient evidence" not in rendered.prompt
     assert "<EVIDENCE>" in rendered.prompt
     assert "Trial evidence supports the intervention." in rendered.prompt
     assert "gold_candidate_id" not in rendered.prompt
@@ -96,3 +109,84 @@ def test_render_state_for_evaluator_truncates_long_state_text() -> None:
 
     assert len(rendered.state_text) <= 100
     assert "[truncated]" in rendered.state_text
+
+
+def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
+    tmp_path,
+) -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    rendered = render_state_for_evaluator(
+        trajectory.task,
+        trajectory.steps[0],
+        position="after",
+        config=EvaluatorRuntimeConfig(),
+    )
+    cache_path = tmp_path / "scores.jsonl"
+    cache = StateScoreCache(cache_path)
+    score = StateScore(
+        scores={"supported": -0.1, "refuted": -2.0},
+        belief={"supported": 0.87, "refuted": 0.13},
+        warnings=["low_margin"],
+        quality_flags={"evaluator_mode": "deepseek-chat-logprob"},
+    )
+
+    cache.put(
+        "cache-1",
+        rendered,
+        score,
+        EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+    )
+
+    row = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert set(row) == {
+        "cache_key",
+        "provider",
+        "model",
+        "mode",
+        "state_hash",
+        "prompt_hash",
+        "candidate_ids",
+        "scores",
+        "belief",
+        "warnings",
+        "quality_flags",
+    }
+    assert row["cache_key"] == "cache-1"
+    assert row["state_hash"] == rendered.state_hash
+    assert row["prompt_hash"] == rendered.prompt_hash
+    assert row["candidate_ids"] == ["supported", "refuted", "not_enough_information"]
+    assert "prompt" not in row
+    assert "state_text" not in row
+    assert "rendered" not in row
+    assert StateScoreCache(cache_path).get("cache-1") == score
+
+
+def test_fill_missing_beliefs_accepts_optional_evaluator_and_cache() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    complete = TrajectoryRecord(
+        trajectory_id=trajectory.trajectory_id,
+        task=trajectory.task,
+        steps=[
+            StepRecord(
+                step_id="s1",
+                index=0,
+                action={"type": "evaluate"},
+                belief_before={"supported": 0.34},
+                belief_after={"supported": 0.87},
+            )
+        ],
+    )
+
+    assert fill_missing_beliefs(
+        [complete],
+        config=EvaluatorRuntimeConfig(),
+        evaluator=None,
+        cache=None,
+    ) == [complete]
+    with pytest.raises(NotImplementedError, match="Task 2"):
+        fill_missing_beliefs(
+            [trajectory],
+            config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+            evaluator=None,
+            cache=None,
+        )
