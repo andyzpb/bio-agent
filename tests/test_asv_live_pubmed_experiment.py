@@ -213,7 +213,6 @@ def test_collect_claims_dry_run_writes_frozen_trajectories(tmp_path: Path) -> No
         output_dir=tmp_path / "out",
         workspace=tmp_path / "workspace",
         limit=1,
-        require_ack_live=True,
     )
 
     rows, trajectories = collect_claims.run_sync(

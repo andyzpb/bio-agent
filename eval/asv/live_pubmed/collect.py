@@ -20,7 +20,6 @@ class CollectionConfig:
     output_dir: Path
     workspace: Path
     limit: int | None = None
-    require_ack_live: bool = True
 
 
 @dataclass(frozen=True)
