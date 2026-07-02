@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -11,6 +12,7 @@ from asv_eval.core import (
     TaskRecord,
     TrajectoryRecord,
 )
+from asv_eval.evaluators import render_forced_choice_prompt
 from asv_eval.runtime import (
     EvaluatorRuntimeConfig,
     StateScore,
@@ -38,7 +40,10 @@ class _FakeEvaluator:
                 "labels": labels,
             }
         )
-        if "completed_steps" in evidence_text or "alpha-improved evidence" in evidence_text:
+        if (
+            "completed_steps" in evidence_text
+            or "alpha-improved evidence" in evidence_text
+        ):
             return (
                 {
                     "supported": -0.05,
@@ -54,6 +59,25 @@ class _FakeEvaluator:
                 "not_enough_information": -1.2,
             },
             ["low_signal"],
+        )
+
+
+class _MissingLabelEvaluator:
+    def score_state(
+        self,
+        *,
+        question: str,
+        evidence_text: str,
+        labels: dict[str, str],
+    ) -> tuple[dict[str, float], list[str]]:
+        _ = question, evidence_text, labels
+        return (
+            {
+                "supported": -0.1,
+                "refuted": -20.0,
+                "not_enough_information": -1.5,
+            },
+            ["missing label for candidate refuted; floor score used"],
         )
 
 
@@ -370,3 +394,77 @@ def test_state_score_cache_reuses_identical_rendered_state(tmp_path) -> None:
         row["quality_flags"]["api_key_env"] for row in rows
     } == {"DEEPSEEK_API_KEY"}
     assert "Bearer" not in cache_text
+
+
+def test_deepseek_missing_label_warning_raises_with_context_by_default() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+
+    with pytest.raises(ValueError) as exc_info:
+        fill_missing_beliefs(
+            [trajectory],
+            config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+            evaluator=_MissingLabelEvaluator(),
+        )
+
+    message = str(exc_info.value)
+    assert "traj-runtime-1" in message
+    assert "s1" in message
+    assert "before" in message
+    assert "missing label for candidate refuted; floor score used" in message
+
+
+def test_deepseek_floor_policy_records_missing_label_quality_flags() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+
+    [filled] = fill_missing_beliefs(
+        [trajectory],
+        config=EvaluatorRuntimeConfig(
+            mode="deepseek-chat-logprob",
+            fallback_policy="floor",
+        ),
+        evaluator=_MissingLabelEvaluator(),
+    )
+
+    flags = filled.steps[0].quality_flags
+    assert flags["missing_label_count"] > 0
+    assert flags["used_floor_score"] is True
+    assert flags["missing_labels"]
+    assert flags["used_fallback"] is True
+
+
+def test_cache_prompt_hash_uses_provider_prompt_not_runtime_display_prompt(
+    tmp_path,
+) -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    config = EvaluatorRuntimeConfig(mode="deepseek-chat-logprob")
+    rendered = render_state_for_evaluator(
+        trajectory.task,
+        trajectory.steps[0],
+        position="after",
+        config=config,
+    )
+    provider_prompt = render_forced_choice_prompt(
+        question=trajectory.task.question,
+        evidence_text=rendered.state_text,
+        labels=rendered.labels,
+    )
+    provider_prompt_hash = "sha256:" + hashlib.sha256(
+        provider_prompt.encode("utf-8")
+    ).hexdigest()
+    cache_path = tmp_path / "scores.jsonl"
+
+    fill_missing_beliefs(
+        [trajectory],
+        config=config,
+        evaluator=_FakeEvaluator(),
+        cache=StateScoreCache(cache_path),
+    )
+
+    rows = [
+        json.loads(line)
+        for line in cache_path.read_text(encoding="utf-8").splitlines()
+    ]
+    after_row = next(row for row in rows if row["state_hash"] == rendered.state_hash)
+    assert after_row["prompt_hash"] == provider_prompt_hash
+    assert after_row["quality_flags"]["prompt_hash"] == provider_prompt_hash
+    assert after_row["prompt_hash"] != rendered.prompt_hash

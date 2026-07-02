@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 from asv_eval.core import StepRecord, TaskRecord, TrajectoryRecord, normalize_log_scores
-from asv_eval.evaluators import DeepSeekLogprobBeliefEvaluator, DeepSeekLogprobConfig
+from asv_eval.evaluators import (
+    DeepSeekLogprobBeliefEvaluator,
+    DeepSeekLogprobConfig,
+    render_forced_choice_prompt,
+)
 
 EvaluatorMode = Literal["provided-belief", "deepseek-chat-logprob"]
 FallbackPolicy = Literal["error", "floor"]
@@ -152,7 +156,10 @@ class StateScoreCache:
             "model": config.model,
             "mode": config.mode,
             "state_hash": rendered.state_hash,
-            "prompt_hash": rendered.prompt_hash,
+            "prompt_hash": score.quality_flags.get(
+                "prompt_hash",
+                rendered.prompt_hash,
+            ),
             "candidate_ids": list(rendered.labels.values()),
             "scores": sanitized_score.scores,
             "belief": sanitized_score.belief,
@@ -244,18 +251,28 @@ def fill_missing_beliefs(
                 config=config,
             )
             before_score, before_cache_hit = _score_rendered_state(
+                trajectory.trajectory_id,
+                step.step_id,
                 trajectory.task,
                 rendered_before,
+                "before",
                 config,
                 active_evaluator,
                 active_cache,
             )
             after_score, after_cache_hit = _score_rendered_state(
+                trajectory.trajectory_id,
+                step.step_id,
                 trajectory.task,
                 rendered_after,
+                "after",
                 config,
                 active_evaluator,
                 active_cache,
+            )
+            missing_label_flags = _merge_missing_label_flags(
+                before_score.quality_flags,
+                after_score.quality_flags,
             )
             quality_flags = {
                 **step.quality_flags,
@@ -267,13 +284,14 @@ def fill_missing_beliefs(
                 "top_logprobs": config.top_logprobs,
                 "floor_score": config.floor_score,
                 "used_cache": before_cache_hit and after_cache_hit,
-                "used_fallback": False,
+                "used_fallback": missing_label_flags["used_floor_score"],
                 "state_before_hash": rendered_before.state_hash,
                 "state_after_hash": rendered_after.state_hash,
-                "prompt_before_hash": rendered_before.prompt_hash,
-                "prompt_after_hash": rendered_after.prompt_hash,
+                "prompt_before_hash": before_score.quality_flags["prompt_hash"],
+                "prompt_after_hash": after_score.quality_flags["prompt_hash"],
                 "before_warnings": before_score.warnings,
                 "after_warnings": after_score.warnings,
+                **missing_label_flags,
             }
             filled_steps.append(
                 replace(
@@ -288,13 +306,18 @@ def fill_missing_beliefs(
 
 
 def _score_rendered_state(
+    trajectory_id: str,
+    step_id: str,
     task: TaskRecord,
     rendered: RenderedState,
+    position: StatePosition,
     config: EvaluatorRuntimeConfig,
     evaluator: Any,
     cache: StateScoreCache,
 ) -> tuple[StateScore, bool]:
-    key = _cache_key(config, rendered.prompt)
+    provider_prompt = _provider_prompt(task, rendered)
+    provider_prompt_hash = _sha256(provider_prompt)
+    key = _cache_key(config, provider_prompt)
     cached = cache.get(key)
     if cached is not None:
         return cached, True
@@ -304,6 +327,13 @@ def _score_rendered_state(
         evidence_text=rendered.state_text,
         labels=rendered.labels,
     )
+    missing_label_flags = _missing_label_flags(warnings)
+    if missing_label_flags["used_floor_score"] and config.fallback_policy == "error":
+        raise ValueError(
+            "ASV evaluator missing label/floor score fallback "
+            f"for trajectory {trajectory_id}, step {step_id}, position {position}: "
+            + "; ".join(warnings)
+        )
     score = StateScore(
         scores=scores,
         belief=normalize_log_scores(scores),
@@ -317,9 +347,10 @@ def _score_rendered_state(
             "top_logprobs": config.top_logprobs,
             "floor_score": config.floor_score,
             "used_cache": False,
-            "used_fallback": False,
+            "used_fallback": missing_label_flags["used_floor_score"],
             "state_hash": rendered.state_hash,
-            "prompt_hash": rendered.prompt_hash,
+            "prompt_hash": provider_prompt_hash,
+            **missing_label_flags,
         },
     )
     cache.put(key, rendered, score, config)
@@ -336,6 +367,51 @@ def _cache_key(config: EvaluatorRuntimeConfig, prompt: str) -> str:
         ensure_ascii=False,
     )
     return _sha256(payload)
+
+
+def _provider_prompt(task: TaskRecord, rendered: RenderedState) -> str:
+    return render_forced_choice_prompt(
+        question=task.question,
+        evidence_text=rendered.state_text,
+        labels=rendered.labels,
+    )
+
+
+def _missing_label_flags(warnings: list[str]) -> dict[str, Any]:
+    missing_labels: list[str] = []
+    used_floor_score = False
+    for warning in warnings:
+        lower_warning = warning.lower()
+        if "floor score" in lower_warning:
+            used_floor_score = True
+        if "missing label" not in lower_warning:
+            continue
+        used_floor_score = True
+        match = re.search(r"missing label for candidate ([^;,\s]+)", warning, re.I)
+        if match:
+            missing_labels.append(match.group(1))
+        else:
+            missing_labels.append(warning)
+    return {
+        "missing_labels": missing_labels,
+        "missing_label_count": len(missing_labels),
+        "used_floor_score": used_floor_score,
+    }
+
+
+def _merge_missing_label_flags(
+    before_flags: dict[str, Any],
+    after_flags: dict[str, Any],
+) -> dict[str, Any]:
+    missing_labels = list(before_flags.get("missing_labels", [])) + list(
+        after_flags.get("missing_labels", [])
+    )
+    return {
+        "missing_labels": missing_labels,
+        "missing_label_count": len(missing_labels),
+        "used_floor_score": bool(before_flags.get("used_floor_score"))
+        or bool(after_flags.get("used_floor_score")),
+    }
 
 
 def _deepseek_config_from_runtime(
