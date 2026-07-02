@@ -22,6 +22,8 @@ Run only on a machine with provider credentials configured through the shell.
 The command writes artifacts under `/tmp` so live provider outputs are not
 committed by accident.
 
+This is a small pilot run for quick verification:
+
 ```bash
 zsh -ic 'cd /Users/andyz/Documents/bio-agent && \
   .venv/bin/python -m eval.asv.live_pubmed.collect \
@@ -31,6 +33,9 @@ zsh -ic 'cd /Users/andyz/Documents/bio-agent && \
     --limit 3 \
     --ack-live'
 ```
+
+For the full 30-claim run, remove the `--limit 3` line and keep the same output
+directory policy.
 
 The collector calls `answer_with_audit` with live PubMed source and LLM workflow
 flags enabled.
@@ -64,5 +69,14 @@ The evaluator uses `deepseek-chat-logprob` through the existing ASV runtime.
   --permutations 3
 ```
 
-Evaluate the permuted trajectories with the same evaluator command and compare
-ASV stability across permutations.
+Evaluate the permuted trajectories with the same evaluator wrapper and separate
+artifact paths, then compare ASV stability across permutations.
+
+```bash
+zsh -ic 'cd /Users/andyz/Documents/bio-agent && \
+  .venv/bin/python -m eval.asv.live_pubmed.evaluate \
+    --input /tmp/asv-live-pubmed-step-value/permuted-trajectories.jsonl \
+    --cache /tmp/asv-live-pubmed-step-value/permuted-deepseek-cache.jsonl \
+    --evaluated /tmp/asv-live-pubmed-step-value/permuted-evaluated.jsonl \
+    --output-dir /tmp/asv-live-pubmed-step-value/permuted-report'
+```
