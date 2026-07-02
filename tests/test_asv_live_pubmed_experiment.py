@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from asv_eval.adapters import write_standard_jsonl
 from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
 from eval.asv.live_pubmed.analyze import (
     aggregate_step_type_rows,
@@ -21,6 +22,10 @@ from eval.asv.live_pubmed.evaluate import (
     EvaluationRun,
     build_evaluate_command,
     scan_for_secret_markers,
+)
+from eval.asv.live_pubmed.robustness import (
+    build_label_permuted_trajectories,
+    summarize_permutation_stability,
 )
 from eval.asv.live_pubmed.claims import (
     CLAIM_LABELS,
@@ -604,3 +609,75 @@ def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> N
     assert summary[0]["mean_gold_log_likelihood_gain"] is None
     assert summary[0]["gold_metric_step_count"] == 0
     assert summary[0]["missing_gold_metric_step_count"] == 1
+
+
+def test_build_label_permuted_trajectories_rotates_candidate_labels() -> None:
+    trajectory = TrajectoryRecord(
+        trajectory_id="t1",
+        task=TaskRecord(
+            task_id="task-1",
+            question="Does alpha improve beta?",
+            candidate_space=CandidateSpace(
+                candidates=[
+                    Candidate(id="supported", label="A", text="supported"),
+                    Candidate(id="refuted", label="B", text="refuted"),
+                    Candidate(
+                        id="not_enough_information",
+                        label="C",
+                        text="not enough information",
+                    ),
+                ],
+                gold_candidate_id="supported",
+            ),
+        ),
+        steps=[],
+    )
+
+    permuted = build_label_permuted_trajectories([trajectory], permutation_count=3)
+
+    assert [item.trajectory_id for item in permuted] == [
+        "t1-permutation-0",
+        "t1-permutation-1",
+        "t1-permutation-2",
+    ]
+    assert [
+        candidate.label
+        for candidate in permuted[1].task.candidate_space.candidates
+    ] == ["C", "A", "B"]
+
+
+def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    (report_dir / "steps.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "trajectory_id": "t1-permutation-0",
+                        "step_id": "retrieve",
+                        "asv_components": {"net_asv": 0.2},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trajectory_id": "t1-permutation-1",
+                        "step_id": "retrieve",
+                        "asv_components": {"net_asv": 0.1},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_permutation_stability(report_dir)
+
+    assert summary == {
+        "step_count": 2,
+        "mean_net_asv": 0.15,
+        "min_net_asv": 0.1,
+        "max_net_asv": 0.2,
+        "range_net_asv": 0.1,
+    }
