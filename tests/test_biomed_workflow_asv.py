@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
+
+from plugins.biomed_evidence.schemas import AnswerWithEvidenceRequest
 from plugins.biomed_evidence.schemas import AgentTraceStep
+from plugins.biomed_evidence.service import BiomedEvidenceService
 from plugins.biomed_evidence.workflow.asv import (
     redact_for_asv,
     trajectory_from_workflow_steps,
@@ -174,3 +179,53 @@ def test_workflow_trace_cost_derives_tool_calls_from_llm_and_source_calls() -> N
     assert step.cost["llm_call_count"] == 1
     assert step.cost["source_call_count"] == 2
     assert step.cost["tool_calls"] == 3
+
+
+@pytest.mark.asyncio
+async def test_service_exports_saved_audited_run_as_asv_trajectory(
+    tmp_path: Path,
+) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        audited = await service.answer_with_audit(
+            AnswerWithEvidenceRequest(
+                question=(
+                    "What recent evidence links microglial activation to "
+                    "Alzheimer's disease progression?"
+                ),
+                source="mock",
+                max_papers=5,
+            )
+        )
+
+        trajectory = service.export_answer_run_asv_trajectory(
+            audited.answer_result.run_id
+        )
+    finally:
+        await service.aclose()
+
+    assert trajectory.run_id == audited.answer_result.run_id
+    assert trajectory.task.question.startswith("What recent evidence")
+    step_types = [step.action["type"] for step in trajectory.steps]
+    assert {"classify", "retrieve", "extract", "audit", "revise", "finalize"} <= set(
+        step_types
+    )
+    assert all(step.state_before is not None for step in trajectory.steps)
+    assert all(step.state_after is not None for step in trajectory.steps)
+    assert any(step.cost for step in trajectory.steps)
+    rendered = json.dumps(
+        [step.observation for step in trajectory.steps],
+        sort_keys=True,
+    ).lower()
+    assert "authorization" not in rendered
+    assert "bearer secret" not in rendered
+    assert "raw_provider_response" not in rendered or "[redacted]" in rendered
+
+
+def test_service_export_asv_trajectory_reports_missing_run(tmp_path: Path) -> None:
+    service = BiomedEvidenceService(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="answer_run_not_found"):
+            service.export_answer_run_asv_trajectory("missing-run")
+    finally:
+        service.storage.close()

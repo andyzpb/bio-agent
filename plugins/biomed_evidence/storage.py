@@ -454,6 +454,16 @@ class BiomedStorage:
             return None
         return AnswerWithEvidenceResult.model_validate_json(str(row["answer_json"]))
 
+    def get_answer_run_question(self, run_id: str) -> str | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT question FROM biomed_answer_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["question"])
+
     def list_answer_runs(
         self,
         *,

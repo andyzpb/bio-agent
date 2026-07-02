@@ -216,6 +216,7 @@ from plugins.biomed_evidence.tool_contracts import (
     get_release_tool_metadata,
     release_source_policy_error,
 )
+from plugins.biomed_evidence.workflow.asv import trajectory_from_answer_run
 
 
 @dataclass(frozen=True)
@@ -6312,6 +6313,29 @@ class BiomedEvidenceService:
         self, run_id: str
     ) -> CitationAuditResult | None:
         return self.storage.get_latest_citation_audit_for_run(run_id)
+
+    def export_answer_run_asv_trajectory(self, run_id: str):
+        result = self.storage.get_answer_run(run_id)
+        if result is None:
+            raise ValueError(f"answer_run_not_found: {run_id}")
+        trace = self.storage.list_agent_trace_steps(run_id)
+        if not trace:
+            raise ValueError(f"answer_trace_not_found: {run_id}")
+        question = (
+            self.storage.get_answer_run_question(run_id)
+            or _pilot_question(result)
+            or result.answer[:240]
+            or run_id
+        )
+        return trajectory_from_answer_run(
+            {
+                "run_id": result.run_id,
+                "question": question,
+                "trace": trace,
+                "answer": result.answer,
+                "answer_result": result.model_dump(mode="json"),
+            }
+        )
 
     def get_answer_trace(self, run_id: str) -> dict[str, object] | None:
         result = self.storage.get_answer_run(run_id)
