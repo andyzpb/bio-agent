@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 
 from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
+from eval.asv.live_pubmed.analyze import (
+    aggregate_step_type_rows,
+    write_analysis_tables,
+)
 from eval.asv.live_pubmed.collect import (
     CollectionConfig,
     CollectionRow,
@@ -498,3 +502,72 @@ def test_build_evaluate_command_allows_python_executable_override(
         "asv_eval",
         "evaluate",
     ]
+
+
+def test_aggregate_step_type_rows_computes_mean_asv() -> None:
+    rows = [
+        {
+            "trajectory_id": "t1",
+            "step_id": "retrieve",
+            "asv_components": {
+                "realized_entropy_reduction": 0.4,
+                "net_asv": 0.3,
+                "cost_scalar": 0.1,
+            },
+            "gold_metrics": {"gold_log_likelihood_gain": 0.5},
+            "quality_flags": {"used_floor_score": False, "used_cache": True},
+        },
+        {
+            "trajectory_id": "t2",
+            "step_id": "retrieve",
+            "asv_components": {
+                "realized_entropy_reduction": 0.2,
+                "net_asv": 0.1,
+                "cost_scalar": 0.1,
+            },
+            "gold_metrics": {"gold_log_likelihood_gain": -0.1},
+            "quality_flags": {"used_floor_score": True, "used_cache": False},
+        },
+    ]
+
+    summary = aggregate_step_type_rows(rows)
+
+    assert summary == [
+        {
+            "step_type": "retrieve",
+            "count": 2,
+            "mean_realized_entropy_reduction": 0.3,
+            "mean_net_asv": 0.2,
+            "mean_cost_scalar": 0.1,
+            "mean_gold_log_likelihood_gain": 0.2,
+            "floor_score_step_count": 1,
+            "cache_hit_step_count": 1,
+        }
+    ]
+
+
+def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    (report_dir / "steps.jsonl").write_text(
+        json.dumps(
+            {
+                "trajectory_id": "t1",
+                "step_id": "classify",
+                "asv_components": {
+                    "realized_entropy_reduction": 0.0,
+                    "net_asv": 0.0,
+                    "cost_scalar": 0.0,
+                },
+                "gold_metrics": {"gold_log_likelihood_gain": 0.0},
+                "quality_flags": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    write_analysis_tables(report_dir)
+
+    assert (report_dir / "tables" / "step_type_summary.csv").exists()
+    assert (report_dir / "analysis_summary.json").exists()
