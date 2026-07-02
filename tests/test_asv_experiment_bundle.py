@@ -93,6 +93,27 @@ def test_live_deepseek_smoke_docs_are_secret_safe_and_untracked_output_only() ->
         in readme
     )
     assert "DEEPSEEK_API_KEY" in readme
+    assert "fails automatically" in readme
+    assert "live_deepseek_asv_smoke=passed" in readme
+    assert "inspect /tmp/asv-biomed-deepseek/summary.json" not in readme
     assert "/tmp/asv-biomed-deepseek" in script
+    assert script.count(".venv/bin/python -m asv_eval evaluate") == 2
+    assert 'rm -rf "$OUTPUT_DIR" "$EVALUATED" "$CACHE"' in script
+    assert (
+        'coverage["cache_hit_state_count"] != coverage["evaluated_state_count"]'
+        in script
+    )
+    assert 'Path("/tmp/asv-biomed-deepseek-evaluated.jsonl")' in script
+    assert 'Path("/tmp/asv-biomed-deepseek-cache.jsonl")' in script
+    assert 'Path("/tmp/asv-biomed-deepseek").rglob("*")' in script
+    assert "if path.is_file()" in script
+    for marker in (
+        "Authorization",
+        "client_secret",
+        "sk-live",
+        "provider_response",
+        "raw_response",
+    ):
+        assert f'"{marker}"' in script
     assert "raw provider" not in script.lower()
     assert "Bearer " not in script

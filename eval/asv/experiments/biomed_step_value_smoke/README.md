@@ -50,5 +50,6 @@ The script runs the evaluator twice with the same cache:
 ```
 
 It writes live outputs under `/tmp` and should not create committed artifacts.
-After a successful second run, inspect `/tmp/asv-biomed-deepseek/summary.json`
-for `evaluator.mode=deepseek-chat-logprob` and nonzero cache-hit state count.
+The script fails automatically on evaluator-mode, cache-hit, or secret-marker
+mismatches, and prints `live_deepseek_asv_smoke=passed` after a successful
+second run.

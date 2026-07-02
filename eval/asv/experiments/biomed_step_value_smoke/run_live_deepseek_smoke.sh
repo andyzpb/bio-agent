@@ -15,7 +15,7 @@ if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
   exit 2
 fi
 
-rm -rf "$OUTPUT_DIR" "$EVALUATED"
+rm -rf "$OUTPUT_DIR" "$EVALUATED" "$CACHE"
 
 .venv/bin/python -m asv_eval evaluate \
   --input "$INPUT" \
@@ -41,16 +41,29 @@ summary = json.loads(Path("/tmp/asv-biomed-deepseek/summary.json").read_text())
 coverage = summary["evaluator_coverage"]
 if summary["evaluator"]["mode"] != "deepseek-chat-logprob":
     raise SystemExit("unexpected evaluator mode")
-if coverage["cache_hit_state_count"] <= 0:
-    raise SystemExit("expected cache-hit state count after second run")
+if coverage["cache_hit_state_count"] != coverage["evaluated_state_count"]:
+    raise SystemExit("expected every evaluated state to be served from cache after second run")
 
-for path in [
-    Path("/tmp/asv-biomed-deepseek/summary.json"),
-    Path("/tmp/asv-biomed-deepseek/steps.jsonl"),
+scan_paths = [
+    Path("/tmp/asv-biomed-deepseek-evaluated.jsonl"),
     Path("/tmp/asv-biomed-deepseek-cache.jsonl"),
-]:
+]
+scan_paths.extend(
+    path for path in Path("/tmp/asv-biomed-deepseek").rglob("*") if path.is_file()
+)
+for path in scan_paths:
     text = path.read_text(encoding="utf-8")
-    for marker in ("Bearer" + " ", "api_key", "password", "token=", "raw_provider_response"):
+    for marker in (
+        "Bearer" + " ",
+        "Authorization",
+        "api_key",
+        "client_secret",
+        "password",
+        "token=",
+        "sk-live",
+        "provider_response",
+        "raw_response",
+    ):
         if marker in text:
             raise SystemExit(f"secret marker {marker!r} found in {path}")
 
