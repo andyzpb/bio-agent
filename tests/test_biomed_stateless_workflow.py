@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from asv_eval.runtime import EvaluatorRuntimeConfig, render_state_for_evaluator
 from plugins.biomed_evidence.workflow.asv import trajectory_from_workflow_steps
 from plugins.biomed_evidence.workflow.stateless.classify import classify_step
+from plugins.biomed_evidence.workflow.stateless.compare import compare_projections
 from plugins.biomed_evidence.workflow.stateless.retrieve import retrieve_step
 from plugins.biomed_evidence.workflow.stateless.types import (
     MockRetrievalArtifact,
@@ -575,3 +576,180 @@ def test_stateless_classify_retrieve_slice_evaluates_with_provided_beliefs(
     assert summary["step_count"] == 2
     assert summary["positive_net_asv_steps"] == 2
     assert summary["evaluator"]["mode"] == "provided-belief"
+
+
+def test_compare_projections_accepts_matching_stateless_slice() -> None:
+    question = "Does microglial activation track Alzheimer's progression?"
+    classify_workflow_step = step_output_to_workflow_step(
+        "stateless-run-7",
+        classify_step(
+            StepInput(
+                run_id="stateless-run-7",
+                question=question,
+            )
+        ),
+    )
+    retrieve_workflow_step = step_output_to_workflow_step(
+        "stateless-run-7",
+        retrieve_step(
+            StepInput(
+                run_id="stateless-run-7",
+                question=question,
+                completed_steps=["classify"],
+                available_artifacts=["classification:research"],
+                artifact_payloads=[
+                    MockRetrievalArtifact(
+                        paper_id="MOCK-PMID-1001",
+                        title="Microglial activation signatures track disease progression",
+                        abstract="Activated microglia correlated with Braak stage.",
+                    )
+                ],
+            )
+        ),
+    )
+    old_trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-7",
+        question=question,
+        steps=[classify_workflow_step, retrieve_workflow_step],
+    )
+    stateless_trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-7",
+        question=question,
+        steps=[classify_workflow_step, retrieve_workflow_step],
+    )
+
+    summary = compare_projections(old_trajectory, stateless_trajectory)
+
+    assert summary.ok is True
+    assert summary.old_step_count == 2
+    assert summary.stateless_step_count == 2
+    assert summary.issues == []
+
+
+def test_compare_projections_reports_missing_core_step() -> None:
+    question = "Does microglial activation track Alzheimer's progression?"
+    classify_workflow_step = step_output_to_workflow_step(
+        "stateless-run-8",
+        classify_step(
+            StepInput(
+                run_id="stateless-run-8",
+                question=question,
+            )
+        ),
+    )
+    old_trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-8",
+        question=question,
+        steps=[classify_workflow_step],
+    )
+    stateless_trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-8",
+        question=question,
+        steps=[classify_workflow_step],
+    )
+
+    summary = compare_projections(old_trajectory, stateless_trajectory)
+
+    assert summary.ok is False
+    assert [issue.code for issue in summary.issues] == ["missing_core_step"]
+
+
+def test_compare_projections_allows_safe_credential_env_quality_flag() -> None:
+    question = "Does microglial activation track Alzheimer's progression?"
+    workflow_steps = [
+        step_output_to_workflow_step(
+            "stateless-run-9",
+            classify_step(StepInput(run_id="stateless-run-9", question=question)),
+        ),
+        step_output_to_workflow_step(
+            "stateless-run-9",
+            retrieve_step(
+                StepInput(
+                    run_id="stateless-run-9",
+                    question=question,
+                    completed_steps=["classify"],
+                    available_artifacts=["classification:research"],
+                    artifact_payloads=[
+                        MockRetrievalArtifact(
+                            paper_id="MOCK-PMID-1001",
+                            title="Microglial activation signatures track disease progression",
+                            abstract="Activated microglia correlated with Braak stage.",
+                        )
+                    ],
+                )
+            ),
+        ),
+    ]
+    trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-9",
+        question=question,
+        steps=workflow_steps,
+    )
+    stateless_trajectory = replace(
+        trajectory,
+        steps=[
+            replace(
+                trajectory.steps[0],
+                quality_flags={"credential_env": "DEEPSEEK_API_KEY"},
+            ),
+            trajectory.steps[1],
+        ],
+    )
+
+    summary = compare_projections(trajectory, stateless_trajectory)
+
+    assert summary.ok is True
+    assert summary.issues == []
+
+
+def test_compare_projections_reports_candidate_space_metadata_mismatch() -> None:
+    question = "Does microglial activation track Alzheimer's progression?"
+    workflow_steps = [
+        step_output_to_workflow_step(
+            "stateless-run-10",
+            classify_step(StepInput(run_id="stateless-run-10", question=question)),
+        ),
+        step_output_to_workflow_step(
+            "stateless-run-10",
+            retrieve_step(
+                StepInput(
+                    run_id="stateless-run-10",
+                    question=question,
+                    completed_steps=["classify"],
+                    available_artifacts=["classification:research"],
+                    artifact_payloads=[
+                        MockRetrievalArtifact(
+                            paper_id="MOCK-PMID-1001",
+                            title="Microglial activation signatures track disease progression",
+                            abstract="Activated microglia correlated with Braak stage.",
+                        )
+                    ],
+                )
+            ),
+        ),
+    ]
+    old_trajectory = trajectory_from_workflow_steps(
+        run_id="stateless-run-10",
+        question=question,
+        steps=workflow_steps,
+    )
+    first_candidate = old_trajectory.task.candidate_space.candidates[0]
+    changed_candidate_space = replace(
+        old_trajectory.task.candidate_space,
+        candidates=[
+            replace(first_candidate, label="Z", text="changed prompt option"),
+            *old_trajectory.task.candidate_space.candidates[1:],
+        ],
+        gold_candidate_id=first_candidate.id,
+    )
+    stateless_trajectory = replace(
+        old_trajectory,
+        task=replace(old_trajectory.task, candidate_space=changed_candidate_space),
+    )
+
+    summary = compare_projections(old_trajectory, stateless_trajectory)
+
+    assert summary.ok is False
+    assert [issue.code for issue in summary.issues] == [
+        "candidate_space_mismatch"
+    ]
