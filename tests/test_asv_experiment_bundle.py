@@ -53,3 +53,46 @@ def test_biomed_step_value_bundle_runs_with_provided_beliefs(tmp_path) -> None:
         "synthesize",
     ]
     assert steps[1]["asv_components"]["realized_entropy_reduction"] > 0
+
+
+SECRET_MARKERS = (
+    "Bearer ",
+    "api_key",
+    "password",
+    "token=",
+    "raw_provider_response",
+    "sk-live",
+    "provider raw secret",
+)
+
+
+def test_biomed_step_value_bundle_contains_no_secret_markers() -> None:
+    checked_paths = [
+        EXPERIMENT_DIR / "trajectory.jsonl",
+        EXPERIMENT_DIR / "beliefs.jsonl",
+        EXPERIMENT_DIR / "expected_summary.provided_belief.json",
+        EXPERIMENT_DIR / "README.md",
+    ]
+    for path in checked_paths:
+        text = path.read_text(encoding="utf-8")
+        for marker in SECRET_MARKERS:
+            assert marker not in text, f"{marker!r} leaked in {path.name}"
+
+
+def test_live_deepseek_smoke_docs_are_secret_safe_and_untracked_output_only() -> None:
+    readme = (EXPERIMENT_DIR / "README.md").read_text(encoding="utf-8")
+    script = (EXPERIMENT_DIR / "run_live_deepseek_smoke.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "zsh -ic" in readme
+    assert "--evaluator deepseek-chat-logprob" in readme
+    assert "--cache /tmp/asv-biomed-deepseek-cache.jsonl" in readme
+    assert (
+        "--write-evaluated-trajectories /tmp/asv-biomed-deepseek-evaluated.jsonl"
+        in readme
+    )
+    assert "DEEPSEEK_API_KEY" in readme
+    assert "/tmp/asv-biomed-deepseek" in script
+    assert "raw provider" not in script.lower()
+    assert "Bearer " not in script
