@@ -23,6 +23,7 @@ from asv_eval.evaluators import (
     ensure_no_gold_leakage,
     normalize_label_token,
 )
+from asv_eval.reporting import build_summary
 
 
 def test_softmax_entropy_and_asv_components() -> None:
@@ -189,3 +190,58 @@ def test_evaluate_trajectory_passes_through_quality_flags() -> None:
 
     assert row["quality_flags"]["evaluator_mode"] == "deepseek_chat_logprob"
     assert row["quality_flags"]["used_cache"] is True
+
+
+def test_build_summary_reports_evaluator_coverage_from_quality_flags() -> None:
+    task = TaskRecord(
+        task_id="task-coverage",
+        question="Does X help?",
+        candidate_space=CandidateSpace(
+            candidates=[
+                Candidate(id="yes", label="A", text="yes"),
+                Candidate(id="no", label="B", text="no"),
+            ],
+        ),
+    )
+    trajectory = TrajectoryRecord(
+        trajectory_id="traj-coverage",
+        task=task,
+        steps=[
+            StepRecord(
+                step_id="s1",
+                index=0,
+                action={"type": "evaluate"},
+                belief_before={"yes": 0.5, "no": 0.5},
+                belief_after={"yes": 0.8, "no": 0.2},
+            ),
+            StepRecord(
+                step_id="s2",
+                index=1,
+                action={"type": "evaluate"},
+                belief_before={"yes": 0.8, "no": 0.2},
+                belief_after={"yes": 0.6, "no": 0.4},
+            ),
+        ],
+    )
+    rows = evaluate_trajectory(trajectory)
+    rows[0]["quality_flags"].update(
+        {
+            "used_cache": True,
+            "used_floor_score": True,
+            "missing_labels": ["B"],
+        }
+    )
+    rows[1]["quality_flags"].update(
+        {
+            "used_fallback": True,
+            "missing_labels": [],
+        }
+    )
+
+    summary = build_summary([trajectory], rows)
+
+    assert summary["evaluator_coverage"]["evaluated_state_count"] == len(rows) * 2
+    assert summary["evaluator_coverage"]["cache_hit_step_count"] == 1
+    assert summary["evaluator_coverage"]["floor_score_step_count"] == 1
+    assert summary["evaluator_coverage"]["fallback_step_count"] == 1
+    assert summary["evaluator_coverage"]["missing_label_step_count"] == 1

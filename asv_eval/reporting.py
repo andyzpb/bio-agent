@@ -56,6 +56,7 @@ def build_summary(
         "negative_net_asv_steps": sum(value < 0 for value in net_values),
         "zero_net_asv_steps": sum(value == 0 for value in net_values),
         "evaluator": evaluator_config or {"mode": "provided-belief"},
+        "evaluator_coverage": _evaluator_coverage(rows),
     }
 
 
@@ -98,6 +99,25 @@ def render_markdown_report(summary: dict[str, Any]) -> str:
             "",
         ]
     )
+
+
+def _evaluator_coverage(rows: list[dict[str, Any]]) -> dict[str, int]:
+    quality_flags = [row.get("quality_flags") or {} for row in rows]
+    return {
+        "evaluated_state_count": len(rows) * 2,
+        "cache_hit_step_count": sum(
+            flags.get("used_cache") is True for flags in quality_flags
+        ),
+        "floor_score_step_count": sum(
+            flags.get("used_floor_score") is True for flags in quality_flags
+        ),
+        "fallback_step_count": sum(
+            flags.get("used_fallback") is True for flags in quality_flags
+        ),
+        "missing_label_step_count": sum(
+            bool(flags.get("missing_labels")) for flags in quality_flags
+        ),
+    }
 
 
 def _state_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

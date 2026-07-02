@@ -290,3 +290,4 @@ def test_cli_evaluate_writes_evaluated_trajectories_with_runtime(
     assert quality_flags["state_after_hash"].startswith("sha256:")
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["evaluator"]["mode"] == "deepseek-chat-logprob"
+    assert summary["evaluator_coverage"]["evaluated_state_count"] == 2
