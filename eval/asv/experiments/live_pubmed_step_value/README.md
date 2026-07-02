@@ -9,6 +9,7 @@ evaluator prompts.
 
 ## Claim Set
 
+`claims.quick.jsonl` contains three smoke-test questions, one per label.
 `claims.pilot.jsonl` contains 30 curated biomedical claim-verification questions
 balanced across:
 
@@ -22,20 +23,20 @@ Run only on a machine with provider credentials configured through the shell.
 The command writes artifacts under `/tmp` so live provider outputs are not
 committed by accident.
 
-This is a small pilot run for quick verification:
+This is a balanced three-claim run for quick verification:
 
 ```bash
 zsh -ic 'cd /Users/andyz/Documents/bio-agent && \
   .venv/bin/python -m eval.asv.live_pubmed.collect \
-    --claims eval/asv/experiments/live_pubmed_step_value/claims.pilot.jsonl \
+    --claims eval/asv/experiments/live_pubmed_step_value/claims.quick.jsonl \
     --workspace /tmp/asv-live-pubmed-step-value/workspace \
     --output-dir /tmp/asv-live-pubmed-step-value/collection \
-    --limit 3 \
     --ack-live'
 ```
 
-For the full 30-claim run, remove the `--limit 3` line and keep the same output
-directory policy.
+For the full 30-claim run, switch `--claims` to
+`eval/asv/experiments/live_pubmed_step_value/claims.pilot.jsonl` and keep the
+same output directory policy.
 
 The collector calls `answer_with_audit` with live PubMed source and LLM workflow
 flags enabled.
@@ -46,12 +47,15 @@ flags enabled.
 zsh -ic 'cd /Users/andyz/Documents/bio-agent && \
   .venv/bin/python -m eval.asv.live_pubmed.evaluate \
     --input /tmp/asv-live-pubmed-step-value/collection/trajectory.jsonl \
+    --model deepseek-chat \
     --cache /tmp/asv-live-pubmed-step-value/deepseek-cache.jsonl \
     --evaluated /tmp/asv-live-pubmed-step-value/evaluated.jsonl \
     --output-dir /tmp/asv-live-pubmed-step-value/report'
 ```
 
 The evaluator uses `deepseek-chat-logprob` through the existing ASV runtime.
+Use `deepseek-chat` for label-token scoring; `deepseek-v4-flash` returns
+reasoning-token logprobs and is not suitable for this evaluator path.
 
 ## Analysis Tables
 

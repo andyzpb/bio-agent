@@ -289,7 +289,7 @@ def test_cli_evaluate_writes_evaluated_trajectories_with_runtime(
     quality_flags = report_step["quality_flags"]
     assert quality_flags["evaluator_mode"] == "deepseek_chat_logprob"
     assert quality_flags["provider"] == "deepseek"
-    assert quality_flags["model"] == "deepseek-v4-flash"
+    assert quality_flags["model"] == "deepseek-chat"
     assert quality_flags["used_cache"] is False
     assert quality_flags["state_before_hash"].startswith("sha256:")
     assert quality_flags["state_after_hash"].startswith("sha256:")

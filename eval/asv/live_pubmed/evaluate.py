@@ -68,7 +68,7 @@ class EvaluationRun:
     evaluated_path: Path
     fallback_policy: str = "floor"
     floor_score: float = -20.0
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-chat"
     python_executable: str = sys.executable
 
 
@@ -212,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--evaluated", required=True)
-    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--model", default="deepseek-chat")
     parser.add_argument("--fallback-policy", choices=["error", "floor"], default="floor")
     parser.add_argument("--floor-score", type=float, default=-20.0)
     args = parser.parse_args(argv)

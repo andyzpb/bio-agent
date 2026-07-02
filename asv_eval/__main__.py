@@ -136,7 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--evaluator",
         choices=["provided-belief", "deepseek-chat-logprob"],
     )
-    evaluate.add_argument("--model", default="deepseek-v4-flash")
+    evaluate.add_argument("--model", default="deepseek-chat")
     evaluate.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     evaluate.add_argument("--cache")
     evaluate.add_argument("--fallback-policy", choices=["error", "floor"], default="error")

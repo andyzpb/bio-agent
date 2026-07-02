@@ -43,6 +43,9 @@ LIVE_EXPERIMENT_DIR = ROOT / "eval" / "asv" / "experiments" / "live_pubmed_step_
 CLAIMS_PATH = (
     LIVE_EXPERIMENT_DIR / "claims.pilot.jsonl"
 )
+QUICK_CLAIMS_PATH = (
+    LIVE_EXPERIMENT_DIR / "claims.quick.jsonl"
+)
 
 
 def test_live_pubmed_experiment_readme_documents_real_run_commands() -> None:
@@ -52,10 +55,12 @@ def test_live_pubmed_experiment_readme_documents_real_run_commands() -> None:
     assert "--ack-live" in readme
     assert "answer_with_audit" in readme
     assert "deepseek-chat-logprob" in readme
+    assert "claims.quick.jsonl" in readme
     assert "claims.pilot.jsonl" in readme
+    assert "--model deepseek-chat" in readme
     assert "/tmp/asv-live-pubmed-step-value" in readme
     assert "permuted-report" in readme
-    assert "small pilot run" in readme
+    assert "balanced three-claim run" in readme
     assert "full 30-claim run" in readme
     assert "gold labels are used only after belief estimation" in readme
 
@@ -74,6 +79,14 @@ def test_live_pubmed_claim_loader_reads_pilot_set() -> None:
     assert all(claim.source == "pubmed" for claim in claims)
     assert all(claim.max_papers >= 3 for claim in claims)
     assert all(claim.question.endswith("?") for claim in claims)
+
+
+def test_live_pubmed_quick_claim_set_has_one_row_per_label() -> None:
+    claims = load_claims_jsonl(QUICK_CLAIMS_PATH)
+
+    assert len(claims) == 3
+    assert {claim.gold_label for claim in claims} == set(CLAIM_LABELS)
+    assert validate_claim_set(claims, min_per_label=1)["duplicate_ids"] == []
 
 
 def test_live_pubmed_claim_set_is_balanced_and_has_unique_ids() -> None:

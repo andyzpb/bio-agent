@@ -12,7 +12,7 @@ from asv_eval.core import StepRecord, normalize_log_scores
 
 @dataclass(frozen=True)
 class DeepSeekLogprobConfig:
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-chat"
     base_url: str = "https://api.deepseek.com/v1"
     api_key_env: str = "DEEPSEEK_API_KEY"
     top_logprobs: int = 20

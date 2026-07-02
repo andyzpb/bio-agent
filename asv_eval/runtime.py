@@ -69,7 +69,7 @@ _SAFE_SECRET_STRING_EXCEPTIONS = {
 class EvaluatorRuntimeConfig:
     mode: EvaluatorMode = "provided-belief"
     provider: str = "deepseek"
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-chat"
     api_key_env: str = "DEEPSEEK_API_KEY"
     top_logprobs: int = 20
     max_tokens: int = 1
