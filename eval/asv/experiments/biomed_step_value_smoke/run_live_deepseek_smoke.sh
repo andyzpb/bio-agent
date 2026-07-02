@@ -62,6 +62,7 @@ for path in scan_paths:
         "token=",
         "sk-live",
         "provider_response",
+        "raw_provider_response",
         "raw_response",
     ):
         if marker in text:

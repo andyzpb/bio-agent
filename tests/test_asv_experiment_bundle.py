@@ -112,6 +112,7 @@ def test_live_deepseek_smoke_docs_are_secret_safe_and_untracked_output_only() ->
         "client_secret",
         "sk-live",
         "provider_response",
+        "raw_provider_response",
         "raw_response",
     ):
         assert f'"{marker}"' in script

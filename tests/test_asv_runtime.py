@@ -391,8 +391,9 @@ def test_state_score_cache_reuses_identical_rendered_state(tmp_path) -> None:
     assert len(rows) == 2
     assert {row["quality_flags"]["provider"] for row in rows} == {"deepseek"}
     assert {
-        row["quality_flags"]["api_key_env"] for row in rows
+        row["quality_flags"]["credential_env"] for row in rows
     } == {"DEEPSEEK_API_KEY"}
+    assert "api_key" not in cache_text
     assert "Bearer" not in cache_text
 
 

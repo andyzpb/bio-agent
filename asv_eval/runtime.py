@@ -54,7 +54,7 @@ _SENSITIVE_CONTAINER_KEYS = {
 }
 _SECRET_STRING_MARKERS = _SECRET_KEY_PARTS + tuple(_SENSITIVE_CONTAINER_KEYS)
 _SAFE_SECRET_KEY_EXCEPTIONS = {
-    "api_key_env",
+    "credential_env",
     "prompt_hash",
     "prompt_tokens",
     "completion_tokens",
@@ -84,7 +84,7 @@ class EvaluatorRuntimeConfig:
             "mode": self.mode,
             "provider": self.provider,
             "model": self.model,
-            "api_key_env": self.api_key_env,
+            "credential_env": self.api_key_env,
             "top_logprobs": self.top_logprobs,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
@@ -279,7 +279,7 @@ def fill_missing_beliefs(
                 "evaluator_mode": "deepseek_chat_logprob",
                 "provider": config.provider,
                 "model": config.model,
-                "api_key_env": config.api_key_env,
+                "credential_env": config.api_key_env,
                 "candidate_count": len(rendered_after.labels),
                 "top_logprobs": config.top_logprobs,
                 "floor_score": config.floor_score,
@@ -344,7 +344,7 @@ def _score_rendered_state(
             "evaluator_mode": "deepseek_chat_logprob",
             "provider": config.provider,
             "model": config.model,
-            "api_key_env": config.api_key_env,
+            "credential_env": config.api_key_env,
             "candidate_count": len(rendered.labels),
             "top_logprobs": config.top_logprobs,
             "floor_score": config.floor_score,

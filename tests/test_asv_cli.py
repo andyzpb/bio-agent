@@ -277,6 +277,7 @@ def test_cli_evaluate_writes_evaluated_trajectories_with_runtime(
     step = evaluated["steps"][0]
     assert step["belief_before"] is not None
     assert step["belief_after"]["supported"] > 0.9
+    assert "api_key" not in evaluated_path.read_text(encoding="utf-8")
     [report_step] = [
         json.loads(line)
         for line in (output_dir / "steps.jsonl").read_text(encoding="utf-8").splitlines()
@@ -291,3 +292,5 @@ def test_cli_evaluate_writes_evaluated_trajectories_with_runtime(
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["evaluator"]["mode"] == "deepseek-chat-logprob"
     assert summary["evaluator_coverage"]["evaluated_state_count"] == 2
+    for path in [output_dir / "summary.json", output_dir / "steps.jsonl"]:
+        assert "api_key" not in path.read_text(encoding="utf-8")
