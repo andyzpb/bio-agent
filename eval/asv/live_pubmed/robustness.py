@@ -39,6 +39,10 @@ def build_label_permuted_trajectories(
                     trajectory,
                     trajectory_id=f"{trajectory.trajectory_id}-permutation-{index}",
                     task=replace(trajectory.task, candidate_space=candidate_space),
+                    metadata={
+                        **trajectory.metadata,
+                        "label_permutation_index": index,
+                    },
                 )
             )
     return permuted
@@ -75,13 +79,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--permutations", type=int, required=True)
+    parser.add_argument("--permutations", type=int, default=3)
     args = parser.parse_args(argv)
 
     trajectories = load_standard_jsonl(Path(args.input))
     permuted = build_label_permuted_trajectories(
         trajectories,
-        permutation_count=args.permutations,
+        permutation_count=max(1, int(args.permutations)),
     )
     write_standard_jsonl(Path(args.output), permuted)
     print(f"trajectory_count={len(permuted)} output={args.output}")

@@ -644,6 +644,7 @@ def test_build_label_permuted_trajectories_rotates_candidate_labels() -> None:
         candidate.label
         for candidate in permuted[1].task.candidate_space.candidates
     ] == ["C", "A", "B"]
+    assert permuted[1].metadata["label_permutation_index"] == 1
 
 
 def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
