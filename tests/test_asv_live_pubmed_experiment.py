@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -388,7 +389,7 @@ def test_build_evaluate_command_uses_deepseek_cache_and_frozen_input(
 
     command = build_evaluate_command(run)
 
-    assert command[:4] == [".venv/bin/python", "-m", "asv_eval", "evaluate"]
+    assert command[:4] == [sys.executable, "-m", "asv_eval", "evaluate"]
     assert "--evaluator" in command
     assert "deepseek-chat-logprob" in command
     assert "--cache" in command
@@ -442,6 +443,41 @@ def test_secret_scan_flags_json_style_provider_secrets(tmp_path: Path) -> None:
     assert f"x-api-key found in {path}" in findings
     assert f"authorization found in {path}" in findings
     assert f"bearer found in {path}" in findings
+    assert f"access_token found in {path}" in findings
+
+
+def test_secret_scan_allows_asv_token_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "summary.json"
+    path.write_text(
+        json.dumps(
+            {
+                "evaluator": {
+                    "max_tokens": 1,
+                    "prompt_tokens": 12,
+                    "completion_tokens": 1,
+                    "total_tokens": 13,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert scan_for_secret_markers([path]) == []
+
+
+def test_secret_scan_flags_jsonl_style_provider_secrets(tmp_path: Path) -> None:
+    path = tmp_path / "cache.jsonl"
+    path.write_text(
+        json.dumps({"state": "safe"})
+        + "\n"
+        + json.dumps({"x-api-key": "provider-secret", "access_token": "token-value"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_for_secret_markers([path])
+
+    assert f"x-api-key found in {path}" in findings
     assert f"access_token found in {path}" in findings
 
 

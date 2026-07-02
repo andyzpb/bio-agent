@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ SAFE_SECRET_KEYS = {
     "prompt_hash",
     "prompt_tokens",
     "completion_tokens",
+    "max_tokens",
     "total_tokens",
 }
 
@@ -59,7 +61,7 @@ class EvaluationRun:
     fallback_policy: str = "floor"
     floor_score: float = -20.0
     model: str = "deepseek-v4-flash"
-    python_executable: str = ".venv/bin/python"
+    python_executable: str = sys.executable
 
 
 def build_evaluate_command(run: EvaluationRun) -> list[str]:
@@ -121,8 +123,21 @@ def _json_secret_markers(text: str) -> list[str]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return []
+        return _jsonl_secret_markers(text)
     return _walk_secret_keys(payload)
+
+
+def _jsonl_secret_markers(text: str) -> list[str]:
+    findings: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        findings.extend(_walk_secret_keys(payload))
+    return findings
 
 
 def _walk_secret_keys(value: Any) -> list[str]:
