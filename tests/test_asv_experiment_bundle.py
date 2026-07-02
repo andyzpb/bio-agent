@@ -87,6 +87,7 @@ def test_live_deepseek_smoke_docs_are_secret_safe_and_untracked_output_only() ->
 
     assert "zsh -ic" in readme
     assert "--evaluator deepseek-chat-logprob" in readme
+    assert "--fallback-policy floor" in readme
     assert "--cache /tmp/asv-biomed-deepseek-cache.jsonl" in readme
     assert (
         "--write-evaluated-trajectories /tmp/asv-biomed-deepseek-evaluated.jsonl"
@@ -98,6 +99,7 @@ def test_live_deepseek_smoke_docs_are_secret_safe_and_untracked_output_only() ->
     assert "inspect /tmp/asv-biomed-deepseek/summary.json" not in readme
     assert "/tmp/asv-biomed-deepseek" in script
     assert script.count(".venv/bin/python -m asv_eval evaluate") == 2
+    assert script.count("--fallback-policy floor") == 2
     assert 'rm -rf "$OUTPUT_DIR" "$EVALUATED" "$CACHE"' in script
     assert (
         'coverage["cache_hit_state_count"] != coverage["evaluated_state_count"]'

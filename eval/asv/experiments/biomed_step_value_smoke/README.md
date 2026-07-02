@@ -44,6 +44,7 @@ The script runs the evaluator twice with the same cache:
 .venv/bin/python -m asv_eval evaluate \
   --input eval/asv/experiments/biomed_step_value_smoke/trajectory.jsonl \
   --evaluator deepseek-chat-logprob \
+  --fallback-policy floor \
   --cache /tmp/asv-biomed-deepseek-cache.jsonl \
   --write-evaluated-trajectories /tmp/asv-biomed-deepseek-evaluated.jsonl \
   --output-dir /tmp/asv-biomed-deepseek
@@ -52,4 +53,6 @@ The script runs the evaluator twice with the same cache:
 It writes live outputs under `/tmp` and should not create committed artifacts.
 The script fails automatically on evaluator-mode, cache-hit, or secret-marker
 mismatches, and prints `live_deepseek_asv_smoke=passed` after a successful
-second run.
+second run. It uses floor-score fallback for missing top-logprob labels so the
+smoke verifies live provider/cache behavior without making label coverage a
+hard CI-style gate.

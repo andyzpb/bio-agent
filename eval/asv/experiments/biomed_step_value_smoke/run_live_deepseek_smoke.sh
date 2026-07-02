@@ -20,6 +20,7 @@ rm -rf "$OUTPUT_DIR" "$EVALUATED" "$CACHE"
 .venv/bin/python -m asv_eval evaluate \
   --input "$INPUT" \
   --evaluator deepseek-chat-logprob \
+  --fallback-policy floor \
   --cache "$CACHE" \
   --write-evaluated-trajectories "$EVALUATED" \
   --output-dir "$OUTPUT_DIR"
@@ -27,6 +28,7 @@ rm -rf "$OUTPUT_DIR" "$EVALUATED" "$CACHE"
 .venv/bin/python -m asv_eval evaluate \
   --input "$INPUT" \
   --evaluator deepseek-chat-logprob \
+  --fallback-policy floor \
   --cache "$CACHE" \
   --write-evaluated-trajectories "$EVALUATED" \
   --output-dir "$OUTPUT_DIR"
@@ -70,4 +72,5 @@ for path in scan_paths:
 
 print("live_deepseek_asv_smoke=passed")
 print(f"cache_hit_state_count={coverage['cache_hit_state_count']}")
+print(f"floor_score_step_count={coverage['floor_score_step_count']}")
 PY
