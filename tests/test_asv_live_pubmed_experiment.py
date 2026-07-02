@@ -420,3 +420,45 @@ def test_secret_scan_flags_raw_provider_payload(tmp_path: Path) -> None:
         f"Authorization found in {path}",
         f"Bearer  found in {path}",
     ]
+
+
+def test_secret_scan_flags_json_style_provider_secrets(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(
+        json.dumps(
+            {
+                "api_key": "sk-proj-test",
+                "x-api-key": "provider-secret",
+                "authorization": "bearer provider-secret",
+                "access_token": "token-value",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    findings = scan_for_secret_markers([path])
+
+    assert f"api_key found in {path}" in findings
+    assert f"x-api-key found in {path}" in findings
+    assert f"authorization found in {path}" in findings
+    assert f"bearer found in {path}" in findings
+    assert f"access_token found in {path}" in findings
+
+
+def test_build_evaluate_command_allows_python_executable_override(
+    tmp_path: Path,
+) -> None:
+    run = EvaluationRun(
+        input_path=tmp_path / "trajectory.jsonl",
+        output_dir=tmp_path / "report",
+        cache_path=tmp_path / "cache.jsonl",
+        evaluated_path=tmp_path / "evaluated.jsonl",
+        python_executable="/opt/python/bin/python",
+    )
+
+    assert build_evaluate_command(run)[:4] == [
+        "/opt/python/bin/python",
+        "-m",
+        "asv_eval",
+        "evaluate",
+    ]

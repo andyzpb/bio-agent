@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 SECRET_MARKERS = (
@@ -18,6 +21,33 @@ SECRET_MARKERS = (
     "token=",
     "sk-live",
 )
+SECRET_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "x-api-key",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+)
+SECRET_VALUE_PATTERNS = (
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\bsk-(?:live|proj)-[A-Za-z0-9._-]+"),
+)
+SAFE_SECRET_VALUES = {
+    "DEEPSEEK_API_KEY",
+}
+SAFE_SECRET_KEYS = {
+    "credential_env",
+    "prompt_hash",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+}
 
 
 @dataclass(frozen=True)
@@ -29,11 +59,12 @@ class EvaluationRun:
     fallback_policy: str = "floor"
     floor_score: float = -20.0
     model: str = "deepseek-v4-flash"
+    python_executable: str = ".venv/bin/python"
 
 
 def build_evaluate_command(run: EvaluationRun) -> list[str]:
     return [
-        ".venv/bin/python",
+        run.python_executable,
         "-m",
         "asv_eval",
         "evaluate",
@@ -62,6 +93,7 @@ def scan_for_secret_markers(paths: list[Path]) -> list[str]:
         if not path.exists() or not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        path_findings: list[str] = []
         for marker in SECRET_MARKERS:
             search_text = (
                 text.replace("raw_provider_response", "")
@@ -69,8 +101,60 @@ def scan_for_secret_markers(paths: list[Path]) -> list[str]:
                 else text
             )
             if marker in search_text:
-                findings.append(f"{marker} found in {path}")
+                _add_finding(path_findings, marker, path)
+        for marker in _json_secret_markers(text):
+            _add_finding(path_findings, marker, path)
+        for pattern in SECRET_VALUE_PATTERNS:
+            for match in pattern.findall(text):
+                normalized = match.split()[0].lower() if " " in match else match[:7].lower()
+                if match in SAFE_SECRET_VALUES:
+                    continue
+                if normalized.startswith("bearer"):
+                    _add_finding(path_findings, "bearer", path)
+                elif normalized.startswith("sk-"):
+                    _add_finding(path_findings, "sk-", path)
+        findings.extend(path_findings)
     return findings
+
+
+def _json_secret_markers(text: str) -> list[str]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return _walk_secret_keys(payload)
+
+
+def _walk_secret_keys(value: Any) -> list[str]:
+    findings: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            normalized = key_text.lower().replace("-", "_")
+            if normalized in SAFE_SECRET_KEYS:
+                findings.extend(_walk_secret_keys(item))
+                continue
+            for marker in SECRET_KEY_PARTS:
+                marker_normalized = marker.replace("-", "_")
+                if marker_normalized in normalized and key_text not in findings:
+                    findings.append(key_text)
+            findings.extend(_walk_secret_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            findings.extend(_walk_secret_keys(item))
+    return findings
+
+
+def _add_finding(findings: list[str], marker: str, path: Path) -> None:
+    normalized_marker = marker.strip().lower()
+    if normalized_marker in _finding_markers(findings, path):
+        return
+    findings.append(f"{marker} found in {path}")
+
+
+def _finding_markers(findings: list[str], path: Path) -> set[str]:
+    suffix = f" found in {path}"
+    return {finding.removesuffix(suffix).strip().lower() for finding in findings}
 
 
 def output_files_for_secret_scan(
@@ -101,6 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache", required=True)
     parser.add_argument("--evaluated", required=True)
     parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--fallback-policy", choices=["error", "floor"], default="floor")
+    parser.add_argument("--floor-score", type=float, default=-20.0)
     args = parser.parse_args(argv)
     run = EvaluationRun(
         input_path=Path(args.input),
@@ -108,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
         cache_path=Path(args.cache),
         evaluated_path=Path(args.evaluated),
         model=str(args.model),
+        fallback_policy=str(args.fallback_policy),
+        floor_score=float(args.floor_score),
     )
     result = run_evaluation(run)
     if result.stdout:
