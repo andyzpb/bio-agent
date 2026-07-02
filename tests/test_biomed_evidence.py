@@ -22,6 +22,7 @@ from plugins.biomed_evidence.schemas import (
     BiomedicalQueryPlan,
     BiomedicalPaper,
     Citation,
+    CitationAuditResult,
     EvidenceExtractionRequest,
     EvidenceItem,
     FullTextEnhancementRequest,
@@ -38,6 +39,7 @@ from plugins.biomed_evidence.schemas import (
     ProjectClaimRecordRequest,
     ProjectPaperDecisionRequest,
     RetrievalManifest,
+    UncertaintyAudit,
     SearchBiomedicalLiteratureRequest,
     WatchSnapshot,
     WatchTopicCreateRequest,
@@ -470,10 +472,37 @@ def test_trace_answer_run_uses_latest_revision_as_display_answer(tmp_path: Path)
             disclaimer=RESEARCH_USE_DISCLAIMER,
         )
         service_instance.storage.save_answer_run(run, question="Does exposure cause outcome?")
+        final_audit = CitationAuditResult(
+            audit_id="audit-revised-display",
+            run_id=run.run_id,
+            uncertainty_audit=UncertaintyAudit(
+                expected_uncertainty="low",
+                observed_uncertainty="low",
+                calibrated=True,
+            ),
+            claim_support_rate=1.0,
+            citation_precision=1.0,
+            unsupported_claim_rate=0.0,
+            overclaim_rate=0.0,
+            conflict_awareness=True,
+            uncertainty_calibrated=True,
+            recommended_action="pass",
+            created_at="2026-06-29T00:00:00+00:00",
+        )
+        later_ad_hoc_audit = final_audit.model_copy(
+            update={
+                "audit_id": "audit-later-ad-hoc",
+                "claim_support_rate": 0.8571,
+                "recommended_action": "pass_with_limitations",
+                "created_at": "2026-06-29T00:01:00+00:00",
+            }
+        )
+        service_instance.storage.save_citation_audit(final_audit)
+        service_instance.storage.save_citation_audit(later_ad_hoc_audit)
         revision = AnswerRevision(
             revision_id="revision-revised-display",
             run_id=run.run_id,
-            audit_id="audit-revised-display",
+            audit_id=final_audit.audit_id,
             revision_mode="llm",
             draft_answer=run.answer,
             final_answer="Revised answer: evidence does not establish causality.",
@@ -488,7 +517,10 @@ def test_trace_answer_run_uses_latest_revision_as_display_answer(tmp_path: Path)
 
     assert trace is not None
     answer_run = cast(dict[str, Any], trace["answer_run"])
+    audit = cast(dict[str, Any], trace["latest_citation_audit"])
     assert answer_run["answer"] == revision.final_answer
+    assert audit["audit_id"] == final_audit.audit_id
+    assert audit["claim_support_rate"] == 1.0
 
 
 def test_unknown_answer_citations_are_detected() -> None:
@@ -503,6 +535,62 @@ def test_unknown_answer_citations_are_detected() -> None:
             )
         ],
     ) == ["MOCK-PMID-40163214"]
+
+
+def test_structured_llm_answer_payload_renders_only_answer_claims() -> None:
+    answer = service._render_llm_answer_payload(
+        {
+            "answer_claims": [
+                {
+                    "text": "Persistent high-risk HPV infection is the primary cause of cervical cancer.",
+                    "paper_ids": ["41127671"],
+                }
+            ],
+            "limitations": [
+                {
+                    "text": "The packet is abstract-derived.",
+                    "basis": "packet",
+                    "paper_ids": [],
+                }
+            ],
+            "coverage_notes": [
+                {
+                    "text": "No refuting evidence was retrieved.",
+                    "basis": "retrieval",
+                }
+            ],
+        }
+    )
+
+    assert "Persistent high-risk HPV infection" in answer
+    assert "[41127671]" in answer
+    assert "No refuting evidence was retrieved" not in answer
+    assert "The packet is abstract-derived" not in answer
+
+
+def test_structured_llm_answer_payload_does_not_duplicate_existing_citations() -> None:
+    answer = service._render_llm_answer_payload(
+        {
+            "answer_claims": [
+                {
+                    "text": "Smoking is the primary risk factor for SCLC [40163214].",
+                    "paper_ids": ["40163214"],
+                },
+                {
+                    "text": (
+                        "Smoking acts synergistically with asbestos exposure "
+                        "[19890827, 3511699]."
+                    ),
+                    "paper_ids": ["19890827", "3511699", "11341561"],
+                },
+            ],
+        }
+    )
+
+    assert answer.count("[40163214]") == 1
+    assert answer.count("19890827") == 1
+    assert answer.count("3511699") == 1
+    assert "[11341561]" in answer
 
 
 @pytest.mark.asyncio

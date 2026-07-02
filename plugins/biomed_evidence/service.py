@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast
+from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast, get_args
 from urllib.parse import quote, urljoin
 
 from bs4 import BeautifulSoup
@@ -114,6 +114,7 @@ from plugins.biomed_evidence.schemas import (
     EvidenceGraphSnapshotRecord,
     EvidenceExtractionRequest,
     EvidenceExtractionResult,
+    EvidenceStrength,
     EvidencePacketBuildRequest,
     EvidencePacketBuildResult,
     EvidencePacketGetResult,
@@ -147,6 +148,12 @@ from plugins.biomed_evidence.schemas import (
     LiteratureSearchRequest,
     LiteratureSearchResult,
     LiteratureSourceTrace,
+    LogicClaimStrength,
+    LogicModality,
+    LogicPolarity,
+    LogicPopulation,
+    LogicPredicate,
+    LogicStudyDesign,
     LogicalClaimFrame,
     LogicalEvidenceFrame,
     MathSignalsResult,
@@ -5076,10 +5083,10 @@ class BiomedEvidenceService:
                         "content": (
                             "You revise biomedical research answers using only supplied "
                             "evidence and citations. Return one valid JSON object only. "
-                            "Every sentence in final_answer that states biomedical "
-                            "evidence, uncertainty, limitations, comparisons, or "
-                            "recommendations must include at least one supplied citation "
-                            "label. Use bracketed paper-id labels such as "
+                            "Prefer answer_claims as structured objects with text and "
+                            "paper_ids; use limitations and coverage_notes for non-claim "
+                            "metadata. Every answer_claim must include supplied citation "
+                            "paper_ids. Use bracketed paper-id labels such as "
                             "[MOCK-PMID-1001], not bare parenthetical identifiers. Do "
                             "not include the research-use disclaimer in final_answer; "
                             "the application displays that boundary separately. Do not add "
@@ -5101,9 +5108,7 @@ class BiomedEvidenceService:
             )
             raw = str(getattr(response, "content", "") or "")
             parsed = _parse_json_object(raw)
-            final_answer = _normalize_llm_answer_text(
-                str(parsed.get("final_answer") or "")
-            )
+            final_answer = _render_llm_answer_payload(parsed)
             if not final_answer:
                 return None
             parsed["final_answer"] = final_answer
@@ -5240,9 +5245,10 @@ class BiomedEvidenceService:
                         "content": (
                             "Synthesize a biomedical research answer using only supplied "
                             "evidence items and citations. Return one valid JSON object "
-                            "only with final_answer. Every biomedical claim, limitation, "
-                            "uncertainty statement, comparison, or interpretation must "
-                            "include at least one supplied bracket citation such as "
+                            "only. Prefer answer_claims as structured objects with text "
+                            "and paper_ids; use limitations and coverage_notes for "
+                            "non-claim metadata. Every answer_claim must include at least "
+                            "one supplied paper_id citation such as "
                             "[12345678]. Use only paper_id values present in the "
                             "provided citations and evidence. Do not add clinical advice "
                             "or uncited future-work claims. Do not include the "
@@ -5259,9 +5265,7 @@ class BiomedEvidenceService:
                 disable_thinking=True,
             )
             parsed = _parse_json_object(str(getattr(response, "content", "") or ""))
-            final_answer = _normalize_llm_answer_text(
-                str(parsed.get("final_answer") or "")
-            )
+            final_answer = _render_llm_answer_payload(parsed)
             if not final_answer:
                 raise ValueError("LLM synthesis returned empty final_answer.")
             unknown_citations = _unknown_answer_citations(final_answer, citations)
@@ -6316,6 +6320,13 @@ class BiomedEvidenceService:
         trace = self.storage.list_agent_trace_steps(run_id)
         revision = self.storage.get_answer_revision(run_id)
         latest_audit = self.storage.get_latest_citation_audit_for_run(run_id)
+        display_audit = latest_audit
+        if revision is not None:
+            revision_audit_id = revision.post_revision_audit_id or revision.audit_id
+            if revision_audit_id:
+                display_audit = (
+                    self.storage.get_citation_audit(revision_audit_id) or latest_audit
+                )
         latest_advisory = self.storage.get_latest_advisory_verifier_for_run(run_id)
         display_maturity = _derive_evidence_maturity(
             question=_pilot_question(result) or result.answer[:240],
@@ -6368,8 +6379,8 @@ class BiomedEvidenceService:
                 revision.model_dump(mode="json") if revision is not None else None
             ),
             "latest_citation_audit": (
-                latest_audit.model_dump(mode="json")
-                if latest_audit is not None
+                display_audit.model_dump(mode="json")
+                if display_audit is not None
                 else None
             ),
             "latest_advisory_verifier": (
@@ -8216,6 +8227,7 @@ def _normalize_logic_payload(
     if payload.get("modality") == "uncertain":
         payload["modality"] = "inconclusive"
         warnings.append("Normalized modality 'uncertain' to 'inconclusive'.")
+    _normalize_logic_enum_fields(payload, warnings)
     text = _logic_payload_text(payload).lower()
     if (
         _has_negative_benefit_language(text)
@@ -8260,6 +8272,33 @@ def _normalize_logic_payload(
             )
     payload["parser_warnings"] = _merge_unique(warnings)
     return payload
+
+
+_LOGIC_ENUM_FIELDS: dict[str, tuple[tuple[str, ...], str]] = {
+    "predicate": (get_args(LogicPredicate), "unspecified"),
+    "polarity": (get_args(LogicPolarity), "unspecified"),
+    "modality": (get_args(LogicModality), "unspecified"),
+    "population": (get_args(LogicPopulation), "unspecified"),
+    "claim_strength": (get_args(LogicClaimStrength), "unspecified"),
+    "study_design": (get_args(LogicStudyDesign), "unspecified"),
+    "evidence_strength": (get_args(EvidenceStrength), "not_assessed"),
+}
+
+
+def _normalize_logic_enum_fields(
+    payload: dict[str, object],
+    warnings: list[str],
+) -> None:
+    for field, (allowed_values, fallback) in _LOGIC_ENUM_FIELDS.items():
+        value = payload.get(field)
+        if value is None or value in allowed_values:
+            continue
+        original = str(value)
+        close = difflib.get_close_matches(original, allowed_values, n=1, cutoff=0.88)
+        payload[field] = close[0] if close else fallback
+        warnings.append(
+            f"Unsupported {field} '{original}' normalized to '{payload[field]}'."
+        )
 
 
 def _logic_payload_text(payload: dict[str, object]) -> str:
@@ -8419,7 +8458,8 @@ def _llm_synthesis_payload(
             "Mention uncertainty and limitations only when supported by supplied evidence.",
             "If refute or limitation searches return no papers, describe that as a retrieval limitation and do not claim a PubMed indexing gap unless explicitly supported by the supplied retrieval metadata.",
             "Do not include the research-use disclaimer in final_answer; it is displayed separately in UI and metadata.",
-            "Return JSON with final_answer, uncertainty_level, and optional added_limitations.",
+            "Prefer structured JSON: answer_claims [{text, paper_ids, role}], limitations [{text, basis, paper_ids}], coverage_notes [{text, basis}], uncertainty_level.",
+            "Use final_answer only if structured answer_claims cannot represent the answer.",
         ],
         "question": request.question,
         "project_context": request.project_context,
@@ -10757,7 +10797,8 @@ def _llm_revision_payload(
             "Do not provide diagnosis, treatment, dosing, prognosis, or patient-specific advice.",
             "If evidence is insufficient, say so.",
             "If refute or limitation searches returned no papers, state that the review is retrieval-limited rather than asserting a PubMed indexing gap unless the retrieval metadata explicitly supports that claim.",
-            "Return JSON with final_answer, changed_claims, removed_claims, softened_claims, added_limitations, and uncertainty_level.",
+            "Prefer structured JSON: answer_claims [{text, paper_ids, role}], limitations [{text, basis, paper_ids}], coverage_notes [{text, basis}], changed_claims, removed_claims, softened_claims, added_limitations, uncertainty_level.",
+            "Use final_answer only if structured answer_claims cannot represent the revision.",
         ],
         "acceptance_gate": (
             "The framework will run a post-revision citation audit and reject the LLM "
@@ -10797,6 +10838,39 @@ def _normalize_llm_answer_text(raw: str) -> str:
     text = raw.strip()
     normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
     return _strip_research_disclaimer(normalized)
+
+
+def _render_llm_answer_payload(parsed: dict[str, object]) -> str:
+    final_answer = _normalize_llm_answer_text(str(parsed.get("final_answer") or ""))
+    if final_answer:
+        return final_answer
+    claims = parsed.get("answer_claims")
+    if not isinstance(claims, list):
+        return ""
+    lines: list[str] = []
+    for item in claims:
+        if not isinstance(item, dict):
+            continue
+        text = _normalize_space(str(item.get("text") or ""))
+        if not text:
+            continue
+        paper_ids = _coerce_string_list(item.get("paper_ids"))
+        lines.append(f"- {_append_missing_citations(text, paper_ids)}")
+    return "\n".join(lines).strip()
+
+
+def _append_missing_citations(text: str, paper_ids: list[str]) -> str:
+    existing_ids: set[str] = set()
+    for bracketed in re.findall(r"\[([^\]]+)\]", text):
+        existing_ids.update(
+            token.strip()
+            for token in re.split(r"[,;\s]+", bracketed)
+            if token.strip()
+        )
+    missing = [paper_id for paper_id in paper_ids if paper_id not in existing_ids]
+    if not missing:
+        return text
+    return f"{text} {' '.join(f'[{paper_id}]' for paper_id in missing)}"
 
 
 def _strip_research_disclaimer(answer: str) -> str:

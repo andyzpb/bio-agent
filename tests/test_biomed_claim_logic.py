@@ -803,6 +803,31 @@ def test_llm_logic_parser_normalizes_null_entities() -> None:
     assert any("missing object" in warning for warning in frame.parser_warnings)
 
 
+def test_llm_logic_parser_normalizes_unsupported_predicate() -> None:
+    evidence = _animal_association_evidence()
+    raw = {
+        "evidence_id": evidence.evidence_id,
+        "paper_id": evidence.paper_id,
+        "evidence_text": evidence.evidence_span,
+        "subject": {"text": "smoking", "entity_type": "unspecified"},
+        "predicate": "prevents",
+        "object": {"text": "lung cancer", "entity_type": "disease"},
+        "population": "human",
+    }
+
+    frames = biomed_service_module._logic_evidence_frames_from_llm(
+        [raw],
+        evidence_items=[evidence],
+        model="fake",
+        prompt_hash="hash",
+    )
+
+    frame = frames[evidence.evidence_id]
+    assert frame.parser_mode == "llm"
+    assert frame.predicate == "unspecified"
+    assert any("Unsupported predicate" in warning for warning in frame.parser_warnings)
+
+
 def test_llm_logic_parser_flags_human_trial_rat_model_system() -> None:
     evidence = EvidenceItem(
         evidence_id="ev_human",
