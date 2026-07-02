@@ -274,8 +274,11 @@ def fill_missing_beliefs(
                 before_score.quality_flags,
                 after_score.quality_flags,
             )
+            inherited_quality_flags = _redact(step.quality_flags)
+            if not isinstance(inherited_quality_flags, dict):
+                inherited_quality_flags = {}
             quality_flags = {
-                **step.quality_flags,
+                **inherited_quality_flags,
                 "evaluator_mode": "deepseek_chat_logprob",
                 "provider": config.provider,
                 "model": config.model,

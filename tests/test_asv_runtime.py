@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 
@@ -365,6 +366,35 @@ def test_fill_missing_beliefs_with_deepseek_mode_scores_before_and_after() -> No
     assert step.quality_flags["used_cache"] is False
     assert step.quality_flags["state_before_hash"].startswith("sha256:")
     assert step.quality_flags["state_after_hash"].startswith("sha256:")
+
+
+def test_fill_missing_beliefs_redacts_input_step_quality_flags() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+    step_with_legacy_flags = replace(
+        trajectory.steps[0],
+        quality_flags={
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "raw_provider_response": "provider raw secret",
+            "note": "safe provenance survives",
+        },
+    )
+    trajectory = replace(trajectory, steps=[step_with_legacy_flags])
+
+    [filled] = fill_missing_beliefs(
+        [trajectory],
+        config=EvaluatorRuntimeConfig(mode="deepseek-chat-logprob"),
+        evaluator=_FakeEvaluator(),
+    )
+
+    flags_text = json.dumps(
+        filled.steps[0].quality_flags,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    assert filled.steps[0].quality_flags["note"] == "safe provenance survives"
+    assert filled.steps[0].quality_flags["credential_env"] == "DEEPSEEK_API_KEY"
+    for marker in ("api_key", "raw_provider_response", "provider raw secret"):
+        assert marker not in flags_text
 
 
 def test_state_score_cache_reuses_identical_rendered_state(tmp_path) -> None:
