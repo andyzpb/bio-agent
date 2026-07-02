@@ -124,3 +124,128 @@ def test_claim_record_to_answer_request_payload_uses_live_flags() -> None:
         "use_llm_claim_logic": True,
         "export_logic_facts": True,
     }
+
+
+from dataclasses import asdict
+
+from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
+from eval.asv.live_pubmed.collect import (
+    CollectionConfig,
+    CollectionRow,
+    collect_claims,
+    write_collection_outputs,
+)
+
+
+class FakeLiveCollectorService:
+    def __init__(self, workspace: Path, **kwargs) -> None:
+        self.workspace = Path(workspace)
+        self.closed = False
+
+    async def answer_with_audit(self, request):
+        run_id = f"run-{request.question.split()[1].lower()}"
+        return type(
+            "Audited",
+            (),
+            {
+                "answer_result": type("AnswerResult", (), {"run_id": run_id})(),
+                "trace": [],
+                "model_dump": lambda self, mode="json": {
+                    "answer_result": {"run_id": run_id},
+                    "trace": [],
+                },
+            },
+        )()
+
+    def export_answer_run_asv_trajectory(self, run_id: str) -> TrajectoryRecord:
+        return TrajectoryRecord(
+            trajectory_id=f"bio-agent-{run_id}",
+            run_id=run_id,
+            source_adapter="bio_agent_workflow",
+            task=TaskRecord(
+                task_id=run_id,
+                question=f"Question for {run_id}",
+                domain="biomedical",
+                candidate_space=CandidateSpace(
+                    candidates=[
+                        Candidate(id="supported", label="A", text="supported"),
+                        Candidate(id="refuted", label="B", text="refuted"),
+                        Candidate(
+                            id="not_enough_information",
+                            label="C",
+                            text="not enough information",
+                        ),
+                    ],
+                    gold_candidate_id=None,
+                ),
+            ),
+            steps=[
+                StepRecord(
+                    step_id="retrieve",
+                    index=0,
+                    action={"type": "retrieve"},
+                    observation={"summary": "retrieved fake papers"},
+                    state_before={"question": f"Question for {run_id}"},
+                    state_after={
+                        "question": f"Question for {run_id}",
+                        "evidence": ["fake evidence"],
+                    },
+                    cost={"source_call_count": 1, "tool_calls": 1},
+                )
+            ],
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_collect_claims_dry_run_writes_frozen_trajectories(tmp_path: Path) -> None:
+    claim = ClaimRecord(
+        claim_id="supported-test",
+        question="Does APOE e4 increase Alzheimer's disease risk?",
+        gold_label="supported",
+        source="pubmed",
+        max_papers=3,
+    )
+    config = CollectionConfig(
+        claims_path=tmp_path / "claims.jsonl",
+        output_dir=tmp_path / "out",
+        workspace=tmp_path / "workspace",
+        limit=1,
+        require_ack_live=True,
+    )
+
+    rows, trajectories = collect_claims.run_sync(
+        [claim],
+        config=config,
+        service_factory=FakeLiveCollectorService,
+    )
+
+    assert [row.status for row in rows] == ["completed"]
+    assert rows[0].claim_id == "supported-test"
+    assert rows[0].gold_label == "supported"
+    assert len(trajectories) == 1
+    assert trajectories[0].task.candidate_space.gold_candidate_id == "supported"
+
+    write_collection_outputs(config.output_dir, rows, trajectories)
+
+    assert (config.output_dir / "collection.jsonl").exists()
+    assert (config.output_dir / "trajectory.jsonl").exists()
+    payload = json.loads(
+        (config.output_dir / "trajectory.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert payload["task"]["candidate_space"]["gold_candidate_id"] == "supported"
+    assert payload["task"]["gold_visible_to_evaluator"] is False
+    assert payload["task"]["gold_used_only_for_validation"] is True
+
+
+def test_collection_row_records_failures_without_throwing() -> None:
+    row = CollectionRow.failure(
+        claim_id="claim-failed",
+        gold_label="refuted",
+        message="provider timeout",
+    )
+
+    assert row.status == "failed"
+    assert row.error == "provider timeout"
+    assert row.run_id is None
