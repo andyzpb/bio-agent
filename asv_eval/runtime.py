@@ -41,10 +41,13 @@ _SECRET_KEY_PARTS = (
 )
 _SENSITIVE_CONTAINER_KEYS = {
     "llm_raw_response",
+    "provider_response",
     "provider_raw_response",
+    "raw_response",
     "raw_llm_response",
     "raw_provider_response",
 }
+_SECRET_STRING_MARKERS = _SECRET_KEY_PARTS + tuple(_SENSITIVE_CONTAINER_KEYS)
 _SAFE_SECRET_KEY_EXCEPTIONS = {
     "prompt_hash",
     "prompt_tokens",
@@ -254,6 +257,9 @@ def _is_secret_key(key: str) -> bool:
 
 
 def _redact_secret_strings(value: str) -> str:
+    normalized = value.lower().replace("-", "_")
+    if any(marker in normalized for marker in _SECRET_STRING_MARKERS):
+        return _SECRET_REDACTION
     redacted = value
     for pattern in _SECRET_STRING_PATTERNS:
         redacted = pattern.sub(_SECRET_REDACTION, redacted)

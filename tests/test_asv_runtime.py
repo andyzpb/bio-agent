@@ -126,6 +126,10 @@ def test_render_state_for_evaluator_redacts_secret_like_state_keys_and_strings()
             "notes": [
                 "Authorization: Bearer live-token",
                 "api_key=inline-live-key",
+                "token=live-token-value",
+                "password=correct-horse",
+                "client_secret=super-secret",
+                "raw_provider_response contained provider raw secret",
                 "safe clinical evidence",
             ],
         },
@@ -146,6 +150,9 @@ def test_render_state_for_evaluator_redacts_secret_like_state_keys_and_strings()
             "token",
             "password",
             "raw_provider_response",
+            "client_secret",
+            "provider_response",
+            "raw_response",
         ):
             assert key not in artifact
     for secret in (
@@ -156,6 +163,10 @@ def test_render_state_for_evaluator_redacts_secret_like_state_keys_and_strings()
         "provider raw secret",
         "Bearer live-token",
         "inline-live-key",
+        "token=live-token-value",
+        "password=correct-horse",
+        "client_secret=super-secret",
+        "raw_provider_response contained provider raw secret",
     ):
         assert secret not in rendered_text
     assert "safe clinical evidence" in rendered_text
@@ -181,6 +192,10 @@ def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
         quality_flags={
             "evaluator_mode": "deepseek-chat-logprob",
             "raw_provider_response": "provider raw secret",
+            "inline_token": "token=live-token-value",
+            "note": "password=correct-horse",
+            "client": "client_secret=super-secret",
+            "provider_note": "raw_provider_response contained provider raw secret",
         },
     )
 
@@ -220,13 +235,24 @@ def test_state_score_cache_writes_exact_jsonl_contract_without_prompt_or_state(
         "token",
         "password",
         "raw_provider_response",
+        "client_secret",
+        "provider_response",
+        "raw_response",
+        "live-token-value",
+        "correct-horse",
+        "super-secret",
     ):
         assert secret_text not in cache_text
     expected_score = StateScore(
         scores=score.scores,
         belief=score.belief,
         warnings=score.warnings,
-        quality_flags={"evaluator_mode": "deepseek-chat-logprob"},
+        quality_flags={
+            "evaluator_mode": "deepseek-chat-logprob",
+            "note": "[REDACTED]",
+            "client": "[REDACTED]",
+            "provider_note": "[REDACTED]",
+        },
     )
     assert cache.get("cache-1") == expected_score
     assert StateScoreCache(cache_path).get("cache-1") == expected_score
