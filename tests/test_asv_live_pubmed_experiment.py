@@ -5,6 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
+from eval.asv.live_pubmed.collect import (
+    CollectionConfig,
+    CollectionRow,
+    collect_claims,
+    write_collection_outputs,
+)
 from eval.asv.live_pubmed.claims import (
     CLAIM_LABELS,
     ClaimRecord,
@@ -126,17 +133,6 @@ def test_claim_record_to_answer_request_payload_uses_live_flags() -> None:
     }
 
 
-from dataclasses import asdict
-
-from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
-from eval.asv.live_pubmed.collect import (
-    CollectionConfig,
-    CollectionRow,
-    collect_claims,
-    write_collection_outputs,
-)
-
-
 class FakeLiveCollectorService:
     def __init__(self, workspace: Path, **kwargs) -> None:
         self.workspace = Path(workspace)
@@ -199,6 +195,11 @@ class FakeLiveCollectorService:
         self.closed = True
 
 
+class FailingLiveCollectorService(FakeLiveCollectorService):
+    async def answer_with_audit(self, request):
+        raise TimeoutError("provider timeout")
+
+
 def test_collect_claims_dry_run_writes_frozen_trajectories(tmp_path: Path) -> None:
     claim = ClaimRecord(
         claim_id="supported-test",
@@ -249,3 +250,121 @@ def test_collection_row_records_failures_without_throwing() -> None:
     assert row.status == "failed"
     assert row.error == "provider timeout"
     assert row.run_id is None
+
+
+def test_collect_claims_records_service_failures_without_throwing(
+    tmp_path: Path,
+) -> None:
+    claim = ClaimRecord(
+        claim_id="refuted-test",
+        question="Does beta carotene reduce lung cancer incidence in smokers?",
+        gold_label="refuted",
+        source="pubmed",
+        max_papers=3,
+    )
+    config = CollectionConfig(
+        claims_path=tmp_path / "claims.jsonl",
+        output_dir=tmp_path / "out",
+        workspace=tmp_path / "workspace",
+        limit=1,
+    )
+
+    rows, trajectories = collect_claims.run_sync(
+        [claim],
+        config=config,
+        service_factory=FailingLiveCollectorService,
+    )
+
+    assert trajectories == []
+    assert len(rows) == 1
+    assert rows[0].status == "failed"
+    assert rows[0].claim_id == "refuted-test"
+    assert rows[0].error == "provider timeout"
+
+
+def test_collect_claims_rejects_non_positive_limit(tmp_path: Path) -> None:
+    config = CollectionConfig(
+        claims_path=tmp_path / "claims.jsonl",
+        output_dir=tmp_path / "out",
+        workspace=tmp_path / "workspace",
+        limit=0,
+    )
+
+    with pytest.raises(ValueError, match="limit must be positive"):
+        collect_claims.run_sync(
+            [],
+            config=config,
+            service_factory=FakeLiveCollectorService,
+        )
+
+
+def test_collect_main_returns_nonzero_on_partial_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from eval.asv.live_pubmed import collect as collect_module
+
+    claims_path = tmp_path / "claims.jsonl"
+    output_dir = tmp_path / "out"
+    claims_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "claim_id": "supported-test",
+                        "question": "Does APOE e4 increase Alzheimer's disease risk?",
+                        "gold_label": "supported",
+                        "source": "pubmed",
+                        "max_papers": 3,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "claim_id": "refuted-test",
+                        "question": "Does beta carotene reduce lung cancer incidence in smokers?",
+                        "gold_label": "refuted",
+                        "source": "pubmed",
+                        "max_papers": 3,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "claim_id": "nei-test",
+                        "question": "Does taurine supplementation slow human brain aging?",
+                        "gold_label": "not_enough_information",
+                        "source": "pubmed",
+                        "max_papers": 3,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class PartiallyFailingService(FakeLiveCollectorService):
+        async def answer_with_audit(self, request):
+            if "beta carotene" in request.question:
+                raise TimeoutError("provider timeout")
+            return await super().answer_with_audit(request)
+
+    monkeypatch.setattr(collect_module, "BiomedEvidenceService", PartiallyFailingService)
+
+    exit_code = collect_module.main(
+        [
+            "--claims",
+            str(claims_path),
+            "--workspace",
+            str(tmp_path / "workspace"),
+            "--output-dir",
+            str(output_dir),
+            "--ack-live",
+        ]
+    )
+
+    assert exit_code == 1
+    rows = [
+        json.loads(line)
+        for line in (output_dir / "collection.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["status"] for row in rows] == ["completed", "failed", "completed"]

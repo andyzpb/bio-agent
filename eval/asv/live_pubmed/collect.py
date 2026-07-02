@@ -73,7 +73,7 @@ class collect_claims:
         claims: list[ClaimRecord],
         *,
         config: CollectionConfig,
-        service_factory: Callable[..., Any] = BiomedEvidenceService,
+        service_factory: Callable[..., Any] | None = None,
     ) -> tuple[list[CollectionRow], list[TrajectoryRecord]]:
         return asyncio.run(
             collect_claims.run(
@@ -88,10 +88,13 @@ class collect_claims:
         claims: list[ClaimRecord],
         *,
         config: CollectionConfig,
-        service_factory: Callable[..., Any] = BiomedEvidenceService,
+        service_factory: Callable[..., Any] | None = None,
     ) -> tuple[list[CollectionRow], list[TrajectoryRecord]]:
-        active_claims = claims[: config.limit] if config.limit else claims
-        service = service_factory(
+        if config.limit is not None and config.limit < 1:
+            raise ValueError("limit must be positive when provided")
+        active_claims = claims[: config.limit] if config.limit is not None else claims
+        factory = service_factory or BiomedEvidenceService
+        service = factory(
             config.workspace,
             allow_live_pubmed_tools=True,
         )
@@ -176,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.ack_live:
         parser.error("--ack-live is required because this command calls live PubMed and LLM providers")
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be positive when provided")
     config = CollectionConfig(
         claims_path=Path(args.claims),
         output_dir=Path(args.output_dir),
@@ -192,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         f"collection_count={len(rows)} completed={completed} "
         f"trajectory_count={len(trajectories)} output_dir={config.output_dir}"
     )
-    return 0 if trajectories else 1
+    return 0 if completed == len(rows) and trajectories else 1
 
 
 if __name__ == "__main__":
