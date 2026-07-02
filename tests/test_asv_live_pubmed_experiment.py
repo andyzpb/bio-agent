@@ -568,6 +568,28 @@ def test_secret_scan_flags_raw_provider_payload(tmp_path: Path) -> None:
     ]
 
 
+def test_secret_scan_allows_redacted_raw_response_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "evaluated.jsonl"
+    path.write_text(
+        json.dumps({"metadata": {"llm_raw_response": "[REDACTED]"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert scan_for_secret_markers([path]) == []
+
+
+def test_secret_scan_flags_unredacted_raw_response_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "evaluated.jsonl"
+    path.write_text(
+        json.dumps({"metadata": {"llm_raw_response": {"choices": []}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert scan_for_secret_markers([path]) == [
+        f"llm_raw_response found in {path}",
+    ]
+
+
 def test_secret_scan_flags_json_style_provider_secrets(tmp_path: Path) -> None:
     path = tmp_path / "bad.json"
     path.write_text(

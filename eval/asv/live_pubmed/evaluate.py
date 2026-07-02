@@ -22,6 +22,14 @@ SECRET_MARKERS = (
     "token=",
     "sk-live",
 )
+RAW_RESPONSE_MARKERS = {
+    "llm_raw_response",
+    "provider_response",
+    "provider_raw_response",
+    "raw_llm_response",
+    "raw_provider_response",
+    "raw_response",
+}
 SECRET_KEY_PARTS = (
     "api_key",
     "apikey",
@@ -96,23 +104,23 @@ def scan_for_secret_markers(paths: list[Path]) -> list[str]:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         path_findings: list[str] = []
-        for marker in SECRET_MARKERS:
-            search_text = (
-                text.replace("raw_provider_response", "")
-                if marker == "provider_response"
-                else text
-            )
-            if marker in search_text:
-                _add_finding(path_findings, marker, path)
-        for marker in _json_secret_markers(text):
+        json_markers = _json_secret_markers(text)
+        for marker in json_markers:
             _add_finding(path_findings, marker, path)
+        if not json_markers:
+            for marker in SECRET_MARKERS:
+                if marker in RAW_RESPONSE_MARKERS:
+                    continue
+                if marker in text:
+                    _add_finding(path_findings, marker, path)
         for pattern in SECRET_VALUE_PATTERNS:
             for match in pattern.findall(text):
                 normalized = match.split()[0].lower() if " " in match else match[:7].lower()
                 if match in SAFE_SECRET_VALUES:
                     continue
                 if normalized.startswith("bearer"):
-                    _add_finding(path_findings, "bearer", path)
+                    marker = "Bearer " if match.startswith("Bearer ") else "bearer"
+                    _add_finding(path_findings, marker, path)
                 elif normalized.startswith("sk-"):
                     _add_finding(path_findings, "sk-", path)
         findings.extend(path_findings)
@@ -146,6 +154,11 @@ def _walk_secret_keys(value: Any) -> list[str]:
         for key, item in value.items():
             key_text = str(key)
             normalized = key_text.lower().replace("-", "_")
+            if normalized in RAW_RESPONSE_MARKERS:
+                if item != "[REDACTED]":
+                    findings.append(key_text)
+                findings.extend(_walk_secret_keys(item))
+                continue
             if normalized in SAFE_SECRET_KEYS:
                 findings.extend(_walk_secret_keys(item))
                 continue
