@@ -298,9 +298,12 @@ def test_claim_record_to_answer_request_payload_uses_live_flags() -> None:
 
 
 class FakeLiveCollectorService:
+    last_kwargs: dict[str, object] = {}
+
     def __init__(self, workspace: Path, **kwargs) -> None:
         self.workspace = Path(workspace)
         self.closed = False
+        type(self).last_kwargs = dict(kwargs)
 
     async def answer_with_audit(self, request):
         run_id = f"run-{request.question.split()[1].lower()}"
@@ -401,6 +404,140 @@ def test_collect_claims_dry_run_writes_frozen_trajectories(tmp_path: Path) -> No
     assert payload["task"]["candidate_space"]["gold_candidate_id"] == "supported"
     assert payload["task"]["gold_visible_to_evaluator"] is False
     assert payload["task"]["gold_used_only_for_validation"] is True
+
+
+def test_collect_claims_passes_actor_provider_to_service(tmp_path: Path) -> None:
+    provider = object()
+    claim = ClaimRecord(
+        claim_id="supported-test",
+        question="Does APOE e4 increase Alzheimer's disease risk?",
+        gold_label="supported",
+        source="pubmed",
+        max_papers=3,
+    )
+    config = CollectionConfig(
+        claims_path=tmp_path / "claims.jsonl",
+        output_dir=tmp_path / "out",
+        workspace=tmp_path / "workspace",
+        limit=1,
+        actor_provider=provider,
+        actor_model="fake-actor",
+        actor_provider_name="fake-provider",
+    )
+
+    collect_claims.run_sync(
+        [claim],
+        config=config,
+        service_factory=FakeLiveCollectorService,
+    )
+
+    assert FakeLiveCollectorService.last_kwargs == {
+        "allow_live_pubmed_tools": True,
+        "revision_provider": provider,
+        "revision_model": "fake-actor",
+    }
+
+
+def test_write_collection_outputs_records_actor_mode_coverage(tmp_path: Path) -> None:
+    trajectory = TrajectoryRecord(
+        trajectory_id="bio-agent-run-1",
+        run_id="run-1",
+        task=TaskRecord(
+            task_id="run-1",
+            question="Does APOE e4 increase Alzheimer's disease risk?",
+            candidate_space=CandidateSpace(
+                candidates=[
+                    Candidate(id="supported", label="A", text="supported"),
+                    Candidate(id="refuted", label="B", text="refuted"),
+                ],
+                gold_candidate_id="supported",
+            ),
+        ),
+        steps=[
+            StepRecord(
+                step_id="classify",
+                index=0,
+                action={"type": "classify"},
+                observation={
+                    "metadata": {
+                        "classification": {"classifier_mode": "llm"},
+                    }
+                },
+            ),
+            StepRecord(
+                step_id="plan",
+                index=1,
+                action={"type": "plan"},
+                observation={
+                    "metadata": {
+                        "query_plan": {"planner_mode": "llm"},
+                    }
+                },
+            ),
+            StepRecord(
+                step_id="draft",
+                index=2,
+                action={"type": "draft"},
+                observation={"metadata": {"synthesis_mode": "llm"}},
+            ),
+            StepRecord(
+                step_id="audit",
+                index=3,
+                action={"type": "audit"},
+                observation={
+                    "metadata": {
+                        "logic_audit": {"parser_mode_counts": {"llm": 1}},
+                    }
+                },
+            ),
+            StepRecord(
+                step_id="advisory_verify",
+                index=4,
+                action={"type": "advisory_verify"},
+                observation={"metadata": {"verifier_mode": "fallback"}},
+            ),
+            StepRecord(
+                step_id="revise",
+                index=5,
+                action={"type": "revise"},
+                observation={"metadata": {"revision_mode": "llm"}},
+            ),
+        ],
+    )
+
+    write_collection_outputs(
+        tmp_path / "out",
+        [
+            CollectionRow.completed(
+                claim=ClaimRecord(
+                    claim_id="supported-test",
+                    question="Does APOE e4 increase Alzheimer's disease risk?",
+                    gold_label="supported",
+                    source="pubmed",
+                    max_papers=3,
+                ),
+                run_id="run-1",
+                trajectory_id="bio-agent-run-1",
+                step_count=6,
+            )
+        ],
+        [trajectory],
+        actor_provider_name="deepseek",
+        actor_model="deepseek-v4-flash",
+    )
+
+    summary = json.loads((tmp_path / "out" / "collection_summary.json").read_text())
+    assert summary["actor"] == {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "configured": True,
+        "classifier_modes": {"llm": 1},
+        "planner_modes": {"llm": 1},
+        "synthesis_modes": {"llm": 1},
+        "verifier_modes": {"fallback": 1},
+        "revision_modes": {"llm": 1},
+        "claim_logic_modes": {"llm": 1},
+    }
 
 
 def test_collection_row_records_failures_without_throwing() -> None:
@@ -531,6 +668,98 @@ def test_collect_main_returns_nonzero_on_partial_failure(
         for line in (output_dir / "collection.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert [row["status"] for row in rows] == ["completed", "failed", "completed"]
+
+
+def test_collect_main_builds_env_backed_actor_provider(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from eval.asv.live_pubmed import collect as collect_module
+
+    claims_path = tmp_path / "claims.jsonl"
+    output_dir = tmp_path / "out"
+    claims_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "claim_id": "supported-test",
+                        "question": "Does APOE e4 increase Alzheimer's disease risk?",
+                        "gold_label": "supported",
+                        "source": "pubmed",
+                        "max_papers": 3,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "claim_id": "refuted-test",
+                        "question": "Does beta carotene reduce lung cancer incidence in smokers?",
+                        "gold_label": "refuted",
+                        "source": "pubmed",
+                        "max_papers": 3,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "claim_id": "nei-test",
+                        "question": "Does microglial activation alone cause Alzheimer's disease?",
+                        "gold_label": "not_enough_information",
+                        "source": "pubmed",
+                        "max_papers": 3,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class FakeActorProvider:
+        kwargs: dict[str, object] = {}
+
+        def __init__(self, **kwargs: object) -> None:
+            type(self).kwargs = dict(kwargs)
+
+    monkeypatch.setenv("FAKE_ACTOR_KEY", "secret")
+    monkeypatch.setattr(collect_module, "LLMProvider", FakeActorProvider, raising=False)
+    monkeypatch.setattr(collect_module, "BiomedEvidenceService", FakeLiveCollectorService)
+
+    exit_code = collect_module.main(
+        [
+            "--claims",
+            str(claims_path),
+            "--workspace",
+            str(tmp_path / "workspace"),
+            "--output-dir",
+            str(output_dir),
+            "--actor-provider",
+            "deepseek",
+            "--actor-model",
+            "deepseek-v4-flash",
+            "--actor-api-key-env",
+            "FAKE_ACTOR_KEY",
+            "--actor-base-url",
+            "https://api.deepseek.test/v1",
+            "--ack-live",
+        ]
+    )
+
+    assert exit_code == 0
+    assert FakeActorProvider.kwargs == {
+        "api_key": "secret",
+        "base_url": "https://api.deepseek.test/v1",
+        "provider_name": "deepseek",
+        "force_disable_thinking": True,
+    }
+    assert FakeLiveCollectorService.last_kwargs["revision_model"] == "deepseek-v4-flash"
+    assert isinstance(
+        FakeLiveCollectorService.last_kwargs["revision_provider"],
+        FakeActorProvider,
+    )
+    summary = json.loads((output_dir / "collection_summary.json").read_text())
+    assert summary["actor"]["provider"] == "deepseek"
+    assert summary["actor"]["model"] == "deepseek-v4-flash"
+    assert summary["actor"]["configured"] is True
 
 
 def test_build_evaluate_command_uses_deepseek_cache_and_frozen_input(

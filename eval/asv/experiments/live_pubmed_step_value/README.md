@@ -33,15 +33,22 @@ zsh -ic 'cd /Users/andyz/Documents/bio-agent && \
     --claims eval/asv/experiments/live_pubmed_step_value/claims.quick.jsonl \
     --workspace /tmp/asv-live-pubmed-step-value/workspace \
     --output-dir /tmp/asv-live-pubmed-step-value/collection \
+    --actor-provider deepseek \
+    --actor-model deepseek-v4-flash \
+    --actor-api-key-env DEEPSEEK_API_KEY \
+    --actor-base-url https://api.deepseek.com/v1 \
     --ack-live'
 ```
+
+Omit the `--actor-*` flags only when intentionally collecting the fallback
+actor baseline.
 
 For the full 30-claim run, switch `--claims` to
 `eval/asv/experiments/live_pubmed_step_value/claims.pilot.jsonl` and keep the
 same output directory policy.
 
-The collector calls `answer_with_audit` with live PubMed source and LLM workflow
-flags enabled.
+The collector calls `answer_with_audit` with live PubMed source, LLM workflow
+flags enabled, and writes `collection_summary.json` with actor-mode coverage.
 
 ## LLM ASV Evaluation
 
