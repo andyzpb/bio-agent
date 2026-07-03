@@ -7,6 +7,8 @@ trajectories, and evaluates step value with the DeepSeek chat-logprob evaluator.
 gold labels are used only after belief estimation. They must not appear in
 evaluator prompts.
 
+Latest quick-pilot result report: `results.quick.md`.
+
 ## Claim Set
 
 `claims.quick.jsonl` contains three smoke-test questions, one per label.
