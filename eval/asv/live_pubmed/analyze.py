@@ -20,9 +20,14 @@ def aggregate_step_type_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     for step_type in sorted(groups):
         items = groups[step_type]
         gold_values = [
-            float(item["gold_metrics"]["gold_log_likelihood_gain"])
+            value
             for item in items
-            if _has_numeric_gold_gain(item)
+            if (value := _gold_metric_value(item, "gold_log_likelihood_gain")) is not None
+        ]
+        oracle_gold_values = [
+            value
+            for item in items
+            if (value := _gold_metric_value(item, "oracle_gold_log_likelihood_gain")) is not None
         ]
         output.append(
             {
@@ -36,6 +41,11 @@ def aggregate_step_type_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "mean_gold_log_likelihood_gain": _mean(gold_values) if gold_values else None,
                 "gold_metric_step_count": len(gold_values),
                 "missing_gold_metric_step_count": len(items) - len(gold_values),
+                "mean_oracle_gold_log_likelihood_gain": (
+                    _mean(oracle_gold_values) if oracle_gold_values else None
+                ),
+                "oracle_gold_metric_step_count": len(oracle_gold_values),
+                "missing_oracle_gold_metric_step_count": len(items) - len(oracle_gold_values),
                 "floor_score_step_count": sum(
                     (item.get("quality_flags") or {}).get("used_floor_score") is True for item in items
                 ),
@@ -54,12 +64,14 @@ def _step_type(row: dict[str, Any]) -> str:
     return str(row["step_id"])
 
 
-def _has_numeric_gold_gain(row: dict[str, Any]) -> bool:
+def _gold_metric_value(row: dict[str, Any], key: str) -> float | None:
     metrics = row.get("gold_metrics")
     if not isinstance(metrics, dict):
-        return False
-    value = metrics.get("gold_log_likelihood_gain")
-    return isinstance(value, int | float)
+        return None
+    value = metrics.get(key)
+    if isinstance(value, int | float):
+        return float(value)
+    return None
 
 
 def write_analysis_tables(report_dir: Path) -> dict[str, Any]:

@@ -691,7 +691,10 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
                 "net_asv": 0.3,
                 "cost_scalar": 0.1,
             },
-            "gold_metrics": {"gold_log_likelihood_gain": 0.5},
+            "gold_metrics": {
+                "gold_log_likelihood_gain": 0.5,
+                "oracle_gold_log_likelihood_gain": 2.0,
+            },
             "quality_flags": {"used_floor_score": False, "used_cache": True},
         },
         {
@@ -703,7 +706,10 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
                 "net_asv": 0.1,
                 "cost_scalar": 0.1,
             },
-            "gold_metrics": {"gold_log_likelihood_gain": None},
+            "gold_metrics": {
+                "gold_log_likelihood_gain": None,
+                "oracle_gold_log_likelihood_gain": 1.0,
+            },
             "quality_flags": {"used_floor_score": True, "used_cache": False},
         },
     ]
@@ -720,6 +726,9 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
             "mean_gold_log_likelihood_gain": 0.5,
             "gold_metric_step_count": 1,
             "missing_gold_metric_step_count": 1,
+            "mean_oracle_gold_log_likelihood_gain": 1.5,
+            "oracle_gold_metric_step_count": 2,
+            "missing_oracle_gold_metric_step_count": 0,
             "floor_score_step_count": 1,
             "cache_hit_step_count": 1,
         }
@@ -740,7 +749,10 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
                     "net_asv": 0.0,
                     "cost_scalar": 0.0,
                 },
-                "gold_metrics": {"gold_log_likelihood_gain": 0.0},
+                "gold_metrics": {
+                    "gold_log_likelihood_gain": 0.0,
+                    "oracle_gold_log_likelihood_gain": 0.0,
+                },
                 "quality_flags": {},
             }
         )
@@ -755,6 +767,7 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
     )
     summary = json.loads((report_dir / "analysis_summary.json").read_text(encoding="utf-8"))
     assert "classify" in csv_text
+    assert "mean_oracle_gold_log_likelihood_gain" in csv_text
     assert summary["step_type_summary"][0]["step_type"] == "classify"
     assert summary["step_type_summary"][0]["gold_metric_step_count"] == 1
 
@@ -771,7 +784,10 @@ def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> N
                     "net_asv": 0.1,
                     "cost_scalar": 0.0,
                 },
-                "gold_metrics": {"gold_log_likelihood_gain": None},
+                "gold_metrics": {
+                    "gold_log_likelihood_gain": None,
+                    "oracle_gold_log_likelihood_gain": None,
+                },
                 "quality_flags": {},
             }
         ]
@@ -780,6 +796,9 @@ def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> N
     assert summary[0]["mean_gold_log_likelihood_gain"] is None
     assert summary[0]["gold_metric_step_count"] == 0
     assert summary[0]["missing_gold_metric_step_count"] == 1
+    assert summary[0]["mean_oracle_gold_log_likelihood_gain"] is None
+    assert summary[0]["oracle_gold_metric_step_count"] == 0
+    assert summary[0]["missing_oracle_gold_metric_step_count"] == 1
 
 
 def test_build_label_permuted_trajectories_rotates_candidate_labels() -> None:

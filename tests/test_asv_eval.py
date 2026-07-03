@@ -98,6 +98,9 @@ def test_evaluate_trajectory_computes_realized_entropy_reduction_and_gold_gain()
         math.log(0.83) - math.log(0.34),
         6,
     )
+    assert row["gold_metrics"]["oracle_gold_log_likelihood_gain"] == row[
+        "gold_metrics"
+    ]["gold_log_likelihood_gain"]
     assert row["action"] == {"type": "search", "is_external_observation": True}
     assert row["state_before_hash"].startswith("sha256:")
     assert row["state_after_hash"].startswith("sha256:")
@@ -124,7 +127,7 @@ def test_evaluate_trajectory_skips_gold_gain_for_zero_probability_gold() -> None
                 index=0,
                 action={"type": "classify"},
                 belief_before={"supported": 0.0, "not_enough_information": 1.0},
-                belief_after={"supported": 0.0, "not_enough_information": 1.0},
+                belief_after={"supported": 1.0, "not_enough_information": 0.0},
             )
         ],
     )
@@ -132,8 +135,12 @@ def test_evaluate_trajectory_skips_gold_gain_for_zero_probability_gold() -> None
     [row] = evaluate_trajectory(trajectory)
 
     assert row["gold_metrics"]["gold_log_likelihood_gain"] is None
+    assert row["gold_metrics"]["oracle_gold_log_likelihood_gain"] == round(
+        math.log(1.0) - math.log(1e-12),
+        6,
+    )
     assert row["gold_metrics"]["gold_rank_before"] == 2
-    assert row["gold_metrics"]["gold_rank_after"] == 2
+    assert row["gold_metrics"]["gold_rank_after"] == 1
 
 
 def test_mock_belief_evaluator_reads_fixture_beliefs() -> None:

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 SCHEMA_VERSION = "asv.v1"
+_GOLD_METRIC_EPSILON = 1e-12
 
 
 @dataclass(frozen=True)
@@ -151,11 +152,17 @@ def evaluate_trajectory(
         net_asv = round(reduction - active_config.lambda_cost * cost_value, 6)
         gold_id = trajectory.task.candidate_space.gold_candidate_id
         gold_gain = None
+        oracle_gold_gain = None
         gold_rank_before = None
         gold_rank_after = None
         if gold_id and gold_id in step.belief_before and gold_id in step.belief_after:
             gold_rank_before = _rank(step.belief_before, gold_id)
             gold_rank_after = _rank(step.belief_after, gold_id)
+            oracle_gold_gain = round(
+                math.log(max(step.belief_after[gold_id], _GOLD_METRIC_EPSILON))
+                - math.log(max(step.belief_before[gold_id], _GOLD_METRIC_EPSILON)),
+                6,
+            )
             if step.belief_before[gold_id] > 0 and step.belief_after[gold_id] > 0:
                 gold_gain = round(
                     math.log(step.belief_after[gold_id])
@@ -195,6 +202,7 @@ def evaluate_trajectory(
                 "gold_metrics": {
                     "gold_candidate_id": gold_id,
                     "gold_log_likelihood_gain": gold_gain,
+                    "oracle_gold_log_likelihood_gain": oracle_gold_gain,
                     "gold_rank_before": gold_rank_before,
                     "gold_rank_after": gold_rank_after,
                 },

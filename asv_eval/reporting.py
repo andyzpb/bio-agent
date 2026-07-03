@@ -165,6 +165,7 @@ def _write_steps_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "realized_entropy_reduction",
         "cost_scalar",
         "gold_log_likelihood_gain",
+        "oracle_gold_log_likelihood_gain",
         "label",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -183,6 +184,9 @@ def _write_steps_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     "gold_log_likelihood_gain": row["gold_metrics"][
                         "gold_log_likelihood_gain"
                     ],
+                    "oracle_gold_log_likelihood_gain": row["gold_metrics"].get(
+                        "oracle_gold_log_likelihood_gain"
+                    ),
                     "label": row.get("label") or "",
                 }
             )

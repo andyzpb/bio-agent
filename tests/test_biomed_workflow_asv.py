@@ -72,6 +72,77 @@ def test_workflow_trace_step_projects_state_action_observation_and_cost() -> Non
     assert "sha256:abc" in rendered
 
 
+def test_workflow_trace_step_carries_compact_evidence_facts_forward() -> None:
+    long_fact = "A" * 650
+    retrieve = workflow_step_from_trace(
+        AgentTraceStep(
+            step_id="trace-retrieve",
+            run_id="run-1",
+            step="retrieve",
+            status="completed",
+            input_summary="Does APOE4 increase Alzheimer risk?",
+            output_summary="evidence-packet-1",
+            metadata={
+                "evidence_packet": {
+                    "supported_claims": [
+                        "APOE epsilon4 is associated with increased Alzheimer risk.",
+                        long_fact,
+                    ],
+                    "conflicting_claims": [
+                        {"claim": "Effect differs by ancestry", "pmid": "123"}
+                    ],
+                    "coverage_gaps": ["No randomized intervention evidence."],
+                    "api_key": "secret-should-not-leak",
+                }
+            },
+            created_at="2026-07-02T12:00:00Z",
+        ),
+        state_before={
+            "run_id": "run-1",
+            "question": "Does APOE4 increase Alzheimer risk?",
+            "completed_steps": [],
+            "available_artifacts": [],
+        },
+    )
+    audit = workflow_step_from_trace(
+        AgentTraceStep(
+            step_id="trace-audit",
+            run_id="run-1",
+            step="audit",
+            status="completed",
+            input_summary="draft",
+            output_summary="audit-1",
+            metadata={
+                "claim_support_rate": 1.0,
+                "unsupported_claim_rate": 0.0,
+                "overclaim_rate": 0.0,
+                "recommended_action": "accept",
+            },
+            created_at="2026-07-02T12:00:01Z",
+        ),
+        state_before=retrieve.output_state,
+    )
+
+    facts = retrieve.output_state["evidence_facts"]
+    assert facts["supported_claims"][0] == (
+        "APOE epsilon4 is associated with increased Alzheimer risk."
+    )
+    assert len(facts["supported_claims"][1]) == 500
+    assert facts["conflicting_claims"] == [
+        '{"claim": "Effect differs by ancestry", "pmid": "123"}'
+    ]
+    assert facts["coverage_gaps"] == ["No randomized intervention evidence."]
+    assert "secret-should-not-leak" not in json.dumps(facts, sort_keys=True)
+
+    assert audit.input_state["evidence_facts"] == retrieve.output_state["evidence_facts"]
+    assert audit.output_state["evidence_facts"]["audit"] == {
+        "claim_support_rate": 1.0,
+        "overclaim_rate": 0.0,
+        "recommended_action": "accept",
+        "unsupported_claim_rate": 0.0,
+    }
+
+
 def test_workflow_steps_convert_to_standard_asv_trajectory() -> None:
     first = workflow_step_from_trace(
         AgentTraceStep(

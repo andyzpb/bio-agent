@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -70,6 +71,19 @@ _COST_KEYS = (
     "tool_calls",
     "total_tokens",
 )
+_EVIDENCE_FACT_LIST_KEYS = (
+    "supported_claims",
+    "conflicting_claims",
+    "coverage_gaps",
+)
+_EVIDENCE_FACT_AUDIT_KEYS = (
+    "claim_support_rate",
+    "overclaim_rate",
+    "recommended_action",
+    "unsupported_claim_rate",
+)
+_MAX_EVIDENCE_FACTS = 8
+_MAX_EVIDENCE_FACT_CHARS = 500
 
 
 def workflow_step_from_trace(
@@ -87,6 +101,10 @@ def workflow_step_from_trace(
         artifact_ref = f"{key}:{value}"
         if artifact_ref not in available_artifacts:
             available_artifacts.append(artifact_ref)
+    evidence_facts = _evidence_facts_from_metadata(
+        metadata,
+        previous=state_before.get("evidence_facts"),
+    )
     output_state = {
         **state_before,
         "run_id": trace.run_id,
@@ -95,6 +113,8 @@ def workflow_step_from_trace(
         "last_step": trace.step,
         "last_status": trace.status,
     }
+    if evidence_facts:
+        output_state["evidence_facts"] = evidence_facts
     return BiomedWorkflowStep(
         step_id=trace.step_id,
         run_id=trace.run_id,
@@ -249,6 +269,70 @@ def _artifact_ids_from_metadata(metadata: dict[str, Any]) -> dict[str, str]:
         if value is not None and not isinstance(value, (dict, list, tuple)):
             artifact_ids[key] = str(value)
     return artifact_ids
+
+
+def _evidence_facts_from_metadata(
+    metadata: dict[str, Any],
+    *,
+    previous: Any,
+) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    if isinstance(previous, dict):
+        for key in _EVIDENCE_FACT_LIST_KEYS:
+            facts[key] = _compact_fact_list(previous.get(key))
+        audit = previous.get("audit")
+        if isinstance(audit, dict):
+            facts["audit"] = dict(audit)
+
+    packet = metadata.get("evidence_packet")
+    if isinstance(packet, dict):
+        for key in _EVIDENCE_FACT_LIST_KEYS:
+            merged = [*facts.get(key, []), *_compact_fact_list(packet.get(key))]
+            facts[key] = _dedupe_limited(merged)
+
+    audit_metrics = {
+        key: metadata[key]
+        for key in _EVIDENCE_FACT_AUDIT_KEYS
+        if key in metadata and metadata[key] is not None
+    }
+    if audit_metrics:
+        facts["audit"] = {**facts.get("audit", {}), **audit_metrics}
+
+    return {
+        key: value
+        for key, value in facts.items()
+        if (isinstance(value, list) and value) or (isinstance(value, dict) and value)
+    }
+
+
+def _compact_fact_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return _dedupe_limited(_compact_fact(item) for item in value)
+
+
+def _compact_fact(value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        redacted = redact_for_asv(value)
+        text = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
+    return _redact_secret_strings(text)[:_MAX_EVIDENCE_FACT_CHARS]
+
+
+def _dedupe_limited(values: Any) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+        if len(output) >= _MAX_EVIDENCE_FACTS:
+            break
+    return output
 
 
 def _cost_from_metadata(metadata: dict[str, Any]) -> dict[str, float]:
