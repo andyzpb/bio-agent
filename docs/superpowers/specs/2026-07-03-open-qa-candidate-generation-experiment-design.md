@@ -53,7 +53,7 @@ Each reviewed JSONL row is the source of truth for ASV:
     {"id": "answer-a", "text": "Candidate answer A."},
     {"id": "answer-b", "text": "Candidate answer B."},
     {"id": "answer-c", "text": "Candidate answer C."},
-    {"id": "answer-d", "text": "Candidate answer D."}
+    {"id": "none-of-the-above", "text": "The available evidence is insufficient to support any of the specific candidate answers."}
   ],
   "gold_candidate_id": "answer-b",
   "review": {
@@ -68,6 +68,35 @@ The raw generated file must also be retained, including the model, prompt hash,
 recommended gold candidate, and any warnings. The reviewed file may edit answer
 text or gold labels, but it must preserve the original question ID.
 
+Every reviewed row must include one explicit insufficiency candidate:
+
+```json
+{
+  "id": "none-of-the-above",
+  "text": "The available evidence is insufficient to support any of the specific candidate answers."
+}
+```
+
+This prevents the evaluator from being forced to rank only wrong substantive
+answers when PubMed evidence does not support any of them.
+
+## Evaluator Bias Controls
+
+The evaluator should not be asked to output chain-of-thought text. The current
+DeepSeek evaluator measures one-token option-label log probabilities; asking it
+to emit reasoning before a label would change the scored token and break the
+metric.
+
+Instead:
+
+1. The forced-choice prompt must instruct the evaluator to compare the evidence
+   against every candidate answer before choosing one label.
+2. The prompt must display candidate answer text, not only answer IDs.
+3. The experiment must run a candidate-label permutation audit and aggregate
+   candidate scores back to stable candidate IDs.
+
+This handles positional bias without changing the logprob scoring contract.
+
 ## Required Implementation Before Running
 
 Two small code gaps must be closed before the experiment is valid:
@@ -77,6 +106,8 @@ Two small code gaps must be closed before the experiment is valid:
 2. Open QA state rendering must redact reference-answer and gold-answer fields,
    including `reference_answer`, `gold_answer`, `correct_answer`,
    `gold_candidate_id`, and near variants.
+3. The experiment runner must support a candidate-label permutation audit for
+   open QA candidate sets.
 
 The existing ASV JSONL contract should remain unchanged. The open QA adapter
 should only emit standard `CandidateSpace(type="candidate_set")` trajectories.
@@ -133,14 +164,16 @@ Do not overwrite the existing live PubMed quick pilot artifacts.
 The experiment is ready to interpret when:
 
 1. 10 reviewed open QA rows exist with four candidate answers each.
-2. Each reviewed row has a valid `gold_candidate_id`.
-3. The adapted ASV trajectory file uses `candidate_set`.
-4. Evaluator prompts include candidate answer text.
-5. Gold/reference answers are redacted from evaluator states.
-6. Live PubMed collection completes or records explicit per-question failures.
-7. Evaluated trajectories and evaluator cache are preserved.
-8. The report exposes `gold_margin_gain` by step and by step type.
-9. The final report distinguishes candidate-generation quality from ASV step
+2. Each reviewed row has exactly one `none-of-the-above` candidate.
+3. Each reviewed row has a valid `gold_candidate_id`.
+4. The adapted ASV trajectory file uses `candidate_set`.
+5. Evaluator prompts include candidate answer text.
+6. Gold/reference answers are redacted from evaluator states.
+7. Candidate-label permutation audit artifacts are preserved.
+8. Live PubMed collection completes or records explicit per-question failures.
+9. Evaluated trajectories and evaluator cache are preserved.
+10. The report exposes `gold_margin_gain` by step and by step type.
+11. The final report distinguishes candidate-generation quality from ASV step
    value.
 
 ## Non-Goals
@@ -148,6 +181,8 @@ The experiment is ready to interpret when:
 - Do not build a review UI.
 - Do not define learned or hand-written embeddings for arbitrary answer text.
 - Do not make the bio-agent generate the candidate set during ASV scoring.
+- Do not ask the evaluator to output chain-of-thought reasoning in the scored
+  logprob call.
 - Do not delete or rewrite existing quick-pilot artifacts.
 - Do not run a large public benchmark until the 10-question quick set is clean.
 
@@ -157,6 +192,6 @@ The experiment is ready to interpret when:
 - Internal consistency: generation is preprocessing; ASV scoring uses only the
   reviewed frozen candidate set.
 - Scope check: this is one experiment slice with two small code hardening
-  requirements before running.
+  requirements plus a permutation audit before running.
 - Ambiguity check: primary open QA metric is `gold_margin_gain`; semantic gain
   is not used for generic candidate answers.
