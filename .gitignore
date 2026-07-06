@@ -76,4 +76,6 @@ docs/.DS_Store
 docs/paper/**/*.zip
 docs/paper/**/artifacts/
 docs/paper/**/generated/
+docs/paper/
+sources/
 tmp/
