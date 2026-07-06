@@ -8,6 +8,12 @@ from typing import Any, Literal
 
 SCHEMA_VERSION = "asv.v1"
 _GOLD_METRIC_EPSILON = 1e-12
+_SURPRISE_EPSILON = 1e-6
+_SEMANTIC_LABEL_EMBEDDINGS = {
+    "supported": (1.0, 1.0),
+    "refuted": (-1.0, 1.0),
+    "not_enough_information": (0.0, 0.0),
+}
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,8 @@ class StepRecord:
     state_after: dict[str, Any] | None = None
     belief_before: dict[str, float] | None = None
     belief_after: dict[str, float] | None = None
+    raw_scores_before: dict[str, float] | None = None
+    raw_scores_after: dict[str, float] | None = None
     cost: dict[str, float] = field(default_factory=dict)
     label: str | None = None
     label_source: str | None = None
@@ -95,6 +103,37 @@ def normalize_log_scores(scores: dict[str, float]) -> dict[str, float]:
 
 def entropy_nats(probs: dict[str, float]) -> float:
     return -sum(value * math.log(value) for value in probs.values() if value > 0)
+
+
+def bayesian_surprise_kl(
+    before: dict[str, float],
+    after: dict[str, float],
+    *,
+    epsilon: float = _SURPRISE_EPSILON,
+) -> float:
+    candidate_ids = sorted(set(before) | set(after))
+    before_probs = _smoothed_distribution(before, candidate_ids, epsilon)
+    after_probs = _smoothed_distribution(after, candidate_ids, epsilon)
+    return _kl_divergence(after_probs, before_probs)
+
+
+def js_pivot_score(
+    before: dict[str, float],
+    after: dict[str, float],
+    *,
+    epsilon: float = _SURPRISE_EPSILON,
+) -> float:
+    candidate_ids = sorted(set(before) | set(after))
+    before_probs = _smoothed_distribution(before, candidate_ids, epsilon)
+    after_probs = _smoothed_distribution(after, candidate_ids, epsilon)
+    midpoint = {
+        candidate_id: 0.5 * (before_probs[candidate_id] + after_probs[candidate_id])
+        for candidate_id in candidate_ids
+    }
+    return 0.5 * _kl_divergence(after_probs, midpoint) + 0.5 * _kl_divergence(
+        before_probs,
+        midpoint,
+    )
 
 
 def state_hash(value: dict[str, Any]) -> str:
@@ -148,11 +187,22 @@ def evaluate_trajectory(
         entropy_before = entropy_nats(step.belief_before)
         entropy_after = entropy_nats(step.belief_after)
         reduction = round(entropy_before - entropy_after, 6)
+        surprise_kl = round(
+            bayesian_surprise_kl(step.belief_before, step.belief_after),
+            6,
+        )
+        js_score = round(js_pivot_score(step.belief_before, step.belief_after), 6)
         cost_value = scalar_cost(step.cost, active_config.cost)
         net_asv = round(reduction - active_config.lambda_cost * cost_value, 6)
         gold_id = trajectory.task.candidate_space.gold_candidate_id
         gold_gain = None
         oracle_gold_gain = None
+        gold_margin_before = None
+        gold_margin_after = None
+        gold_margin_gain = None
+        semantic_gold_distance_before = None
+        semantic_gold_distance_after = None
+        semantic_gold_gain = None
         gold_rank_before = None
         gold_rank_after = None
         if gold_id and gold_id in step.belief_before and gold_id in step.belief_after:
@@ -169,6 +219,26 @@ def evaluate_trajectory(
                     - math.log(step.belief_before[gold_id]),
                     6,
                 )
+            gold_margin_before = _gold_margin(step.raw_scores_before, gold_id)
+            gold_margin_after = _gold_margin(step.raw_scores_after, gold_id)
+            if gold_margin_before is not None and gold_margin_after is not None:
+                gold_margin_gain = round(gold_margin_after - gold_margin_before, 6)
+            semantic_gold_distance_before = _semantic_gold_distance(
+                step.belief_before,
+                gold_id,
+            )
+            semantic_gold_distance_after = _semantic_gold_distance(
+                step.belief_after,
+                gold_id,
+            )
+            if (
+                semantic_gold_distance_before is not None
+                and semantic_gold_distance_after is not None
+            ):
+                semantic_gold_gain = round(
+                    semantic_gold_distance_before - semantic_gold_distance_after,
+                    6,
+                )
         rows.append(
             {
                 "trajectory_id": trajectory.trajectory_id,
@@ -180,6 +250,8 @@ def evaluate_trajectory(
                 "state_after_hash": state_hash(state_after),
                 "belief_before": step.belief_before,
                 "belief_after": step.belief_after,
+                "raw_scores_before": step.raw_scores_before,
+                "raw_scores_after": step.raw_scores_after,
                 "asv_components": {
                     "entropy_before_nats": round(entropy_before, 6),
                     "entropy_after_nats": round(entropy_after, 6),
@@ -192,6 +264,9 @@ def evaluate_trajectory(
                         6,
                     ),
                     "entropy_base": "e",
+                    "bayesian_surprise_kl": surprise_kl,
+                    "js_pivot_score": js_score,
+                    "surprise_epsilon": _SURPRISE_EPSILON,
                     "num_candidates": candidate_count,
                     "realized_entropy_reduction": reduction,
                     "normalized_entropy_reduction": round(reduction / max_entropy, 6),
@@ -203,6 +278,12 @@ def evaluate_trajectory(
                     "gold_candidate_id": gold_id,
                     "gold_log_likelihood_gain": gold_gain,
                     "oracle_gold_log_likelihood_gain": oracle_gold_gain,
+                    "gold_margin_before": gold_margin_before,
+                    "gold_margin_after": gold_margin_after,
+                    "gold_margin_gain": gold_margin_gain,
+                    "semantic_gold_distance_before": semantic_gold_distance_before,
+                    "semantic_gold_distance_after": semantic_gold_distance_after,
+                    "semantic_gold_gain": semantic_gold_gain,
                     "gold_rank_before": gold_rank_before,
                     "gold_rank_after": gold_rank_after,
                 },
@@ -225,3 +306,71 @@ def evaluate_trajectory(
 def _rank(probs: dict[str, float], candidate_id: str) -> int:
     ordered = sorted(probs.items(), key=lambda item: item[1], reverse=True)
     return [key for key, _ in ordered].index(candidate_id) + 1
+
+
+def _gold_margin(scores: dict[str, float] | None, gold_id: str) -> float | None:
+    if not scores or gold_id not in scores:
+        return None
+    other_scores = [
+        score for candidate_id, score in scores.items() if candidate_id != gold_id
+    ]
+    if not other_scores:
+        return None
+    return round(float(scores[gold_id]) - _logsumexp(other_scores), 6)
+
+
+def _logsumexp(values: list[float]) -> float:
+    peak = max(values)
+    return peak + math.log(sum(math.exp(value - peak) for value in values))
+
+
+def _smoothed_distribution(
+    probs: dict[str, float],
+    candidate_ids: list[str],
+    epsilon: float,
+) -> dict[str, float]:
+    if not candidate_ids:
+        return {}
+    if not 0 <= epsilon <= 1:
+        raise ValueError("epsilon must be between 0 and 1")
+    clipped = {
+        candidate_id: max(float(probs.get(candidate_id, 0.0)), 0.0)
+        for candidate_id in candidate_ids
+    }
+    total = sum(clipped.values())
+    uniform = 1.0 / len(candidate_ids)
+    if total <= 0:
+        return {candidate_id: uniform for candidate_id in candidate_ids}
+    return {
+        candidate_id: (1.0 - epsilon) * (clipped[candidate_id] / total)
+        + epsilon * uniform
+        for candidate_id in candidate_ids
+    }
+
+
+def _kl_divergence(p: dict[str, float], q: dict[str, float]) -> float:
+    return sum(
+        p_value * math.log(p_value / q[candidate_id])
+        for candidate_id, p_value in p.items()
+        if p_value > 0
+    )
+
+
+def _semantic_gold_distance(
+    probs: dict[str, float],
+    gold_id: str,
+) -> float | None:
+    if gold_id not in _SEMANTIC_LABEL_EMBEDDINGS:
+        return None
+    if any(candidate_id not in _SEMANTIC_LABEL_EMBEDDINGS for candidate_id in probs):
+        return None
+    x = sum(
+        float(probability) * _SEMANTIC_LABEL_EMBEDDINGS[candidate_id][0]
+        for candidate_id, probability in probs.items()
+    )
+    y = sum(
+        float(probability) * _SEMANTIC_LABEL_EMBEDDINGS[candidate_id][1]
+        for candidate_id, probability in probs.items()
+    )
+    gold_x, gold_y = _SEMANTIC_LABEL_EMBEDDINGS[gold_id]
+    return round(math.dist((x, y), (gold_x, gold_y)), 6)

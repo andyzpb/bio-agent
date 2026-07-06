@@ -9,6 +9,7 @@ from asv_eval.adapters import (
     adapt_bio_agent_workspace,
     adapt_bio_agent_run_from_storage,
     load_belief_fixture,
+    load_open_qa_candidate_specs,
     load_standard_jsonl,
     react_transcript_to_trajectory,
     write_standard_jsonl,
@@ -19,6 +20,7 @@ from asv_eval.core import (
     StepRecord,
     TaskRecord,
     TrajectoryRecord,
+    evaluate_trajectory,
 )
 
 
@@ -81,6 +83,8 @@ def test_standard_jsonl_roundtrip_preserves_step_quality_flags(tmp_path) -> None
                 action={"type": "evaluate"},
                 belief_before={"yes": 0.5, "no": 0.5},
                 belief_after={"yes": 0.8, "no": 0.2},
+                raw_scores_before={"yes": -0.7, "no": -0.7},
+                raw_scores_after={"yes": -0.1, "no": -2.0},
                 quality_flags={
                     "evaluator_mode": "deepseek_chat_logprob",
                     "prompt_before_hash": "sha256:before",
@@ -98,6 +102,8 @@ def test_standard_jsonl_roundtrip_preserves_step_quality_flags(tmp_path) -> None
         "prompt_before_hash": "sha256:before",
         "used_cache": True,
     }
+    assert loaded.steps[0].raw_scores_before == {"yes": -0.7, "no": -0.7}
+    assert loaded.steps[0].raw_scores_after == {"yes": -0.1, "no": -2.0}
 
 
 def test_belief_fixture_loader_reports_malformed_json_with_context(tmp_path) -> None:
@@ -106,6 +112,154 @@ def test_belief_fixture_loader_reports_malformed_json_with_context(tmp_path) -> 
 
     with pytest.raises(ValueError, match="invalid belief fixture"):
         load_belief_fixture(path)
+
+
+def test_open_qa_candidate_answer_spec_builds_candidate_set_trajectory(
+    tmp_path,
+) -> None:
+    path = tmp_path / "open_qa.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "open-qa-1",
+                "question": "Which mechanism explains the observed response?",
+                "candidate_answers": [
+                    {
+                        "id": "answer-a",
+                        "text": "The response is explained by pathway alpha.",
+                    },
+                    {
+                        "id": "answer-b",
+                        "text": "The response is explained by pathway beta.",
+                    },
+                    {
+                        "id": "none-of-the-above",
+                        "text": "Evidence is insufficient to support any candidate.",
+                    },
+                ],
+                "gold_candidate_id": "answer-a",
+                "steps": [
+                    {
+                        "step_id": "retrieve",
+                        "index": 0,
+                        "action": {"type": "retrieve"},
+                        "state_before": {"evidence": "baseline notes"},
+                        "state_after": {"evidence": "alpha pathway evidence"},
+                        "belief_before": {
+                            "answer-a": 0.3,
+                            "answer-b": 0.4,
+                            "none-of-the-above": 0.3,
+                        },
+                        "belief_after": {
+                            "answer-a": 0.8,
+                            "answer-b": 0.1,
+                            "none-of-the-above": 0.1,
+                        },
+                        "raw_scores_before": {
+                            "answer-a": -1.0,
+                            "answer-b": -0.4,
+                            "none-of-the-above": -0.9,
+                        },
+                        "raw_scores_after": {
+                            "answer-a": -0.1,
+                            "answer-b": -2.3,
+                            "none-of-the-above": -2.1,
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    [trajectory] = load_open_qa_candidate_specs(path)
+    [row] = evaluate_trajectory(trajectory)
+
+    assert trajectory.task.candidate_space.type == "candidate_set"
+    assert trajectory.task.candidate_space.candidates[0].label == "A"
+    assert trajectory.task.candidate_space.candidates[0].text == (
+        "The response is explained by pathway alpha."
+    )
+    assert trajectory.task.candidate_space.gold_candidate_id == "answer-a"
+    assert row["gold_metrics"]["gold_margin_gain"] > 0
+    assert row["gold_metrics"]["semantic_gold_gain"] is None
+
+
+def test_open_qa_candidate_answer_spec_requires_none_of_the_above(tmp_path) -> None:
+    path = tmp_path / "open_qa.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "missing-none",
+                "question": "Which answer is right?",
+                "candidate_answers": [
+                    {"id": "answer-a", "text": "Alpha."},
+                    {"id": "answer-b", "text": "Beta."},
+                ],
+                "gold_candidate_id": "answer-a",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="none-of-the-above"):
+        load_open_qa_candidate_specs(path)
+
+
+def test_open_qa_candidate_answer_spec_rejects_duplicate_none_of_the_above(
+    tmp_path,
+) -> None:
+    path = tmp_path / "open_qa.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "duplicate-none",
+                "question": "Which answer is right?",
+                "candidate_answers": [
+                    {"id": "answer-a", "text": "Alpha."},
+                    {
+                        "id": "none-of-the-above",
+                        "text": "Insufficient evidence.",
+                    },
+                    {"id": "none-of-the-above", "text": "No support."},
+                ],
+                "gold_candidate_id": "none-of-the-above",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate candidate answer id"):
+        load_open_qa_candidate_specs(path)
+
+
+def test_open_qa_candidate_answer_spec_rejects_unknown_gold_id(tmp_path) -> None:
+    path = tmp_path / "open_qa.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "trajectory_id": "open-qa-bad-gold",
+                "question": "Which answer is right?",
+                "candidate_answers": [
+                    {"id": "answer-a", "text": "Alpha."},
+                    {"id": "answer-b", "text": "Beta."},
+                    {
+                        "id": "none-of-the-above",
+                        "text": "Evidence is insufficient.",
+                    },
+                ],
+                "gold_candidate_id": "answer-c",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown gold_candidate_id"):
+        load_open_qa_candidate_specs(path)
 
 
 def test_react_adapter_scores_only_observation_steps() -> None:

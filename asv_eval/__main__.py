@@ -7,7 +7,9 @@ from pathlib import Path
 from asv_eval.adapters import (
     adapt_bio_agent_workspace,
     apply_belief_fixture,
+    build_label_permuted_trajectories,
     load_belief_fixture,
+    load_open_qa_candidate_specs,
     load_standard_jsonl,
     react_transcript_to_trajectory,
     write_standard_jsonl,
@@ -17,6 +19,8 @@ from asv_eval.evaluators import DeepSeekLogprobBeliefEvaluator, DeepSeekLogprobC
 from asv_eval.reporting import write_report_bundle
 from asv_eval.runtime import (
     EvaluatorRuntimeConfig,
+    RationaleTextCache,
+    RunLedger,
     StateScoreCache,
     fill_missing_beliefs,
 )
@@ -39,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     if args.command == "adapt-react":
         return _adapt_react(args)
+    if args.command == "adapt-open-qa":
+        return _adapt_open_qa(args)
+    if args.command == "audit-permutations":
+        return _audit_permutations(args)
     if args.command == "adapt-bio-agent":
         return _adapt_bio_agent(args)
     parser.error(f"unknown command: {args.command}")
@@ -65,11 +73,19 @@ def _evaluate(args: argparse.Namespace) -> int:
     evaluator_mode = args.evaluator or "provided-belief"
     runtime_config = EvaluatorRuntimeConfig(
         mode=evaluator_mode,
+        provider=args.provider,
         model=args.model,
+        base_url=args.base_url,
         api_key_env=args.api_key_env,
+        top_logprobs=args.top_logprobs,
+        max_logprob_candidates=args.max_logprob_candidates,
         fallback_policy=args.fallback_policy,
         floor_score=args.floor_score,
         state_text_max_chars=args.state_text_max_chars,
+        rationale_mode=args.rationale_mode,
+        rationale_max_tokens=args.rationale_max_tokens,
+        rationale_leakage_policy=args.rationale_leakage_policy,
+        max_concurrency=args.max_concurrency,
     )
     runtime_evaluator = (
         _build_deepseek_evaluator(runtime_config)
@@ -81,6 +97,16 @@ def _evaluate(args: argparse.Namespace) -> int:
         config=runtime_config,
         evaluator=runtime_evaluator,
         cache=StateScoreCache(Path(args.cache)) if args.cache else None,
+        persistent_rationale_cache=(
+            RationaleTextCache(Path(args.rationale_cache))
+            if args.rationale_cache
+            else (
+                RationaleTextCache(Path(f"{args.cache}.rationale.jsonl"))
+                if args.cache and args.rationale_mode != "off"
+                else None
+            )
+        ),
+        ledger=RunLedger(Path(args.run_ledger)) if args.run_ledger else None,
     )
     if args.write_evaluated_trajectories:
         write_standard_jsonl(Path(args.write_evaluated_trajectories), trajectories)
@@ -88,7 +114,12 @@ def _evaluate(args: argparse.Namespace) -> int:
         trajectories,
         Path(args.output_dir),
         config=config,
-        evaluator_config=runtime_config.cache_identity(),
+        evaluator_config={
+            **runtime_config.cache_identity(),
+            "max_concurrency": runtime_config.max_concurrency,
+        },
+        bootstrap_resamples=args.bootstrap_resamples,
+        bootstrap_seed=args.bootstrap_seed,
     )
     print(
         " ".join(
@@ -115,6 +146,24 @@ def _adapt_react(args: argparse.Namespace) -> int:
     return 0
 
 
+def _adapt_open_qa(args: argparse.Namespace) -> int:
+    trajectories = load_open_qa_candidate_specs(Path(args.input))
+    write_standard_jsonl(Path(args.output), trajectories)
+    print(f"trajectory_count={len(trajectories)} output={args.output}")
+    return 0
+
+
+def _audit_permutations(args: argparse.Namespace) -> int:
+    trajectories = load_standard_jsonl(Path(args.input))
+    permuted = build_label_permuted_trajectories(
+        trajectories,
+        permutation_count=max(1, int(args.b)),
+    )
+    write_standard_jsonl(Path(args.output), permuted)
+    print(f"trajectory_count={len(permuted)} output={args.output}")
+    return 0
+
+
 def _adapt_bio_agent(args: argparse.Namespace) -> int:
     trajectory = adapt_bio_agent_workspace(Path(args.workspace), args.run_id)
     _write_trajectory_jsonl(Path(args.output), trajectory)
@@ -137,13 +186,33 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["provided-belief", "deepseek-chat-logprob"],
     )
     evaluate.add_argument("--model", default="deepseek-chat")
+    evaluate.add_argument("--provider", default="deepseek")
+    evaluate.add_argument("--base-url", default="https://api.deepseek.com/v1")
     evaluate.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    evaluate.add_argument("--top-logprobs", type=int, default=20)
+    evaluate.add_argument("--max-logprob-candidates", type=int, default=10)
     evaluate.add_argument("--cache")
-    evaluate.add_argument("--fallback-policy", choices=["error", "floor"], default="error")
+    evaluate.add_argument("--rationale-cache")
+    evaluate.add_argument("--run-ledger")
+    evaluate.add_argument(
+        "--fallback-policy", choices=["error", "floor"], default="error"
+    )
     evaluate.add_argument("--floor-score", type=float, default=-20.0)
     evaluate.add_argument("--state-text-max-chars", type=int, default=6000)
+    evaluate.add_argument(
+        "--rationale-mode", choices=["off", "label-free"], default="off"
+    )
+    evaluate.add_argument("--rationale-max-tokens", type=int, default=128)
+    evaluate.add_argument(
+        "--rationale-leakage-policy",
+        choices=["error", "warn"],
+        default="error",
+    )
     evaluate.add_argument("--write-evaluated-trajectories")
     evaluate.add_argument("--output-dir", required=True)
+    evaluate.add_argument("--bootstrap-resamples", type=int, default=5000)
+    evaluate.add_argument("--bootstrap-seed", type=int, default=7)
+    evaluate.add_argument("--max-concurrency", type=int, default=1)
     evaluate.add_argument("--lambda-cost", type=float, default=0.0)
     evaluate.add_argument("--prompt-token-weight", type=float, default=0.0)
     evaluate.add_argument("--completion-token-weight", type=float, default=0.0)
@@ -162,6 +231,21 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="candidate mapping like A=supported",
     )
+
+    open_qa = subparsers.add_parser(
+        "adapt-open-qa",
+        help="convert open QA candidate answer specs",
+    )
+    open_qa.add_argument("--input", required=True)
+    open_qa.add_argument("--output", required=True)
+
+    permutations = subparsers.add_parser(
+        "audit-permutations",
+        help="write label-permuted standard ASV trajectories",
+    )
+    permutations.add_argument("--input", required=True)
+    permutations.add_argument("--output", required=True)
+    permutations.add_argument("--b", type=int, default=4)
 
     bio_agent = subparsers.add_parser(
         "adapt-bio-agent",
@@ -193,6 +277,7 @@ def _build_deepseek_evaluator(
     return DeepSeekLogprobBeliefEvaluator(
         DeepSeekLogprobConfig(
             model=config.model,
+            base_url=config.base_url,
             api_key_env=config.api_key_env,
             top_logprobs=config.top_logprobs,
             max_tokens=config.max_tokens,

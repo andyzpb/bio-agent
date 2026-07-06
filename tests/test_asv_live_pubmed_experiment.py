@@ -6,9 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from asv_eval.core import Candidate, CandidateSpace, StepRecord, TaskRecord, TrajectoryRecord
+from asv_eval.core import (
+    Candidate,
+    CandidateSpace,
+    StepRecord,
+    TaskRecord,
+    TrajectoryRecord,
+)
 from eval.asv.live_pubmed.analyze import (
     aggregate_step_type_rows,
+    build_surprise_pivot_rows,
     write_analysis_tables,
 )
 from eval.asv.live_pubmed.collect import (
@@ -37,15 +44,10 @@ from eval.asv.live_pubmed.claims import (
     validate_claim_set,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_EXPERIMENT_DIR = ROOT / "eval" / "asv" / "experiments" / "live_pubmed_step_value"
-CLAIMS_PATH = (
-    LIVE_EXPERIMENT_DIR / "claims.pilot.jsonl"
-)
-QUICK_CLAIMS_PATH = (
-    LIVE_EXPERIMENT_DIR / "claims.quick.jsonl"
-)
+CLAIMS_PATH = LIVE_EXPERIMENT_DIR / "claims.pilot.jsonl"
+QUICK_CLAIMS_PATH = LIVE_EXPERIMENT_DIR / "claims.quick.jsonl"
 
 
 def test_live_pubmed_experiment_readme_documents_real_run_commands() -> None:
@@ -399,7 +401,9 @@ def test_collect_claims_dry_run_writes_frozen_trajectories(tmp_path: Path) -> No
     assert (config.output_dir / "collection.jsonl").exists()
     assert (config.output_dir / "trajectory.jsonl").exists()
     payload = json.loads(
-        (config.output_dir / "trajectory.jsonl").read_text(encoding="utf-8").splitlines()[0]
+        (config.output_dir / "trajectory.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
     )
     assert payload["task"]["candidate_space"]["gold_candidate_id"] == "supported"
     assert payload["task"]["gold_visible_to_evaluator"] is False
@@ -648,7 +652,9 @@ def test_collect_main_returns_nonzero_on_partial_failure(
                 raise TimeoutError("provider timeout")
             return await super().answer_with_audit(request)
 
-    monkeypatch.setattr(collect_module, "BiomedEvidenceService", PartiallyFailingService)
+    monkeypatch.setattr(
+        collect_module, "BiomedEvidenceService", PartiallyFailingService
+    )
 
     exit_code = collect_module.main(
         [
@@ -665,7 +671,9 @@ def test_collect_main_returns_nonzero_on_partial_failure(
     assert exit_code == 1
     rows = [
         json.loads(line)
-        for line in (output_dir / "collection.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (output_dir / "collection.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     assert [row["status"] for row in rows] == ["completed", "failed", "completed"]
 
@@ -722,7 +730,9 @@ def test_collect_main_builds_env_backed_actor_provider(
 
     monkeypatch.setenv("FAKE_ACTOR_KEY", "secret")
     monkeypatch.setattr(collect_module, "LLMProvider", FakeActorProvider, raising=False)
-    monkeypatch.setattr(collect_module, "BiomedEvidenceService", FakeLiveCollectorService)
+    monkeypatch.setattr(
+        collect_module, "BiomedEvidenceService", FakeLiveCollectorService
+    )
 
     exit_code = collect_module.main(
         [
@@ -789,9 +799,48 @@ def test_build_evaluate_command_uses_deepseek_cache_and_frozen_input(
     assert "-20.0" in command
 
 
+def test_build_evaluate_command_can_enable_label_free_rationale(tmp_path: Path) -> None:
+    run = EvaluationRun(
+        input_path=tmp_path / "trajectory.jsonl",
+        output_dir=tmp_path / "report",
+        cache_path=tmp_path / "cache.jsonl",
+        evaluated_path=tmp_path / "evaluated.jsonl",
+        rationale_mode="label-free",
+        rationale_max_tokens=256,
+        rationale_leakage_policy="warn",
+    )
+
+    command = build_evaluate_command(run)
+
+    assert "--rationale-mode" in command
+    assert "label-free" in command
+    assert "--rationale-max-tokens" in command
+    assert "256" in command
+    assert "--rationale-leakage-policy" in command
+    assert "warn" in command
+
+
 def test_secret_scan_allows_safe_env_var_name(tmp_path: Path) -> None:
     path = tmp_path / "summary.json"
     path.write_text('{"credential_env": "DEEPSEEK_API_KEY"}', encoding="utf-8")
+
+    assert scan_for_secret_markers([path]) == []
+
+
+def test_secret_scan_allows_rationale_token_count_fields(tmp_path: Path) -> None:
+    path = tmp_path / "summary.json"
+    path.write_text(
+        json.dumps(
+            {
+                "rationale_max_tokens": 128,
+                "mean_rationale_after_tokens_approx": 64,
+                "rationale_after_tokens_approx": 64,
+                "rationale_before_tokens_approx": 63,
+                "secret_scan_findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert scan_for_secret_markers([path]) == []
 
@@ -918,11 +967,15 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
             "asv_components": {
                 "realized_entropy_reduction": 0.4,
                 "net_asv": 0.3,
+                "bayesian_surprise_kl": 1.2,
+                "js_pivot_score": 0.4,
                 "cost_scalar": 0.1,
             },
             "gold_metrics": {
                 "gold_log_likelihood_gain": 0.5,
                 "oracle_gold_log_likelihood_gain": 2.0,
+                "gold_margin_gain": 1.5,
+                "semantic_gold_gain": 0.75,
             },
             "quality_flags": {"used_floor_score": False, "used_cache": True},
         },
@@ -933,11 +986,15 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
             "asv_components": {
                 "realized_entropy_reduction": 0.2,
                 "net_asv": 0.1,
+                "bayesian_surprise_kl": 0.2,
+                "js_pivot_score": 0.1,
                 "cost_scalar": 0.1,
             },
             "gold_metrics": {
                 "gold_log_likelihood_gain": None,
                 "oracle_gold_log_likelihood_gain": 1.0,
+                "gold_margin_gain": 0.5,
+                "semantic_gold_gain": 0.25,
             },
             "quality_flags": {"used_floor_score": True, "used_cache": False},
         },
@@ -951,6 +1008,8 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
             "count": 2,
             "mean_realized_entropy_reduction": 0.3,
             "mean_net_asv": 0.2,
+            "mean_bayesian_surprise_kl": 0.7,
+            "mean_js_pivot_score": 0.25,
             "mean_cost_scalar": 0.1,
             "mean_gold_log_likelihood_gain": 0.5,
             "gold_metric_step_count": 1,
@@ -958,6 +1017,12 @@ def test_aggregate_step_type_rows_computes_mean_asv() -> None:
             "mean_oracle_gold_log_likelihood_gain": 1.5,
             "oracle_gold_metric_step_count": 2,
             "missing_oracle_gold_metric_step_count": 0,
+            "mean_gold_margin_gain": 1.0,
+            "gold_margin_metric_step_count": 2,
+            "missing_gold_margin_metric_step_count": 0,
+            "mean_semantic_gold_gain": 0.5,
+            "semantic_gold_metric_step_count": 2,
+            "missing_semantic_gold_metric_step_count": 0,
             "floor_score_step_count": 1,
             "cache_hit_step_count": 1,
         }
@@ -976,11 +1041,14 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
                 "asv_components": {
                     "realized_entropy_reduction": 0.0,
                     "net_asv": 0.0,
+                    "bayesian_surprise_kl": 0.8,
+                    "js_pivot_score": 0.25,
                     "cost_scalar": 0.0,
                 },
                 "gold_metrics": {
                     "gold_log_likelihood_gain": 0.0,
                     "oracle_gold_log_likelihood_gain": 0.0,
+                    "gold_margin_gain": 1.0,
                 },
                 "quality_flags": {},
             }
@@ -994,11 +1062,16 @@ def test_write_analysis_tables_creates_csv_and_json(tmp_path: Path) -> None:
     csv_text = (report_dir / "tables" / "step_type_summary.csv").read_text(
         encoding="utf-8"
     )
-    summary = json.loads((report_dir / "analysis_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads(
+        (report_dir / "analysis_summary.json").read_text(encoding="utf-8")
+    )
     assert "classify" in csv_text
     assert "mean_oracle_gold_log_likelihood_gain" in csv_text
+    assert "mean_bayesian_surprise_kl" in csv_text
+    assert (report_dir / "tables" / "surprise_pivots.csv").exists()
     assert summary["step_type_summary"][0]["step_type"] == "classify"
     assert summary["step_type_summary"][0]["gold_metric_step_count"] == 1
+    assert summary["surprise_pivots"][0]["pivot_alignment"] == "constructive_pivot"
 
 
 def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> None:
@@ -1011,6 +1084,8 @@ def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> N
                 "asv_components": {
                     "realized_entropy_reduction": 0.1,
                     "net_asv": 0.1,
+                    "bayesian_surprise_kl": 0.0,
+                    "js_pivot_score": 0.0,
                     "cost_scalar": 0.0,
                 },
                 "gold_metrics": {
@@ -1028,6 +1103,39 @@ def test_aggregate_step_type_rows_uses_null_when_all_gold_metrics_missing() -> N
     assert summary[0]["mean_oracle_gold_log_likelihood_gain"] is None
     assert summary[0]["oracle_gold_metric_step_count"] == 0
     assert summary[0]["missing_oracle_gold_metric_step_count"] == 1
+
+
+def test_build_surprise_pivot_rows_orders_by_kl_and_labels_alignment() -> None:
+    rows = [
+        {
+            "trajectory_id": "t1",
+            "step_id": "s-low",
+            "action": {"type": "retrieve"},
+            "asv_components": {
+                "bayesian_surprise_kl": 0.2,
+                "js_pivot_score": 0.1,
+                "realized_entropy_reduction": 0.0,
+            },
+            "gold_metrics": {"gold_margin_gain": -1.0},
+        },
+        {
+            "trajectory_id": "t1",
+            "step_id": "s-high",
+            "action": {"type": "revise"},
+            "asv_components": {
+                "bayesian_surprise_kl": 3.0,
+                "js_pivot_score": 0.5,
+                "realized_entropy_reduction": 0.0,
+            },
+            "gold_metrics": {"gold_margin_gain": 2.0},
+        },
+    ]
+
+    pivots = build_surprise_pivot_rows(rows)
+
+    assert [row["step_id"] for row in pivots] == ["s-high", "s-low"]
+    assert pivots[0]["pivot_alignment"] == "constructive_pivot"
+    assert pivots[1]["pivot_alignment"] == "destructive_pivot"
 
 
 def test_build_label_permuted_trajectories_rotates_candidate_labels() -> None:
@@ -1060,8 +1168,7 @@ def test_build_label_permuted_trajectories_rotates_candidate_labels() -> None:
         "t1-permutation-2",
     ]
     assert [
-        candidate.label
-        for candidate in permuted[1].task.candidate_space.candidates
+        candidate.label for candidate in permuted[1].task.candidate_space.candidates
     ] == ["C", "A", "B"]
     assert permuted[1].metadata["label_permutation_index"] == 1
 
@@ -1078,7 +1185,13 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
                         "step_id": "retrieve",
                         "state_before_hash": "before-retrieve",
                         "state_after_hash": "after-retrieve",
-                        "asv_components": {"net_asv": 0.20},
+                        "belief_before": {"yes": 0.7, "no": 0.3},
+                        "belief_after": {"yes": 0.8, "no": 0.2},
+                        "asv_components": {
+                            "net_asv": 0.20,
+                            "bayesian_surprise_kl": 0.4,
+                        },
+                        "gold_metrics": {"gold_margin_gain": 1.0},
                     }
                 ),
                 json.dumps(
@@ -1087,7 +1200,13 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
                         "step_id": "retrieve",
                         "state_before_hash": "before-retrieve",
                         "state_after_hash": "after-retrieve",
-                        "asv_components": {"net_asv": 0.15},
+                        "belief_before": {"yes": 0.5, "no": 0.5},
+                        "belief_after": {"yes": 0.6, "no": 0.4},
+                        "asv_components": {
+                            "net_asv": 0.15,
+                            "bayesian_surprise_kl": 0.1,
+                        },
+                        "gold_metrics": {"gold_margin_gain": 0.5},
                     }
                 ),
                 json.dumps(
@@ -1096,7 +1215,13 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
                         "step_id": "synthesize",
                         "state_before_hash": "before-synthesize",
                         "state_after_hash": "after-synthesize",
-                        "asv_components": {"net_asv": 2.00},
+                        "belief_before": {"yes": 0.2, "no": 0.8},
+                        "belief_after": {"yes": 0.3, "no": 0.7},
+                        "asv_components": {
+                            "net_asv": 2.00,
+                            "bayesian_surprise_kl": 2.0,
+                        },
+                        "gold_metrics": {"gold_margin_gain": -0.5},
                     }
                 ),
                 json.dumps(
@@ -1105,7 +1230,13 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
                         "step_id": "synthesize",
                         "state_before_hash": "before-synthesize",
                         "state_after_hash": "after-synthesize",
-                        "asv_components": {"net_asv": 2.10},
+                        "belief_before": {"yes": 0.4, "no": 0.6},
+                        "belief_after": {"yes": 0.6, "no": 0.4},
+                        "asv_components": {
+                            "net_asv": 2.10,
+                            "bayesian_surprise_kl": 1.0,
+                        },
+                        "gold_metrics": {"gold_margin_gain": -1.0},
                     }
                 ),
             ]
@@ -1124,4 +1255,12 @@ def test_summarize_permutation_stability_reads_reports(tmp_path: Path) -> None:
         "max_net_asv": 2.1,
         "mean_group_range_net_asv": 0.075,
         "max_group_range_net_asv": 0.1,
+        "mean_group_range_bayesian_surprise_kl": 0.65,
+        "max_group_range_bayesian_surprise_kl": 1.0,
+        "mean_permutation_averaged_gold_margin_gain": 0.0,
+        "mean_group_range_gold_margin_gain": 0.5,
+        "max_group_range_gold_margin_gain": 0.5,
+        "mean_channel_anisotropy_before": 0.022582,
+        "mean_channel_anisotropy_after": 0.035179,
+        "mean_channel_anisotropy_delta": 0.012597,
     }

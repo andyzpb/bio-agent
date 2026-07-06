@@ -11,6 +11,7 @@ jieba>=0.42.1
 knowhere-python-sdk==0.5.1
 lxml>=6.0.0
 numpy>=2.4.0
+matplotlib>=3.10.0
 sqlite-vec>=0.1.6
 openai>=2.0.0
 Pillow>=11.0.0

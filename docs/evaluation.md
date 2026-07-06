@@ -107,6 +107,82 @@ mock biomedical eval runner:
 - `tests/test_biomed_release_contracts.py` checks which release tools require
   confirmation before they can write/export/review.
 
+## Agent Step Value Open QA
+
+Open QA tasks can be evaluated by freezing a candidate answer set before ASV
+scoring. Each JSONL row provides the question, candidate answers, optional gold
+answer ID for validation, and ASV steps:
+
+```json
+{
+  "trajectory_id": "open-qa-1",
+  "question": "Which candidate answer best explains the result?",
+  "candidate_answers": [
+    {"id": "answer-a", "text": "Alpha explains the result."},
+    {"id": "answer-b", "text": "Beta explains the result."},
+    {"id": "answer-c", "text": "Gamma explains the result."},
+    {"id": "none-of-the-above", "text": "Evidence is insufficient to support any candidate."}
+  ],
+  "gold_candidate_id": "answer-b",
+  "steps": [
+    {
+      "step_id": "read",
+      "index": 0,
+      "action": {"type": "read"},
+      "observation": {"text": "beta evidence"}
+    }
+  ]
+}
+```
+
+Convert the candidate-answer spec to standard ASV JSONL, then evaluate it with
+the same evaluator path:
+
+```bash
+.venv/bin/python -m asv_eval adapt-open-qa \
+  --input /tmp/open_qa_candidate_answers.jsonl \
+  --output /tmp/open_qa_trajectories.jsonl
+
+.venv/bin/python -m asv_eval evaluate \
+  --input /tmp/open_qa_trajectories.jsonl \
+  --evaluator deepseek-chat-logprob \
+  --output-dir /tmp/open_qa_asv_report
+```
+
+The reviewed open QA spec must include exactly one `none-of-the-above`
+candidate. The evaluator still scores one option label at a time; candidate
+text is included in the prompt, and label-position robustness can be checked
+with the permutation audit.
+
+ASV reports entropy movement as an uncertainty diagnostic and gold margin gain
+as the primary offline correctness-directed metric. It also exports two
+belief-update diagnostics from the before/after candidate distributions:
+`bayesian_surprise_kl`, defined as `D_KL(after || before)` with epsilon
+smoothing, and `js_pivot_score`, a bounded Jensen-Shannon companion. These
+values measure how much the evaluator's belief vector moved; they do not say
+whether the movement was useful without the gold-margin direction. Running
+`eval.asv.live_pubmed.analyze` writes `tables/surprise_pivots.csv`, ranking the
+highest-surprise steps with their entropy movement, gold margin gain, and pivot
+alignment.
+
+The 10-question live PubMed + DeepSeek experiment is under
+`eval/asv/open_qa/`:
+
+```bash
+.venv/bin/python -m eval.asv.open_qa.generate \
+  --questions eval/asv/open_qa/questions.quick.jsonl \
+  --output /tmp/asv-open-qa/generated.jsonl \
+  --provider deepseek \
+  --model deepseek-v4-flash
+
+.venv/bin/python -m eval.asv.open_qa.run_experiment \
+  --reviewed /tmp/asv-open-qa/reviewed.jsonl \
+  --artifact-root /tmp/asv-open-qa-candidate-generation-$(date +%Y%m%d-%H%M%S) \
+  --actor-provider deepseek \
+  --actor-model deepseek-v4-flash \
+  --ack-live
+```
+
 ## Release 1.0 Gate
 
 The Release 1.0 mock gate is:

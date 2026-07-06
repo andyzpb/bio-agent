@@ -52,6 +52,8 @@ plugins/**/.data/
 benchmark/result*.json
 benchmark/data/
 /eval/local_testsets/
+eval/asv/experiments/
+eval/asv/open_qa/*.jsonl
 qa_error_log_*.txt
 lme_error_log_*.txt
 /config.json.bak
@@ -70,3 +72,8 @@ lme_error_log_*.txt
 /start.sh
 docs/biomedical_evidence_graph_requirements.md
 docs/biomedical_evidence_graph_implementation_plan.md
+docs/.DS_Store
+docs/paper/**/*.zip
+docs/paper/**/artifacts/
+docs/paper/**/generated/
+tmp/

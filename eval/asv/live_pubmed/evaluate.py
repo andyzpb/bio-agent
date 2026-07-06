@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 SECRET_MARKERS = (
     "raw_provider_response",
     "provider_response",
@@ -56,6 +55,11 @@ SAFE_SECRET_KEYS = {
     "prompt_tokens",
     "completion_tokens",
     "max_tokens",
+    "mean_rationale_after_tokens_approx",
+    "rationale_after_tokens_approx",
+    "rationale_before_tokens_approx",
+    "rationale_max_tokens",
+    "secret_scan_findings",
     "total_tokens",
 }
 
@@ -69,11 +73,14 @@ class EvaluationRun:
     fallback_policy: str = "floor"
     floor_score: float = -20.0
     model: str = "deepseek-chat"
+    rationale_mode: str = "off"
+    rationale_max_tokens: int = 128
+    rationale_leakage_policy: str = "error"
     python_executable: str = sys.executable
 
 
 def build_evaluate_command(run: EvaluationRun) -> list[str]:
-    return [
+    command = [
         run.python_executable,
         "-m",
         "asv_eval",
@@ -95,6 +102,18 @@ def build_evaluate_command(run: EvaluationRun) -> list[str]:
         "--output-dir",
         str(run.output_dir),
     ]
+    if run.rationale_mode != "off":
+        command.extend(
+            [
+                "--rationale-mode",
+                run.rationale_mode,
+                "--rationale-max-tokens",
+                str(run.rationale_max_tokens),
+                "--rationale-leakage-policy",
+                run.rationale_leakage_policy,
+            ]
+        )
+    return command
 
 
 def scan_for_secret_markers(paths: list[Path]) -> list[str]:
@@ -115,7 +134,9 @@ def scan_for_secret_markers(paths: list[Path]) -> list[str]:
                     _add_finding(path_findings, marker, path)
         for pattern in SECRET_VALUE_PATTERNS:
             for match in pattern.findall(text):
-                normalized = match.split()[0].lower() if " " in match else match[:7].lower()
+                normalized = (
+                    match.split()[0].lower() if " " in match else match[:7].lower()
+                )
                 if match in SAFE_SECRET_VALUES:
                     continue
                 if normalized.startswith("bearer"):
@@ -207,14 +228,27 @@ def run_evaluation(run: EvaluationRun) -> subprocess.CompletedProcess[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Evaluate frozen live PubMed ASV trajectories.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate frozen live PubMed ASV trajectories."
+    )
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--evaluated", required=True)
     parser.add_argument("--model", default="deepseek-chat")
-    parser.add_argument("--fallback-policy", choices=["error", "floor"], default="floor")
+    parser.add_argument(
+        "--fallback-policy", choices=["error", "floor"], default="floor"
+    )
     parser.add_argument("--floor-score", type=float, default=-20.0)
+    parser.add_argument(
+        "--rationale-mode", choices=["off", "label-free"], default="off"
+    )
+    parser.add_argument("--rationale-max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--rationale-leakage-policy",
+        choices=["error", "warn"],
+        default="error",
+    )
     args = parser.parse_args(argv)
     run = EvaluationRun(
         input_path=Path(args.input),
@@ -224,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
         model=str(args.model),
         fallback_policy=str(args.fallback_policy),
         floor_score=float(args.floor_score),
+        rationale_mode=str(args.rationale_mode),
+        rationale_max_tokens=int(args.rationale_max_tokens),
+        rationale_leakage_policy=str(args.rationale_leakage_policy),
     )
     result = run_evaluation(run)
     if result.stdout:

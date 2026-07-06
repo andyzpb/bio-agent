@@ -9,7 +9,11 @@ from typing import Any
 
 
 def load_steps(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def aggregate_step_type_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -22,39 +26,118 @@ def aggregate_step_type_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
         gold_values = [
             value
             for item in items
-            if (value := _gold_metric_value(item, "gold_log_likelihood_gain")) is not None
+            if (value := _gold_metric_value(item, "gold_log_likelihood_gain"))
+            is not None
         ]
         oracle_gold_values = [
             value
             for item in items
-            if (value := _gold_metric_value(item, "oracle_gold_log_likelihood_gain")) is not None
+            if (value := _gold_metric_value(item, "oracle_gold_log_likelihood_gain"))
+            is not None
+        ]
+        gold_margin_values = [
+            value
+            for item in items
+            if (value := _gold_metric_value(item, "gold_margin_gain")) is not None
+        ]
+        semantic_gold_values = [
+            value
+            for item in items
+            if (value := _gold_metric_value(item, "semantic_gold_gain")) is not None
+        ]
+        surprise_values = [
+            value
+            for item in items
+            if (value := _asv_component_value(item, "bayesian_surprise_kl")) is not None
+        ]
+        js_values = [
+            value
+            for item in items
+            if (value := _asv_component_value(item, "js_pivot_score")) is not None
         ]
         output.append(
             {
                 "step_type": step_type,
                 "count": len(items),
                 "mean_realized_entropy_reduction": _mean(
-                    float(item["asv_components"]["realized_entropy_reduction"]) for item in items
+                    float(item["asv_components"]["realized_entropy_reduction"])
+                    for item in items
                 ),
-                "mean_net_asv": _mean(float(item["asv_components"]["net_asv"]) for item in items),
-                "mean_cost_scalar": _mean(float(item["asv_components"]["cost_scalar"]) for item in items),
-                "mean_gold_log_likelihood_gain": _mean(gold_values) if gold_values else None,
+                "mean_net_asv": _mean(
+                    float(item["asv_components"]["net_asv"]) for item in items
+                ),
+                "mean_bayesian_surprise_kl": (
+                    _mean(surprise_values) if surprise_values else None
+                ),
+                "mean_js_pivot_score": _mean(js_values) if js_values else None,
+                "mean_cost_scalar": _mean(
+                    float(item["asv_components"]["cost_scalar"]) for item in items
+                ),
+                "mean_gold_log_likelihood_gain": (
+                    _mean(gold_values) if gold_values else None
+                ),
                 "gold_metric_step_count": len(gold_values),
                 "missing_gold_metric_step_count": len(items) - len(gold_values),
                 "mean_oracle_gold_log_likelihood_gain": (
                     _mean(oracle_gold_values) if oracle_gold_values else None
                 ),
                 "oracle_gold_metric_step_count": len(oracle_gold_values),
-                "missing_oracle_gold_metric_step_count": len(items) - len(oracle_gold_values),
+                "missing_oracle_gold_metric_step_count": len(items)
+                - len(oracle_gold_values),
+                "mean_gold_margin_gain": (
+                    _mean(gold_margin_values) if gold_margin_values else None
+                ),
+                "gold_margin_metric_step_count": len(gold_margin_values),
+                "missing_gold_margin_metric_step_count": len(items)
+                - len(gold_margin_values),
+                "mean_semantic_gold_gain": (
+                    _mean(semantic_gold_values) if semantic_gold_values else None
+                ),
+                "semantic_gold_metric_step_count": len(semantic_gold_values),
+                "missing_semantic_gold_metric_step_count": len(items)
+                - len(semantic_gold_values),
                 "floor_score_step_count": sum(
-                    (item.get("quality_flags") or {}).get("used_floor_score") is True for item in items
+                    (item.get("quality_flags") or {}).get("used_floor_score") is True
+                    for item in items
                 ),
                 "cache_hit_step_count": sum(
-                    (item.get("quality_flags") or {}).get("used_cache") is True for item in items
+                    (item.get("quality_flags") or {}).get("used_cache") is True
+                    for item in items
                 ),
             }
         )
     return output
+
+
+def build_surprise_pivot_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        surprise = _asv_component_value(row, "bayesian_surprise_kl")
+        if surprise is None:
+            continue
+        margin_gain = _gold_metric_value(row, "gold_margin_gain")
+        entropy_delta = _asv_component_value(row, "realized_entropy_reduction")
+        candidates.append(
+            {
+                "trajectory_id": row.get("trajectory_id"),
+                "step_id": row.get("step_id"),
+                "step_type": _step_type(row),
+                "bayesian_surprise_kl": surprise,
+                "js_pivot_score": _asv_component_value(row, "js_pivot_score"),
+                "realized_entropy_reduction": entropy_delta,
+                "gold_margin_gain": margin_gain,
+                "pivot_alignment": _pivot_alignment(surprise, margin_gain),
+            }
+        )
+    candidates.sort(key=lambda item: float(item["bayesian_surprise_kl"]), reverse=True)
+    return [
+        {"rank": index + 1, **row}
+        for index, row in enumerate(candidates[: max(0, limit)])
+    ]
 
 
 def _step_type(row: dict[str, Any]) -> str:
@@ -74,9 +157,30 @@ def _gold_metric_value(row: dict[str, Any], key: str) -> float | None:
     return None
 
 
+def _asv_component_value(row: dict[str, Any], key: str) -> float | None:
+    components = row.get("asv_components")
+    if not isinstance(components, dict):
+        return None
+    value = components.get(key)
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
+def _pivot_alignment(surprise: float, margin_gain: float | None) -> str:
+    if margin_gain is None:
+        return "unlabeled_belief_shift"
+    if margin_gain > 0:
+        return "constructive_pivot" if surprise > 0 else "steady_consolidation"
+    if margin_gain < 0:
+        return "destructive_pivot" if surprise > 0 else "noise_or_drift"
+    return "belief_shift_without_margin_change" if surprise > 0 else "unchanged"
+
+
 def write_analysis_tables(report_dir: Path) -> dict[str, Any]:
     rows = load_steps(report_dir / "steps.jsonl")
     summary = aggregate_step_type_rows(rows)
+    pivots = build_surprise_pivot_rows(rows)
     tables_dir = report_dir / "tables"
     tables_dir.mkdir(exist_ok=True)
     csv_path = tables_dir / "step_type_summary.csv"
@@ -85,7 +189,26 @@ def write_analysis_tables(report_dir: Path) -> dict[str, Any]:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(summary)
-    payload = {"step_type_summary": summary}
+    pivot_fields = [
+        "rank",
+        "trajectory_id",
+        "step_id",
+        "step_type",
+        "bayesian_surprise_kl",
+        "js_pivot_score",
+        "realized_entropy_reduction",
+        "gold_margin_gain",
+        "pivot_alignment",
+    ]
+    with (tables_dir / "surprise_pivots.csv").open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=pivot_fields)
+        writer.writeheader()
+        writer.writerows(pivots)
+    payload = {"step_type_summary": summary, "surprise_pivots": pivots}
     (report_dir / "analysis_summary.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -101,7 +224,9 @@ def _mean(values: Any) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build live PubMed ASV analysis tables.")
+    parser = argparse.ArgumentParser(
+        description="Build live PubMed ASV analysis tables."
+    )
     parser.add_argument("--report-dir", required=True)
     args = parser.parse_args(argv)
     write_analysis_tables(Path(args.report_dir))

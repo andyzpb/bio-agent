@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 from asv_eval.core import (
     Candidate,
@@ -17,14 +17,18 @@ from asv_eval.core import (
 
 def load_standard_jsonl(path: Path) -> list[TrajectoryRecord]:
     trajectories: list[TrajectoryRecord] = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_no, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         if not line.strip():
             continue
         try:
             payload = json.loads(line)
             trajectories.append(trajectory_from_dict(payload))
         except Exception as exc:
-            raise ValueError(f"{path}:{line_no}: invalid ASV trajectory: {exc}") from exc
+            raise ValueError(
+                f"{path}:{line_no}: invalid ASV trajectory: {exc}"
+            ) from exc
     return trajectories
 
 
@@ -37,6 +41,44 @@ def write_standard_jsonl(path: Path, trajectories: list[TrajectoryRecord]) -> No
         ),
         encoding="utf-8",
     )
+
+
+def build_label_permuted_trajectories(
+    trajectories: Sequence[TrajectoryRecord],
+    permutation_count: int,
+) -> list[TrajectoryRecord]:
+    if permutation_count < 0:
+        raise ValueError("permutation_count must be non-negative")
+
+    permuted: list[TrajectoryRecord] = []
+    for trajectory in trajectories:
+        candidates = trajectory.task.candidate_space.candidates
+        labels = [candidate.label for candidate in candidates]
+        for index in range(permutation_count):
+            rotated_labels = _rotate_labels(labels, index)
+            candidate_space = replace(
+                trajectory.task.candidate_space,
+                candidates=[
+                    replace(candidate, label=rotated_label)
+                    for candidate, rotated_label in zip(
+                        candidates,
+                        rotated_labels,
+                        strict=True,
+                    )
+                ],
+            )
+            permuted.append(
+                replace(
+                    trajectory,
+                    trajectory_id=f"{trajectory.trajectory_id}-permutation-{index}",
+                    task=replace(trajectory.task, candidate_space=candidate_space),
+                    metadata={
+                        **trajectory.metadata,
+                        "label_permutation_index": index,
+                    },
+                )
+            )
+    return permuted
 
 
 def load_belief_fixture(
@@ -54,16 +96,16 @@ def load_belief_fixture(
             key = (str(payload["trajectory_id"]), str(payload["step_id"]))
             fixture[key] = {
                 "belief_before": {
-                    str(k): float(v)
-                    for k, v in dict(payload["belief_before"]).items()
+                    str(k): float(v) for k, v in dict(payload["belief_before"]).items()
                 },
                 "belief_after": {
-                    str(k): float(v)
-                    for k, v in dict(payload["belief_after"]).items()
+                    str(k): float(v) for k, v in dict(payload["belief_after"]).items()
                 },
             }
         except Exception as exc:
-            raise ValueError(f"{path}:{line_no}: invalid belief fixture: {exc}") from exc
+            raise ValueError(
+                f"{path}:{line_no}: invalid belief fixture: {exc}"
+            ) from exc
     return fixture
 
 
@@ -88,6 +130,101 @@ def apply_belief_fixture(
             )
         updated.append(replace(trajectory, steps=steps))
     return updated
+
+
+def load_open_qa_candidate_specs(path: Path) -> list[TrajectoryRecord]:
+    trajectories: list[TrajectoryRecord] = []
+    for line_no, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            trajectories.append(open_qa_candidate_spec_to_trajectory(json.loads(line)))
+        except Exception as exc:
+            raise ValueError(
+                f"{path}:{line_no}: invalid open QA candidate answer spec: {exc}"
+            ) from exc
+    return trajectories
+
+
+def open_qa_candidate_spec_to_trajectory(payload: dict[str, Any]) -> TrajectoryRecord:
+    candidates = _candidate_answers(payload)
+    none_count = sum(item["id"] == "none-of-the-above" for item in candidates)
+    if none_count != 1:
+        raise ValueError(
+            "open QA candidate spec must include exactly one "
+            "none-of-the-above candidate"
+        )
+    trajectory_id = str(payload["trajectory_id"])
+    gold_candidate_id = payload.get("gold_candidate_id") or payload.get(
+        "gold_answer_id"
+    )
+    if gold_candidate_id and gold_candidate_id not in {
+        item["id"] for item in candidates
+    }:
+        raise ValueError(f"unknown gold_candidate_id: {gold_candidate_id}")
+    task_payload = {
+        "task_id": str(payload.get("task_id") or trajectory_id),
+        "question": str(payload["question"]),
+        "task_type": str(payload.get("task_type", "open_qa_candidate_set")),
+        "domain": payload.get("domain"),
+        "difficulty": payload.get("difficulty"),
+        "candidate_space": {
+            "type": "candidate_set",
+            "candidates": candidates,
+            "gold_candidate_id": gold_candidate_id,
+        },
+        "gold_visible_to_evaluator": bool(
+            payload.get("gold_visible_to_evaluator", False)
+        ),
+        "gold_used_only_for_validation": bool(
+            payload.get("gold_used_only_for_validation", True)
+        ),
+    }
+    return trajectory_from_dict(
+        {
+            "trajectory_id": trajectory_id,
+            "task": task_payload,
+            "steps": payload.get("steps") or [],
+            "source_adapter": str(
+                payload.get("source_adapter", "open_qa_candidate_spec")
+            ),
+            "created_at": payload.get("created_at"),
+            "metadata": dict(payload.get("metadata") or {}),
+            "final_score": payload.get("final_score"),
+            "success": payload.get("success"),
+        }
+    )
+
+
+def _candidate_answers(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_candidates = payload.get("candidate_answers")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise ValueError("candidate_answers must be a non-empty list")
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(raw_candidates):
+        if not isinstance(item, dict):
+            raise ValueError("candidate answer must be a JSON object")
+        candidate_id = str(item.get("id") or item.get("answer_id") or "")
+        candidate_text = str(item.get("text") or item.get("answer") or "")
+        if not candidate_id:
+            raise ValueError("candidate answer is missing id")
+        if not candidate_text:
+            raise ValueError(f"candidate answer {candidate_id} is missing text")
+        if candidate_id in seen_ids:
+            raise ValueError(f"duplicate candidate answer id: {candidate_id}")
+        seen_ids.add(candidate_id)
+        candidates.append(
+            {
+                "id": candidate_id,
+                "label": str(item.get("label") or chr(ord("A") + idx)),
+                "text": candidate_text,
+                "prior": item.get("prior"),
+            }
+        )
+    return candidates
 
 
 def trajectory_from_dict(payload: dict[str, Any]) -> TrajectoryRecord:
@@ -130,6 +267,8 @@ def trajectory_from_dict(payload: dict[str, Any]) -> TrajectoryRecord:
             state_after=item.get("state_after"),
             belief_before=item.get("belief_before"),
             belief_after=item.get("belief_after"),
+            raw_scores_before=_float_dict_or_none(item.get("raw_scores_before")),
+            raw_scores_after=_float_dict_or_none(item.get("raw_scores_after")),
             cost=dict(item.get("cost") or {}),
             label=item.get("label"),
             label_source=item.get("label_source"),
@@ -152,6 +291,19 @@ def trajectory_from_dict(payload: dict[str, Any]) -> TrajectoryRecord:
     )
 
 
+def _float_dict_or_none(value: Any) -> dict[str, float] | None:
+    if value is None:
+        return None
+    return {str(key): float(item) for key, item in dict(value).items()}
+
+
+def _rotate_labels(labels: list[str], offset: int) -> list[str]:
+    if not labels:
+        return []
+    offset %= len(labels)
+    return labels[-offset:] + labels[:-offset] if offset else labels
+
+
 def react_transcript_to_trajectory(
     transcript: str,
     *,
@@ -160,7 +312,8 @@ def react_transcript_to_trajectory(
     candidates: dict[str, str],
 ) -> TrajectoryRecord:
     candidate_items = [
-        Candidate(id=value, label=label, text=value) for label, value in candidates.items()
+        Candidate(id=value, label=label, text=value)
+        for label, value in candidates.items()
     ]
     task = TaskRecord(
         task_id=trajectory_id,
