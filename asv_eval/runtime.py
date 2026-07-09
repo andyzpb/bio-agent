@@ -18,7 +18,8 @@ from asv_eval.evaluators import (
 
 EvaluatorMode = Literal["provided-belief", "deepseek-chat-logprob"]
 FallbackPolicy = Literal["error", "floor"]
-RationaleMode = Literal["off", "label-free"]
+OptionLabelScheme = Literal["source", "numeric"]
+RationaleMode = Literal["off", "label-free", "quote"]
 RationaleLeakagePolicy = Literal["error", "warn"]
 StatePosition = Literal["before", "after"]
 
@@ -92,6 +93,18 @@ _GOLD_LEAKAGE_RE = re.compile(
     r"\b(?:gold|answer\s*key|success\s*flag|final\s*score)\b",
     re.I,
 )
+_QUOTE_BUFFER_FIELD_NAMES = {
+    "conflicting_claims",
+    "coverage_gaps",
+    "limitations",
+    "supported_claims",
+}
+_QUOTE_BUFFER_LINE_KEYS = (
+    "conflicting_claims",
+    "coverage_gaps",
+    "limitations",
+    "supported_claims",
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,8 @@ class EvaluatorRuntimeConfig:
     max_logprob_candidates: int = 10
     fallback_policy: FallbackPolicy = "error"
     state_text_max_chars: int = 6000
+    option_label_scheme: OptionLabelScheme = "source"
+    disable_thinking: bool = False
     rationale_mode: RationaleMode = "off"
     rationale_max_tokens: int = 128
     rationale_leakage_policy: RationaleLeakagePolicy = "error"
@@ -127,6 +142,8 @@ class EvaluatorRuntimeConfig:
             "max_logprob_candidates": self.max_logprob_candidates,
             "fallback_policy": self.fallback_policy,
             "state_text_max_chars": self.state_text_max_chars,
+            "option_label_scheme": self.option_label_scheme,
+            "disable_thinking": self.disable_thinking,
             "rationale_mode": self.rationale_mode,
             "rationale_max_tokens": self.rationale_max_tokens,
             "rationale_leakage_policy": self.rationale_leakage_policy,
@@ -240,9 +257,7 @@ class RationaleTextCache:
                         list(row.get("warnings") or []),
                     )
 
-    def get(
-        self, key: str
-    ) -> tuple[str | None, dict[str, Any], list[str]] | None:
+    def get(self, key: str) -> tuple[str | None, dict[str, Any], list[str]] | None:
         with self._lock:
             return self._rows.get(key)
 
@@ -324,15 +339,15 @@ def render_state_for_evaluator(
     raw_state = _state_for_position(step, position)
     redacted_state = _redact(raw_state)
     state_text = _bounded_json(redacted_state, config.state_text_max_chars)
-    labels = {
-        candidate.label: candidate.id for candidate in task.candidate_space.candidates
-    }
+    labels = _candidate_labels(task, config.option_label_scheme)
     candidate_texts = {
         candidate.id: candidate.text for candidate in task.candidate_space.candidates
     }
     options = "\n".join(
-        f"{candidate.label}: {candidate.id} - {candidate.text}"
+        f"{label}: {candidate.id} - {candidate.text}"
         for candidate in task.candidate_space.candidates
+        for label, candidate_id in labels.items()
+        if candidate_id == candidate.id
     )
     prompt = "\n".join(
         [
@@ -363,6 +378,23 @@ def render_state_for_evaluator(
         labels=labels,
         candidate_texts=candidate_texts,
     )
+
+
+def _candidate_labels(task: TaskRecord, scheme: OptionLabelScheme) -> dict[str, str]:
+    if scheme == "source":
+        return {
+            candidate.label: candidate.id
+            for candidate in task.candidate_space.candidates
+        }
+    if scheme == "numeric":
+        return {
+            str(index): candidate.id
+            for index, candidate in enumerate(
+                task.candidate_space.candidates,
+                start=1,
+            )
+        }
+    raise ValueError(f"unsupported option label scheme: {scheme}")
 
 
 def fill_missing_beliefs(
@@ -601,7 +633,16 @@ def _score_rendered_state(
         rationale_cache,
         rationale_cache_lock,
     )
-    provider_prompt = _provider_prompt(task, rendered, rationale_text=rationale_text)
+    scoring_rendered = rendered
+    scoring_rationale_text = rationale_text
+    if config.rationale_mode == "quote":
+        scoring_rendered = replace(rendered, state_text=rationale_text or "")
+        scoring_rationale_text = None
+    provider_prompt = _provider_prompt(
+        task,
+        scoring_rendered,
+        rationale_text=scoring_rationale_text,
+    )
     provider_prompt_hash = _sha256(provider_prompt)
     key = _cache_key(config, provider_prompt)
     resume_key = _resume_key(config, rendered, provider_prompt_hash)
@@ -623,11 +664,13 @@ def _score_rendered_state(
 
         score_kwargs = {
             "question": task.question,
-            "evidence_text": rendered.state_text,
+            "evidence_text": scoring_rendered.state_text,
             "labels": rendered.labels,
         }
-        if rationale_text:
-            score_kwargs["rationale_text"] = rationale_text
+        if scoring_rationale_text:
+            score_kwargs["rationale_text"] = scoring_rationale_text
+            score_kwargs["candidate_texts"] = rendered.candidate_texts
+        if config.rationale_mode == "quote":
             score_kwargs["candidate_texts"] = rendered.candidate_texts
         scores, warnings = evaluator.score_state(**score_kwargs)
         warnings = list(rationale_warnings) + list(warnings)
@@ -761,6 +804,17 @@ def _rationale_for_rendered_state(
 ) -> tuple[str | None, dict[str, Any], list[str]]:
     if config.rationale_mode == "off":
         return None, {"rationale_mode": "off"}, []
+    if config.rationale_mode == "quote":
+        rationale_text = quote_buffer_from_state_text(rendered.state_text)
+        flags = _rationale_quality_flags(rationale_text, rendered.candidate_texts)
+        flags.update(
+            {
+                "rationale_mode": "quote",
+                "rationale_hash": _sha256(rationale_text),
+                "rationale_quote_constrained": True,
+            }
+        )
+        return rationale_text, flags, []
     cache_key = _rationale_cache_key(config, rendered)
     with rationale_cache_lock:
         if cache_key in rationale_cache:
@@ -816,6 +870,53 @@ def _rationale_cache_key(
         ensure_ascii=False,
     )
     return _sha256(payload)
+
+
+def quote_buffer_from_state_text(state_text: str, max_lines: int = 24) -> str:
+    json_quotes = _json_quote_buffer_lines(state_text, max_lines)
+    if json_quotes:
+        return "\n".join(json_quotes)
+    lines = [line.strip() for line in state_text.splitlines() if line.strip()]
+    keep = [
+        line
+        for line in lines
+        if any(token in line.lower() for token in _QUOTE_BUFFER_LINE_KEYS)
+        or line.startswith('"')
+    ]
+    if not keep:
+        keep = lines
+    return "\n".join(keep[:max_lines])
+
+
+def _json_quote_buffer_lines(state_text: str, max_lines: int) -> list[str]:
+    try:
+        value = json.loads(state_text)
+    except json.JSONDecodeError:
+        return []
+    quotes: list[str] = []
+
+    def visit(item: Any) -> None:
+        if len(quotes) >= max_lines:
+            return
+        if isinstance(item, dict):
+            for key, child in item.items():
+                key_text = str(key)
+                key_lower = key_text.lower()
+                if key_lower == "audit":
+                    continue
+                if key_lower in _QUOTE_BUFFER_FIELD_NAMES and not isinstance(child, dict):
+                    value_text = json.dumps(child, sort_keys=True, ensure_ascii=False)
+                    quote = f"{json.dumps(key_text, ensure_ascii=False)}: {value_text}"
+                    if quote in state_text:
+                        quotes.append(quote)
+                        continue
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return quotes
 
 
 def _rationale_quality_flags(
@@ -889,6 +990,7 @@ def _deepseek_config_from_runtime(
         max_logprob_candidates=config.max_logprob_candidates,
         floor_score=config.floor_score,
         rationale_max_tokens=config.rationale_max_tokens,
+        disable_thinking=config.disable_thinking,
     )
 
 

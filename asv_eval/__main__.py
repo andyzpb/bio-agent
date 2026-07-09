@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from asv_eval.adapters import (
@@ -49,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
         return _audit_permutations(args)
     if args.command == "adapt-bio-agent":
         return _adapt_bio_agent(args)
+    if args.command == "probe-provider":
+        return _probe_provider(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -82,6 +86,8 @@ def _evaluate(args: argparse.Namespace) -> int:
         fallback_policy=args.fallback_policy,
         floor_score=args.floor_score,
         state_text_max_chars=args.state_text_max_chars,
+        option_label_scheme=args.option_label_scheme,
+        disable_thinking=args.disable_thinking,
         rationale_mode=args.rationale_mode,
         rationale_max_tokens=args.rationale_max_tokens,
         rationale_leakage_policy=args.rationale_leakage_policy,
@@ -171,6 +177,80 @@ def _adapt_bio_agent(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_provider(args: argparse.Namespace) -> int:
+    trajectories = load_standard_jsonl(Path(args.input))
+    sampled = [
+        replace(trajectory, steps=trajectory.steps[: max(0, args.sample_steps)])
+        for trajectory in trajectories[: max(0, args.sample_trajectories)]
+    ]
+    runtime_config = EvaluatorRuntimeConfig(
+        mode=args.evaluator,
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+        api_key_env=args.api_key_env,
+        top_logprobs=args.top_logprobs,
+        max_logprob_candidates=args.max_logprob_candidates,
+        fallback_policy=args.fallback_policy,
+        floor_score=args.floor_score,
+        state_text_max_chars=args.state_text_max_chars,
+        option_label_scheme=args.option_label_scheme,
+        disable_thinking=args.disable_thinking,
+        max_concurrency=args.max_concurrency,
+    )
+    filled = fill_missing_beliefs(
+        sampled,
+        config=runtime_config,
+        evaluator=_build_deepseek_evaluator(runtime_config),
+        cache=StateScoreCache(),
+    )
+    rows = [
+        {
+            "trajectory_id": trajectory.trajectory_id,
+            "step_id": step.step_id,
+            "missing_label_count": int(
+                (step.quality_flags or {}).get("missing_label_count") or 0
+            ),
+            "used_floor_score": bool(
+                (step.quality_flags or {}).get("used_floor_score")
+            ),
+            "before_warnings": (step.quality_flags or {}).get("before_warnings") or [],
+            "after_warnings": (step.quality_flags or {}).get("after_warnings") or [],
+        }
+        for trajectory in filled
+        for step in trajectory.steps
+    ]
+    covered_steps = sum(row["missing_label_count"] == 0 for row in rows)
+    coverage_rate = covered_steps / len(rows) if rows else 0.0
+    status = "passed" if coverage_rate >= args.min_all_label_coverage else "failed"
+    summary = {
+        "status": status,
+        "provider": runtime_config.provider,
+        "model": runtime_config.model,
+        "option_label_scheme": runtime_config.option_label_scheme,
+        "disable_thinking": runtime_config.disable_thinking,
+        "top_logprobs": runtime_config.top_logprobs,
+        "step_count": len(rows),
+        "state_count": len(rows) * 2,
+        "all_label_coverage_rate": round(coverage_rate, 6),
+        "floor_score_step_count": sum(row["used_floor_score"] for row in rows),
+        "missing_label_step_count": sum(row["missing_label_count"] > 0 for row in rows),
+        "min_all_label_coverage": args.min_all_label_coverage,
+    }
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "provider_gate.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "provider_gate_states.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, sort_keys=True))
+    return 0 if status == "passed" else 2
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m asv_eval",
@@ -185,22 +265,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--evaluator",
         choices=["provided-belief", "deepseek-chat-logprob"],
     )
-    evaluate.add_argument("--model", default="deepseek-chat")
-    evaluate.add_argument("--provider", default="deepseek")
-    evaluate.add_argument("--base-url", default="https://api.deepseek.com/v1")
-    evaluate.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    evaluate.add_argument("--top-logprobs", type=int, default=20)
-    evaluate.add_argument("--max-logprob-candidates", type=int, default=10)
+    _add_provider_runtime_args(evaluate)
     evaluate.add_argument("--cache")
     evaluate.add_argument("--rationale-cache")
     evaluate.add_argument("--run-ledger")
     evaluate.add_argument(
-        "--fallback-policy", choices=["error", "floor"], default="error"
-    )
-    evaluate.add_argument("--floor-score", type=float, default=-20.0)
-    evaluate.add_argument("--state-text-max-chars", type=int, default=6000)
-    evaluate.add_argument(
-        "--rationale-mode", choices=["off", "label-free"], default="off"
+        "--rationale-mode", choices=["off", "label-free", "quote"], default="off"
     )
     evaluate.add_argument("--rationale-max-tokens", type=int, default=128)
     evaluate.add_argument(
@@ -212,7 +282,6 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output-dir", required=True)
     evaluate.add_argument("--bootstrap-resamples", type=int, default=5000)
     evaluate.add_argument("--bootstrap-seed", type=int, default=7)
-    evaluate.add_argument("--max-concurrency", type=int, default=1)
     evaluate.add_argument("--lambda-cost", type=float, default=0.0)
     evaluate.add_argument("--prompt-token-weight", type=float, default=0.0)
     evaluate.add_argument("--completion-token-weight", type=float, default=0.0)
@@ -254,7 +323,42 @@ def _build_parser() -> argparse.ArgumentParser:
     bio_agent.add_argument("--workspace", required=True)
     bio_agent.add_argument("--run-id", required=True)
     bio_agent.add_argument("--output", required=True)
+
+    probe = subparsers.add_parser(
+        "probe-provider",
+        help="check whether a logprob provider covers all option labels on real ASV states",
+    )
+    probe.add_argument("--input", required=True)
+    probe.add_argument("--output-dir", required=True)
+    probe.add_argument(
+        "--evaluator",
+        choices=["deepseek-chat-logprob"],
+        default="deepseek-chat-logprob",
+    )
+    probe.add_argument("--sample-trajectories", type=int, default=2)
+    probe.add_argument("--sample-steps", type=int, default=5)
+    probe.add_argument("--min-all-label-coverage", type=float, default=1.0)
+    _add_provider_runtime_args(probe)
     return parser
+
+
+def _add_provider_runtime_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", default="deepseek-chat")
+    parser.add_argument("--provider", default="deepseek")
+    parser.add_argument("--base-url", default="https://api.deepseek.com/v1")
+    parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    parser.add_argument("--top-logprobs", type=int, default=20)
+    parser.add_argument("--max-logprob-candidates", type=int, default=10)
+    parser.add_argument(
+        "--fallback-policy", choices=["error", "floor"], default="error"
+    )
+    parser.add_argument("--floor-score", type=float, default=-20.0)
+    parser.add_argument("--state-text-max-chars", type=int, default=6000)
+    parser.add_argument(
+        "--option-label-scheme", choices=["source", "numeric"], default="source"
+    )
+    parser.add_argument("--disable-thinking", action="store_true")
+    parser.add_argument("--max-concurrency", type=int, default=1)
 
 
 def _parse_candidate_args(values: list[str]) -> dict[str, str]:
@@ -284,6 +388,8 @@ def _build_deepseek_evaluator(
             temperature=config.temperature,
             max_logprob_candidates=config.max_logprob_candidates,
             floor_score=config.floor_score,
+            rationale_max_tokens=config.rationale_max_tokens,
+            disable_thinking=config.disable_thinking,
         )
     )
 

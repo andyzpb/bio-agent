@@ -208,6 +208,30 @@ def test_render_state_for_evaluator_uses_candidates_and_redacts_leaky_fields() -
     assert rendered.prompt_hash.startswith("sha256:")
 
 
+def test_render_state_for_evaluator_can_use_numeric_option_labels() -> None:
+    trajectory = _trajectory_with_missing_beliefs()
+
+    rendered = render_state_for_evaluator(
+        trajectory.task,
+        trajectory.steps[0],
+        position="after",
+        config=EvaluatorRuntimeConfig(
+            state_text_max_chars=2000,
+            option_label_scheme="numeric",
+        ),
+    )
+
+    assert rendered.labels == {
+        "1": "supported",
+        "2": "refuted",
+        "3": "not_enough_information",
+    }
+    assert "1: supported" in rendered.prompt
+    assert "2: refuted" in rendered.prompt
+    assert "3: not_enough_information" in rendered.prompt
+    assert "A: supported" not in rendered.prompt
+
+
 def test_render_state_for_evaluator_truncates_long_state_text() -> None:
     trajectory = _trajectory_with_missing_beliefs()
     step = StepRecord(

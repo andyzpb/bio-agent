@@ -24,6 +24,7 @@ class DeepSeekLogprobConfig:
     floor_score: float = -20.0
     rationale_max_tokens: int = 128
     rationale_temperature: float = 0.0
+    disable_thinking: bool = False
 
     def validate_candidate_count(self, candidate_count: int) -> None:
         if (
@@ -135,17 +136,17 @@ class DeepSeekLogprobBeliefEvaluator:
             rationale_text=rationale_text,
         )
         ensure_no_gold_leakage(prompt)
-        response = _post_chat_completion(
-            self.client,
-            {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": self.config.max_tokens,
-                "temperature": self.config.temperature,
-                "logprobs": True,
-                "top_logprobs": self.config.top_logprobs,
-            },
-        )
+        payload = {
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+            "logprobs": True,
+            "top_logprobs": self.config.top_logprobs,
+        }
+        if self.config.disable_thinking:
+            payload["enable_thinking"] = False
+        response = _post_chat_completion(self.client, payload)
         response.raise_for_status()
         top_logprobs = _first_top_logprobs(response.json())
         return candidate_scores_from_top_logprobs(
@@ -167,15 +168,15 @@ class DeepSeekLogprobBeliefEvaluator:
             candidate_texts=candidate_texts,
         )
         ensure_no_gold_leakage(prompt)
-        response = _post_chat_completion(
-            self.client,
-            {
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": self.config.rationale_max_tokens,
-                "temperature": self.config.rationale_temperature,
-            },
-        )
+        payload = {
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.config.rationale_max_tokens,
+            "temperature": self.config.rationale_temperature,
+        }
+        if self.config.disable_thinking:
+            payload["enable_thinking"] = False
+        response = _post_chat_completion(self.client, payload)
         response.raise_for_status()
         return _first_message_content(response.json()), []
 
@@ -311,7 +312,9 @@ def _first_message_content(payload: dict[str, Any]) -> str:
         return ""
 
 
-def _post_chat_completion(client: httpx.Client, payload: dict[str, Any]) -> httpx.Response:
+def _post_chat_completion(
+    client: httpx.Client, payload: dict[str, Any]
+) -> httpx.Response:
     for attempt in range(12):
         try:
             response = client.post("/chat/completions", json=payload)

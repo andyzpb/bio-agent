@@ -28,3 +28,10 @@ Review `generated.jsonl` manually, keeping exactly one
 The artifact root preserves generated and reviewed specs, adapted ASV JSONL,
 collection outputs, evaluator cache, evaluated trajectories, reports,
 label-permutation inputs, and `results.md`.
+
+## Provider capability gate
+
+Before using a new logprob provider for a full ASV replay, run the provider
+coverage gate in `qwen_gate_runbook.md`. A provider must cover all option
+labels on real ASV states; otherwise the replay is floor-score dominated and
+should not be interpreted as a likelihood ASV result.

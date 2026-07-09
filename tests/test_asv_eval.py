@@ -19,6 +19,7 @@ from asv_eval.core import (
     normalize_log_scores,
 )
 from asv_eval.evaluators import (
+    DeepSeekLogprobBeliefEvaluator,
     DeepSeekLogprobConfig,
     MockBeliefEvaluator,
     candidate_scores_from_top_logprobs,
@@ -313,6 +314,64 @@ def test_logprob_candidate_limit_fails_before_provider_call() -> None:
 
     with pytest.raises(ValueError, match="candidate_count"):
         config.validate_candidate_count(11)
+
+
+class _CaptureClient:
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, object]] = []
+
+    def post(self, path: str, json: dict[str, object]):
+        self.payloads.append(json)
+
+        class _Response:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "choices": [
+                        {
+                            "logprobs": {
+                                "content": [
+                                    {
+                                        "top_logprobs": [
+                                            {"token": "1", "logprob": -0.1},
+                                            {"token": "2", "logprob": -2.0},
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+        return _Response()
+
+
+def test_disable_thinking_adds_dashscope_payload_flag() -> None:
+    client = _CaptureClient()
+    evaluator = DeepSeekLogprobBeliefEvaluator(
+        DeepSeekLogprobConfig(
+            model="qwen3.7-plus",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key_env="DASHSCOPE_API_KEY",
+            top_logprobs=5,
+            max_logprob_candidates=5,
+            disable_thinking=True,
+        ),
+        client=client,
+    )
+
+    evaluator.score_state(
+        question="Which option is supported?",
+        evidence_text='{"evidence": "alpha"}',
+        labels={"1": "answer-a", "2": "answer-b"},
+    )
+
+    assert client.payloads[0]["enable_thinking"] is False
 
 
 def test_prompt_leakage_guard_rejects_gold_and_success_fields() -> None:
